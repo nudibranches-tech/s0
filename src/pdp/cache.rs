@@ -57,4 +57,8 @@ impl Pdp for CachingPdp {
         self.cache.insert(key, decision.clone()).await;
         Ok(decision)
     }
+
+    async fn reload(&self, bundle: &serde_json::Value) -> Result<()> {
+        self.inner.reload(bundle).await
+    }
 }

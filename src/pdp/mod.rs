@@ -9,7 +9,7 @@ mod cache;
 mod embedded;
 mod sidecar;
 
-pub use bundle::{Bundle, BundleStore, DECISION_RULE, GATEWAY_REGO};
+pub use bundle::{Bundle, BundleStore, DECISION_RULE, GATEWAY_REGO, content_revision};
 pub use cache::CachingPdp;
 pub use embedded::RegorusPdp;
 pub use sidecar::SidecarPdp;
@@ -25,4 +25,12 @@ use crate::error::Result;
 #[async_trait]
 pub trait Pdp: Send + Sync {
     async fn decide(&self, input: &OpaInput) -> Result<Decision>;
+
+    /// Install new projected policy data (a new bundle revision). Live policy /
+    /// live revocation (§6.1). Default no-op: the sidecar engine is fed the bundle
+    /// out-of-band by OPA's bundle plugin, so only the revision (in [`BundleStore`])
+    /// changes for it.
+    async fn reload(&self, _bundle: &serde_json::Value) -> Result<()> {
+        Ok(())
+    }
 }

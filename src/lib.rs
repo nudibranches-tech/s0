@@ -20,6 +20,7 @@ pub mod access;
 pub mod audit;
 pub mod auth;
 pub mod authz;
+pub mod bundle_refresh;
 pub mod config;
 pub mod error;
 pub mod gateway;

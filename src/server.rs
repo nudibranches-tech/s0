@@ -6,6 +6,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
@@ -13,6 +14,7 @@ use hyper_util::server::graceful::GracefulShutdown;
 use s3s::config::{S3Config, StaticConfigProvider};
 use s3s::service::{S3Service, S3ServiceBuilder};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 
 use crate::access::GatewayAccess;
 use crate::auth::GatewayAuth;
@@ -40,13 +42,27 @@ fn s3_config(gw: &Gateway) -> S3Config {
 }
 
 pub async fn serve(gw: Arc<Gateway>, listen: SocketAddr) -> Result<()> {
+    let limits = gw.limits.clone();
     let service = build_service(gw);
     let listener = TcpListener::bind(listen).await?;
     tracing::info!(%listen, "gateway listening");
 
-    let http = ConnBuilder::new(TokioExecutor::new());
+    // s3s does not protect the HTTP layer (§9.1); we own connection bounding, the
+    // header-read (slowloris) timeout, and graceful drain.
+    let mut http = ConnBuilder::new(TokioExecutor::new());
+    http.http1()
+        .header_read_timeout(Duration::from_secs(limits.header_read_timeout_secs));
+    let conn_limit = Arc::new(Semaphore::new(limits.max_connections));
     let graceful = GracefulShutdown::new();
+
     loop {
+        let permit = tokio::select! {
+            p = conn_limit.clone().acquire_owned() => p.expect("semaphore never closed"),
+            _ = shutdown_signal() => {
+                tracing::info!("shutdown signal; draining connections");
+                break;
+            }
+        };
         let (stream, peer) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
@@ -60,6 +76,37 @@ pub async fn serve(gw: Arc<Gateway>, listen: SocketAddr) -> Result<()> {
             if let Err(e) = conn.await {
                 tracing::debug!(%peer, %e, "connection ended");
             }
+            drop(permit);
         });
+    }
+
+    tokio::select! {
+        _ = graceful.shutdown() => tracing::info!("all connections drained"),
+        _ = tokio::time::sleep(Duration::from_secs(30)) => {
+            tracing::warn!("drain timed out after 30s");
+        }
+    }
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }

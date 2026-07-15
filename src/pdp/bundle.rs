@@ -35,6 +35,15 @@ impl Bundle {
     }
 }
 
+/// Stable revision derived from raw bundle content: a content change is a new
+/// revision, which is exactly the cache-invalidation signal (§4.3.2).
+pub fn content_revision(raw: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    raw.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
 /// Hot-swappable current bundle, shared by every engine instance and the decision
 /// cache. Swapping is lock-free; readers never block a decision.
 pub struct BundleStore {

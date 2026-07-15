@@ -58,12 +58,6 @@ impl RegorusPdp {
             .map_err(|e| GatewayError::Pdp(format!("compile: {e}")))
     }
 
-    /// Rebuild + atomically swap the compiled policy for a new bundle revision.
-    pub fn reload(&self, bundle: &serde_json::Value) -> Result<()> {
-        let compiled = Self::compile(&self.base, &self.entrypoint, bundle)?;
-        self.compiled.store(Arc::new(compiled));
-        Ok(())
-    }
 }
 
 #[async_trait]
@@ -84,5 +78,12 @@ impl Pdp for RegorusPdp {
             .to_json_str()
             .map_err(|e| GatewayError::Pdp(format!("decision to json: {e}")))?;
         Ok(serde_json::from_str(&decision_json)?)
+    }
+
+    /// Rebuild + atomically swap the compiled policy for a new bundle revision.
+    async fn reload(&self, bundle: &serde_json::Value) -> Result<()> {
+        let compiled = Self::compile(&self.base, &self.entrypoint, bundle)?;
+        self.compiled.store(Arc::new(compiled));
+        Ok(())
     }
 }

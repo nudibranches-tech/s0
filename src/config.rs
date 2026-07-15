@@ -30,6 +30,12 @@ pub struct GatewayConfig {
     /// Path to the initial per-Org bundle JSON (the projected policy data). In
     /// production this is polled from the console bundle endpoint (§3.4).
     pub bundle_path: PathBuf,
+    /// Optional console bundle endpoint to poll for live updates (§3.4, §6.1). When
+    /// unset, the refresher re-reads `bundle_path` (dev/local).
+    #[serde(default)]
+    pub bundle_url: Option<String>,
+    #[serde(default = "default_bundle_poll_secs")]
+    pub bundle_poll_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -97,6 +103,10 @@ pub struct LimitsConfig {
     pub max_delete_keys: usize,
     /// Multi-prefix list fan-out bound; above it the list fails closed (§5.1).
     pub max_list_fanout: usize,
+    /// Max concurrent connections (slowloris / resource-exhaustion guard, §9.1).
+    pub max_connections: usize,
+    /// Header read timeout (slowloris, §9.1).
+    pub header_read_timeout_secs: u64,
 }
 
 impl Default for LimitsConfig {
@@ -107,6 +117,8 @@ impl Default for LimitsConfig {
             presigned_url_max_skew_time_secs: 900,
             max_delete_keys: 1000,
             max_list_fanout: 16,
+            max_connections: 1024,
+            header_read_timeout_secs: 15,
         }
     }
 }
@@ -169,6 +181,9 @@ impl GatewayConfig {
 
 fn default_session_ttl_secs() -> u64 {
     3600
+}
+fn default_bundle_poll_secs() -> u64 {
+    30
 }
 fn default_cache_capacity() -> u64 {
     100_000

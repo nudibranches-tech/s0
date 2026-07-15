@@ -1,7 +1,6 @@
 //! The assembled gateway: the shared context the S3 front (auth / access / proxy)
 //! draws on, plus its construction from config.
 
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,7 +9,9 @@ use crate::auth::{Identity, StaticCredential, StaticCredentialStore};
 use crate::auth::sts::StsAuthority;
 use crate::config::{GatewayConfig, LimitsConfig, PdpConfig};
 use crate::error::{GatewayError, Result};
-use crate::pdp::{Bundle, BundleStore, CachingPdp, GATEWAY_REGO, Pdp, RegorusPdp, SidecarPdp};
+use crate::pdp::{
+    Bundle, BundleStore, CachingPdp, GATEWAY_REGO, Pdp, RegorusPdp, SidecarPdp, content_revision,
+};
 use crate::proxy::BackendRegistry;
 
 /// Shared, cheaply-cloneable state. `Arc<Gateway>` is held by the auth, access, and
@@ -101,12 +102,4 @@ fn build_pdp(cfg: &GatewayConfig) -> Result<(Arc<BundleStore>, Arc<dyn Pdp>)> {
     };
     let pdp: Arc<dyn Pdp> = Arc::new(CachingPdp::new(inner, bundles.clone(), capacity));
     Ok((bundles, pdp))
-}
-
-/// Stable revision derived from bundle content — a content change is a new revision,
-/// which is exactly the cache-invalidation signal (§4.3.2).
-fn content_revision(raw: &str) -> String {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    raw.hash(&mut h);
-    format!("{:016x}", h.finish())
 }
