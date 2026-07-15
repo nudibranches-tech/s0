@@ -60,11 +60,21 @@ impl GatewayAccess {
             .registry
             .backend_of(&p.tenant)
             .unwrap_or((BackendId(String::new()), BackendKind::Ceph));
+        // Org is the gateway's AUTHORITATIVE tenant->org binding, never the
+        // credential's self-declared org — audit attribution must not be drift-able
+        // (§6.6). Post-`check` the tenant is routable, so this is always resolved; an
+        // unresolved org yields an empty label the console drops fail-closed (§3.6).
+        let organization_id = self
+            .gw
+            .registry
+            .organization_of(&p.tenant)
+            .map(str::to_string)
+            .unwrap_or_default();
         OpaInput {
             principal: p.to_opa_principal(),
             backend: Backend { id: id.0, kind },
             tenant: p.tenant.clone(),
-            organization_id: p.organization_id.clone(),
+            organization_id,
             action,
             bucket,
             object: None,
@@ -390,6 +400,14 @@ enum ListOutcome {
 fn apply_list_obligation(decision: &Decision, prefix: &mut Option<String>) -> ListOutcome {
     if !decision.allow {
         return ListOutcome::Deny(decision.reason.clone());
+    }
+    // Defense in depth: the shipped rego sets at most one, but if a decision ever
+    // carries BOTH a single-prefix rewrite and a multi-prefix set, fail closed rather
+    // than silently taking the narrower branch.
+    if decision.obligations.narrow_prefix.is_some()
+        && !decision.obligations.allowed_prefixes.is_empty()
+    {
+        return ListOutcome::Deny("ambiguous list obligation (narrow + allowed prefixes)".into());
     }
     if let Some(np) = &decision.obligations.narrow_prefix {
         *prefix = Some(np.clone());

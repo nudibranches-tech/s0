@@ -64,6 +64,13 @@ impl StsAuthority {
         if master_key.len() < 32 || signing_key.len() < 32 {
             return Err(GatewayError::Sts("sts keys must be >= 32 bytes".into()));
         }
+        // The secret-derivation and token-signing keys must be distinct, or the
+        // two-key separation the design relies on collapses to one.
+        if master_key == signing_key {
+            return Err(GatewayError::Sts(
+                "sts master_key and signing_key must differ".into(),
+            ));
+        }
         Ok(StsAuthority {
             master_key,
             signing_key,

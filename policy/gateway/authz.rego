@@ -68,8 +68,12 @@ member if data.tenants[input.tenant].user_attributes[input.principal.sub]
 
 grants contains g if some g in data.tenants[input.tenant].s3_grants[input.principal.sub]
 
+# Group membership is read LIVE from the bundle (user_attributes[sub].groups), NOT
+# from the caller's token. A token's groups are frozen at mint; sourcing group grants
+# from them would make group removal non-revocable until token expiry (violates §6.1).
+# The bundle is re-projected on every revision, so a group removal lands immediately.
 grants contains g if {
-	some group in input.principal.attributes.groups
+	some group in data.tenants[input.tenant].user_attributes[input.principal.sub].groups
 	some g in data.tenants[input.tenant].group_grants[group]
 }
 

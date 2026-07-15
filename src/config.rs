@@ -171,6 +171,30 @@ impl GatewayConfig {
                 )));
             }
         }
+        // A static credential's org must match its tenant's authoritative org, or
+        // audit attribution would drift from the tenant->org binding (§6.6).
+        let tenant_org: HashMap<&str, &str> = self
+            .tenants
+            .iter()
+            .map(|t| (t.tenant.as_str(), t.organization_id.as_str()))
+            .collect();
+        for c in &self.static_credentials {
+            match tenant_org.get(c.tenant.as_str()) {
+                None => {
+                    return Err(GatewayError::Config(format!(
+                        "static credential {} references unknown tenant {}",
+                        c.access_key_id, c.tenant
+                    )));
+                }
+                Some(org) if *org != c.organization_id => {
+                    return Err(GatewayError::Config(format!(
+                        "static credential {} org {} disagrees with tenant {} org {}",
+                        c.access_key_id, c.organization_id, c.tenant, org
+                    )));
+                }
+                _ => {}
+            }
+        }
         Ok(())
     }
 

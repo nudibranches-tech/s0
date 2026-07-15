@@ -9,7 +9,8 @@
             "alice": { "groups": ["analysts"], "attributes": [] },
             "bob":   { "groups": [], "attributes": [] },
             "carol": { "groups": ["admins"], "attributes": [] },
-            "dave":  { "groups": [], "attributes": [] }
+            "dave":  { "groups": [], "attributes": [] },
+            "mallory": { "groups": [], "attributes": [] }
           },
           "bucket_attributes": {
             "reports": { "denylist": { "bob": true }, "sensitivity": "high" },
@@ -94,6 +95,10 @@
     { "name": "group grant does not cover other prefixes", "bundle": "default",
       "input": { "principal": {"sub":"alice","type":"user","attributes":{"groups":["analysts"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"read_objects", "bucket":"public", "object":"private/secret.csv", "request":{"method":"GET"} },
       "expect": { "allow": false } },
+
+    { "name": "token-claimed group is ignored; live bundle membership is authoritative", "bundle": "default",
+      "input": { "principal": {"sub":"mallory","type":"user","attributes":{"groups":["analysts"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"read_objects", "bucket":"public", "object":"shared/report.csv", "request":{"method":"GET"} },
+      "expect": { "allow": false, "reason_contains": "no grant" } },
 
     { "name": "list unbounded with multiple prefix grants -> allowed_prefixes", "bundle": "default",
       "input": { "principal": {"sub":"alice","type":"user","attributes":{"groups":["analysts"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"list_objects", "bucket":"reports", "request":{"method":"GET"} },
