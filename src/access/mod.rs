@@ -35,6 +35,13 @@ const ALLOWED_OPS: &[&str] = &[
     "CopyObject",
     "ListObjectsV2",
     "ListObjects",
+    "CreateMultipartUpload",
+    "UploadPart",
+    "UploadPartCopy",
+    "CompleteMultipartUpload",
+    "AbortMultipartUpload",
+    "ListParts",
+    "ListMultipartUploads",
 ];
 // PostObject is intentionally NOT allow-listed: `s3s_aws::Proxy` has no `post_object`,
 // so a form upload cannot be forwarded. Allow-listing it would authorize + audit an
@@ -146,6 +153,80 @@ impl GatewayAccess {
             Ok(())
         } else {
             Err(s3_error!(AccessDenied, "{reason}"))
+        }
+    }
+
+    /// Copy-style path (CopyObject, UploadPartCopy): authorize BOTH the source read
+    /// and the dest write (blind spot #1). One request-level audit record.
+    async fn enforce_copy(
+        &self,
+        principal: &ResolvedPrincipal,
+        source: &CopySource,
+        dest_bucket: String,
+        dest_key: String,
+        request: RequestMeta,
+    ) -> S3Result<()> {
+        let (src_bucket, src_key) = match source {
+            CopySource::Bucket { bucket, key, .. } => (bucket.to_string(), key.to_string()),
+            _ => {
+                return Err(s3_error!(
+                    AccessDenied,
+                    "unsupported copy source (access-point/outpost)"
+                ));
+            }
+        };
+        let mut src_input = self.base_input(principal, Action::ReadObjects, src_bucket.clone());
+        src_input.object = Some(src_key.clone());
+        let src_allow = self.decide(&src_input).await.allow;
+
+        let mut dst_input = self.base_input(principal, Action::WriteObjects, dest_bucket);
+        dst_input.object = Some(dest_key);
+        dst_input.copy_source = Some(AuthzCopySource {
+            bucket: src_bucket,
+            key: src_key,
+        });
+        dst_input.request = request;
+        let dst_allow = self.decide(&dst_input).await.allow;
+
+        let allow = src_allow && dst_allow;
+        let decision = if allow {
+            Decision::allow("copy allowed (source read + dest write)")
+        } else {
+            Decision::deny(format!(
+                "copy denied (source_read={src_allow}, dest_write={dst_allow})"
+            ))
+        };
+        self.audit(dst_input, &decision, outcome_of(allow), vec![]);
+        if allow {
+            Ok(())
+        } else {
+            Err(s3_error!(AccessDenied, "copy denied by policy"))
+        }
+    }
+
+    /// List-style path (ListObjects*, ListMultipartUploads): decide + apply the
+    /// prefix-narrowing obligation (§5.1) in place on the caller's prefix.
+    async fn enforce_list(
+        &self,
+        principal: &ResolvedPrincipal,
+        bucket: String,
+        prefix: &mut Option<String>,
+        request: RequestMeta,
+    ) -> S3Result<()> {
+        let mut input = self.base_input(principal, Action::ListObjects, bucket);
+        input.prefix = prefix.clone();
+        input.request = request;
+        let decision = self.decide(&input).await;
+        match apply_list_obligation(&decision, prefix) {
+            ListOutcome::Allow => {
+                self.audit(input, &decision, Outcome::Allowed, vec![]);
+                Ok(())
+            }
+            ListOutcome::Deny(reason) => {
+                let d = Decision::deny(reason.clone());
+                self.audit(input, &d, Outcome::Denied, vec![]);
+                Err(s3_error!(AccessDenied, "{reason}"))
+            }
         }
     }
 }
@@ -322,85 +403,123 @@ impl S3Access for GatewayAccess {
     }
 
     async fn copy_object(&self, req: &mut S3Request<CopyObjectInput>) -> S3Result<()> {
-        // Blind spot #1: authorize BOTH the source read and the dest write.
         let p = self.principal(req)?;
-        let dest_bucket = req.input.bucket.clone();
-        let dest_key = req.input.key.clone();
-        let (src_bucket, src_key) = match &req.input.copy_source {
-            CopySource::Bucket { bucket, key, .. } => (bucket.to_string(), key.to_string()),
-            _ => {
-                return Err(s3_error!(
-                    AccessDenied,
-                    "unsupported copy source (access-point/outpost)"
-                ));
-            }
-        };
-
-        let mut src_input = self.base_input(&p, Action::ReadObjects, src_bucket.clone());
-        src_input.object = Some(src_key.clone());
-        let src_allow = self.decide(&src_input).await.allow;
-
-        let mut dst_input = self.base_input(&p, Action::WriteObjects, dest_bucket);
-        dst_input.object = Some(dest_key);
-        dst_input.copy_source = Some(AuthzCopySource {
-            bucket: src_bucket,
-            key: src_key,
-        });
-        dst_input.request = request_meta(req);
-        let dst_allow = self.decide(&dst_input).await.allow;
-
-        let allow = src_allow && dst_allow;
-        let decision = if allow {
-            Decision::allow("copy allowed (source read + dest write)")
-        } else {
-            Decision::deny(format!(
-                "copy denied (source_read={src_allow}, dest_write={dst_allow})"
-            ))
-        };
-        self.audit(dst_input, &decision, outcome_of(allow), vec![]);
-        if allow {
-            Ok(())
-        } else {
-            Err(s3_error!(AccessDenied, "copy denied by policy"))
-        }
+        let meta = request_meta(req);
+        let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
+        self.enforce_copy(&p, &req.input.copy_source, bucket, key, meta)
+            .await
     }
 
     async fn list_objects_v2(&self, req: &mut S3Request<ListObjectsV2Input>) -> S3Result<()> {
         let p = self.principal(req)?;
-        let mut input = self.base_input(&p, Action::ListObjects, req.input.bucket.clone());
-        input.prefix = req.input.prefix.clone();
-        input.request = request_meta(req);
-        let decision = self.decide(&input).await;
-        match apply_list_obligation(&decision, &mut req.input.prefix) {
-            ListOutcome::Allow => {
-                self.audit(input, &decision, Outcome::Allowed, vec![]);
-                Ok(())
-            }
-            ListOutcome::Deny(reason) => {
-                let d = Decision::deny(reason.clone());
-                self.audit(input, &d, Outcome::Denied, vec![]);
-                Err(s3_error!(AccessDenied, "{reason}"))
-            }
-        }
+        let bucket = req.input.bucket.clone();
+        let meta = request_meta(req);
+        self.enforce_list(&p, bucket, &mut req.input.prefix, meta)
+            .await
     }
 
     async fn list_objects(&self, req: &mut S3Request<ListObjectsInput>) -> S3Result<()> {
         let p = self.principal(req)?;
-        let mut input = self.base_input(&p, Action::ListObjects, req.input.bucket.clone());
-        input.prefix = req.input.prefix.clone();
-        input.request = request_meta(req);
-        let decision = self.decide(&input).await;
-        match apply_list_obligation(&decision, &mut req.input.prefix) {
-            ListOutcome::Allow => {
-                self.audit(input, &decision, Outcome::Allowed, vec![]);
-                Ok(())
-            }
-            ListOutcome::Deny(reason) => {
-                let d = Decision::deny(reason.clone());
-                self.audit(input, &d, Outcome::Denied, vec![]);
-                Err(s3_error!(AccessDenied, "{reason}"))
-            }
-        }
+        let bucket = req.input.bucket.clone();
+        let meta = request_meta(req);
+        self.enforce_list(&p, bucket, &mut req.input.prefix, meta)
+            .await
+    }
+
+    // ── Multipart upload lifecycle (write on the key), plus its copy + list ops ──
+
+    async fn create_multipart_upload(
+        &self,
+        req: &mut S3Request<CreateMultipartUploadInput>,
+    ) -> S3Result<()> {
+        let p = self.principal(req)?;
+        let meta = request_meta(req);
+        self.enforce_object(
+            &p,
+            Action::WriteObjects,
+            req.input.bucket.clone(),
+            req.input.key.clone(),
+            meta,
+        )
+        .await
+    }
+
+    async fn upload_part(&self, req: &mut S3Request<UploadPartInput>) -> S3Result<()> {
+        let p = self.principal(req)?;
+        let meta = request_meta(req);
+        self.enforce_object(
+            &p,
+            Action::WriteObjects,
+            req.input.bucket.clone(),
+            req.input.key.clone(),
+            meta,
+        )
+        .await
+    }
+
+    async fn complete_multipart_upload(
+        &self,
+        req: &mut S3Request<CompleteMultipartUploadInput>,
+    ) -> S3Result<()> {
+        let p = self.principal(req)?;
+        let meta = request_meta(req);
+        self.enforce_object(
+            &p,
+            Action::WriteObjects,
+            req.input.bucket.clone(),
+            req.input.key.clone(),
+            meta,
+        )
+        .await
+    }
+
+    async fn abort_multipart_upload(
+        &self,
+        req: &mut S3Request<AbortMultipartUploadInput>,
+    ) -> S3Result<()> {
+        let p = self.principal(req)?;
+        let meta = request_meta(req);
+        self.enforce_object(
+            &p,
+            Action::WriteObjects,
+            req.input.bucket.clone(),
+            req.input.key.clone(),
+            meta,
+        )
+        .await
+    }
+
+    async fn list_parts(&self, req: &mut S3Request<ListPartsInput>) -> S3Result<()> {
+        let p = self.principal(req)?;
+        let meta = request_meta(req);
+        self.enforce_object(
+            &p,
+            Action::ReadObjects,
+            req.input.bucket.clone(),
+            req.input.key.clone(),
+            meta,
+        )
+        .await
+    }
+
+    async fn upload_part_copy(&self, req: &mut S3Request<UploadPartCopyInput>) -> S3Result<()> {
+        // Blind spot: authorize the copy source read + the dest part write.
+        let p = self.principal(req)?;
+        let meta = request_meta(req);
+        let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
+        self.enforce_copy(&p, &req.input.copy_source, bucket, key, meta)
+            .await
+    }
+
+    async fn list_multipart_uploads(
+        &self,
+        req: &mut S3Request<ListMultipartUploadsInput>,
+    ) -> S3Result<()> {
+        let p = self.principal(req)?;
+        let bucket = req.input.bucket.clone();
+        let meta = request_meta(req);
+        self.enforce_list(&p, bucket, &mut req.input.prefix, meta)
+            .await
     }
 }
 
@@ -474,7 +593,14 @@ mod tests {
 
     #[test]
     fn allowlist_covers_the_blind_spot_ops() {
-        for op in ["CopyObject", "DeleteObjects", "ListObjectsV2"] {
+        for op in [
+            "CopyObject",
+            "DeleteObjects",
+            "ListObjectsV2",
+            "CreateMultipartUpload",
+            "UploadPartCopy",
+            "CompleteMultipartUpload",
+        ] {
             assert!(ALLOWED_OPS.contains(&op), "{op} must be on the allowlist");
         }
         // Ops we do not (or cannot yet) forward must NOT be allow-listed — they would

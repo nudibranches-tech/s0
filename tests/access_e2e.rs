@@ -19,7 +19,10 @@ use hyperfluid_s3_gateway::pdp::{Bundle, BundleStore, CachingPdp, GATEWAY_REGO, 
 use hyperfluid_s3_gateway::proxy::BackendRegistry;
 use s3s::S3Request;
 use s3s::access::S3Access;
-use s3s::dto::{Delete, DeleteObjectsInput, GetObjectInput, ListObjectsV2Input, ObjectIdentifier};
+use s3s::dto::{
+    CreateMultipartUploadInput, Delete, DeleteObjectsInput, GetObjectInput,
+    ListMultipartUploadsInput, ListObjectsV2Input, ObjectIdentifier,
+};
 
 fn bundle() -> serde_json::Value {
     serde_json::json!({
@@ -29,7 +32,7 @@ fn bundle() -> serde_json::Value {
             "bucket_attributes": { "reports": { "denylist": {} } },
             "s3_grants": { "alice": [
                 { "bucket": "reports",
-                  "actions": ["read_objects", "list_objects", "delete_objects"],
+                  "actions": ["read_objects", "list_objects", "write_objects", "delete_objects"],
                   "prefixes": ["2024/"] }
             ] },
             "group_grants": {}
@@ -189,5 +192,48 @@ async fn unbounded_list_is_narrowed_to_grant_prefix() {
         Method::GET,
     );
     assert!(access.list_objects_v2(&mut req).await.is_ok());
+    assert_eq!(req.input.prefix.as_deref(), Some("2024/"));
+}
+
+#[tokio::test]
+async fn create_multipart_upload_within_grant_is_allowed() {
+    let access = GatewayAccess::new(test_gateway().await);
+    let mut req = request(
+        CreateMultipartUploadInput {
+            bucket: "reports".into(),
+            key: "2024/big.bin".into(),
+            ..Default::default()
+        },
+        Method::POST,
+    );
+    assert!(access.create_multipart_upload(&mut req).await.is_ok());
+}
+
+#[tokio::test]
+async fn create_multipart_upload_outside_prefix_is_denied() {
+    let access = GatewayAccess::new(test_gateway().await);
+    let mut req = request(
+        CreateMultipartUploadInput {
+            bucket: "reports".into(),
+            key: "2023/big.bin".into(),
+            ..Default::default()
+        },
+        Method::POST,
+    );
+    assert!(access.create_multipart_upload(&mut req).await.is_err());
+}
+
+#[tokio::test]
+async fn list_multipart_uploads_is_narrowed_to_grant_prefix() {
+    let access = GatewayAccess::new(test_gateway().await);
+    let mut req = request(
+        ListMultipartUploadsInput {
+            bucket: "reports".into(),
+            prefix: None,
+            ..Default::default()
+        },
+        Method::GET,
+    );
+    assert!(access.list_multipart_uploads(&mut req).await.is_ok());
     assert_eq!(req.input.prefix.as_deref(), Some("2024/"));
 }

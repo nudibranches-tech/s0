@@ -199,4 +199,55 @@ impl S3 for GatewayS3 {
     ) -> S3Result<S3Response<ListObjectsOutput>> {
         self.proxy_for_req(&req)?.list_objects(req).await
     }
+
+    async fn create_multipart_upload(
+        &self,
+        req: S3Request<CreateMultipartUploadInput>,
+    ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
+        self.proxy_for_req(&req)?.create_multipart_upload(req).await
+    }
+
+    async fn upload_part(
+        &self,
+        req: S3Request<UploadPartInput>,
+    ) -> S3Result<S3Response<UploadPartOutput>> {
+        self.proxy_for_req(&req)?.upload_part(req).await
+    }
+
+    async fn upload_part_copy(
+        &self,
+        req: S3Request<UploadPartCopyInput>,
+    ) -> S3Result<S3Response<UploadPartCopyOutput>> {
+        self.proxy_for_req(&req)?.upload_part_copy(req).await
+    }
+
+    async fn complete_multipart_upload(
+        &self,
+        req: S3Request<CompleteMultipartUploadInput>,
+    ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+        self.proxy_for_req(&req)?
+            .complete_multipart_upload(req)
+            .await
+    }
+
+    async fn abort_multipart_upload(
+        &self,
+        req: S3Request<AbortMultipartUploadInput>,
+    ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
+        self.proxy_for_req(&req)?.abort_multipart_upload(req).await
+    }
+
+    async fn list_parts(
+        &self,
+        req: S3Request<ListPartsInput>,
+    ) -> S3Result<S3Response<ListPartsOutput>> {
+        self.proxy_for_req(&req)?.list_parts(req).await
+    }
+
+    async fn list_multipart_uploads(
+        &self,
+        req: S3Request<ListMultipartUploadsInput>,
+    ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
+        self.proxy_for_req(&req)?.list_multipart_uploads(req).await
+    }
 }
