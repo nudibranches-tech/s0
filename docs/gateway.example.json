@@ -40,5 +40,14 @@
   "static_credentials": [],
   "bundle_path": "/etc/hyperfluid-gateway/bundle.json",
   "bundle_url": "http://console.internal/api/internal/v1/organizations/org-acme/ceph-bundle",
-  "bundle_poll_secs": 30
+  "bundle_poll_secs": 30,
+  "sts_mint": {
+    "listen": "0.0.0.0:8015",
+    "issuer": "https://keycloak.internal/realms/acme",
+    "audience": "hyperfluid-gateway",
+    "jwks_uri": "https://keycloak.internal/realms/acme/protocol/openid-connect/certs",
+    "tenant_claim": "harbor",
+    "org_claim": "org",
+    "groups_claim": "groups"
+  }
 }

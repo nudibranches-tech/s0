@@ -88,6 +88,12 @@ impl Identity {
         Identity { sts, creds }
     }
 
+    /// The STS authority, shared with the mint (the badge desk) so minted sessions and
+    /// inbound verification use the same keys.
+    pub fn sts(&self) -> Arc<StsAuthority> {
+        self.sts.clone()
+    }
+
     fn secret_key(&self, access_key_id: &str) -> Option<String> {
         self.sts
             .secret_for_access_key(access_key_id)

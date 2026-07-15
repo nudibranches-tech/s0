@@ -25,6 +25,7 @@ pub mod config;
 pub mod error;
 pub mod gateway;
 pub mod identity;
+pub mod mint;
 pub mod model;
 pub mod pdp;
 pub mod proxy;

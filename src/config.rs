@@ -36,6 +36,33 @@ pub struct GatewayConfig {
     pub bundle_url: Option<String>,
     #[serde(default = "default_bundle_poll_secs")]
     pub bundle_poll_secs: u64,
+    /// Optional STS mint (the badge desk, §4.2). When present, a control-plane server
+    /// runs on its own listener and issues gateway session creds from OIDC tokens.
+    #[serde(default)]
+    pub sts_mint: Option<StsMintConfig>,
+}
+
+/// OIDC → gateway-credentials mint. Backend-agnostic: verifies a Keycloak token and
+/// mints the gateway's own session (never a backend STS).
+#[derive(Debug, Clone, Deserialize)]
+pub struct StsMintConfig {
+    pub listen: SocketAddr,
+    pub issuer: String,
+    pub audience: String,
+    /// JWKS endpoint (production; keys rotate). Exactly one of jwks_uri / public_key_pem.
+    #[serde(default)]
+    pub jwks_uri: Option<String>,
+    /// Static RS256 public key PEM (simpler deployments / tests).
+    #[serde(default)]
+    pub public_key_pem: Option<String>,
+    #[serde(default = "default_sub_claim")]
+    pub sub_claim: String,
+    #[serde(default = "default_groups_claim")]
+    pub groups_claim: String,
+    /// Claim carrying the Harbor/tenant slug.
+    pub tenant_claim: String,
+    /// Claim carrying the organization id.
+    pub org_claim: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -216,6 +243,12 @@ fn default_session_ttl_secs() -> u64 {
 }
 fn default_bundle_poll_secs() -> u64 {
     30
+}
+fn default_sub_claim() -> String {
+    "sub".into()
+}
+fn default_groups_claim() -> String {
+    "groups".into()
 }
 fn default_cache_capacity() -> u64 {
     100_000
