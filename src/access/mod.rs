@@ -149,14 +149,22 @@ impl GatewayAccess {
 #[async_trait::async_trait]
 impl S3Access for GatewayAccess {
     async fn check(&self, cx: &mut S3AccessContext<'_>) -> S3Result<()> {
+        // Gate rejections are logged for ops visibility of denied access *attempts*
+        // (the access-key id is a semi-public identifier, never the secret). They are
+        // not emitted as decision-log records — those are per parsed object op (§6.6);
+        // a dedicated gate-rejection audit event is a documented follow-up.
+        let op = cx.s3_op().name().to_string();
         let access_key = match cx.credentials() {
             Some(c) => c.access_key.clone(),
-            None => return Err(s3_error!(AccessDenied, "Signature is required")),
+            None => {
+                tracing::debug!(%op, "gate deny: anonymous request");
+                return Err(s3_error!(AccessDenied, "Signature is required"));
+            }
         };
         // Deny-by-default backstop: un-listed ops fail-open at their typed hook, so
         // they MUST be rejected here (§6.2).
-        let op = cx.s3_op().name().to_string();
         if !ALLOWED_OPS.contains(&op.as_str()) {
+            tracing::warn!(%op, %access_key, "gate deny: operation not permitted");
             return Err(s3_error!(
                 AccessDenied,
                 "operation {op} is not permitted by the gateway"
@@ -167,12 +175,15 @@ impl S3Access for GatewayAccess {
             .get(SECURITY_TOKEN_HEADER)
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
-        let principal = self
-            .gw
-            .identity
-            .resolve(&access_key, token.as_deref())
-            .map_err(|e| s3_error!(AccessDenied, "identity rejected: {e}"))?;
+        let principal = match self.gw.identity.resolve(&access_key, token.as_deref()) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(%op, %access_key, error = %e, "gate deny: identity rejected");
+                return Err(s3_error!(AccessDenied, "identity rejected: {e}"));
+            }
+        };
         if self.gw.registry.backend_of(&principal.tenant).is_none() {
+            tracing::warn!(%op, sub = %principal.sub, tenant = %principal.tenant, "gate deny: tenant not routable");
             return Err(s3_error!(
                 AccessDenied,
                 "tenant {} is not routable",
