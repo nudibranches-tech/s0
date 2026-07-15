@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+    branches: ["main", "master", "feat/**", "fix/**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: format check
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: build
+        run: cargo build --all-targets
+
+      # Dual-engine parity gate (§4.3.1): the embedded regorus fast path may only
+      # serve traffic if it agrees with OPA over the golden decision corpus. The
+      # tests/parity.rs harness skips when `opa` is absent, so installing it here is
+      # what makes the gate enforce.
+      - name: install OPA (parity gate)
+        uses: open-policy-agent/setup-opa@v2
+        with:
+          version: "0.70.0"
+
+      - name: test (unit + e2e + corpus + parity)
+        run: cargo test --all-targets
+
+  # S3 protocol conformance (Ceph s3-tests / MinIO Mint) per supported backend
+  # vendor (§9.4). Scaffolded in .github/workflows/conformance.yml (manual trigger)
+  # because it needs a live backend service; wire into CI once a Ceph/MinIO service
+  # container is standardized.

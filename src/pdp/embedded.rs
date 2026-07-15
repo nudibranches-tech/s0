@@ -57,7 +57,6 @@ impl RegorusPdp {
             .compile_with_entrypoint(entrypoint)
             .map_err(|e| GatewayError::Pdp(format!("compile: {e}")))
     }
-
 }
 
 #[async_trait]

@@ -15,15 +15,18 @@ use crate::pdp::{Bundle, BundleStore, Pdp, content_revision};
 
 pub enum BundleSource {
     File(PathBuf),
-    Http { client: reqwest::Client, url: String },
+    Http {
+        client: reqwest::Client,
+        url: String,
+    },
 }
 
 impl BundleSource {
     async fn fetch(&self) -> Result<String, String> {
         match self {
-            BundleSource::File(path) => {
-                tokio::fs::read_to_string(path).await.map_err(|e| e.to_string())
-            }
+            BundleSource::File(path) => tokio::fs::read_to_string(path)
+                .await
+                .map_err(|e| e.to_string()),
             BundleSource::Http { client, url } => {
                 let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
                 if !resp.status().is_success() {

@@ -72,8 +72,8 @@ impl StsAuthority {
 
     /// `secret = hex(HMAC-SHA256(master, sid))`. Deterministic, store-free.
     pub fn derive_secret(&self, sid: &str) -> String {
-        let mut mac = HmacSha256::new_from_slice(&self.master_key)
-            .expect("hmac accepts any key length");
+        let mut mac =
+            HmacSha256::new_from_slice(&self.master_key).expect("hmac accepts any key length");
         mac.update(sid.as_bytes());
         hex::encode(mac.finalize().into_bytes())
     }
@@ -132,7 +132,9 @@ impl StsAuthority {
         )
         .map_err(|e| GatewayError::Sts(format!("session token invalid: {e}")))?;
         if data.claims.sid != sid {
-            return Err(GatewayError::Sts("session token not bound to access key".into()));
+            return Err(GatewayError::Sts(
+                "session token not bound to access key".into(),
+            ));
         }
         Ok(data.claims)
     }

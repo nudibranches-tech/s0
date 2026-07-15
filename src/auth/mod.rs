@@ -60,13 +60,15 @@ impl CredentialStore for StaticCredentialStore {
     }
 
     fn resolve(&self, access_key_id: &str) -> Option<ResolvedPrincipal> {
-        self.by_access_key.get(access_key_id).map(|c| ResolvedPrincipal {
-            sub: c.principal_sub.clone(),
-            principal_type: PrincipalType::ServiceAccount,
-            groups: c.groups.clone(),
-            tenant: c.tenant.clone(),
-            organization_id: c.organization_id.clone(),
-        })
+        self.by_access_key
+            .get(access_key_id)
+            .map(|c| ResolvedPrincipal {
+                sub: c.principal_sub.clone(),
+                principal_type: PrincipalType::ServiceAccount,
+                groups: c.groups.clone(),
+                tenant: c.tenant.clone(),
+                organization_id: c.organization_id.clone(),
+            })
     }
 }
 
@@ -101,9 +103,8 @@ impl Identity {
         security_token: Option<&str>,
     ) -> Result<ResolvedPrincipal> {
         if StsAuthority::sid_from_access_key(access_key_id).is_some() {
-            let token = security_token.ok_or_else(|| {
-                GatewayError::Sts("sts credential without session token".into())
-            })?;
+            let token = security_token
+                .ok_or_else(|| GatewayError::Sts("sts credential without session token".into()))?;
             let claims = self.sts.verify_session(access_key_id, token)?;
             return Ok(ResolvedPrincipal {
                 sub: claims.sub,
@@ -167,10 +168,7 @@ mod tests {
                 groups: vec!["reporters".into()],
             },
         );
-        (
-            Identity::new(Arc::new(sts.clone()), Arc::new(store)),
-            sts,
-        )
+        (Identity::new(Arc::new(sts.clone()), Arc::new(store)), sts)
     }
 
     #[test]

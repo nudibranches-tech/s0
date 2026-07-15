@@ -136,7 +136,10 @@ mod tests {
         );
         assert_eq!(rec.requested_by, "alice");
         assert_eq!(rec.path, DECISION_PATH);
-        assert_eq!(rec.labels.get(LABEL_ORG_ID).map(String::as_str), Some("org-acme"));
+        assert_eq!(
+            rec.labels.get(LABEL_ORG_ID).map(String::as_str),
+            Some("org-acme")
+        );
         assert_eq!(
             rec.labels.get(super::LABEL_DOCK_TYPE).map(String::as_str),
             Some(DOCK_TYPE_VALUE)

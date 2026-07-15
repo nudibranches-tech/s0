@@ -87,7 +87,13 @@ impl GatewayAccess {
         }
     }
 
-    fn audit(&self, input: OpaInput, decision: &Decision, outcome: Outcome, denied_keys: Vec<String>) {
+    fn audit(
+        &self,
+        input: OpaInput,
+        decision: &Decision,
+        outcome: Outcome,
+        denied_keys: Vec<String>,
+    ) {
         let meta = GatewayMeta {
             backend_id: input.backend.id.clone(),
             backend_kind: input.backend.kind.as_str().to_string(),
@@ -95,7 +101,13 @@ impl GatewayAccess {
             denied_keys,
             backend_status: None,
         };
-        let record = AuditRecord::new(new_decision_id(), now_rfc3339(), input, decision.clone(), meta);
+        let record = AuditRecord::new(
+            new_decision_id(),
+            now_rfc3339(),
+            input,
+            decision.clone(),
+            meta,
+        );
         self.gw.audit.emit(record);
     }
 
@@ -135,7 +147,10 @@ impl S3Access for GatewayAccess {
         // they MUST be rejected here (§6.2).
         let op = cx.s3_op().name().to_string();
         if !ALLOWED_OPS.contains(&op.as_str()) {
-            return Err(s3_error!(AccessDenied, "operation {op} is not permitted by the gateway"));
+            return Err(s3_error!(
+                AccessDenied,
+                "operation {op} is not permitted by the gateway"
+            ));
         }
         let token = cx
             .headers()
@@ -148,7 +163,11 @@ impl S3Access for GatewayAccess {
             .resolve(&access_key, token.as_deref())
             .map_err(|e| s3_error!(AccessDenied, "identity rejected: {e}"))?;
         if self.gw.registry.backend_of(&principal.tenant).is_none() {
-            return Err(s3_error!(AccessDenied, "tenant {} is not routable", principal.tenant));
+            return Err(s3_error!(
+                AccessDenied,
+                "tenant {} is not routable",
+                principal.tenant
+            ));
         }
         cx.extensions_mut().insert(Arc::new(principal));
         Ok(())
@@ -157,37 +176,67 @@ impl S3Access for GatewayAccess {
     async fn get_object(&self, req: &mut S3Request<GetObjectInput>) -> S3Result<()> {
         let p = self.principal(req)?;
         let meta = request_meta(req);
-        self.enforce_object(&p, Action::ReadObjects, req.input.bucket.clone(), req.input.key.clone(), meta)
-            .await
+        self.enforce_object(
+            &p,
+            Action::ReadObjects,
+            req.input.bucket.clone(),
+            req.input.key.clone(),
+            meta,
+        )
+        .await
     }
 
     async fn head_object(&self, req: &mut S3Request<HeadObjectInput>) -> S3Result<()> {
         let p = self.principal(req)?;
         let meta = request_meta(req);
-        self.enforce_object(&p, Action::ReadObjects, req.input.bucket.clone(), req.input.key.clone(), meta)
-            .await
+        self.enforce_object(
+            &p,
+            Action::ReadObjects,
+            req.input.bucket.clone(),
+            req.input.key.clone(),
+            meta,
+        )
+        .await
     }
 
     async fn put_object(&self, req: &mut S3Request<PutObjectInput>) -> S3Result<()> {
         let p = self.principal(req)?;
         let meta = request_meta(req);
-        self.enforce_object(&p, Action::WriteObjects, req.input.bucket.clone(), req.input.key.clone(), meta)
-            .await
+        self.enforce_object(
+            &p,
+            Action::WriteObjects,
+            req.input.bucket.clone(),
+            req.input.key.clone(),
+            meta,
+        )
+        .await
     }
 
     async fn post_object(&self, req: &mut S3Request<PostObjectInput>) -> S3Result<()> {
         // Blind spot #3: the form-upload key is in the parsed body — authorize it.
         let p = self.principal(req)?;
         let meta = request_meta(req);
-        self.enforce_object(&p, Action::WriteObjects, req.input.bucket.clone(), req.input.key.clone(), meta)
-            .await
+        self.enforce_object(
+            &p,
+            Action::WriteObjects,
+            req.input.bucket.clone(),
+            req.input.key.clone(),
+            meta,
+        )
+        .await
     }
 
     async fn delete_object(&self, req: &mut S3Request<DeleteObjectInput>) -> S3Result<()> {
         let p = self.principal(req)?;
         let meta = request_meta(req);
-        self.enforce_object(&p, Action::DeleteObjects, req.input.bucket.clone(), req.input.key.clone(), meta)
-            .await
+        self.enforce_object(
+            &p,
+            Action::DeleteObjects,
+            req.input.bucket.clone(),
+            req.input.key.clone(),
+            meta,
+        )
+        .await
     }
 
     async fn delete_objects(&self, req: &mut S3Request<DeleteObjectsInput>) -> S3Result<()> {
@@ -214,14 +263,24 @@ impl S3Access for GatewayAccess {
             }
         }
 
-        let all_keys: Vec<String> = req.input.delete.objects.iter().map(|o| o.key.clone()).collect();
+        let all_keys: Vec<String> = req
+            .input
+            .delete
+            .objects
+            .iter()
+            .map(|o| o.key.clone())
+            .collect();
         let mut record_input = self.base_input(&p, Action::DeleteObjects, bucket);
         record_input.delete_keys = Some(all_keys);
         record_input.request = request_meta(req);
         let decision = if allowed.is_empty() {
             Decision::deny("all delete keys denied")
         } else {
-            Decision::allow(format!("{} allowed, {} denied", allowed.len(), denied.len()))
+            Decision::allow(format!(
+                "{} allowed, {} denied",
+                allowed.len(),
+                denied.len()
+            ))
         };
         let outcome = outcome_of(!allowed.is_empty());
         self.audit(record_input, &decision, outcome, denied.clone());
@@ -230,7 +289,10 @@ impl S3Access for GatewayAccess {
             return Err(s3_error!(AccessDenied, "all delete keys denied by policy"));
         }
         // Per-key filtering: forward only authorized keys.
-        req.input.delete.objects.retain(|o| allowed.contains(&o.key));
+        req.input
+            .delete
+            .objects
+            .retain(|o| allowed.contains(&o.key));
         Ok(())
     }
 
@@ -241,7 +303,12 @@ impl S3Access for GatewayAccess {
         let dest_key = req.input.key.clone();
         let (src_bucket, src_key) = match &req.input.copy_source {
             CopySource::Bucket { bucket, key, .. } => (bucket.to_string(), key.to_string()),
-            _ => return Err(s3_error!(AccessDenied, "unsupported copy source (access-point/outpost)")),
+            _ => {
+                return Err(s3_error!(
+                    AccessDenied,
+                    "unsupported copy source (access-point/outpost)"
+                ));
+            }
         };
 
         let mut src_input = self.base_input(&p, Action::ReadObjects, src_bucket.clone());
@@ -261,7 +328,9 @@ impl S3Access for GatewayAccess {
         let decision = if allow {
             Decision::allow("copy allowed (source read + dest write)")
         } else {
-            Decision::deny(format!("copy denied (source_read={src_allow}, dest_write={dst_allow})"))
+            Decision::deny(format!(
+                "copy denied (source_read={src_allow}, dest_write={dst_allow})"
+            ))
         };
         self.audit(dst_input, &decision, outcome_of(allow), vec![]);
         if allow {
@@ -326,14 +395,19 @@ fn apply_list_obligation(decision: &Decision, prefix: &mut Option<String>) -> Li
         *prefix = Some(np.clone());
     } else if !decision.obligations.allowed_prefixes.is_empty() {
         return ListOutcome::Deny(
-            "list spans multiple granted prefixes; narrow your prefix (fan-out not yet enabled)".into(),
+            "list spans multiple granted prefixes; narrow your prefix (fan-out not yet enabled)"
+                .into(),
         );
     }
     ListOutcome::Allow
 }
 
 fn outcome_of(allow: bool) -> Outcome {
-    if allow { Outcome::Allowed } else { Outcome::Denied }
+    if allow {
+        Outcome::Allowed
+    } else {
+        Outcome::Denied
+    }
 }
 
 fn request_meta<T>(req: &S3Request<T>) -> RequestMeta {
@@ -394,7 +468,10 @@ mod tests {
             allowed_prefixes: vec![],
         });
         let mut prefix = None;
-        assert!(matches!(apply_list_obligation(&d, &mut prefix), ListOutcome::Allow));
+        assert!(matches!(
+            apply_list_obligation(&d, &mut prefix),
+            ListOutcome::Allow
+        ));
         assert_eq!(prefix.as_deref(), Some("2024/"));
     }
 
@@ -415,7 +492,10 @@ mod tests {
     fn list_unrestricted_allow_keeps_prefix() {
         let d = allow_with(Obligations::default());
         let mut prefix = Some("mine/".to_string());
-        assert!(matches!(apply_list_obligation(&d, &mut prefix), ListOutcome::Allow));
+        assert!(matches!(
+            apply_list_obligation(&d, &mut prefix),
+            ListOutcome::Allow
+        ));
         assert_eq!(prefix.as_deref(), Some("mine/"));
     }
 }

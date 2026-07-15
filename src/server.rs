@@ -27,7 +27,9 @@ pub fn build_service(gw: Arc<Gateway>) -> S3Service {
     let mut builder = S3ServiceBuilder::new(s3);
     builder.set_auth(GatewayAuth::new(gw.identity.clone()));
     builder.set_access(GatewayAccess::new(gw.clone()));
-    builder.set_config(Arc::new(StaticConfigProvider::new(Arc::new(s3_config(&gw)))));
+    builder.set_config(Arc::new(StaticConfigProvider::new(Arc::new(s3_config(
+        &gw,
+    )))));
     builder.build()
 }
 

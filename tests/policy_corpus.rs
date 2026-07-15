@@ -85,18 +85,21 @@ fn check_case(case: &Case, d: &Decision) -> Vec<String> {
         ));
         return out; // allow mismatch subsumes obligation checks
     }
-    if let Some(rc) = &case.expect.reason_contains {
-        if !d.reason.contains(rc.as_str()) {
-            out.push(format!("[{tag}] reason {:?} does not contain {:?}", d.reason, rc));
-        }
+    if let Some(rc) = &case.expect.reason_contains
+        && !d.reason.contains(rc.as_str())
+    {
+        out.push(format!(
+            "[{tag}] reason {:?} does not contain {:?}",
+            d.reason, rc
+        ));
     }
-    if let Some(np) = &case.expect.narrow_prefix {
-        if d.obligations.narrow_prefix.as_deref() != Some(np.as_str()) {
-            out.push(format!(
-                "[{tag}] narrow_prefix = {:?} expected {:?}",
-                d.obligations.narrow_prefix, np
-            ));
-        }
+    if let Some(np) = &case.expect.narrow_prefix
+        && d.obligations.narrow_prefix.as_deref() != Some(np.as_str())
+    {
+        out.push(format!(
+            "[{tag}] narrow_prefix = {:?} expected {:?}",
+            d.obligations.narrow_prefix, np
+        ));
     }
     if let Some(ap) = &case.expect.allowed_prefixes {
         let mut got = d.obligations.allowed_prefixes.clone();
@@ -113,7 +116,10 @@ fn check_case(case: &Case, d: &Decision) -> Vec<String> {
     if case.expect.no_obligations
         && (d.obligations.narrow_prefix.is_some() || !d.obligations.allowed_prefixes.is_empty())
     {
-        out.push(format!("[{tag}] expected no obligations, got {:?}", d.obligations));
+        out.push(format!(
+            "[{tag}] expected no obligations, got {:?}",
+            d.obligations
+        ));
     }
     out
 }

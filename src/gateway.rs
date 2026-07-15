@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::audit::{self, AuditConfig, AuditSink};
-use crate::auth::{Identity, StaticCredential, StaticCredentialStore};
 use crate::auth::sts::StsAuthority;
+use crate::auth::{Identity, StaticCredential, StaticCredentialStore};
 use crate::config::{GatewayConfig, LimitsConfig, PdpConfig};
 use crate::error::{GatewayError, Result};
 use crate::pdp::{
@@ -82,21 +82,25 @@ fn build_static_store(cfg: &GatewayConfig) -> StaticCredentialStore {
 fn build_pdp(cfg: &GatewayConfig) -> Result<(Arc<BundleStore>, Arc<dyn Pdp>)> {
     let raw = std::fs::read_to_string(&cfg.bundle_path)
         .map_err(|e| GatewayError::Bundle(format!("read {:?}: {e}", cfg.bundle_path)))?;
-    let data: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|e| GatewayError::Bundle(format!("parse bundle: {e}")))?;
+    let data: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| GatewayError::Bundle(format!("parse bundle: {e}")))?;
     let revision = content_revision(&raw);
     let bundles = Arc::new(BundleStore::new(Bundle::new(revision, data.clone())));
 
     let (inner, capacity): (Arc<dyn Pdp>, u64) = match &cfg.pdp {
-        PdpConfig::Embedded { cache_capacity } => {
-            (Arc::new(RegorusPdp::new(GATEWAY_REGO, &data)?), *cache_capacity)
-        }
+        PdpConfig::Embedded { cache_capacity } => (
+            Arc::new(RegorusPdp::new(GATEWAY_REGO, &data)?),
+            *cache_capacity,
+        ),
         PdpConfig::Sidecar {
             base_url,
             cache_capacity,
             timeout_ms,
         } => (
-            Arc::new(SidecarPdp::new(base_url, Duration::from_millis(*timeout_ms))?),
+            Arc::new(SidecarPdp::new(
+                base_url,
+                Duration::from_millis(*timeout_ms),
+            )?),
             *cache_capacity,
         ),
     };

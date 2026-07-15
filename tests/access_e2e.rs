@@ -167,7 +167,13 @@ async fn multi_delete_filters_to_authorized_keys() {
     );
     // At least one key allowed => Ok, and the denied key is stripped from the forward.
     assert!(access.delete_objects(&mut req).await.is_ok());
-    let kept: Vec<&str> = req.input.delete.objects.iter().map(|o| o.key.as_str()).collect();
+    let kept: Vec<&str> = req
+        .input
+        .delete
+        .objects
+        .iter()
+        .map(|o| o.key.as_str())
+        .collect();
     assert_eq!(kept, vec!["2024/a.csv"]);
 }
 
