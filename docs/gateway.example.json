@@ -1,0 +1,44 @@
+{
+  "listen": "0.0.0.0:8014",
+  "sts": {
+    "master_key_hex": "REPLACE_ME_openssl_rand_hex_32_0000000000000000000000000000",
+    "signing_key_hex": "REPLACE_ME_openssl_rand_hex_32_1111111111111111111111111111",
+    "session_ttl_secs": 3600
+  },
+  "pdp": { "mode": "embedded", "cache_capacity": 100000 },
+  "audit": {
+    "sink_url": "http://console.internal/api/v1/decision-logs",
+    "spill_path": "/var/lib/hyperfluid-gateway/audit-spill.ndjson"
+  },
+  "limits": {
+    "xml_max_body_size": 20971520,
+    "post_object_max_file_size": 5368709120,
+    "presigned_url_max_skew_time_secs": 900,
+    "max_delete_keys": 1000,
+    "max_list_fanout": 16,
+    "max_connections": 1024,
+    "header_read_timeout_secs": 15
+  },
+  "backends": [
+    {
+      "id": "bay-eu-1",
+      "kind": "ceph",
+      "endpoint_url": "https://rgw.internal:7480",
+      "region": "us-east-1",
+      "force_path_style": true
+    }
+  ],
+  "tenants": [
+    {
+      "tenant": "acme",
+      "organization_id": "org-acme",
+      "backend_id": "bay-eu-1",
+      "owner_access_key": "REPLACE_WITH_PER_TENANT_BACKEND_KEY",
+      "owner_secret_key": "REPLACE_WITH_PER_TENANT_BACKEND_SECRET"
+    }
+  ],
+  "static_credentials": [],
+  "bundle_path": "/etc/hyperfluid-gateway/bundle.json",
+  "bundle_url": "http://console.internal/api/internal/v1/organizations/org-acme/ceph-bundle",
+  "bundle_poll_secs": 30
+}

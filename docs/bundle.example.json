@@ -1,0 +1,29 @@
+{
+  "_note": "Projected per-Org policy data (§3.4). Reuses today's user_attributes / bucket_attributes / org_settings.freeze_writes; the s3_grants / group_grants superset is the companion projection (§3.3, ADR-006). The gateway rego reads these by name.",
+  "org_settings": { "freeze_writes": false },
+  "tenants": {
+    "acme": {
+      "user_attributes": {
+        "5f3a...oidc-sub-alice": { "groups": ["analysts"], "attributes": [] },
+        "9c21...oidc-sub-bob": { "groups": [], "attributes": [] }
+      },
+      "bucket_attributes": {
+        "reports": { "denylist": { "9c21...oidc-sub-bob": true }, "sensitivity": "high" },
+        "public": { "denylist": {}, "sensitivity": "low" }
+      },
+      "s3_grants": {
+        "5f3a...oidc-sub-alice": [
+          { "bucket": "reports", "actions": ["read_objects", "list_objects"], "prefixes": ["2024/", "2025/"] }
+        ],
+        "9c21...oidc-sub-bob": [
+          { "bucket": "public", "actions": ["read_objects", "list_objects", "write_objects"], "prefixes": [] }
+        ]
+      },
+      "group_grants": {
+        "analysts": [
+          { "bucket": "public", "actions": ["read_objects", "list_objects"], "prefixes": ["shared/"] }
+        ]
+      }
+    }
+  }
+}
