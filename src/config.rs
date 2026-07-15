@@ -179,6 +179,14 @@ impl GatewayConfig {
             .map(|t| (t.tenant.as_str(), t.organization_id.as_str()))
             .collect();
         for c in &self.static_credentials {
+            if c.access_key_id.starts_with(crate::auth::sts::STS_PREFIX) {
+                return Err(GatewayError::Config(format!(
+                    "static credential {} collides with the STS access-key prefix {:?}; \
+                     it would be shadowed by STS secret derivation",
+                    c.access_key_id,
+                    crate::auth::sts::STS_PREFIX
+                )));
+            }
             match tenant_org.get(c.tenant.as_str()) {
                 None => {
                     return Err(GatewayError::Config(format!(

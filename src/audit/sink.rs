@@ -17,6 +17,10 @@ use tokio::sync::mpsc;
 
 use super::record::AuditRecord;
 
+/// Cap on the on-disk spill file: replay reads it whole, so this bounds replay memory
+/// during a long sink outage (§9.2).
+const MAX_SPILL_BYTES: u64 = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct AuditConfig {
     /// Console ingest, e.g. `https://console/api/v1/decision-logs`.
@@ -77,7 +81,10 @@ pub fn spawn(cfg: AuditConfig) -> AuditSink {
     let client = reqwest::Client::builder()
         .timeout(cfg.http_timeout)
         .build()
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            tracing::error!(%e, "audit http client build failed; using default client (no timeout)");
+            reqwest::Client::new()
+        });
     tokio::spawn(Worker { rx, cfg, client }.run());
     AuditSink { tx, dropped }
 }
@@ -154,6 +161,18 @@ impl Worker {
         }
         if let Some(parent) = self.cfg.spill_path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        // Bound the spill file: replay reads it whole, so unbounded growth during a long
+        // outage would OOM the process. At the cap we drop (loud alert) rather than grow.
+        if let Ok(meta) = tokio::fs::metadata(&self.cfg.spill_path).await
+            && meta.len() > MAX_SPILL_BYTES
+        {
+            tracing::error!(
+                size = meta.len(),
+                cap = MAX_SPILL_BYTES,
+                "audit spill at cap; dropping batch (records lost)"
+            );
+            return;
         }
         let file = tokio::fs::OpenOptions::new()
             .create(true)

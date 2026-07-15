@@ -55,12 +55,14 @@ allow if {
 
 # ── org-global and per-bucket denies (evaluated ahead of grants) ────────────────
 
+# Truthy (not `== true`) so a malformed projected value ("true", 1, …) fails toward
+# the SAFE direction — frozen/denied — instead of silently faulting open.
 frozen if {
 	input.action in {"write_objects", "delete_objects", "manage_lifecycle"}
-	data.org_settings.freeze_writes == true
+	data.org_settings.freeze_writes
 }
 
-denylisted if data.tenants[input.tenant].bucket_attributes[input.bucket].denylist[input.principal.sub] == true
+denylisted if data.tenants[input.tenant].bucket_attributes[input.bucket].denylist[input.principal.sub]
 
 member if data.tenants[input.tenant].user_attributes[input.principal.sub]
 
@@ -107,15 +109,25 @@ grant_matches if {
 
 object_in_scope(g) if whole_bucket(g)
 
+# Prefixes are LITERAL S3 key prefixes, matched exactly as S3 ListObjects/IAM do:
+# a grant on "team" also matches "team-private/x". This is intentional and consistent
+# with the backend's own prefix semantics (the key the PDP sees is the canonical key
+# that is forwarded, §6.3, so there is no parser-differential). To isolate a folder,
+# author the grant with a trailing slash ("team/"). The projection SHOULD normalize
+# folder-scoped grants to end in "/" (ADR-006).
 object_in_scope(g) if {
 	some p in g.prefixes
 	startswith(input.object, p)
 }
 
-# bucket-level ops without a key or list semantics (e.g. manage_lifecycle).
+# Genuinely bucket-level actions (manage_lifecycle) — no key, no list semantics.
+# Restricted to manage_lifecycle ON PURPOSE: a read/write/delete arriving with a
+# MISSING object key must NOT fall through to a keyless whole-bucket allow (that
+# would bypass the grant's prefix scope). Missing key on an object op ⇒ no rule
+# matches ⇒ deny (§6.2).
 grant_matches if {
 	not input.object
-	input.action != "list_objects"
+	input.action == "manage_lifecycle"
 	some g in grants
 	applicable_grant(g)
 }

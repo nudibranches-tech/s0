@@ -87,23 +87,30 @@ fn build_pdp(cfg: &GatewayConfig) -> Result<(Arc<BundleStore>, Arc<dyn Pdp>)> {
     let revision = content_revision(&raw);
     let bundles = Arc::new(BundleStore::new(Bundle::new(revision, data.clone())));
 
-    let (inner, capacity): (Arc<dyn Pdp>, u64) = match &cfg.pdp {
-        PdpConfig::Embedded { cache_capacity } => (
-            Arc::new(RegorusPdp::new(GATEWAY_REGO, &data)?),
-            *cache_capacity,
-        ),
+    let pdp: Arc<dyn Pdp> = match &cfg.pdp {
+        PdpConfig::Embedded { cache_capacity } => {
+            // Cache is sound for the embedded engine: the gateway reloads the engine
+            // and bumps the revision atomically, so a stale entry misses by
+            // construction (§4.3.2).
+            let engine: Arc<dyn Pdp> = Arc::new(RegorusPdp::new(GATEWAY_REGO, &data)?);
+            Arc::new(CachingPdp::new(engine, bundles.clone(), *cache_capacity))
+        }
         PdpConfig::Sidecar {
             base_url,
-            cache_capacity,
             timeout_ms,
-        } => (
+            ..
+        } => {
+            // NO decision cache for the sidecar: OPA polls its own bundle
+            // independently, so the gateway's BundleStore revision is not bound to the
+            // data OPA actually evaluates. A revision-keyed cache would serve stale
+            // allows across the skew window (a live-revocation bypass, §6.1). Every
+            // request hits OPA, which holds the current bundle. Caching returns once
+            // the gateway is authoritative for OPA's revision (ADR-005 follow-up).
             Arc::new(SidecarPdp::new(
                 base_url,
                 Duration::from_millis(*timeout_ms),
-            )?),
-            *cache_capacity,
-        ),
+            )?)
+        }
     };
-    let pdp: Arc<dyn Pdp> = Arc::new(CachingPdp::new(inner, bundles.clone(), capacity));
     Ok((bundles, pdp))
 }

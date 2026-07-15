@@ -30,13 +30,17 @@ const ALLOWED_OPS: &[&str] = &[
     "GetObject",
     "HeadObject",
     "PutObject",
-    "PostObject",
     "DeleteObject",
     "DeleteObjects",
     "CopyObject",
     "ListObjectsV2",
     "ListObjects",
 ];
+// PostObject is intentionally NOT allow-listed: `s3s_aws::Proxy` has no `post_object`,
+// so a form upload cannot be forwarded. Allow-listing it would authorize + audit an
+// "Allowed" write that then 501s — a misleading record. The `post_object` hook below is
+// retained (it authorizes the parsed form key, blind spot #3); re-add to the allowlist
+// once form-upload forwarding lands (PostObject→PutObject conversion).
 
 pub struct GatewayAccess {
     gw: Arc<Gateway>,
@@ -470,12 +474,18 @@ mod tests {
 
     #[test]
     fn allowlist_covers_the_blind_spot_ops() {
-        for op in ["CopyObject", "DeleteObjects", "PostObject", "ListObjectsV2"] {
+        for op in ["CopyObject", "DeleteObjects", "ListObjectsV2"] {
             assert!(ALLOWED_OPS.contains(&op), "{op} must be on the allowlist");
         }
-        // Ops we do not implement a hook for must NOT be on the allowlist (they would
-        // fail-open at their default hook, so check() must reject them, §6.2).
-        for op in ["PutBucketAcl", "DeleteBucket", "GetBucketPolicy"] {
+        // Ops we do not (or cannot yet) forward must NOT be allow-listed — they would
+        // fail-open at their default typed hook, so check() must reject them (§6.2).
+        // PostObject is excluded on purpose: s3s_aws::Proxy has no post_object.
+        for op in [
+            "PutBucketAcl",
+            "DeleteBucket",
+            "GetBucketPolicy",
+            "PostObject",
+        ] {
             assert!(!ALLOWED_OPS.contains(&op), "{op} must be denied by default");
         }
     }

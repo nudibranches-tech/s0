@@ -43,13 +43,16 @@ pub struct AuditRecord {
 pub struct GatewayMeta {
     pub backend_id: String,
     pub backend_kind: String,
-    /// Final disposition after forwarding: `allowed`, `denied`, or `error`.
+    /// The POLICY disposition (`allowed`/`denied`), emitted at decision time — this is
+    /// a decision log, so it records the authorization outcome, not whether the backend
+    /// forward later succeeded.
     pub outcome: Outcome,
     /// Keys the PEP stripped from a multi-delete because they were unauthorized
     /// (§5, per-key filtering). Empty for non-multi-delete ops.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub denied_keys: Vec<String>,
-    /// Backend HTTP status once forwarded, if the request reached the backend.
+    /// Backend HTTP status. Populated only once post-forward audit enrichment is wired
+    /// (emit the record from the dispatcher after the backend responds); absent today.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_status: Option<u16>,
 }

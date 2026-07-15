@@ -82,7 +82,9 @@ impl BackendRegistry {
             .get(tenant)
             .ok_or_else(|| GatewayError::Backend(format!("no route for tenant {tenant}")))?;
         let key = (route.backend.id.clone(), tenant.to_string());
-        let mut pool = self.pool.lock().expect("proxy pool poisoned");
+        // Recover from a poisoned lock (a prior build_proxy panic) rather than let one
+        // panic become a permanent gateway-wide forward outage — the map is intact.
+        let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(p) = pool.get(&key) {
             return Ok(p.clone());
         }

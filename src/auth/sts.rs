@@ -89,9 +89,13 @@ impl StsAuthority {
         format!("{STS_PREFIX}{sid}")
     }
 
-    /// Recover the `sid` from an access-key id, if it is one of ours.
+    /// Recover the `sid` from an access-key id, if it is one of ours. A bare prefix
+    /// with an empty `sid` is rejected (not treated as an STS key).
     pub fn sid_from_access_key(access_key_id: &str) -> Option<&str> {
-        access_key_id.strip_prefix(STS_PREFIX)
+        match access_key_id.strip_prefix(STS_PREFIX) {
+            Some(sid) if !sid.is_empty() => Some(sid),
+            _ => None,
+        }
     }
 
     /// The [`crate::auth`] `S3Auth` path: derive the secret for an STS access key.
@@ -103,6 +107,9 @@ impl StsAuthority {
     /// Mint a session. `sid` is supplied by the caller (random at the endpoint;
     /// fixed in tests) so this stays deterministic.
     pub fn mint(&self, sid: &str, claims: SessionClaims) -> Result<SessionCredentials> {
+        if sid.is_empty() {
+            return Err(GatewayError::Sts("sid must be non-empty".into()));
+        }
         if claims.sid != sid {
             return Err(GatewayError::Sts("sid mismatch in claims".into()));
         }

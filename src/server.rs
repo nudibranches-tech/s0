@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use hyper_util::server::graceful::GracefulShutdown;
 use s3s::config::{S3Config, StaticConfigProvider};
@@ -50,10 +50,14 @@ pub async fn serve(gw: Arc<Gateway>, listen: SocketAddr) -> Result<()> {
     tracing::info!(%listen, "gateway listening");
 
     // s3s does not protect the HTTP layer (§9.1); we own connection bounding, the
-    // header-read (slowloris) timeout, and graceful drain.
+    // header-read (slowloris) timeout, h2 keep-alive, and graceful drain.
     let mut http = ConnBuilder::new(TokioExecutor::new());
     http.http1()
         .header_read_timeout(Duration::from_secs(limits.header_read_timeout_secs));
+    http.http2()
+        .timer(TokioTimer::new())
+        .keep_alive_interval(Some(Duration::from_secs(20)))
+        .keep_alive_timeout(Duration::from_secs(20));
     let conn_limit = Arc::new(Semaphore::new(limits.max_connections));
     let graceful = GracefulShutdown::new();
 
@@ -68,7 +72,11 @@ pub async fn serve(gw: Arc<Gateway>, listen: SocketAddr) -> Result<()> {
         let (stream, peer) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(%e, "accept failed");
+                // Back off instead of busy-spinning on a persistent accept error
+                // (e.g. fd exhaustion). The permit is released by the drop below.
+                tracing::warn!(%e, "accept failed; backing off");
+                drop(permit);
+                tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
         };

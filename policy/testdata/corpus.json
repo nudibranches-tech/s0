@@ -128,6 +128,10 @@
       "input": { "principal": {"sub":"alice","type":"user","attributes":{"groups":["analysts"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"manage_lifecycle", "bucket":"reports", "request":{"method":"PUT"} },
       "expect": { "allow": false } },
 
+    { "name": "object read with MISSING key denies (no keyless whole-bucket fallthrough)", "bundle": "default",
+      "input": { "principal": {"sub":"carol","type":"user","attributes":{"groups":["admins"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"read_objects", "bucket":"reports", "request":{"method":"GET"} },
+      "expect": { "allow": false } },
+
     { "name": "copy source read half allowed (carol)", "bundle": "default",
       "input": { "principal": {"sub":"carol","type":"user","attributes":{"groups":["admins"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"read_objects", "bucket":"reports", "object":"2024/src.csv", "copy_source":{"bucket":"reports","key":"2024/src.csv"}, "request":{"method":"PUT"} },
       "expect": { "allow": true } },
