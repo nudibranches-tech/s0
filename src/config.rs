@@ -1,0 +1,184 @@
+//! Gateway configuration. Secrets (STS keys, per-tenant backend credentials) are
+//! expected from a secret store in production; here they load from a JSON file
+//! referenced by `$GATEWAY_CONFIG` so the binary is runnable end-to-end.
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use serde::Deserialize;
+
+use crate::error::{GatewayError, Result};
+use crate::model::BackendKind;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GatewayConfig {
+    pub listen: SocketAddr,
+    pub sts: StsConfig,
+    pub pdp: PdpConfig,
+    #[serde(default)]
+    pub audit: AuditFileConfig,
+    #[serde(default)]
+    pub limits: LimitsConfig,
+    pub backends: Vec<BackendConfig>,
+    pub tenants: Vec<TenantConfig>,
+    /// Long-lived static credentials (external apps / service accounts). Each is its
+    /// own principal — never a shared bay key (§6.5).
+    #[serde(default)]
+    pub static_credentials: Vec<StaticCredentialConfig>,
+    /// Path to the initial per-Org bundle JSON (the projected policy data). In
+    /// production this is polled from the console bundle endpoint (§3.4).
+    pub bundle_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StaticCredentialConfig {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub principal_sub: String,
+    pub tenant: String,
+    pub organization_id: String,
+    #[serde(default)]
+    pub groups: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StsConfig {
+    /// Hex-encoded master key (≥32 bytes) deriving session secrets.
+    pub master_key_hex: String,
+    /// Hex-encoded signing key (≥32 bytes) authenticating session tokens.
+    pub signing_key_hex: String,
+    #[serde(default = "default_session_ttl_secs")]
+    pub session_ttl_secs: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum PdpConfig {
+    /// Embedded regorus (fast path). Permitted only behind the parity gate (§4.3.1).
+    Embedded {
+        #[serde(default = "default_cache_capacity")]
+        cache_capacity: u64,
+    },
+    /// Sidecar OPA over loopback (shipping default, §4.3.1).
+    Sidecar {
+        base_url: String,
+        #[serde(default = "default_cache_capacity")]
+        cache_capacity: u64,
+        #[serde(default = "default_pdp_timeout_ms")]
+        timeout_ms: u64,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuditFileConfig {
+    pub sink_url: String,
+    pub spill_path: PathBuf,
+}
+
+impl Default for AuditFileConfig {
+    fn default() -> Self {
+        AuditFileConfig {
+            sink_url: "http://127.0.0.1:9000/api/v1/decision-logs".into(),
+            spill_path: PathBuf::from("/var/lib/hyperfluid-gateway/audit-spill.ndjson"),
+        }
+    }
+}
+
+/// Request-shape + hardening limits (§9.1). Mapped onto `s3s::S3Config` plus the
+/// gateway's own semantic caps enforced before the PDP fan-out.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LimitsConfig {
+    pub xml_max_body_size: usize,
+    pub post_object_max_file_size: u64,
+    pub presigned_url_max_skew_time_secs: u32,
+    /// AWS semantic cap: `DeleteObjects` ≤ 1000 keys (enforced before OPA, §9.1).
+    pub max_delete_keys: usize,
+    /// Multi-prefix list fan-out bound; above it the list fails closed (§5.1).
+    pub max_list_fanout: usize,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        LimitsConfig {
+            xml_max_body_size: 20 * 1024 * 1024,
+            post_object_max_file_size: 5 * 1024 * 1024 * 1024,
+            presigned_url_max_skew_time_secs: 900,
+            max_delete_keys: 1000,
+            max_list_fanout: 16,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BackendConfig {
+    pub id: String,
+    pub kind: BackendKind,
+    pub endpoint_url: String,
+    #[serde(default = "default_region")]
+    pub region: String,
+    #[serde(default = "default_true")]
+    pub force_path_style: bool,
+}
+
+/// Maps a Harbor tenant to its Org, its backend, and the per-tenant backend
+/// credential the proxy re-signs with (never the caller's, §4.4/§6.4).
+#[derive(Debug, Clone, Deserialize)]
+pub struct TenantConfig {
+    pub tenant: String,
+    pub organization_id: String,
+    pub backend_id: String,
+    pub owner_access_key: String,
+    pub owner_secret_key: String,
+}
+
+impl GatewayConfig {
+    pub fn load() -> Result<Self> {
+        let path = std::env::var("GATEWAY_CONFIG").unwrap_or_else(|_| "gateway.json".into());
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|e| GatewayError::Config(format!("read {path}: {e}")))?;
+        Self::from_json(&raw)
+    }
+
+    pub fn from_json(raw: &str) -> Result<Self> {
+        let cfg: GatewayConfig =
+            serde_json::from_str(raw).map_err(|e| GatewayError::Config(format!("parse: {e}")))?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    fn validate(&self) -> Result<()> {
+        let ids: HashMap<&str, &BackendConfig> =
+            self.backends.iter().map(|b| (b.id.as_str(), b)).collect();
+        for t in &self.tenants {
+            if !ids.contains_key(t.backend_id.as_str()) {
+                return Err(GatewayError::Config(format!(
+                    "tenant {} references unknown backend {}",
+                    t.tenant, t.backend_id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn session_ttl(&self) -> Duration {
+        Duration::from_secs(self.sts.session_ttl_secs)
+    }
+}
+
+fn default_session_ttl_secs() -> u64 {
+    3600
+}
+fn default_cache_capacity() -> u64 {
+    100_000
+}
+fn default_pdp_timeout_ms() -> u64 {
+    2000
+}
+fn default_region() -> String {
+    "us-east-1".into()
+}
+fn default_true() -> bool {
+    true
+}
