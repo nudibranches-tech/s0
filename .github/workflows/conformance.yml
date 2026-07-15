@@ -1,0 +1,52 @@
+# S3 protocol conformance (§9.4). Runs the gateway in front of a real S3 backend and
+# executes an S3 compatibility suite against the GATEWAY endpoint (not the backend
+# directly), per supported backend vendor. This is the compatibility story for "other
+# clouds" backends and the safety net for `s3s` upgrades (§9.4).
+#
+# Manually triggered because it needs a live backend service and gateway credentials.
+# The MinIO leg below is scaffolded; the s3-tests / Mint harness step is marked TODO
+# and must be wired before this can gate merges — it is intentionally NOT a green no-op.
+
+name: conformance
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1" # weekly
+
+jobs:
+  minio:
+    runs-on: ubuntu-latest
+    services:
+      minio:
+        image: minio/minio:latest
+        ports: ["9000:9000"]
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        options: >-
+          --health-cmd "curl -f http://localhost:9000/minio/health/live || exit 1"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: build gateway
+        run: cargo build --release
+
+      - name: start gateway in front of MinIO
+        run: |
+          # A conformance config points a tenant at the MinIO service as a remote_s3
+          # backend and issues a static test credential; the gateway listens on :8014.
+          # (Config generation TODO — mirror docs/gateway.example.json with
+          #  endpoint_url=http://localhost:9000 and matching bundle grants.)
+          echo "TODO: render conformance gateway.json + bundle.json"
+
+      - name: run S3 conformance suite against the gateway
+        run: |
+          # TODO: execute Ceph s3-tests and/or MinIO Mint against http://localhost:8014
+          # (the GATEWAY, not MinIO directly), with the test credential. Fail the job on
+          # any regression. Until wired, fail loudly rather than pass silently.
+          echo "conformance harness not yet wired (§9.4)" >&2
+          exit 1
