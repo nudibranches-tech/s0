@@ -255,11 +255,10 @@ impl S3Access for GatewayAccess {
                 "operation {op} is not permitted by the gateway"
             ));
         }
-        let token = cx
-            .headers()
-            .get(SECURITY_TOKEN_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
+        // The STS session token rides in the header for signed requests and in the
+        // query string for presigned URLs (§4.2) — presigned links flow through the
+        // same OPA gate, so accept both.
+        let token = session_token(cx.headers(), cx.uri());
         let principal = match self.gw.identity.resolve(&access_key, token.as_deref()) {
             Ok(p) => p,
             Err(e) => {
@@ -570,6 +569,51 @@ fn request_meta<T>(req: &S3Request<T>) -> RequestMeta {
     }
 }
 
+/// The STS session token from the `X-Amz-Security-Token` header (signed requests) or
+/// query param (presigned URLs). Our session tokens are URL-safe JWTs, but we
+/// percent-decode defensively.
+fn session_token(headers: &http::HeaderMap, uri: &http::Uri) -> Option<String> {
+    if let Some(v) = headers
+        .get(SECURITY_TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok())
+    {
+        return Some(v.to_string());
+    }
+    let query = uri.query()?;
+    query.split('&').find_map(|pair| {
+        pair.strip_prefix("X-Amz-Security-Token=")
+            .map(percent_decode)
+    })
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+        {
+            out.push((h << 4) | l);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn new_decision_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
@@ -662,5 +706,25 @@ mod tests {
             ListOutcome::Allow
         ));
         assert_eq!(prefix.as_deref(), Some("mine/"));
+    }
+
+    #[test]
+    fn session_token_from_header_and_presigned_query() {
+        let uri: http::Uri = "/b/k".parse().unwrap();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(SECURITY_TOKEN_HEADER, "hdr-token".parse().unwrap());
+        assert_eq!(session_token(&headers, &uri).as_deref(), Some("hdr-token"));
+
+        // Presigned URL: token in the query, percent-encoded.
+        let empty = http::HeaderMap::new();
+        let uri: http::Uri =
+            "/b/k?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Security-Token=ab%2Fcd&X-Amz-Signature=x"
+                .parse()
+                .unwrap();
+        assert_eq!(session_token(&empty, &uri).as_deref(), Some("ab/cd"));
+
+        // Neither.
+        let uri: http::Uri = "/b/k?X-Amz-Signature=x".parse().unwrap();
+        assert_eq!(session_token(&empty, &uri), None);
     }
 }
