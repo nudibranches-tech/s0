@@ -113,6 +113,14 @@ upload ops; POST-form forwarding (authorized but `s3s_aws::Proxy` lacks `post_ob
 the companion console-side grant projection (ADR-006) and Ceph/S3 audit extractor
 (ADR-002); the direct-credential closure (ADR-001).
 
+## Dependency policy (§9.4)
+
+`s3s` is experimental and effectively single-maintainer, and it is on the critical
+path. It is pinned to the **exact** version (`s3s = "=0.14.1"`) so upgrades are
+deliberate events, gated by the conformance suite (`.github/workflows/conformance.yml`)
+run per backend vendor. To make an upgrade fully hermetic, vendor it —
+`cargo vendor vendor/ && printf '[source.crates-io]\nreplace-with = "vendored"\n[source.vendored]\ndirectory = "vendor"\n' >> .cargo/config.toml` — and review the diff on each bump.
+
 ## Design records
 
 Substrate API reference: [`docs/substrate-api.md`](docs/substrate-api.md). Decisions on
