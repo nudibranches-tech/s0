@@ -351,3 +351,71 @@ fn new_decision_id() -> String {
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::authz::Obligations;
+
+    fn allow_with(obl: Obligations) -> Decision {
+        Decision {
+            allow: true,
+            reason: "ok".into(),
+            obligations: obl,
+        }
+    }
+
+    #[test]
+    fn allowlist_covers_the_blind_spot_ops() {
+        for op in ["CopyObject", "DeleteObjects", "PostObject", "ListObjectsV2"] {
+            assert!(ALLOWED_OPS.contains(&op), "{op} must be on the allowlist");
+        }
+        // Ops we do not implement a hook for must NOT be on the allowlist (they would
+        // fail-open at their default hook, so check() must reject them, §6.2).
+        for op in ["PutBucketAcl", "DeleteBucket", "GetBucketPolicy"] {
+            assert!(!ALLOWED_OPS.contains(&op), "{op} must be denied by default");
+        }
+    }
+
+    #[test]
+    fn list_denied_passes_through_reason() {
+        let d = Decision::deny("nope");
+        let mut prefix = None;
+        assert!(matches!(
+            apply_list_obligation(&d, &mut prefix),
+            ListOutcome::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn list_single_prefix_is_rewritten() {
+        let d = allow_with(Obligations {
+            narrow_prefix: Some("2024/".into()),
+            allowed_prefixes: vec![],
+        });
+        let mut prefix = None;
+        assert!(matches!(apply_list_obligation(&d, &mut prefix), ListOutcome::Allow));
+        assert_eq!(prefix.as_deref(), Some("2024/"));
+    }
+
+    #[test]
+    fn list_multi_prefix_fails_closed() {
+        let d = allow_with(Obligations {
+            narrow_prefix: None,
+            allowed_prefixes: vec!["2024/".into(), "2025/".into()],
+        });
+        let mut prefix = None;
+        assert!(matches!(
+            apply_list_obligation(&d, &mut prefix),
+            ListOutcome::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn list_unrestricted_allow_keeps_prefix() {
+        let d = allow_with(Obligations::default());
+        let mut prefix = Some("mine/".to_string());
+        assert!(matches!(apply_list_obligation(&d, &mut prefix), ListOutcome::Allow));
+        assert_eq!(prefix.as_deref(), Some("mine/"));
+    }
+}

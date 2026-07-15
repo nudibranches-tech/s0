@@ -140,3 +140,89 @@ impl S3Auth for GatewayAuth {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sts::SessionClaims;
+
+    fn far_future() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600
+    }
+
+    fn identity() -> (Identity, StsAuthority) {
+        let sts = StsAuthority::new(vec![3u8; 32], vec![5u8; 32]).unwrap();
+        let mut store = StaticCredentialStore::new();
+        store.insert(
+            "AKIASTATIC",
+            StaticCredential {
+                secret_access_key: "shhh".into(),
+                principal_sub: "svc-reporter".into(),
+                tenant: "acme".into(),
+                organization_id: "org-acme".into(),
+                groups: vec!["reporters".into()],
+            },
+        );
+        (
+            Identity::new(Arc::new(sts.clone()), Arc::new(store)),
+            sts,
+        )
+    }
+
+    #[test]
+    fn resolves_static_credential() {
+        let (id, _) = identity();
+        let p = id.resolve("AKIASTATIC", None).unwrap();
+        assert_eq!(p.sub, "svc-reporter");
+        assert_eq!(p.tenant, "acme");
+        assert_eq!(p.principal_type, PrincipalType::ServiceAccount);
+    }
+
+    #[test]
+    fn resolves_sts_session_with_token() {
+        let (id, sts) = identity();
+        let claims = SessionClaims {
+            sub: "alice".into(),
+            principal_type: PrincipalType::User,
+            groups: vec!["analysts".into()],
+            tenant: "acme".into(),
+            org: "org-acme".into(),
+            sid: "sid-1".into(),
+            exp: far_future(),
+        };
+        let creds = sts.mint("sid-1", claims).unwrap();
+        let p = id
+            .resolve(&creds.access_key_id, Some(&creds.session_token))
+            .unwrap();
+        assert_eq!(p.sub, "alice");
+        assert_eq!(p.groups, vec!["analysts".to_string()]);
+    }
+
+    #[test]
+    fn sts_key_without_token_is_rejected() {
+        let (id, _) = identity();
+        let ak = StsAuthority::access_key_id("sid-1");
+        assert!(id.resolve(&ak, None).is_err());
+    }
+
+    #[test]
+    fn unknown_static_key_is_rejected() {
+        let (id, _) = identity();
+        assert!(id.resolve("AKIANOPE", None).is_err());
+    }
+
+    #[test]
+    fn secret_key_path_covers_both_kinds() {
+        let (id, sts) = identity();
+        assert_eq!(id.secret_key("AKIASTATIC").as_deref(), Some("shhh"));
+        let ak = StsAuthority::access_key_id("sid-9");
+        assert_eq!(
+            id.secret_key(&ak).as_deref(),
+            Some(sts.derive_secret("sid-9").as_str())
+        );
+    }
+}

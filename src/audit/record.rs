@@ -87,3 +87,83 @@ impl AuditRecord {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::authz::{Backend, OpaInput, Principal, PrincipalAttributes, RequestMeta};
+    use crate::model::{Action, BackendKind, PrincipalType};
+
+    fn sample_input() -> OpaInput {
+        OpaInput {
+            principal: Principal {
+                sub: "alice".into(),
+                kind: PrincipalType::User,
+                attributes: PrincipalAttributes::default(),
+            },
+            backend: Backend {
+                id: "bay-1".into(),
+                kind: BackendKind::Ceph,
+            },
+            tenant: "acme".into(),
+            organization_id: "org-acme".into(),
+            action: Action::ReadObjects,
+            bucket: "reports".into(),
+            object: Some("2024/q1.csv".into()),
+            prefix: None,
+            copy_source: None,
+            delete_keys: None,
+            object_tags: None,
+            request: RequestMeta::default(),
+        }
+    }
+
+    #[test]
+    fn record_carries_trusted_org_label_and_principal() {
+        let meta = GatewayMeta {
+            backend_id: "bay-1".into(),
+            backend_kind: "ceph".into(),
+            outcome: Outcome::Allowed,
+            denied_keys: vec![],
+            backend_status: None,
+        };
+        let rec = AuditRecord::new(
+            "dec-1".into(),
+            "2026-07-15T00:00:00Z".into(),
+            sample_input(),
+            Decision::allow("grant matched"),
+            meta,
+        );
+        assert_eq!(rec.requested_by, "alice");
+        assert_eq!(rec.path, DECISION_PATH);
+        assert_eq!(rec.labels.get(LABEL_ORG_ID).map(String::as_str), Some("org-acme"));
+        assert_eq!(
+            rec.labels.get(super::LABEL_DOCK_TYPE).map(String::as_str),
+            Some(DOCK_TYPE_VALUE)
+        );
+        // Round-trips through the spill format.
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: AuditRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.requested_by, "alice");
+    }
+
+    #[test]
+    fn multi_delete_denied_keys_serialize() {
+        let meta = GatewayMeta {
+            backend_id: "bay-1".into(),
+            backend_kind: "ceph".into(),
+            outcome: Outcome::Allowed,
+            denied_keys: vec!["secret/x".into()],
+            backend_status: None,
+        };
+        let rec = AuditRecord::new(
+            "dec-2".into(),
+            "2026-07-15T00:00:00Z".into(),
+            sample_input(),
+            Decision::allow("2 allowed, 1 denied"),
+            meta,
+        );
+        let json = serde_json::to_value(&rec).unwrap();
+        assert_eq!(json["gateway"]["denied_keys"][0], "secret/x");
+    }
+}
