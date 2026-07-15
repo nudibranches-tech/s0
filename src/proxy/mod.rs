@@ -7,13 +7,15 @@
 //! §6.3 (canonicalize-before-forward) holds by construction: the typed hook mutates
 //! `S3Request<Input>` and we forward that same value — there is no raw passthrough.
 
+pub mod fanout;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::{Client, Config};
 use s3s::dto::*;
-use s3s::{S3, S3Request, S3Response, S3Result, s3_error};
+use s3s::{S3, S3Error, S3Request, S3Response, S3Result, s3_error};
 use s3s_aws::Proxy;
 
 use crate::config::{BackendConfig, GatewayConfig};
@@ -190,7 +192,12 @@ impl S3 for GatewayS3 {
         &self,
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
-        self.proxy_for_req(&req)?.list_objects_v2(req).await
+        let proxy = self.proxy_for_req(&req)?;
+        // Multi-prefix fan-out obligation stashed by the access layer (ADR-004)?
+        if let Some(fo) = req.extensions.get::<Arc<fanout::ListFanout>>().cloned() {
+            return fan_out_list_v2(proxy, req, &fo.prefixes).await;
+        }
+        proxy.list_objects_v2(req).await
     }
 
     async fn list_objects(
@@ -250,4 +257,73 @@ impl S3 for GatewayS3 {
     ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
         self.proxy_for_req(&req)?.list_multipart_uploads(req).await
     }
+}
+
+/// Execute a multi-prefix `ListObjectsV2` by fanning out one backend LIST per granted
+/// prefix and merging into a single page with a gateway-owned continuation cursor
+/// (ADR-004). Each page is re-decided by the access layer, so live revocation holds.
+// ListObjectsV2Output is #[non_exhaustive], so struct-update syntax is unavailable;
+// field-reassign on a Default instance is the only construction path.
+#[allow(clippy::field_reassign_with_default)]
+async fn fan_out_list_v2(
+    proxy: Arc<Proxy>,
+    req: S3Request<ListObjectsV2Input>,
+    prefixes: &[String],
+) -> S3Result<S3Response<ListObjectsV2Output>> {
+    let bucket = req.input.bucket.clone();
+    let max_keys = req.input.max_keys.unwrap_or(1000).clamp(1, 1000) as usize;
+    let cursor = req
+        .input
+        .continuation_token
+        .as_deref()
+        .and_then(fanout::Cursor::decode);
+
+    // Backend errors from any sub-list must abort the whole page (never silently drop
+    // keys, which would corrupt pagination). Captured here since the lister returns a
+    // plain Vec.
+    let error: Arc<Mutex<Option<S3Error>>> = Arc::new(Mutex::new(None));
+    let template = req;
+
+    let lister = |prefix: String, start_after: Option<String>, limit: usize| {
+        let proxy = proxy.clone();
+        let error = error.clone();
+        let mut sub = template.clone();
+        sub.input.prefix = Some(prefix);
+        sub.input.start_after = start_after;
+        sub.input.continuation_token = None;
+        sub.input.delimiter = None;
+        sub.input.max_keys = Some(limit as i32);
+        async move {
+            match proxy.list_objects_v2(sub).await {
+                Ok(resp) => resp.output.contents.unwrap_or_default(),
+                Err(e) => {
+                    *error.lock().expect("fanout error cell") = Some(e);
+                    Vec::new()
+                }
+            }
+        }
+    };
+
+    let page = fanout::fan_out(
+        prefixes,
+        cursor,
+        max_keys,
+        |o: &Object| o.key.clone().unwrap_or_default(),
+        lister,
+    )
+    .await
+    .map_err(|e| s3_error!(InvalidArgument, "{e}"))?;
+
+    if let Some(e) = error.lock().expect("fanout error cell").take() {
+        return Err(e);
+    }
+
+    let mut output = ListObjectsV2Output::default();
+    output.name = Some(bucket);
+    output.max_keys = Some(max_keys as i32);
+    output.key_count = Some(page.items.len() as i32);
+    output.is_truncated = Some(page.truncated);
+    output.contents = Some(page.items);
+    output.next_continuation_token = page.next.map(|c| c.encode());
+    Ok(S3Response::new(output))
 }

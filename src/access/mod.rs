@@ -22,6 +22,7 @@ use crate::authz::{Backend, CopySource as AuthzCopySource, Decision, OpaInput, R
 use crate::gateway::Gateway;
 use crate::identity::ResolvedPrincipal;
 use crate::model::{Action, BackendId, BackendKind};
+use crate::proxy::fanout;
 
 /// The ops the gateway implements a typed hook for. `check` denies everything else
 /// (deny-by-default backstop — adding an op here and implementing its hook are one
@@ -204,30 +205,29 @@ impl GatewayAccess {
         }
     }
 
-    /// List-style path (ListObjects*, ListMultipartUploads): decide + apply the
-    /// prefix-narrowing obligation (§5.1) in place on the caller's prefix.
+    /// List-style path (ListObjects*, ListMultipartUploads): decide, classify the
+    /// obligation (§5.1), and audit. The caller applies the verdict to the request
+    /// (rewrite prefix, stash a fan-out obligation, or deny).
     async fn enforce_list(
         &self,
         principal: &ResolvedPrincipal,
         bucket: String,
-        prefix: &mut Option<String>,
+        prefix: Option<String>,
         request: RequestMeta,
-    ) -> S3Result<()> {
+    ) -> ListVerdict {
         let mut input = self.base_input(principal, Action::ListObjects, bucket);
-        input.prefix = prefix.clone();
+        input.prefix = prefix;
         input.request = request;
         let decision = self.decide(&input).await;
-        match apply_list_obligation(&decision, prefix) {
-            ListOutcome::Allow => {
-                self.audit(input, &decision, Outcome::Allowed, vec![]);
-                Ok(())
-            }
-            ListOutcome::Deny(reason) => {
+        let verdict = classify_list(&decision, self.gw.limits.max_list_fanout);
+        match &verdict {
+            ListVerdict::Deny(reason) => {
                 let d = Decision::deny(reason.clone());
                 self.audit(input, &d, Outcome::Denied, vec![]);
-                Err(s3_error!(AccessDenied, "{reason}"))
             }
+            _ => self.audit(input, &decision, Outcome::Allowed, vec![]),
         }
+        verdict
     }
 }
 
@@ -413,16 +413,37 @@ impl S3Access for GatewayAccess {
         let p = self.principal(req)?;
         let bucket = req.input.bucket.clone();
         let meta = request_meta(req);
-        self.enforce_list(&p, bucket, &mut req.input.prefix, meta)
-            .await
+        let prefix = req.input.prefix.clone();
+        match self.enforce_list(&p, bucket, prefix, meta).await {
+            ListVerdict::Deny(reason) => Err(s3_error!(AccessDenied, "{reason}")),
+            ListVerdict::AllowAsIs => Ok(()),
+            ListVerdict::Narrow(np) => {
+                req.input.prefix = Some(np);
+                Ok(())
+            }
+            ListVerdict::FanOut(prefixes) => {
+                // Fan-out re-paginates raw keys; delimiter (folder) listing across
+                // multiple prefixes is a follow-up (ADR-004).
+                if req.input.delimiter.is_some() {
+                    return Err(s3_error!(
+                        AccessDenied,
+                        "delimiter listing across multiple granted prefixes is unsupported; list a single prefix"
+                    ));
+                }
+                req.extensions
+                    .insert(Arc::new(fanout::ListFanout { prefixes }));
+                Ok(())
+            }
+        }
     }
 
     async fn list_objects(&self, req: &mut S3Request<ListObjectsInput>) -> S3Result<()> {
         let p = self.principal(req)?;
         let bucket = req.input.bucket.clone();
         let meta = request_meta(req);
-        self.enforce_list(&p, bucket, &mut req.input.prefix, meta)
-            .await
+        let prefix = req.input.prefix.clone();
+        let verdict = self.enforce_list(&p, bucket, prefix, meta).await;
+        list_verdict_single(verdict, &mut req.input.prefix)
     }
 
     // ── Multipart upload lifecycle (write on the key), plus its copy + list ops ──
@@ -517,40 +538,69 @@ impl S3Access for GatewayAccess {
         let p = self.principal(req)?;
         let bucket = req.input.bucket.clone();
         let meta = request_meta(req);
-        self.enforce_list(&p, bucket, &mut req.input.prefix, meta)
-            .await
+        let prefix = req.input.prefix.clone();
+        let verdict = self.enforce_list(&p, bucket, prefix, meta).await;
+        list_verdict_single(verdict, &mut req.input.prefix)
     }
 }
 
-enum ListOutcome {
-    Allow,
+/// What to do with a list request after the PDP decision.
+enum ListVerdict {
     Deny(String),
+    /// Allowed as requested (whole-bucket or already-in-scope prefix).
+    AllowAsIs,
+    /// Rewrite the request prefix to this single granted prefix (§5.1).
+    Narrow(String),
+    /// Allowed across several granted prefixes — the dispatcher fans out (ADR-004).
+    FanOut(Vec<String>),
 }
 
-/// Apply the list-narrowing obligation (§5.1): a single granted prefix rewrites the
-/// request; multiple granted prefixes cannot be expressed as one S3 `prefix` param,
-/// so — until fan-out lands (ADR-004) — the request fails closed.
-fn apply_list_obligation(decision: &Decision, prefix: &mut Option<String>) -> ListOutcome {
+/// Classify the PDP obligation into a list verdict. Multi-prefix within the fan-out
+/// bound becomes `FanOut`; above the bound it fails closed.
+fn classify_list(decision: &Decision, max_fanout: usize) -> ListVerdict {
     if !decision.allow {
-        return ListOutcome::Deny(decision.reason.clone());
+        return ListVerdict::Deny(decision.reason.clone());
     }
-    // Defense in depth: the shipped rego sets at most one, but if a decision ever
-    // carries BOTH a single-prefix rewrite and a multi-prefix set, fail closed rather
-    // than silently taking the narrower branch.
+    // Defense in depth: the shipped rego sets at most one obligation.
     if decision.obligations.narrow_prefix.is_some()
         && !decision.obligations.allowed_prefixes.is_empty()
     {
-        return ListOutcome::Deny("ambiguous list obligation (narrow + allowed prefixes)".into());
+        return ListVerdict::Deny("ambiguous list obligation (narrow + allowed prefixes)".into());
     }
     if let Some(np) = &decision.obligations.narrow_prefix {
-        *prefix = Some(np.clone());
-    } else if !decision.obligations.allowed_prefixes.is_empty() {
-        return ListOutcome::Deny(
-            "list spans multiple granted prefixes; narrow your prefix (fan-out not yet enabled)"
-                .into(),
-        );
+        return ListVerdict::Narrow(np.clone());
     }
-    ListOutcome::Allow
+    let allowed = &decision.obligations.allowed_prefixes;
+    if !allowed.is_empty() {
+        if allowed.len() > max_fanout {
+            return ListVerdict::Deny(format!(
+                "list spans {} granted prefixes, exceeding the fan-out bound {max_fanout}; narrow your prefix",
+                allowed.len()
+            ));
+        }
+        let mut prefixes = allowed.clone();
+        prefixes.sort();
+        prefixes.dedup();
+        return ListVerdict::FanOut(prefixes);
+    }
+    ListVerdict::AllowAsIs
+}
+
+/// Apply a list verdict for ops without fan-out dispatch (v1 list, multipart list):
+/// a multi-prefix `FanOut` fails closed here.
+fn list_verdict_single(verdict: ListVerdict, prefix: &mut Option<String>) -> S3Result<()> {
+    match verdict {
+        ListVerdict::Deny(reason) => Err(s3_error!(AccessDenied, "{reason}")),
+        ListVerdict::AllowAsIs => Ok(()),
+        ListVerdict::Narrow(np) => {
+            *prefix = Some(np);
+            Ok(())
+        }
+        ListVerdict::FanOut(_) => Err(s3_error!(
+            AccessDenied,
+            "multi-prefix listing is not supported for this operation; list a single prefix"
+        )),
+    }
 }
 
 fn outcome_of(allow: bool) -> Outcome {
@@ -663,49 +713,43 @@ mod tests {
     #[test]
     fn list_denied_passes_through_reason() {
         let d = Decision::deny("nope");
-        let mut prefix = None;
-        assert!(matches!(
-            apply_list_obligation(&d, &mut prefix),
-            ListOutcome::Deny(_)
-        ));
+        assert!(matches!(classify_list(&d, 16), ListVerdict::Deny(_)));
     }
 
     #[test]
-    fn list_single_prefix_is_rewritten() {
+    fn list_single_prefix_narrows() {
         let d = allow_with(Obligations {
             narrow_prefix: Some("2024/".into()),
             allowed_prefixes: vec![],
         });
-        let mut prefix = None;
-        assert!(matches!(
-            apply_list_obligation(&d, &mut prefix),
-            ListOutcome::Allow
-        ));
-        assert_eq!(prefix.as_deref(), Some("2024/"));
+        assert!(matches!(classify_list(&d, 16), ListVerdict::Narrow(np) if np == "2024/"));
     }
 
     #[test]
-    fn list_multi_prefix_fails_closed() {
+    fn list_multi_prefix_within_bound_fans_out_sorted() {
         let d = allow_with(Obligations {
             narrow_prefix: None,
-            allowed_prefixes: vec!["2024/".into(), "2025/".into()],
+            allowed_prefixes: vec!["2025/".into(), "2024/".into()],
         });
-        let mut prefix = None;
         assert!(matches!(
-            apply_list_obligation(&d, &mut prefix),
-            ListOutcome::Deny(_)
+            classify_list(&d, 16),
+            ListVerdict::FanOut(p) if p == vec!["2024/".to_string(), "2025/".to_string()]
         ));
     }
 
     #[test]
-    fn list_unrestricted_allow_keeps_prefix() {
+    fn list_multi_prefix_over_bound_fails_closed() {
+        let d = allow_with(Obligations {
+            narrow_prefix: None,
+            allowed_prefixes: vec!["a/".into(), "b/".into(), "c/".into()],
+        });
+        assert!(matches!(classify_list(&d, 2), ListVerdict::Deny(_)));
+    }
+
+    #[test]
+    fn list_unrestricted_is_allow_as_is() {
         let d = allow_with(Obligations::default());
-        let mut prefix = Some("mine/".to_string());
-        assert!(matches!(
-            apply_list_obligation(&d, &mut prefix),
-            ListOutcome::Allow
-        ));
-        assert_eq!(prefix.as_deref(), Some("mine/"));
+        assert!(matches!(classify_list(&d, 16), ListVerdict::AllowAsIs));
     }
 
     #[test]

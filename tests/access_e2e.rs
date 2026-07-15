@@ -28,13 +28,21 @@ fn bundle() -> serde_json::Value {
     serde_json::json!({
         "org_settings": { "freeze_writes": false },
         "tenants": { "acme": {
-            "user_attributes": { "alice": { "groups": [], "attributes": [] } },
+            "user_attributes": {
+                "alice": { "groups": [], "attributes": [] },
+                "multi": { "groups": [], "attributes": [] }
+            },
             "bucket_attributes": { "reports": { "denylist": {} } },
-            "s3_grants": { "alice": [
-                { "bucket": "reports",
-                  "actions": ["read_objects", "list_objects", "write_objects", "delete_objects"],
-                  "prefixes": ["2024/"] }
-            ] },
+            "s3_grants": {
+                "alice": [
+                    { "bucket": "reports",
+                      "actions": ["read_objects", "list_objects", "write_objects", "delete_objects"],
+                      "prefixes": ["2024/"] }
+                ],
+                "multi": [
+                    { "bucket": "reports", "actions": ["list_objects"], "prefixes": ["2024/", "2025/"] }
+                ]
+            },
             "group_grants": {}
         }}
     })
@@ -99,9 +107,23 @@ fn alice() -> ResolvedPrincipal {
     }
 }
 
+fn multi() -> ResolvedPrincipal {
+    ResolvedPrincipal {
+        sub: "multi".into(),
+        principal_type: PrincipalType::User,
+        groups: vec![],
+        tenant: "acme".into(),
+        organization_id: "org-acme".into(),
+    }
+}
+
 fn request<T>(input: T, method: Method) -> S3Request<T> {
+    request_as(alice(), input, method)
+}
+
+fn request_as<T>(principal: ResolvedPrincipal, input: T, method: Method) -> S3Request<T> {
     let mut extensions = Extensions::new();
-    extensions.insert(Arc::new(alice()));
+    extensions.insert(Arc::new(principal));
     S3Request {
         input,
         method,
@@ -236,4 +258,27 @@ async fn list_multipart_uploads_is_narrowed_to_grant_prefix() {
     );
     assert!(access.list_multipart_uploads(&mut req).await.is_ok());
     assert_eq!(req.input.prefix.as_deref(), Some("2024/"));
+}
+
+#[tokio::test]
+async fn multi_prefix_list_allows_and_stashes_fanout() {
+    use hyperfluid_s3_gateway::proxy::fanout::ListFanout;
+    let access = GatewayAccess::new(test_gateway().await);
+    // `multi` holds list grants on two prefixes; an unbounded list is now allowed with
+    // a fan-out obligation (previously it fail-closed).
+    let mut req = request_as(
+        multi(),
+        ListObjectsV2Input {
+            bucket: "reports".into(),
+            prefix: None,
+            ..Default::default()
+        },
+        Method::GET,
+    );
+    assert!(access.list_objects_v2(&mut req).await.is_ok());
+    let fo = req
+        .extensions
+        .get::<Arc<ListFanout>>()
+        .expect("fan-out obligation stashed");
+    assert_eq!(fo.prefixes, vec!["2024/".to_string(), "2025/".to_string()]);
 }
