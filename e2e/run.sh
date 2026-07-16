@@ -4,10 +4,10 @@ set -euo pipefail
 cd "$(dirname "$0")"
 mkdir -p out
 rm -f out/audit-spill.ndjson
-pkill -f 'target/release/hyperfluid-s3-gateway' 2>/dev/null || true
+pkill -f 'target/release/s0' 2>/dev/null || true
 
 echo "== build gateway + smoke driver =="
-( cd .. && cargo build --release --bin hyperfluid-s3-gateway --example e2e_smoke )
+( cd .. && cargo build --release --bin s0 --example e2e_smoke )
 
 echo "== up minio + opa =="
 docker compose up -d
@@ -21,7 +21,7 @@ wait_for localhost:9000/minio/health/live || { echo "minio not ready"; exit 1; }
 echo "-- opa loaded data.tenants: $(curl -s localhost:8181/v1/data/tenants | head -c 120)"
 
 echo "== start gateway (sidecar OPA mode) =="
-GATEWAY_CONFIG="$PWD/gateway.e2e.json" ../target/release/hyperfluid-s3-gateway >out/gateway.log 2>&1 &
+GATEWAY_CONFIG="$PWD/gateway.e2e.json" ../target/release/s0 >out/gateway.log 2>&1 &
 GW=$!
 wait_for localhost:8014/ || { echo "gateway not ready"; cat out/gateway.log; exit 1; }
 
