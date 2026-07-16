@@ -1740,42 +1740,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hyperfluid-s3-gateway"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arc-swap",
- "async-trait",
- "aws-config",
- "aws-credential-types",
- "aws-sdk-s3",
- "aws-smithy-types",
- "bytes",
- "chrono",
- "hex",
- "hmac 0.13.0",
- "http 1.4.2",
- "http-body-util",
- "hyper 1.10.1",
- "hyper-util",
- "jsonwebtoken",
- "moka",
- "regorus",
- "reqwest",
- "s3s",
- "s3s-aws",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "thiserror",
- "tokio",
- "tower",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "iana-time-zone"
 version = "0.1.65"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3009,6 +2973,42 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
+name = "s0"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "aws-sdk-s3",
+ "aws-smithy-types",
+ "bytes",
+ "chrono",
+ "hex",
+ "hmac 0.13.0",
+ "http 1.4.2",
+ "http-body-util",
+ "hyper 1.10.1",
+ "hyper-util",
+ "jsonwebtoken",
+ "moka",
+ "regorus",
+ "reqwest",
+ "s3s",
+ "s3s-aws",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
 
 [[package]]
 name = "s3s"

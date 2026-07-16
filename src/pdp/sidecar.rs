@@ -35,7 +35,7 @@ impl SidecarPdp {
         Ok(SidecarPdp {
             client,
             decision_url: format!(
-                "{}/v1/data/hyperfluid/gateway/decision",
+                "{}/v1/data/s0/gateway/decision",
                 base_url.trim_end_matches('/')
             ),
         })

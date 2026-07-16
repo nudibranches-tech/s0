@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 pub const GATEWAY_REGO: &str = include_str!("../../policy/gateway/authz.rego");
 
 /// The rule the engines evaluate.
-pub const DECISION_RULE: &str = "data.hyperfluid.gateway.decision";
+pub const DECISION_RULE: &str = "data.s0.gateway.decision";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bundle {

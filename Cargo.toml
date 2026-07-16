@@ -1,5 +1,5 @@
 [package]
-name = "hyperfluid-s3-gateway"
+name = "s0"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"

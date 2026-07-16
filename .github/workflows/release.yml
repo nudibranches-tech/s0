@@ -11,7 +11,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  BINARY: hyperfluid-s3-gateway
+  BINARY: s0
 
 jobs:
   build:

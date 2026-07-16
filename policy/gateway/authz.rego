@@ -9,7 +9,7 @@
 # It is evaluated once per parsed request (or per sub-decision: one multi-delete
 # key, or the source-read / dest-write halves of a copy — the PEP decomposes those
 # blind-spot ops into separate questions, §5). The engine reads the single rule
-# `data.hyperfluid.gateway.decision`.
+# `data.s0.gateway.decision`.
 #
 # ── input (PROMPT §5) ──────────────────────────────────────────────────────────
 #   input.principal.{sub,type,attributes.groups,attributes.<extra>}
@@ -30,7 +30,7 @@
 # Deny-by-default. Membership is necessary but NOT sufficient (unlike ceph.authz):
 # an explicit data-plane grant must match the (action, bucket, object|prefix).
 
-package hyperfluid.gateway
+package s0.gateway
 
 import future.keywords.contains
 import future.keywords.if

@@ -40,7 +40,7 @@ impl Default for AuditConfig {
             batch_max: 256,
             flush_interval: Duration::from_secs(2),
             http_timeout: Duration::from_secs(5),
-            spill_path: PathBuf::from("/var/lib/hyperfluid-gateway/audit-spill.ndjson"),
+            spill_path: PathBuf::from("/var/lib/s0/audit-spill.ndjson"),
         }
     }
 }

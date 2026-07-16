@@ -14,11 +14,11 @@ use crate::authz::{Decision, OpaInput};
 /// Label keys. `data-dock-type` mirrors the Trino record's discriminator so the
 /// console can route gateway records to the (companion) Ceph/S3 extractor; the
 /// org-id label is the trusted, fail-closed org attribution.
-pub const LABEL_DOCK_TYPE: &str = "hyperfluid.nudibranches.tech/data-dock-type";
-pub const LABEL_ORG_ID: &str = "hyperfluid.nudibranches.tech/organization-id";
+pub const LABEL_DOCK_TYPE: &str = "s0.dev/data-dock-type";
+pub const LABEL_ORG_ID: &str = "s0.dev/organization-id";
 pub const DOCK_TYPE_VALUE: &str = "s3-gateway";
 
-pub const DECISION_PATH: &str = "hyperfluid/gateway/decision";
+pub const DECISION_PATH: &str = "s0/gateway/decision";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditRecord {

@@ -7,8 +7,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use hyperfluid_s3_gateway::authz::OpaInput;
-use hyperfluid_s3_gateway::pdp::{Bundle, BundleStore, CachingPdp, GATEWAY_REGO, Pdp, RegorusPdp};
+use s0::authz::OpaInput;
+use s0::pdp::{Bundle, BundleStore, CachingPdp, GATEWAY_REGO, Pdp, RegorusPdp};
 
 fn bundle() -> serde_json::Value {
     serde_json::json!({

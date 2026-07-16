@@ -5,15 +5,15 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use hyperfluid_s3_gateway::config::StsMintConfig;
-use hyperfluid_s3_gateway::mint::{OidcVerifier, StandardVerifier};
+use s0::config::StsMintConfig;
+use s0::mint::{OidcVerifier, StandardVerifier};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 
 const PRIVATE_PEM: &str = include_str!("testdata/oidc_test_rsa.pem");
 const PUBLIC_PEM: &str = include_str!("testdata/oidc_test_rsa_pub.pem");
 
 const ISSUER: &str = "https://kc.example/realms/acme";
-const AUDIENCE: &str = "hyperfluid-gateway";
+const AUDIENCE: &str = "s0";
 
 fn verifier() -> StandardVerifier {
     let cfg = StsMintConfig {

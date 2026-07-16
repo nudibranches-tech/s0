@@ -10,15 +10,15 @@ WORKDIR /build
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
-    cargo build --release --locked --bin hyperfluid-s3-gateway && \
-    cp target/release/hyperfluid-s3-gateway /usr/local/bin/hyperfluid-s3-gateway
+    cargo build --release --locked --bin s0 && \
+    cp target/release/s0 /usr/local/bin/s0
 
 # ---- Runtime stage -----------------------------------------------------------
 # distroless "cc" carries glibc + libgcc for the dynamically linked gnu binary.
 # The `:nonroot` tag runs as uid/gid 65532 by default.
 FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 
-COPY --from=builder /usr/local/bin/hyperfluid-s3-gateway /usr/local/bin/hyperfluid-s3-gateway
+COPY --from=builder /usr/local/bin/s0 /usr/local/bin/s0
 
 # S3 data-plane listener (and the STS mint listener, when configured).
 EXPOSE 8014
@@ -28,4 +28,4 @@ EXPOSE 8015
 # e.g. `-v /etc/s0-gas:/etc/s0-gas -e GATEWAY_CONFIG=/etc/s0-gas/gateway.json`.
 USER nonroot:nonroot
 
-ENTRYPOINT ["/usr/local/bin/hyperfluid-s3-gateway"]
+ENTRYPOINT ["/usr/local/bin/s0"]

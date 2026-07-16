@@ -114,7 +114,7 @@ impl Default for AuditFileConfig {
     fn default() -> Self {
         AuditFileConfig {
             sink_url: "http://127.0.0.1:9000/api/v1/decision-logs".into(),
-            spill_path: PathBuf::from("/var/lib/hyperfluid-gateway/audit-spill.ndjson"),
+            spill_path: PathBuf::from("/var/lib/s0/audit-spill.ndjson"),
         }
     }
 }

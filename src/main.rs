@@ -4,25 +4,25 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperfluid_s3_gateway::bundle_refresh::{self, BundleSource};
-use hyperfluid_s3_gateway::config::GatewayConfig;
-use hyperfluid_s3_gateway::error::Result;
-use hyperfluid_s3_gateway::mint::{self, Mint, StandardVerifier};
-use hyperfluid_s3_gateway::{gateway::Gateway, server};
+use s0::bundle_refresh::{self, BundleSource};
+use s0::config::GatewayConfig;
+use s0::error::Result;
+use s0::mint::{self, Mint, StandardVerifier};
+use s0::{gateway::Gateway, server};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,hyperfluid_s3_gateway=debug".into()),
+                .unwrap_or_else(|_| "info,s0=debug".into()),
         )
         .json()
         .init();
 
     let config = GatewayConfig::load()?;
     let listen = config.listen;
-    tracing::info!("hyperfluid-s3-gateway starting");
+    tracing::info!("s0 starting");
     let (gateway, audit_handle) = Gateway::build(&config)?;
 
     let source = match &config.bundle_url {

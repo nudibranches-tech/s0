@@ -126,14 +126,14 @@ aws_backend s3 cp /work/classified.txt s3://secret/classified.txt    >/dev/null
 # --- 3. build + run the gateway -------------------------------------------
 if [ -z "${GW_BIN:-}" ]; then
   info "building gateway (debug)"
-  ( cd "$ROOT" && cargo build --bin hyperfluid-s3-gateway ) || { echo "cargo build failed"; exit 1; }
-  GW_BIN="$ROOT/target/debug/hyperfluid-s3-gateway"
+  ( cd "$ROOT" && cargo build --bin s0 ) || { echo "cargo build failed"; exit 1; }
+  GW_BIN="$ROOT/target/debug/s0"
 fi
 info "seeding pushed policy bundle -> $STATE/bundle.json"
 mkdir -p "$STATE"
 cp "$E2E/bundle.e2e.json" "$STATE/bundle.json"
 info "starting gateway -> $GW_ENDPOINT"
-GATEWAY_CONFIG="$E2E/gateway.e2e.json" RUST_LOG="${RUST_LOG:-hyperfluid_s3_gateway=info,warn}" \
+GATEWAY_CONFIG="$E2E/gateway.e2e.json" RUST_LOG="${RUST_LOG:-s0=info,warn}" \
   "$GW_BIN" > "$WORK/gateway.log" 2>&1 &
 GW_PID=$!
 wait_http "$GW_ENDPOINT/" gateway || { echo "gateway failed to start"; tail -n 20 "$WORK/gateway.log"; exit 1; }

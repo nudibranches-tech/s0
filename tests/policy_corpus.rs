@@ -7,8 +7,8 @@
 
 use std::collections::HashMap;
 
-use hyperfluid_s3_gateway::authz::{Decision, OpaInput};
-use hyperfluid_s3_gateway::pdp::{GATEWAY_REGO, Pdp, RegorusPdp};
+use s0::authz::{Decision, OpaInput};
+use s0::pdp::{GATEWAY_REGO, Pdp, RegorusPdp};
 use serde::Deserialize;
 
 const CORPUS: &str = include_str!(concat!(
