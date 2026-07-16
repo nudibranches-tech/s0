@@ -1,5 +1,5 @@
 {
-  "_note": "Projected per-Org policy data (§3.4). Reuses today's user_attributes / bucket_attributes / org_settings.freeze_writes; the s3_grants / group_grants superset is the companion projection (§3.3, ADR-006). The gateway rego reads these by name.",
+  "_note": "Projected per-tenant policy data: user_attributes / bucket_attributes / org_settings.freeze_writes, plus the s3_grants / group_grants grant superset the control plane projects. The gateway's rego reads these by name. This object is the 'data'. To push the policy module alongside it, wrap it as { \"policy\": \"<rego source>\", \"data\": { ... } }; a bare object (this file) uses the gateway's compiled-in default policy.",
   "org_settings": { "freeze_writes": false },
   "tenants": {
     "acme": {

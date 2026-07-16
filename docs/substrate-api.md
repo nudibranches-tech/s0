@@ -5,9 +5,9 @@ Consolidated from five recon passes over the vendored trees at
 
 ---
 
-## ⚠ Discrepancies vs PROMPT (v4)
+## ⚠ Discrepancies vs the design
 
-**Bottom line: all four PROMPT assertions are CONFIRMED against vendored source. There are no discrepancies.** However, four adjacent facts the PROMPT does *not* state are load-bearing traps — read "Traps" below before coding.
+**Bottom line: all four the design requirements assertions are CONFIRMED against vendored source. There are no discrepancies.** However, four adjacent facts the the design requirements does *not* state are load-bearing traps — read "Traps" below before coding.
 
 ### (a) Pipeline order — CONFIRMED
 
@@ -76,7 +76,7 @@ impl From<aws_sdk_s3::Client> for Proxy {
 
 Single private tuple field; the **only** constructor is `From<aws_sdk_s3::Client>` (no `new`); the inner client cannot be extracted. One `Proxy` == one client == correct unit per (backend, tenant).
 
-### Traps — true facts the PROMPT omits
+### Traps — true facts the the design requirements omits
 
 1. **The general `check` runs ONLY when an auth provider is set** (`ops/mod.rs:608`, module docs `access/mod.rs:19-29`). `set_access` without `set_auth` ⇒ `check`/`default_check` are **silently skipped**. The gateway MUST call both `set_auth` and `set_access`.
 2. **Typed per-op hooks are NOT gated on auth** — they run whenever access is configured (`ops/generated.rs:539`). So with access-only wiring you get hooks but no general gate; with both, you get both.
@@ -957,7 +957,7 @@ use aws_sdk_s3::{Client, Config};
 let creds = Credentials::new(access_key, secret_key, None, None, "static");
 let conf: Config = Config::builder()
     .behavior_version(BehaviorVersion::latest())   // REQUIRED: behavior-version-latest feature off; omit => panic at build()
-    .endpoint_url("https://rgw.internal:7480")     // Ceph RGW
+    .endpoint_url("https://s3-backend.example.com:7480")     // Ceph RGW
     .region(Region::new("us-east-1"))              // RGW ignores it but SigV4 needs a value
     .credentials_provider(creds)
     .force_path_style(true)                        // RGW: path-style, not vhost
