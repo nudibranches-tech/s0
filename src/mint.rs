@@ -362,7 +362,7 @@ mod tests {
         ClaimNames {
             sub: "sub".into(),
             groups: "groups".into(),
-            tenant: "harbor".into(),
+            tenant: "tenant".into(),
             org: "org".into(),
         }
     }
@@ -376,7 +376,7 @@ mod tests {
             claims: claim_names(),
         };
         let claims = serde_json::json!({
-            "sub": "alice", "harbor": "acme", "org": "org-acme",
+            "sub": "alice", "tenant": "acme", "org": "org-acme",
             "groups": ["analysts", "radiology"]
         });
         let id = v.extract(&claims).unwrap();

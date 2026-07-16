@@ -30,7 +30,7 @@ jobs:
       - name: build
         run: cargo build --all-targets
 
-      # Dual-engine parity gate (§4.3.1): the embedded regorus fast path may only
+      # Dual-engine parity gate: the embedded regorus fast path may only
       # serve traffic if it agrees with OPA over the golden decision corpus. The
       # tests/parity.rs harness skips when `opa` is absent, so installing it here is
       # what makes the gate enforce.
@@ -43,6 +43,6 @@ jobs:
         run: cargo test --all-targets
 
   # S3 protocol conformance (Ceph s3-tests / MinIO Mint) per supported backend
-  # vendor (§9.4). Scaffolded in .github/workflows/conformance.yml (manual trigger)
+  # vendor. Scaffolded in .github/workflows/conformance.yml (manual trigger)
   # because it needs a live backend service; wire into CI once a Ceph/MinIO service
   # container is standardized.

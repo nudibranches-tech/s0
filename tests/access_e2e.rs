@@ -1,7 +1,7 @@
 //! End-to-end enforcement through the real `S3Access` typed hooks: principal →
-//! OPA input (§5) → regorus decision → obligation/mutation. Exercises the object
+//! OPA input → regorus decision → obligation/mutation. Exercises the object
 //! read/deny path, per-key multi-delete filtering (blind spot #2), and single-prefix
-//! list rewrite (§5.1) against the shipped rego — no live backend needed (the hooks
+//! list rewrite against the shipped rego — no live backend needed (the hooks
 //! only read the routing table, they never open a backend connection).
 
 use std::sync::Arc;

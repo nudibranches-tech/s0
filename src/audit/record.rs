@@ -104,7 +104,7 @@ mod tests {
                 attributes: PrincipalAttributes::default(),
             },
             backend: Backend {
-                id: "bay-1".into(),
+                id: "backend-1".into(),
                 kind: BackendKind::Ceph,
             },
             tenant: "acme".into(),
@@ -123,7 +123,7 @@ mod tests {
     #[test]
     fn record_carries_trusted_org_label_and_principal() {
         let meta = GatewayMeta {
-            backend_id: "bay-1".into(),
+            backend_id: "backend-1".into(),
             backend_kind: "ceph".into(),
             outcome: Outcome::Allowed,
             denied_keys: vec![],
@@ -155,7 +155,7 @@ mod tests {
     #[test]
     fn multi_delete_denied_keys_serialize() {
         let meta = GatewayMeta {
-            backend_id: "bay-1".into(),
+            backend_id: "backend-1".into(),
             backend_kind: "ceph".into(),
             outcome: Outcome::Allowed,
             denied_keys: vec!["secret/x".into()],

@@ -1,4 +1,4 @@
-//! Dual-engine parity gate (§4.3.1). Replays the golden decision corpus through
+//! Dual-engine parity gate. Replays the golden decision corpus through
 //! BOTH the embedded regorus engine and a real OPA (`opa eval`) and requires
 //! identical decisions. The regorus fast path is only allowed to serve traffic
 //! behind this gate.

@@ -1,4 +1,4 @@
-//! Golden decision corpus replayed through the embedded regorus engine (§4.3.1).
+//! Golden decision corpus replayed through the embedded regorus engine.
 //! This is the executable specification of `policy/gateway/authz.rego`: every branch
 //! of the grant/prefix/deny logic has a case in `policy/testdata/corpus.json`.
 //!
