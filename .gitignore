@@ -4,3 +4,4 @@
 .scratch_*
 gateway.json
 /audit-spill.ndjson
+e2e/out/

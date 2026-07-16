@@ -51,9 +51,10 @@ pub async fn serve(gw: Arc<Gateway>, listen: SocketAddr) -> Result<()> {
 
     // s3s does not protect the HTTP layer (§9.1); we own connection bounding, the
     // header-read (slowloris) timeout, h2 keep-alive, and graceful drain.
+    // NOTE: the auto builder's h1 `header_read_timeout` needs a timer that does not
+    // survive `into_owned()` below, so it panics per connection; a reliable request
+    // read-timeout is a follow-up. The connection cap + h2 keep-alive remain.
     let mut http = ConnBuilder::new(TokioExecutor::new());
-    http.http1()
-        .header_read_timeout(Duration::from_secs(limits.header_read_timeout_secs));
     http.http2()
         .timer(TokioTimer::new())
         .keep_alive_interval(Some(Duration::from_secs(20)))
