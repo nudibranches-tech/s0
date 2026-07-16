@@ -73,6 +73,25 @@ async fn rejects_wrong_audience() {
 }
 
 #[tokio::test]
+async fn rejects_token_missing_audience() {
+    // A token that simply omits `aud` must be rejected, not accepted.
+    let token = sign(serde_json::json!({
+        "iss": ISSUER, "exp": now() + 3600,
+        "sub": "alice", "harbor": "acme", "org": "org-acme"
+    }));
+    assert!(verifier().verify(&token).await.is_err());
+}
+
+#[tokio::test]
+async fn rejects_token_missing_issuer() {
+    let token = sign(serde_json::json!({
+        "aud": AUDIENCE, "exp": now() + 3600,
+        "sub": "alice", "harbor": "acme", "org": "org-acme"
+    }));
+    assert!(verifier().verify(&token).await.is_err());
+}
+
+#[tokio::test]
 async fn rejects_expired_token() {
     let token = sign(serde_json::json!({
         "iss": ISSUER, "aud": AUDIENCE, "exp": 1_000_000_000u64,

@@ -161,7 +161,11 @@ impl OidcVerifier for StandardVerifier {
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_issuer(&[&self.issuer]);
         validation.set_audience(&[&self.audience]);
+        // Require these, not just check-when-present: a token omitting aud/iss must be
+        // rejected, or the audience binding is void.
+        validation.set_required_spec_claims(&["exp", "iss", "aud"]);
         validation.validate_exp = true;
+        validation.validate_nbf = true;
         let data = decode::<Value>(token, &key, &validation)
             .map_err(|e| GatewayError::Sts(format!("oidc token invalid: {e}")))?;
         self.extract(&data.claims)
