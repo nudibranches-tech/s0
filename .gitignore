@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+*.log
+.scratch_*
+gateway.json
+/audit-spill.ndjson
