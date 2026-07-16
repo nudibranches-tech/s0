@@ -614,9 +614,30 @@ fn outcome_of(allow: bool) -> Outcome {
 fn request_meta<T>(req: &S3Request<T>) -> RequestMeta {
     RequestMeta {
         method: req.method.to_string(),
-        params: req.uri.query().map(str::to_string),
+        params: req.uri.query().map(redact_query),
         headers_subset: Default::default(),
     }
+}
+
+/// Redact credential-bearing presign params so an audit record never stores a
+/// replayable URL or bearer token. Param names are kept; only the values are dropped.
+fn redact_query(q: &str) -> String {
+    const REDACT: [&str; 3] = [
+        "x-amz-signature",
+        "x-amz-security-token",
+        "x-amz-credential",
+    ];
+    q.split('&')
+        .map(|p| {
+            let name = p.split('=').next().unwrap_or(p);
+            if REDACT.contains(&name.to_ascii_lowercase().as_str()) {
+                format!("{name}=REDACTED")
+            } else {
+                p.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 /// The STS session token from the `X-Amz-Security-Token` header (signed requests) or
@@ -770,5 +791,16 @@ mod tests {
         // Neither.
         let uri: http::Uri = "/b/k?X-Amz-Signature=x".parse().unwrap();
         assert_eq!(session_token(&empty, &uri), None);
+    }
+
+    #[test]
+    fn redact_query_drops_credential_values() {
+        let q = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIA%2F..&X-Amz-Security-Token=jwt&X-Amz-Signature=abcd";
+        let r = redact_query(q);
+        assert!(r.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"));
+        assert!(r.contains("X-Amz-Signature=REDACTED"));
+        assert!(r.contains("X-Amz-Security-Token=REDACTED"));
+        assert!(r.contains("X-Amz-Credential=REDACTED"));
+        assert!(!r.contains("jwt") && !r.contains("abcd"));
     }
 }

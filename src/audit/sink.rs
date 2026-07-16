@@ -74,10 +74,35 @@ impl AuditSink {
     }
 }
 
-/// Spawn the audit worker and return a handle. Must run inside a tokio runtime.
-pub fn spawn(cfg: AuditConfig) -> AuditSink {
+/// Awaitable handle for draining the worker on shutdown, so buffered + queued records
+/// are shipped instead of aborted when the runtime drops (§9.2: on shutdown, no silent
+/// loss). Held by `main`, awaited after the HTTP server drains.
+pub struct AuditHandle {
+    join: tokio::task::JoinHandle<()>,
+    shutdown: Arc<tokio::sync::Notify>,
+}
+
+impl AuditHandle {
+    /// Signal the worker to drain everything currently queued + buffered, ship it, then
+    /// await the worker (bounded by `timeout`). Call after the HTTP server has drained
+    /// its connections, so no new records race the drain.
+    pub async fn drain(self, timeout: Duration) {
+        self.shutdown.notify_one();
+        match tokio::time::timeout(timeout, self.join).await {
+            Ok(_) => tracing::info!("audit worker drained on shutdown"),
+            Err(_) => {
+                tracing::error!("audit worker drain timed out; some records may be lost")
+            }
+        }
+    }
+}
+
+/// Spawn the audit worker and return the emit handle plus an [`AuditHandle`] for
+/// shutdown draining. Must run inside a tokio runtime.
+pub fn spawn(cfg: AuditConfig) -> (AuditSink, AuditHandle) {
     let (tx, rx) = mpsc::channel(cfg.queue_capacity);
     let dropped = Arc::new(AtomicU64::new(0));
+    let shutdown = Arc::new(tokio::sync::Notify::new());
     let client = reqwest::Client::builder()
         .timeout(cfg.http_timeout)
         .build()
@@ -85,14 +110,23 @@ pub fn spawn(cfg: AuditConfig) -> AuditSink {
             tracing::error!(%e, "audit http client build failed; using default client (no timeout)");
             reqwest::Client::new()
         });
-    tokio::spawn(Worker { rx, cfg, client }.run());
-    AuditSink { tx, dropped }
+    let join = tokio::spawn(
+        Worker {
+            rx,
+            cfg,
+            client,
+            shutdown: shutdown.clone(),
+        }
+        .run(),
+    );
+    (AuditSink { tx, dropped }, AuditHandle { join, shutdown })
 }
 
 struct Worker {
     rx: mpsc::Receiver<AuditRecord>,
     cfg: AuditConfig,
     client: reqwest::Client,
+    shutdown: Arc<tokio::sync::Notify>,
 }
 
 impl Worker {
@@ -111,12 +145,25 @@ impl Worker {
                     }
                     None => {
                         self.flush(&mut buf).await;
+                        self.replay_spill().await;
                         break;
                     }
                 },
                 _ = ticker.tick() => {
                     self.flush(&mut buf).await;
                     self.replay_spill().await;
+                }
+                _ = self.shutdown.notified() => {
+                    // Shutdown: drain everything currently queued, ship it, and exit.
+                    // serve() has already drained the data path, so nothing races in.
+                    while let Ok(rec) = self.rx.try_recv() {
+                        buf.push(rec);
+                        if buf.len() >= self.cfg.batch_max {
+                            self.flush(&mut buf).await;
+                        }
+                    }
+                    self.flush(&mut buf).await;
+                    break;
                 }
             }
         }
