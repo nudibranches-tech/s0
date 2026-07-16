@@ -1,4 +1,4 @@
-//! Own STS (§4.2). Mints short-lived S3 credentials from an OIDC token and verifies
+//! Own STS. Mints short-lived S3 credentials from an OIDC token and verifies
 //! them on the hot path **without any per-session secret at rest and without a
 //! hot-path store lookup**:
 //!
@@ -6,11 +6,11 @@
 //!   `get_secret_key` re-derives it from the access-key id alone.
 //! - The session **claims** (sub, groups, tenant, org, expiry) ride in a signed
 //!   session token (`X-Amz-Security-Token`), MAC-bound to the same `sid`. No store.
-//! - **Revocation stays live** because policy lives in OPA/grants, not in the token
-//!   (§6.1): a revoked grant denies at the PDP even while the token is unexpired.
+//! - **Revocation stays live** because policy lives in OPA/grants, not in the token:
+//!   a revoked grant denies at the PDP even while the token is unexpired.
 //!
-//! This mints the platform's identity shape — `principal.sub` is the OIDC `sub`
-//! (§3.1) — so gateway decisions and audit line up with the rest of the platform.
+//! This mints the platform's identity shape — `principal.sub` is the OIDC `sub` — so
+//! gateway decisions and audit line up with the rest of the platform.
 
 use hmac::{Hmac, KeyInit, Mac};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};

@@ -1,8 +1,7 @@
-//! The audit record — OPA's native decision-log shape (§3.6), the format the
-//! console sink already ingests. Org attribution rides in a **trusted label**
-//! (mirroring the Trino extractor) so the companion Ceph/S3 extractor can attribute
-//! fail-closed (§4.5). Exactly one record is emitted per S3 request (§6.6): for
-//! blind-spot ops the request-level `input` carries the full detail (delete_keys,
+//! The audit record — OPA's native decision-log shape, the format the control-plane
+//! sink ingests. Org attribution rides in a **trusted label** so the downstream
+//! extractor can attribute fail-closed. Exactly one record is emitted per S3 request:
+//! for blind-spot ops the request-level `input` carries the full detail (delete_keys,
 //! copy_source) and `result` is the aggregate verdict.
 
 use std::collections::BTreeMap;
@@ -11,12 +10,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::authz::{Decision, OpaInput};
 
-/// Label keys. `data-dock-type` mirrors the Trino record's discriminator so the
-/// console can route gateway records to the (companion) Ceph/S3 extractor; the
-/// org-id label is the trusted, fail-closed org attribution.
-pub const LABEL_DOCK_TYPE: &str = "s0.dev/data-dock-type";
+/// Label keys. The record-type label lets the control plane route gateway records to
+/// the right decision-log extractor; the org-id label is the trusted, fail-closed org
+/// attribution.
+pub const LABEL_RECORD_TYPE: &str = "s0.dev/record-type";
 pub const LABEL_ORG_ID: &str = "s0.dev/organization-id";
-pub const DOCK_TYPE_VALUE: &str = "s3-gateway";
+pub const RECORD_TYPE_VALUE: &str = "s3-gateway";
 
 pub const DECISION_PATH: &str = "s0/gateway/decision";
 
@@ -25,17 +24,17 @@ pub struct AuditRecord {
     pub decision_id: String,
     /// The policy path evaluated — OPA decision-log convention.
     pub path: String,
-    /// The full parsed request that was authorized (the §5 superset).
+    /// The full parsed request that was authorized (the input superset).
     pub input: OpaInput,
     /// The PDP verdict.
     pub result: Decision,
-    /// Principal subject — the end-user identity (§6.6), never a service identity.
+    /// Principal subject — the end-user identity, never a service identity.
     pub requested_by: String,
     /// RFC3339 UTC.
     pub timestamp: String,
     /// Trusted attribution + routing labels.
     pub labels: BTreeMap<String, String>,
-    /// S3-specific fields the Ceph/S3 extractor consumes beyond the OPA envelope.
+    /// S3-specific fields the decision-log extractor consumes beyond the OPA envelope.
     pub gateway: GatewayMeta,
 }
 
@@ -48,7 +47,7 @@ pub struct GatewayMeta {
     /// forward later succeeded.
     pub outcome: Outcome,
     /// Keys the PEP stripped from a multi-delete because they were unauthorized
-    /// (§5, per-key filtering). Empty for non-multi-delete ops.
+    /// (per-key filtering). Empty for non-multi-delete ops.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub denied_keys: Vec<String>,
     /// Backend HTTP status. Populated only once post-forward audit enrichment is wired
@@ -76,7 +75,7 @@ impl AuditRecord {
         gateway: GatewayMeta,
     ) -> Self {
         let mut labels = BTreeMap::new();
-        labels.insert(LABEL_DOCK_TYPE.to_string(), DOCK_TYPE_VALUE.to_string());
+        labels.insert(LABEL_RECORD_TYPE.to_string(), RECORD_TYPE_VALUE.to_string());
         labels.insert(LABEL_ORG_ID.to_string(), input.organization_id.clone());
         AuditRecord {
             decision_id,
@@ -144,8 +143,8 @@ mod tests {
             Some("org-acme")
         );
         assert_eq!(
-            rec.labels.get(super::LABEL_DOCK_TYPE).map(String::as_str),
-            Some(DOCK_TYPE_VALUE)
+            rec.labels.get(super::LABEL_RECORD_TYPE).map(String::as_str),
+            Some(RECORD_TYPE_VALUE)
         );
         // Round-trips through the spill format.
         let json = serde_json::to_string(&rec).unwrap();

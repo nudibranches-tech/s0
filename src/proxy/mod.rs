@@ -1,10 +1,10 @@
-//! Backend proxy (§4.4, §6.4). Forwards allowed, canonicalized requests to the
+//! Backend proxy. Forwards allowed, canonicalized requests to the
 //! target backend, re-signed with a **per-tenant / per-backend** credential — never
 //! the caller's. `s3s_aws::Proxy` wraps exactly one `aws_sdk_s3::Client`, so
 //! per-tenant credentials require a client pool keyed on `(backend, tenant)` with a
 //! dispatching `impl S3` in front (this is the real architecture, not a line item).
 //!
-//! §6.3 (canonicalize-before-forward) holds by construction: the typed hook mutates
+//! Canonicalize-before-forward holds by construction: the typed hook mutates
 //! `S3Request<Input>` and we forward that same value — there is no raw passthrough.
 
 pub mod fanout;
@@ -110,7 +110,7 @@ fn build_proxy(backend: &BackendConfig, access_key: &str, secret_key: &str) -> P
     );
     let conf: Config = Config::builder()
         // behavior-version-latest is NOT enabled in s3s-aws's aws-sdk pin; setting it
-        // explicitly is required or build() panics (substrate §6.5).
+        // explicitly is required or build() panics (a substrate quirk).
         .behavior_version(BehaviorVersion::latest())
         .endpoint_url(backend.endpoint_url.clone())
         .region(Region::new(backend.region.clone()))

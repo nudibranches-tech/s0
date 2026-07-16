@@ -23,7 +23,7 @@ pub struct Gateway {
     pub audit: AuditSink,
     pub registry: Arc<BackendRegistry>,
     pub limits: LimitsConfig,
-    /// Kept so a bundle-refresh loop can swap revisions (cache stays coherent, §4.3.2).
+    /// Kept so a bundle-refresh loop can swap revisions (cache stays coherent).
     pub bundles: Arc<BundleStore>,
 }
 
@@ -93,7 +93,7 @@ fn build_pdp(cfg: &GatewayConfig) -> Result<(Arc<BundleStore>, Arc<dyn Pdp>)> {
         PdpConfig::Embedded { cache_capacity } => {
             // Cache is sound for the embedded engine: the gateway reloads the engine
             // and bumps the revision atomically, so a stale entry misses by
-            // construction (§4.3.2).
+            // construction.
             // The platform's pushed module is authoritative; the compiled-in default is
             // the fallback when the bundle carries data only.
             let policy = parsed.policy.as_deref().unwrap_or(GATEWAY_REGO);
@@ -108,7 +108,7 @@ fn build_pdp(cfg: &GatewayConfig) -> Result<(Arc<BundleStore>, Arc<dyn Pdp>)> {
             // NO decision cache for the sidecar: OPA polls its own bundle
             // independently, so the gateway's BundleStore revision is not bound to the
             // data OPA actually evaluates. A revision-keyed cache would serve stale
-            // allows across the skew window (a live-revocation bypass, §6.1). Every
+            // allows across the skew window (a live-revocation bypass). Every
             // request hits OPA, which holds the current bundle. Caching returns once
             // the gateway is authoritative for OPA's revision (ADR-005 follow-up).
             Arc::new(SidecarPdp::new(

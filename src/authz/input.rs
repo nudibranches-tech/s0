@@ -1,8 +1,8 @@
-//! The OPA input contract (PROMPT §5) — the core interface of the gateway.
+//! The OPA input contract — the core interface of the gateway.
 //!
-//! This is a *superset* of today's `ceph.authz` input: the gateway sees the full
-//! parsed request (multi-delete keys, copy source, list prefix, object tags) that
-//! the in-RGW hook cannot. The field names here are load-bearing — the rego reads
+//! This is a *superset* of a typical in-backend authorization input: the gateway sees
+//! the full parsed request (multi-delete keys, copy source, list prefix, object tags)
+//! that an in-RGW hook cannot. The field names here are load-bearing — the rego reads
 //! them by name — so treat this struct as a stable wire schema, not an internal type.
 
 use serde::{Deserialize, Serialize};
@@ -17,10 +17,10 @@ use crate::model::{Action, BackendKind, PrincipalType};
 pub struct OpaInput {
     pub principal: Principal,
     pub backend: Backend,
-    /// Harbor slug == Ceph tenant.
+    /// Tenant slug == Ceph tenant.
     pub tenant: String,
     /// Organization owning the tenant. Trusted org attribution for org-global
-    /// deny rules and for fail-closed audit (§3.6, §4.5).
+    /// deny rules and for fail-closed audit.
     pub organization_id: String,
     pub action: Action,
     pub bucket: String,
@@ -37,8 +37,8 @@ pub struct OpaInput {
     /// single decision covers the whole batch; per-key decisions set `object`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delete_keys: Option<Vec<String>>,
-    /// Object tags fetched on demand for ABAC (§5.2). Gated behind §7.1 — never
-    /// populated until the direct-path question resolves.
+    /// Object tags fetched on demand for ABAC. Gated behind a future opt-in — never
+    /// populated until the on-demand tag fetch is wired.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_tags: Option<BTreeMap<String, String>>,
     #[serde(default)]
@@ -86,7 +86,7 @@ pub struct RequestMeta {
 }
 
 impl OpaInput {
-    /// Stable cache identity for the resource half of the §4.3.2 key. Excludes
+    /// Stable cache identity for the resource half of the decision-cache key. Excludes
     /// on-demand data (`object_tags`): the cache layer refuses to cache tag-bearing
     /// decisions unless a tag version is folded in.
     pub fn resource_key(&self) -> String {
@@ -104,7 +104,7 @@ impl OpaInput {
     }
 
     /// True when the input carries on-demand data whose freshness the
-    /// revision-keyed cache cannot guarantee (§4.3.2, §5.2).
+    /// revision-keyed cache cannot guarantee.
     pub fn has_on_demand_data(&self) -> bool {
         self.object_tags.is_some()
     }

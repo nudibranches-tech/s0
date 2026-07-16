@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
         Duration::from_secs(config.bundle_poll_secs),
     );
 
-    // The badge desk (§4.2): OIDC token -> gateway session creds, on its own listener.
+    // The badge desk: OIDC token -> gateway session creds, on its own listener.
     if let Some(sts_cfg) = &config.sts_mint {
         let verifier = Arc::new(StandardVerifier::from_config(sts_cfg)?);
         let mint = Arc::new(Mint::new(

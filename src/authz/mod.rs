@@ -1,4 +1,4 @@
-//! The authorization contract: the OPA input superset (§5) and the PDP decision.
+//! The authorization contract: the OPA input superset and the PDP decision.
 //! These types are the stable seam between the S3 protocol layer, the policy
 //! engines, and the audit sink.
 

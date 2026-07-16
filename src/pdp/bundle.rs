@@ -52,10 +52,9 @@ pub fn parse_bundle(raw: &str) -> Result<ParsedBundle, String> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bundle {
-    /// Opaque monotonic revision from the console bundle builder (an etag/version).
+    /// Opaque monotonic revision from the control-plane bundle builder (an etag/version).
     pub revision: String,
-    /// The projected policy data (`tenants`, `org_settings`, …). Shape per §3.4 +
-    /// the target grant superset (§3.3).
+    /// The projected policy data (`tenants`, `org_settings`, …).
     pub data: serde_json::Value,
 }
 
@@ -69,7 +68,7 @@ impl Bundle {
 }
 
 /// Stable revision derived from raw bundle content: a content change is a new
-/// revision, which is exactly the cache-invalidation signal (§4.3.2).
+/// revision, which is exactly the cache-invalidation signal.
 pub fn content_revision(raw: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();

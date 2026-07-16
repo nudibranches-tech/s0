@@ -1,8 +1,8 @@
-//! STS mint — the "badge desk" (§4.2). A backend-agnostic control-plane endpoint:
+//! STS mint — the "badge desk". A backend-agnostic control-plane endpoint:
 //! it verifies a Keycloak OIDC token and issues short-lived **gateway** credentials
 //! that the gateway itself later verifies (derived secrets, [`crate::auth::sts`]).
 //!
-//! No backend (Ceph/RGW/RustFS/…) is ever involved — this supersedes RGW's STS (§6.7)
+//! No backend (Ceph/RGW/RustFS/…) is ever involved — this supersedes RGW's STS
 //! and works identically regardless of what object store sits behind the gateway.
 
 use std::net::SocketAddr;

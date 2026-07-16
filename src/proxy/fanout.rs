@@ -5,7 +5,7 @@
 //! `2024/` sorts before every key under `2025/`. The merged listing is therefore a
 //! plain **concatenation** in prefix order — no re-sort — and a **single resume key**
 //! (S3-native `start_after`/`marker`) is enough to paginate across all of them. That
-//! keeps the cursor backend-agnostic (§6.7) and the gateway stateless (§9.3).
+//! keeps the cursor backend-agnostic and the gateway stateless.
 //!
 //! This module is the pure, backend-independent core: it drives an injected `lister`
 //! (the backend LIST call in production, a fake in tests) and merges + paginates.

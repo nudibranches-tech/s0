@@ -1,5 +1,5 @@
-//! Identity / credential authority (§4.2). The gateway owns identity: it verifies
-//! inbound SigV4 signatures itself and never depends on a backend's STS (§6.7).
+//! Identity / credential authority. The gateway owns identity: it verifies
+//! inbound SigV4 signatures itself and never depends on a backend's STS.
 //!
 //! Two credential kinds share the `S3Auth` path:
 //! - **STS sessions** — derived secrets, no store, claims in a signed token ([`sts`]).
@@ -20,11 +20,11 @@ use crate::model::PrincipalType;
 use sts::StsAuthority;
 
 /// SigV4 verification recomputes an HMAC, so the plaintext secret must be
-/// retrievable per principal — a hash cannot be stored (§4.2).
+/// retrievable per principal — a hash cannot be stored.
 pub trait CredentialStore: Send + Sync {
     fn secret(&self, access_key_id: &str) -> Option<String>;
     /// The full end-user identity bound to a static access-key id (its own identity,
-    /// never a shared bay key — §6.5).
+    /// never a shared backend key).
     fn resolve(&self, access_key_id: &str) -> Option<ResolvedPrincipal>;
 }
 

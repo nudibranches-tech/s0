@@ -1,10 +1,10 @@
-//! Decision cache — correct by construction (§4.3.2).
+//! Decision cache — correct by construction.
 //!
 //! The key embeds the bundle revision, the full principal (so a differing group set
 //! never reuses another principal's verdict), and the resource tuple (backend, tenant,
 //! bucket, action, object/prefix). A revocation bumps the revision, so stale entries
 //! are simply never looked up again — no TTL, no invalidation. Decisions whose input
-//! carries on-demand data (object tags, §5.2) are never cached: their freshness is not
+//! carries on-demand data (object tags) are never cached: their freshness is not
 //! bounded by the revision.
 
 use std::sync::Arc;

@@ -1,4 +1,4 @@
-//! Sidecar OPA PDP (the shipping default, §4.3.1): the same engine every other PEP
+//! Sidecar OPA PDP (the shipping default): the same engine every other PEP
 //! in the platform runs, on loopback, fed by the bundle. ~0.5–2ms per decision.
 //!
 //! The embedded regorus engine is a config-swap behind the same [`Pdp`] trait, gated
@@ -60,7 +60,7 @@ impl Pdp for SidecarPdp {
             .json()
             .await
             .map_err(|e| GatewayError::Pdp(format!("opa decode: {e}")))?;
-        // Undefined result ⇒ deny (fail closed, §6.2).
+        // Undefined result ⇒ deny (fail closed).
         Ok(parsed
             .result
             .unwrap_or_else(|| Decision::deny("opa: undefined decision")))

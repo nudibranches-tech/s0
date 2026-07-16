@@ -1,9 +1,9 @@
-//! Async, batched audit shipping (§9.2). The data path only ever `try_send`s onto a
+//! Async, batched audit shipping. The data path only ever `try_send`s onto a
 //! bounded queue — it never awaits the sink. A background worker batches records to
-//! the console decision-log endpoint and spills to local disk on sink outage.
+//! the control-plane decision-log endpoint and spills to local disk on sink outage.
 //!
 //! Invariant: **audit-emit failure never fails the request.** Audit loss and authz
-//! loss are different failures (§9.2); a console outage must not become a storage
+//! loss are different failures; a sink outage must not become a storage
 //! outage. Overflow/errors raise a loud alert and increment a counter, but the data
 //! path proceeds.
 
@@ -18,12 +18,12 @@ use tokio::sync::mpsc;
 use super::record::AuditRecord;
 
 /// Cap on the on-disk spill file: replay reads it whole, so this bounds replay memory
-/// during a long sink outage (§9.2).
+/// during a long sink outage.
 const MAX_SPILL_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct AuditConfig {
-    /// Console ingest, e.g. `https://console/api/v1/decision-logs`.
+    /// Control-plane ingest, e.g. `https://control-plane/api/v1/decision-logs`.
     pub sink_url: String,
     pub queue_capacity: usize,
     pub batch_max: usize,
