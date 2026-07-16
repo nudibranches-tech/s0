@@ -2,6 +2,13 @@
 name = "hyperfluid-s3-gateway"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+license = "BUSL-1.1"
+description = "An OPA/ABAC-enforcing, S3-compatible authorization gateway."
+repository = "https://github.com/nudibranches-tech/s0-gas"
+authors = ["Nudibranches <roch@nudibranches.tech>"]
+keywords = ["s3", "abac", "opa", "gateway", "authorization"]
+categories = ["web-programming", "authentication"]
 
 [dependencies]
 anyhow = "1.0.103"

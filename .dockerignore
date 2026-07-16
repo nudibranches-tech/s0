@@ -1,0 +1,27 @@
+# Build output — rebuilt inside the image.
+/target
+
+# VCS / CI / editor cruft.
+.git
+.github
+.gitignore
+.idea
+.vscode
+
+# Local runtime / dev files (never bake secrets or config into the image).
+gateway.json
+bundle.json
+*.log
+/audit-spill.ndjson
+.scratch_*
+
+# Docs and images that don't affect the build.
+Dockerfile
+.dockerignore
+*.md
+!README.md
+
+# OS junk.
+.DS_Store
+**/*.rs.bk
+*.pdb
