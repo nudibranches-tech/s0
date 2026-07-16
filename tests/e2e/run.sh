@@ -34,7 +34,11 @@ info() { echo "${c_dim}==> $*${c_rst}"; }
 
 cleanup() {
   info "cleanup"
-  [ -n "$GW_PID" ] && kill "$GW_PID" 2>/dev/null
+  if [ -n "$GW_PID" ]; then
+    kill "$GW_PID" 2>/dev/null
+    for _ in 1 2 3 4 5; do kill -0 "$GW_PID" 2>/dev/null || break; sleep 0.3; done
+    kill -9 "$GW_PID" 2>/dev/null
+  fi
   docker rm -f "$MINIO_NAME" >/dev/null 2>&1
   rm -rf "$WORK" "$STATE"
 }
@@ -129,9 +133,10 @@ info "seeding pushed policy bundle -> $STATE/bundle.json"
 mkdir -p "$STATE"
 cp "$E2E/bundle.e2e.json" "$STATE/bundle.json"
 info "starting gateway -> $GW_ENDPOINT"
-GATEWAY_CONFIG="$E2E/gateway.e2e.json" RUST_LOG="${RUST_LOG:-hyperfluid_s3_gateway=info,warn}" "$GW_BIN" &
+GATEWAY_CONFIG="$E2E/gateway.e2e.json" RUST_LOG="${RUST_LOG:-hyperfluid_s3_gateway=info,warn}" \
+  "$GW_BIN" > "$WORK/gateway.log" 2>&1 &
 GW_PID=$!
-wait_http "$GW_ENDPOINT/" gateway || { echo "gateway failed to start"; exit 1; }
+wait_http "$GW_ENDPOINT/" gateway || { echo "gateway failed to start"; tail -n 20 "$WORK/gateway.log"; exit 1; }
 
 # --- 4. scenarios through the gateway (virtual creds, real client) --------
 echo ""; echo "-- object read / list / write ------------------------------"
