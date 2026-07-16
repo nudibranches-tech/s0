@@ -295,10 +295,15 @@ async fn fan_out_list_v2(
         sub.input.max_keys = Some(limit as i32);
         async move {
             match proxy.list_objects_v2(sub).await {
-                Ok(resp) => resp.output.contents.unwrap_or_default(),
+                Ok(resp) => {
+                    // A backend may return fewer than `limit` keys yet still be
+                    // truncated; keep the flag so fan_out re-lists instead of stopping.
+                    let truncated = resp.output.is_truncated.unwrap_or(false);
+                    (resp.output.contents.unwrap_or_default(), truncated)
+                }
                 Err(e) => {
                     *error.lock().expect("fanout error cell") = Some(e);
-                    Vec::new()
+                    (Vec::new(), false)
                 }
             }
         }

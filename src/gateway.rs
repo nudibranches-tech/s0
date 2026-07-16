@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::audit::{self, AuditConfig, AuditSink};
+use crate::audit::{self, AuditConfig, AuditHandle, AuditSink};
 use crate::auth::sts::StsAuthority;
 use crate::auth::{Identity, StaticCredential, StaticCredentialStore};
 use crate::config::{GatewayConfig, LimitsConfig, PdpConfig};
@@ -28,8 +28,9 @@ pub struct Gateway {
 
 impl Gateway {
     /// Build the full gateway from config. Must run inside a tokio runtime (spawns
-    /// the audit worker).
-    pub fn build(cfg: &GatewayConfig) -> Result<Arc<Gateway>> {
+    /// the audit worker). Returns the shared gateway plus the audit drain handle, which
+    /// the caller must `drain()` on shutdown so buffered records are not lost (§9.2).
+    pub fn build(cfg: &GatewayConfig) -> Result<(Arc<Gateway>, AuditHandle)> {
         let sts = Arc::new(build_sts(cfg)?);
         let creds = Arc::new(build_static_store(cfg));
         let identity = Arc::new(Identity::new(sts, creds));
@@ -37,20 +38,21 @@ impl Gateway {
         let (bundles, pdp) = build_pdp(cfg)?;
         let registry = Arc::new(BackendRegistry::from_config(cfg)?);
 
-        let audit = audit::spawn(AuditConfig {
+        let (audit, audit_handle) = audit::spawn(AuditConfig {
             sink_url: cfg.audit.sink_url.clone(),
             spill_path: cfg.audit.spill_path.clone(),
             ..AuditConfig::default()
         });
 
-        Ok(Arc::new(Gateway {
+        let gateway = Arc::new(Gateway {
             identity,
             pdp,
             audit,
             registry,
             limits: cfg.limits.clone(),
             bundles,
-        }))
+        });
+        Ok((gateway, audit_handle))
     }
 }
 

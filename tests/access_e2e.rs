@@ -82,7 +82,7 @@ async fn test_gateway() -> Arc<Gateway> {
         Arc::new(StaticCredentialStore::new()),
     ));
     let registry = Arc::new(BackendRegistry::from_config(&cfg).unwrap());
-    let audit = audit::spawn(AuditConfig {
+    let (audit, _audit_handle) = audit::spawn(AuditConfig {
         sink_url: cfg.audit.sink_url.clone(),
         spill_path: cfg.audit.spill_path.clone(),
         ..AuditConfig::default()

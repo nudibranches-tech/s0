@@ -23,7 +23,7 @@ async fn main() -> Result<()> {
     let config = GatewayConfig::load()?;
     let listen = config.listen;
     tracing::info!("hyperfluid-s3-gateway starting");
-    let gateway = Gateway::build(&config)?;
+    let (gateway, audit_handle) = Gateway::build(&config)?;
 
     let source = match &config.bundle_url {
         Some(url) => BundleSource::Http {
@@ -58,5 +58,11 @@ async fn main() -> Result<()> {
         });
     }
 
-    server::serve(gateway, listen).await
+    server::serve(gateway, listen).await?;
+
+    // The HTTP server has drained its connections; now drain the audit worker so any
+    // queued/buffered records are shipped or spilled rather than aborted with the
+    // runtime (§9.2: on shutdown, no silent audit loss).
+    audit_handle.drain(Duration::from_secs(10)).await;
+    Ok(())
 }

@@ -68,9 +68,17 @@ pub struct Page<T> {
 /// Fan out over sorted, disjoint `prefixes`, resuming after `cursor` if given, and
 /// return one page of at most `max_keys` items.
 ///
-/// `lister(prefix, start_after, limit)` returns up to `limit` items whose key is
-/// strictly greater than `start_after`, in ascending key order — i.e. exactly S3
-/// `ListObjectsV2(prefix, start_after, max_keys=limit)`.
+/// `lister(prefix, start_after, limit)` returns `(items, sub_truncated)`: up to `limit`
+/// items whose key is strictly greater than `start_after`, in ascending key order, plus
+/// whether the backend has **more** keys under this prefix beyond what it returned — i.e.
+/// exactly S3 `ListObjectsV2(prefix, start_after, max_keys=limit)`'s `Contents` +
+/// `IsTruncated`.
+///
+/// A backend may legally return **fewer** than `limit` keys while still being truncated
+/// ("the response might contain fewer keys but will never contain more"). We therefore
+/// paginate *within* a prefix on the lister's own `sub_truncated` flag, never inferring
+/// exhaustion from a short page — otherwise authorized keys silently vanish from the
+/// listing (a backend-agnostic-correctness bug, §6.7).
 ///
 /// Returns `Err` if the cursor's `scope_hash` no longer matches the grants (client
 /// must restart the listing).
@@ -83,7 +91,7 @@ pub async fn fan_out<T, F, Fut>(
 ) -> std::result::Result<Page<T>, &'static str>
 where
     F: FnMut(String, Option<String>, usize) -> Fut,
-    Fut: Future<Output = Vec<T>>,
+    Fut: Future<Output = (Vec<T>, bool)>,
 {
     let hash = scope_hash(prefixes);
     let mut resume = match cursor {
@@ -95,9 +103,10 @@ where
     let mut items: Vec<T> = Vec::new();
     let mut truncated = false;
 
-    for prefix in prefixes {
-        // Skip prefixes fully before the resume key; resume the one that contains it.
-        let start_after = match &resume {
+    'outer: for prefix in prefixes {
+        // Establish the resume point for this prefix: skip prefixes fully before the
+        // resume key; resume the one that contains it.
+        let mut start_after = match &resume {
             Some(rk) => {
                 if rk.starts_with(prefix.as_str()) {
                     let sa = Some(rk.clone());
@@ -110,20 +119,32 @@ where
             None => None,
         };
 
-        let remaining = max_keys - items.len();
-        if remaining == 0 {
-            truncated = true;
+        // Paginate WITHIN this prefix until the page fills or the prefix is genuinely
+        // exhausted (lister reports not-truncated). A short-but-truncated page loops.
+        loop {
+            let remaining = max_keys - items.len();
+            if remaining == 0 {
+                truncated = true;
+                break 'outer;
+            }
+            let (batch, sub_truncated) =
+                lister(prefix.clone(), start_after.take(), remaining).await;
+            let got = batch.len();
+            items.extend(batch.into_iter().take(remaining));
+            if items.len() >= max_keys {
+                // Page is full; there may be more (in this prefix or later ones).
+                truncated = true;
+                break 'outer;
+            }
+            // Whole batch consumed and the page is not yet full.
+            if sub_truncated && got > 0 {
+                // Backend short-paged; continue this prefix after the last key seen.
+                start_after = items.last().map(&key_of);
+                continue;
+            }
+            // Prefix exhausted (or returned nothing) ⇒ move to the next prefix.
             break;
         }
-        let batch = lister(prefix.clone(), start_after, remaining).await;
-        let filled = batch.len() >= remaining;
-        items.extend(batch.into_iter().take(remaining));
-        if filled {
-            // Page filled by this prefix; there may be more of it.
-            truncated = true;
-            break;
-        }
-        // Fewer than requested ⇒ this prefix is exhausted; fall through to the next.
     }
 
     let next = if truncated {
@@ -147,23 +168,36 @@ mod tests {
     use std::collections::BTreeMap;
 
     /// A fake backend: prefix -> sorted keys. Returns keys strictly greater than
-    /// start_after, capped at limit — exactly S3 ListObjectsV2 semantics.
-    fn fake(
+    /// start_after, capped at limit, plus `is_truncated` — exactly S3 ListObjectsV2
+    /// semantics. `page_cap` optionally forces a *short* page (returns at most `page_cap`
+    /// keys per call even when more match and `limit` is higher) to exercise the
+    /// short-but-truncated backend behavior.
+    fn fake_paged(
         store: BTreeMap<&'static str, Vec<&'static str>>,
-    ) -> impl Fn(String, Option<String>, usize) -> std::future::Ready<Vec<String>> {
+        page_cap: usize,
+    ) -> impl Fn(String, Option<String>, usize) -> std::future::Ready<(Vec<String>, bool)> {
         move |prefix: String, start_after: Option<String>, limit: usize| {
             let keys = store.get(prefix.as_str()).cloned().unwrap_or_default();
-            let out: Vec<String> = keys
+            let matching: Vec<String> = keys
                 .into_iter()
                 .filter(|k| match &start_after {
                     Some(sa) => *k > sa.as_str(),
                     None => true,
                 })
-                .take(limit)
                 .map(String::from)
                 .collect();
-            std::future::ready(out)
+            let take = limit.min(page_cap);
+            let truncated = matching.len() > take;
+            let out: Vec<String> = matching.into_iter().take(take).collect();
+            std::future::ready((out, truncated))
         }
+    }
+
+    /// A conforming backend that fills `limit` whenever enough keys match.
+    fn fake(
+        store: BTreeMap<&'static str, Vec<&'static str>>,
+    ) -> impl Fn(String, Option<String>, usize) -> std::future::Ready<(Vec<String>, bool)> {
+        fake_paged(store, usize::MAX)
     }
 
     #[tokio::test]
@@ -254,5 +288,70 @@ mod tests {
         )
         .await;
         assert!(r.is_err());
+    }
+
+    #[tokio::test]
+    async fn short_backend_page_does_not_lose_keys() {
+        // A short-but-truncated page must not be read as prefix-exhausted (else keys
+        // are silently dropped).
+        let store = BTreeMap::from([("2024/", vec!["2024/a", "2024/b", "2024/c", "2024/d"])]);
+        let prefixes = vec!["2024/".to_string()];
+        // page_cap=1: one key per backend call, though 4 match and limit is 100.
+        let page = fan_out(
+            &prefixes,
+            None,
+            100,
+            |k: &String| k.clone(),
+            fake_paged(store, 1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            page.items,
+            vec!["2024/a", "2024/b", "2024/c", "2024/d"],
+            "short-but-truncated pages must not drop authorized keys"
+        );
+        assert!(!page.truncated);
+        assert!(page.next.is_none());
+    }
+
+    #[tokio::test]
+    async fn short_pages_cross_prefixes_and_paginate() {
+        // Short pages that also span multiple prefixes, with a page limit forcing
+        // truncation partway. Proves the within-prefix loop + cross-prefix resume compose.
+        let store = BTreeMap::from([
+            ("2024/", vec!["2024/a", "2024/b", "2024/c"]),
+            ("2025/", vec!["2025/a", "2025/b"]),
+        ]);
+        let prefixes = vec!["2024/".to_string(), "2025/".to_string()];
+
+        // Page of 4 with a 1-key backend cap: must gather 2024/a..c then 2025/a.
+        let p1 = fan_out(
+            &prefixes,
+            None,
+            4,
+            |k: &String| k.clone(),
+            fake_paged(store.clone(), 1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(p1.items, vec!["2024/a", "2024/b", "2024/c", "2025/a"]);
+        assert!(p1.truncated);
+        let c1 = p1.next.unwrap();
+        assert_eq!(c1.last_key, "2025/a");
+
+        // Next page: the tail of 2025/.
+        let p2 = fan_out(
+            &prefixes,
+            Some(c1),
+            4,
+            |k: &String| k.clone(),
+            fake_paged(store, 1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(p2.items, vec!["2025/b"]);
+        assert!(!p2.truncated);
+        assert!(p2.next.is_none());
     }
 }

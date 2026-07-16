@@ -6,4 +6,4 @@ mod record;
 mod sink;
 
 pub use record::{AuditRecord, DOCK_TYPE_VALUE, GatewayMeta, LABEL_ORG_ID, Outcome};
-pub use sink::{AuditConfig, AuditSink, spawn};
+pub use sink::{AuditConfig, AuditHandle, AuditSink, spawn};
