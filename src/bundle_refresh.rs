@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::pdp::{Bundle, BundleStore, Pdp, content_revision};
+use crate::pdp::{Bundle, BundleStore, Pdp, content_revision, parse_bundle};
 
 pub enum BundleSource {
     File(PathBuf),
@@ -67,11 +67,13 @@ async fn refresh_once(
     if revision == bundles.revision() {
         return Ok(());
     }
-    let data: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|e| format!("parse bundle: {e}"))?;
-    // Reload the engine first, then advertise the new revision.
-    pdp.reload(&data).await.map_err(|e| e.to_string())?;
-    bundles.store(Bundle::new(revision.clone(), data));
+    let parsed = parse_bundle(&raw)?;
+    // Reload the engine first (with the pushed module, if any), then advertise the new
+    // revision.
+    pdp.reload(parsed.policy.as_deref(), &parsed.data)
+        .await
+        .map_err(|e| e.to_string())?;
+    bundles.store(Bundle::new(revision.clone(), parsed.data));
     tracing::info!(%revision, "bundle reloaded");
     Ok(())
 }

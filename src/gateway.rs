@@ -11,6 +11,7 @@ use crate::config::{GatewayConfig, LimitsConfig, PdpConfig};
 use crate::error::{GatewayError, Result};
 use crate::pdp::{
     Bundle, BundleStore, CachingPdp, GATEWAY_REGO, Pdp, RegorusPdp, SidecarPdp, content_revision,
+    parse_bundle,
 };
 use crate::proxy::BackendRegistry;
 
@@ -84,17 +85,19 @@ fn build_static_store(cfg: &GatewayConfig) -> StaticCredentialStore {
 fn build_pdp(cfg: &GatewayConfig) -> Result<(Arc<BundleStore>, Arc<dyn Pdp>)> {
     let raw = std::fs::read_to_string(&cfg.bundle_path)
         .map_err(|e| GatewayError::Bundle(format!("read {:?}: {e}", cfg.bundle_path)))?;
-    let data: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| GatewayError::Bundle(format!("parse bundle: {e}")))?;
+    let parsed = parse_bundle(&raw).map_err(GatewayError::Bundle)?;
     let revision = content_revision(&raw);
-    let bundles = Arc::new(BundleStore::new(Bundle::new(revision, data.clone())));
+    let bundles = Arc::new(BundleStore::new(Bundle::new(revision, parsed.data.clone())));
 
     let pdp: Arc<dyn Pdp> = match &cfg.pdp {
         PdpConfig::Embedded { cache_capacity } => {
             // Cache is sound for the embedded engine: the gateway reloads the engine
             // and bumps the revision atomically, so a stale entry misses by
             // construction (§4.3.2).
-            let engine: Arc<dyn Pdp> = Arc::new(RegorusPdp::new(GATEWAY_REGO, &data)?);
+            // The platform's pushed module is authoritative; the compiled-in default is
+            // the fallback when the bundle carries data only.
+            let policy = parsed.policy.as_deref().unwrap_or(GATEWAY_REGO);
+            let engine: Arc<dyn Pdp> = Arc::new(RegorusPdp::new(policy, &parsed.data)?);
             Arc::new(CachingPdp::new(engine, bundles.clone(), *cache_capacity))
         }
         PdpConfig::Sidecar {

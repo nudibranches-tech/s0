@@ -9,7 +9,9 @@ mod cache;
 mod embedded;
 mod sidecar;
 
-pub use bundle::{Bundle, BundleStore, DECISION_RULE, GATEWAY_REGO, content_revision};
+pub use bundle::{
+    Bundle, BundleStore, DECISION_RULE, GATEWAY_REGO, ParsedBundle, content_revision, parse_bundle,
+};
 pub use cache::CachingPdp;
 pub use embedded::RegorusPdp;
 pub use sidecar::SidecarPdp;
@@ -26,11 +28,12 @@ use crate::error::Result;
 pub trait Pdp: Send + Sync {
     async fn decide(&self, input: &OpaInput) -> Result<Decision>;
 
-    /// Install new projected policy data (a new bundle revision). Live policy /
-    /// live revocation (§6.1). Default no-op: the sidecar engine is fed the bundle
-    /// out-of-band by OPA's bundle plugin, so only the revision (in [`BundleStore`])
+    /// Install a new pushed bundle (a new revision): live policy and live revocation.
+    /// `policy` is the rego module when the platform pushed one, else `None` (keep the
+    /// engine's current policy). Default no-op: the sidecar engine is fed the bundle
+    /// out-of-band by OPA's own bundle plugin, so only the revision (in [`BundleStore`])
     /// changes for it.
-    async fn reload(&self, _bundle: &serde_json::Value) -> Result<()> {
+    async fn reload(&self, _policy: Option<&str>, _data: &serde_json::Value) -> Result<()> {
         Ok(())
     }
 }
