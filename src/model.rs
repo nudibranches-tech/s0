@@ -1,12 +1,12 @@
 //! Core domain vocabulary shared across the gateway.
 //!
-//! Domain shape (platform contract §3.2): `Organization → Harbor (= one Ceph tenant) → Bucket`.
-//! A Harbor *slug* is the Ceph tenant. Object keys nest under a bucket.
+//! Domain shape: `Organization → Tenant (= one Ceph tenant) → Bucket`.
+//! A tenant *slug* is the Ceph tenant. Object keys nest under a bucket.
 
 use serde::{Deserialize, Serialize};
 
 /// The data-plane object operations the gateway authorizes. This is the target
-/// grant vocabulary from PROMPT §3.3 / §5 — deliberately coarser than the 99 S3
+/// grant vocabulary — deliberately coarser than the 99 S3
 /// ops: every supported S3 op maps onto exactly one of these actions (a write to
 /// `write_objects`, etc.), and `CopyObject` maps to two (source read + dest write).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -30,7 +30,7 @@ impl Action {
         }
     }
 
-    /// Writes are subject to the org-global `freeze_writes` kill-switch (§3.5).
+    /// Writes are subject to the org-global `freeze_writes` kill-switch.
     pub const fn is_write(self) -> bool {
         matches!(
             self,
@@ -40,7 +40,7 @@ impl Action {
 }
 
 /// Which backend family a request is proxied to. Enforcement never depends on
-/// backend-native features (§6.7); this only selects the proxy client + re-signing.
+/// backend-native features; this only selects the proxy client + re-signing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendKind {
@@ -57,8 +57,8 @@ impl BackendKind {
     }
 }
 
-/// Principal classes. Engines present a per-user identity like any other client
-/// (§6.5), so there is no dedicated engine principal type.
+/// Principal classes. Analytics engines present a per-user identity like any other
+/// client, so there is no dedicated engine principal type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PrincipalType {
@@ -66,12 +66,12 @@ pub enum PrincipalType {
     ServiceAccount,
 }
 
-/// Identifies one physical backend (a Ceph RGW bay or a remote S3 endpoint).
+/// Identifies one physical backend (a Ceph RGW instance or a remote S3 endpoint).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct BackendId(pub String);
 
-/// A Harbor slug == a Ceph tenant.
+/// A tenant slug == a Ceph tenant.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Tenant(pub String);
@@ -97,7 +97,7 @@ impl std::fmt::Display for OrgId {
     }
 }
 
-/// Key into the per-`(backend, tenant)` proxy client pool (§4.4, §6.4). Backend
+/// Key into the per-`(backend, tenant)` proxy client pool. Backend
 /// credentials are per-tenant/per-backend so an authz bug cannot cross tenants.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PoolKey {

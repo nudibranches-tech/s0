@@ -1,5 +1,5 @@
 {
-  "_comment": "Golden decision corpus for policy/gateway/authz.rego. Engine-agnostic: replayed through BOTH regorus (fast path) and OPA (sidecar) by the dual-engine parity gate (PROMPT §4.3.1), and the seed of the §7.1 conformance corpus. `expect` asserts allow + obligations; obligations.allowed_prefixes is compared order-insensitively.",
+  "_comment": "Golden decision corpus for policy/gateway/authz.rego. Engine-agnostic: replayed through BOTH regorus (fast path) and OPA (sidecar) by the dual-engine parity gate, and the seed of the conformance corpus. `expect` asserts allow + obligations; obligations.allowed_prefixes is compared order-insensitively.",
   "bundles": {
     "default": {
       "org_settings": { "freeze_writes": false },

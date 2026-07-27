@@ -24,19 +24,19 @@ pub struct GatewayConfig {
     pub backends: Vec<BackendConfig>,
     pub tenants: Vec<TenantConfig>,
     /// Long-lived static credentials (external apps / service accounts). Each is its
-    /// own principal — never a shared bay key (§6.5).
+    /// own principal — never a shared backend key.
     #[serde(default)]
     pub static_credentials: Vec<StaticCredentialConfig>,
     /// Path to the initial per-Org bundle JSON (the projected policy data). In
-    /// production this is polled from the console bundle endpoint (§3.4).
+    /// production this is polled from the control-plane bundle endpoint.
     pub bundle_path: PathBuf,
-    /// Optional console bundle endpoint to poll for live updates (§3.4, §6.1). When
+    /// Optional control-plane bundle endpoint to poll for live updates. When
     /// unset, the refresher re-reads `bundle_path` (dev/local).
     #[serde(default)]
     pub bundle_url: Option<String>,
     #[serde(default = "default_bundle_poll_secs")]
     pub bundle_poll_secs: u64,
-    /// Optional STS mint (the badge desk, §4.2). When present, a control-plane server
+    /// Optional STS mint (the badge desk). When present, a control-plane server
     /// runs on its own listener and issues gateway session creds from OIDC tokens.
     #[serde(default)]
     pub sts_mint: Option<StsMintConfig>,
@@ -59,7 +59,7 @@ pub struct StsMintConfig {
     pub sub_claim: String,
     #[serde(default = "default_groups_claim")]
     pub groups_claim: String,
-    /// Claim carrying the Harbor/tenant slug.
+    /// Claim carrying the tenant slug.
     pub tenant_claim: String,
     /// Claim carrying the organization id.
     pub org_claim: String,
@@ -89,12 +89,12 @@ pub struct StsConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum PdpConfig {
-    /// Embedded regorus (fast path). Permitted only behind the parity gate (§4.3.1).
+    /// Embedded regorus (fast path). Permitted only behind the parity gate.
     Embedded {
         #[serde(default = "default_cache_capacity")]
         cache_capacity: u64,
     },
-    /// Sidecar OPA over loopback (shipping default, §4.3.1).
+    /// Sidecar OPA over loopback (shipping default).
     Sidecar {
         base_url: String,
         #[serde(default = "default_cache_capacity")]
@@ -114,25 +114,25 @@ impl Default for AuditFileConfig {
     fn default() -> Self {
         AuditFileConfig {
             sink_url: "http://127.0.0.1:9000/api/v1/decision-logs".into(),
-            spill_path: PathBuf::from("/var/lib/hyperfluid-gateway/audit-spill.ndjson"),
+            spill_path: PathBuf::from("/var/lib/s0/audit-spill.ndjson"),
         }
     }
 }
 
-/// Request-shape + hardening limits (§9.1). Mapped onto `s3s::S3Config` plus the
+/// Request-shape + hardening limits. Mapped onto `s3s::S3Config` plus the
 /// gateway's own semantic caps enforced before the PDP fan-out.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LimitsConfig {
     pub xml_max_body_size: usize,
     pub post_object_max_file_size: u64,
     pub presigned_url_max_skew_time_secs: u32,
-    /// AWS semantic cap: `DeleteObjects` ≤ 1000 keys (enforced before OPA, §9.1).
+    /// AWS semantic cap: `DeleteObjects` ≤ 1000 keys (enforced before OPA).
     pub max_delete_keys: usize,
-    /// Multi-prefix list fan-out bound; above it the list fails closed (§5.1).
+    /// Multi-prefix list fan-out bound; above it the list fails closed.
     pub max_list_fanout: usize,
-    /// Max concurrent connections (slowloris / resource-exhaustion guard, §9.1).
+    /// Max concurrent connections (slowloris / resource-exhaustion guard).
     pub max_connections: usize,
-    /// Header read timeout (slowloris, §9.1).
+    /// Header read timeout (slowloris).
     pub header_read_timeout_secs: u64,
 }
 
@@ -161,8 +161,8 @@ pub struct BackendConfig {
     pub force_path_style: bool,
 }
 
-/// Maps a Harbor tenant to its Org, its backend, and the per-tenant backend
-/// credential the proxy re-signs with (never the caller's, §4.4/§6.4).
+/// Maps a tenant to its Org, its backend, and the per-tenant backend
+/// credential the proxy re-signs with (never the caller's).
 #[derive(Debug, Clone, Deserialize)]
 pub struct TenantConfig {
     pub tenant: String,
@@ -199,7 +199,7 @@ impl GatewayConfig {
             }
         }
         // A static credential's org must match its tenant's authoritative org, or
-        // audit attribution would drift from the tenant->org binding (§6.6).
+        // audit attribution would drift from the tenant->org binding.
         let tenant_org: HashMap<&str, &str> = self
             .tenants
             .iter()

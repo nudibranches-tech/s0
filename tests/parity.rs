@@ -1,4 +1,4 @@
-//! Dual-engine parity gate (§4.3.1). Replays the golden decision corpus through
+//! Dual-engine parity gate. Replays the golden decision corpus through
 //! BOTH the embedded regorus engine and a real OPA (`opa eval`) and requires
 //! identical decisions. The regorus fast path is only allowed to serve traffic
 //! behind this gate.
@@ -9,8 +9,8 @@
 use std::io::Write;
 use std::process::Command;
 
-use hyperfluid_s3_gateway::authz::{Decision, OpaInput};
-use hyperfluid_s3_gateway::pdp::{GATEWAY_REGO, Pdp, RegorusPdp};
+use s0::authz::{Decision, OpaInput};
+use s0::pdp::{GATEWAY_REGO, Pdp, RegorusPdp};
 
 const CORPUS: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -47,7 +47,7 @@ fn opa_decision(bundle: &serde_json::Value, input: &serde_json::Value) -> Decisi
         .arg(&bundle_path)
         .arg("-i")
         .arg(&input_path)
-        .arg("data.hyperfluid.gateway.decision")
+        .arg("data.s0.gateway.decision")
         .output()
         .expect("run opa eval");
     assert!(

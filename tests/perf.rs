@@ -1,4 +1,4 @@
-//! Performance budget gate (§9.5). Loose thresholds — generous enough not to flake
+//! Performance budget gate. Loose thresholds — generous enough not to flake
 //! on shared CI runners, tight enough to catch a gross regression (e.g. someone makes
 //! the decision path 100× slower). The actual numbers are printed so the budget is
 //! visible. Target: PDP decision sub-ms cached, low-ms uncached; zero body copies on
@@ -7,8 +7,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use hyperfluid_s3_gateway::authz::OpaInput;
-use hyperfluid_s3_gateway::pdp::{Bundle, BundleStore, CachingPdp, GATEWAY_REGO, Pdp, RegorusPdp};
+use s0::authz::OpaInput;
+use s0::pdp::{Bundle, BundleStore, CachingPdp, GATEWAY_REGO, Pdp, RegorusPdp};
 
 fn bundle() -> serde_json::Value {
     serde_json::json!({

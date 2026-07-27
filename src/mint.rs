@@ -1,8 +1,8 @@
-//! STS mint — the "badge desk" (§4.2). A backend-agnostic control-plane endpoint:
+//! STS mint — the "badge desk". A backend-agnostic control-plane endpoint:
 //! it verifies a Keycloak OIDC token and issues short-lived **gateway** credentials
 //! that the gateway itself later verifies (derived secrets, [`crate::auth::sts`]).
 //!
-//! No backend (Ceph/RGW/RustFS/…) is ever involved — this supersedes RGW's STS (§6.7)
+//! No backend (Ceph/RGW/RustFS/…) is ever involved — this supersedes RGW's STS
 //! and works identically regardless of what object store sits behind the gateway.
 
 use std::net::SocketAddr;
@@ -161,7 +161,11 @@ impl OidcVerifier for StandardVerifier {
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_issuer(&[&self.issuer]);
         validation.set_audience(&[&self.audience]);
+        // Require these, not just check-when-present: a token omitting aud/iss must be
+        // rejected, or the audience binding is void.
+        validation.set_required_spec_claims(&["exp", "iss", "aud"]);
         validation.validate_exp = true;
+        validation.validate_nbf = true;
         let data = decode::<Value>(token, &key, &validation)
             .map_err(|e| GatewayError::Sts(format!("oidc token invalid: {e}")))?;
         self.extract(&data.claims)
@@ -358,7 +362,7 @@ mod tests {
         ClaimNames {
             sub: "sub".into(),
             groups: "groups".into(),
-            tenant: "harbor".into(),
+            tenant: "tenant".into(),
             org: "org".into(),
         }
     }
@@ -372,7 +376,7 @@ mod tests {
             claims: claim_names(),
         };
         let claims = serde_json::json!({
-            "sub": "alice", "harbor": "acme", "org": "org-acme",
+            "sub": "alice", "tenant": "acme", "org": "org-acme",
             "groups": ["analysts", "radiology"]
         });
         let id = v.extract(&claims).unwrap();

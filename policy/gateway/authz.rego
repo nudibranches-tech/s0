@@ -1,36 +1,40 @@
-# Hyperfluid S3 Authorization Gateway — data-plane object authorization.
+# s0 — data-plane object authorization policy.
 #
-# This is NET-NEW policy (PROMPT §3.4: nothing in the in-RGW `ceph.rego` does
-# object/prefix/op matching — it is membership + per-bucket denylist only). It
-# consumes the *target* data-plane grant projection (§3.3, [NOT-YET-BUILT] on the
-# console side) while reusing the bundle data that already exists today
-# (`user_attributes`, `bucket_attributes`, `org_settings.freeze_writes`).
+# This policy does object/prefix/op-level authorization: finer-grained than a plain
+# membership + per-bucket denylist check. It consumes a data-plane grant projection
+# delivered in the bundle, alongside the membership, denylist, and `freeze_writes`
+# data (`user_attributes`, `bucket_attributes`, `org_settings.freeze_writes`).
+#
+# This module is the gateway's compiled-in DEFAULT policy: what runs for local
+# development, and the oracle the dual-engine parity check replays against. In
+# production the control plane pushes the authoritative policy module and data as a
+# bundle; a data-only bundle leaves this default in force.
 #
 # It is evaluated once per parsed request (or per sub-decision: one multi-delete
 # key, or the source-read / dest-write halves of a copy — the PEP decomposes those
-# blind-spot ops into separate questions, §5). The engine reads the single rule
-# `data.hyperfluid.gateway.decision`.
+# blind-spot ops into separate questions). The engine reads the single rule
+# `data.s0.gateway.decision`.
 #
-# ── input (PROMPT §5) ──────────────────────────────────────────────────────────
+# ── input ──────────────────────────────────────────────────────────────────────
 #   input.principal.{sub,type,attributes.groups,attributes.<extra>}
 #   input.backend.{id,kind}   input.tenant   input.organization_id
 #   input.action  ∈ {read_objects,list_objects,write_objects,delete_objects,manage_lifecycle}
 #   input.bucket  input.object?  input.prefix?  input.copy_source?  input.delete_keys?
 #
-# ── data / grant contract (target projection) ──────────────────────────────────
-#   data.org_settings.freeze_writes : bool                       # EXISTS today
-#   data.tenants[t].user_attributes[sub] : {groups, attributes}  # EXISTS today
-#   data.tenants[t].bucket_attributes[b].denylist[sub] : true    # EXISTS today
-#   data.tenants[t].s3_grants[sub]     : [ Grant ]               # NOT-YET-BUILT
-#   data.tenants[t].group_grants[group]: [ Grant ]               # NOT-YET-BUILT
+# ── data / grant contract ──────────────────────────────────────────────────────
+#   data.org_settings.freeze_writes : bool
+#   data.tenants[t].user_attributes[sub] : {groups, attributes}
+#   data.tenants[t].bucket_attributes[b].denylist[sub] : true
+#   data.tenants[t].s3_grants[sub]     : [ Grant ]
+#   data.tenants[t].group_grants[group]: [ Grant ]
 #     Grant := { "bucket": "<name>" | "*",
 #                "actions": ["read_objects", ...] | ["*"],
 #                "prefixes": ["reports/", ...] }   # absent/[] ⇒ whole bucket
 #
-# Deny-by-default. Membership is necessary but NOT sufficient (unlike ceph.authz):
-# an explicit data-plane grant must match the (action, bucket, object|prefix).
+# Deny-by-default. Membership is necessary but NOT sufficient: an explicit
+# data-plane grant must match the (action, bucket, object|prefix).
 
-package hyperfluid.gateway
+package s0.gateway
 
 import future.keywords.contains
 import future.keywords.if
@@ -72,8 +76,8 @@ grants contains g if some g in data.tenants[input.tenant].s3_grants[input.princi
 
 # Group membership is read LIVE from the bundle (user_attributes[sub].groups), NOT
 # from the caller's token. A token's groups are frozen at mint; sourcing group grants
-# from them would make group removal non-revocable until token expiry (violates §6.1).
-# The bundle is re-projected on every revision, so a group removal lands immediately.
+# from them would make group removal non-revocable until token expiry. The bundle is
+# re-projected on every revision, so a group removal lands immediately.
 grants contains g if {
 	some group in data.tenants[input.tenant].user_attributes[input.principal.sub].groups
 	some g in data.tenants[input.tenant].group_grants[group]
@@ -112,7 +116,7 @@ object_in_scope(g) if whole_bucket(g)
 # Prefixes are LITERAL S3 key prefixes, matched exactly as S3 ListObjects/IAM do:
 # a grant on "team" also matches "team-private/x". This is intentional and consistent
 # with the backend's own prefix semantics (the key the PDP sees is the canonical key
-# that is forwarded, §6.3, so there is no parser-differential). To isolate a folder,
+# that is forwarded, so there is no parser-differential). To isolate a folder,
 # author the grant with a trailing slash ("team/"). The projection SHOULD normalize
 # folder-scoped grants to end in "/" (ADR-006).
 object_in_scope(g) if {
@@ -124,7 +128,7 @@ object_in_scope(g) if {
 # Restricted to manage_lifecycle ON PURPOSE: a read/write/delete arriving with a
 # MISSING object key must NOT fall through to a keyless whole-bucket allow (that
 # would bypass the grant's prefix scope). Missing key on an object op ⇒ no rule
-# matches ⇒ deny (§6.2).
+# matches ⇒ deny.
 grant_matches if {
 	not input.object
 	input.action == "manage_lifecycle"
@@ -133,7 +137,7 @@ grant_matches if {
 }
 
 # list ops: allowed if a whole-bucket grant applies, or the request overlaps a
-# prefix grant (which then drives the narrowing obligation, §5.1).
+# prefix grant (which then drives the narrowing obligation).
 grant_matches if {
 	input.action == "list_objects"
 	not input.object
@@ -146,7 +150,7 @@ grant_matches if {
 	count(scoped_arr) > 0
 }
 
-# ── list-prefix narrowing (§5.1): rewrite an unbounded/over-broad list to scope ──
+# ── list-prefix narrowing: rewrite an unbounded/over-broad list to scope ─────────
 
 requested_prefix := input.prefix
 
@@ -206,7 +210,7 @@ list_obligations := {} if {
 	scoped_arr[0] == requested_prefix
 }
 
-# ── audit-facing reason (deny reasons matter as much as allow, §6.6) ─────────────
+# ── audit-facing reason (deny reasons matter as much as allow) ───────────────────
 
 default reason := "deny: no grant matches action/scope"
 

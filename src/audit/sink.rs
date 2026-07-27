@@ -1,9 +1,9 @@
-//! Async, batched audit shipping (§9.2). The data path only ever `try_send`s onto a
+//! Async, batched audit shipping. The data path only ever `try_send`s onto a
 //! bounded queue — it never awaits the sink. A background worker batches records to
-//! the console decision-log endpoint and spills to local disk on sink outage.
+//! the control-plane decision-log endpoint and spills to local disk on sink outage.
 //!
 //! Invariant: **audit-emit failure never fails the request.** Audit loss and authz
-//! loss are different failures (§9.2); a console outage must not become a storage
+//! loss are different failures; a sink outage must not become a storage
 //! outage. Overflow/errors raise a loud alert and increment a counter, but the data
 //! path proceeds.
 
@@ -18,12 +18,12 @@ use tokio::sync::mpsc;
 use super::record::AuditRecord;
 
 /// Cap on the on-disk spill file: replay reads it whole, so this bounds replay memory
-/// during a long sink outage (§9.2).
+/// during a long sink outage.
 const MAX_SPILL_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct AuditConfig {
-    /// Console ingest, e.g. `https://console/api/v1/decision-logs`.
+    /// Control-plane ingest, e.g. `https://control-plane/api/v1/decision-logs`.
     pub sink_url: String,
     pub queue_capacity: usize,
     pub batch_max: usize,
@@ -40,7 +40,7 @@ impl Default for AuditConfig {
             batch_max: 256,
             flush_interval: Duration::from_secs(2),
             http_timeout: Duration::from_secs(5),
-            spill_path: PathBuf::from("/var/lib/hyperfluid-gateway/audit-spill.ndjson"),
+            spill_path: PathBuf::from("/var/lib/s0/audit-spill.ndjson"),
         }
     }
 }
@@ -74,10 +74,35 @@ impl AuditSink {
     }
 }
 
-/// Spawn the audit worker and return a handle. Must run inside a tokio runtime.
-pub fn spawn(cfg: AuditConfig) -> AuditSink {
+/// Awaitable handle for draining the worker on shutdown, so buffered + queued records
+/// are shipped instead of aborted when the runtime drops (§9.2: on shutdown, no silent
+/// loss). Held by `main`, awaited after the HTTP server drains.
+pub struct AuditHandle {
+    join: tokio::task::JoinHandle<()>,
+    shutdown: Arc<tokio::sync::Notify>,
+}
+
+impl AuditHandle {
+    /// Signal the worker to drain everything currently queued + buffered, ship it, then
+    /// await the worker (bounded by `timeout`). Call after the HTTP server has drained
+    /// its connections, so no new records race the drain.
+    pub async fn drain(self, timeout: Duration) {
+        self.shutdown.notify_one();
+        match tokio::time::timeout(timeout, self.join).await {
+            Ok(_) => tracing::info!("audit worker drained on shutdown"),
+            Err(_) => {
+                tracing::error!("audit worker drain timed out; some records may be lost")
+            }
+        }
+    }
+}
+
+/// Spawn the audit worker and return the emit handle plus an [`AuditHandle`] for
+/// shutdown draining. Must run inside a tokio runtime.
+pub fn spawn(cfg: AuditConfig) -> (AuditSink, AuditHandle) {
     let (tx, rx) = mpsc::channel(cfg.queue_capacity);
     let dropped = Arc::new(AtomicU64::new(0));
+    let shutdown = Arc::new(tokio::sync::Notify::new());
     let client = reqwest::Client::builder()
         .timeout(cfg.http_timeout)
         .build()
@@ -85,14 +110,23 @@ pub fn spawn(cfg: AuditConfig) -> AuditSink {
             tracing::error!(%e, "audit http client build failed; using default client (no timeout)");
             reqwest::Client::new()
         });
-    tokio::spawn(Worker { rx, cfg, client }.run());
-    AuditSink { tx, dropped }
+    let join = tokio::spawn(
+        Worker {
+            rx,
+            cfg,
+            client,
+            shutdown: shutdown.clone(),
+        }
+        .run(),
+    );
+    (AuditSink { tx, dropped }, AuditHandle { join, shutdown })
 }
 
 struct Worker {
     rx: mpsc::Receiver<AuditRecord>,
     cfg: AuditConfig,
     client: reqwest::Client,
+    shutdown: Arc<tokio::sync::Notify>,
 }
 
 impl Worker {
@@ -111,12 +145,25 @@ impl Worker {
                     }
                     None => {
                         self.flush(&mut buf).await;
+                        self.replay_spill().await;
                         break;
                     }
                 },
                 _ = ticker.tick() => {
                     self.flush(&mut buf).await;
                     self.replay_spill().await;
+                }
+                _ = self.shutdown.notified() => {
+                    // Shutdown: drain everything currently queued, ship it, and exit.
+                    // serve() has already drained the data path, so nothing races in.
+                    while let Ok(rec) = self.rx.try_recv() {
+                        buf.push(rec);
+                        if buf.len() >= self.cfg.batch_max {
+                            self.flush(&mut buf).await;
+                        }
+                    }
+                    self.flush(&mut buf).await;
+                    break;
                 }
             }
         }

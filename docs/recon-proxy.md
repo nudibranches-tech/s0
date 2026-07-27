@@ -122,7 +122,7 @@ use aws_sdk_s3::{Client, Config};
 let creds = Credentials::new(access_key, secret_key, None, None, "static");
 let conf: Config = Config::builder()
     .behavior_version(BehaviorVersion::latest())   // REQUIRED: behavior-version-latest feature is off; omit => panic at build()
-    .endpoint_url("https://rgw.internal:7480")     // Ceph RGW
+    .endpoint_url("https://s3-backend.example.com:7480")     // Ceph RGW
     .region(Region::new("us-east-1"))              // RGW ignores it but SigV4 needs a value
     .credentials_provider(creds)
     .force_path_style(true)                         // RGW: path-style, not vhost

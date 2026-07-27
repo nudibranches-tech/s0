@@ -1,22 +1,22 @@
 //! End-to-end enforcement through the real `S3Access` typed hooks: principal →
-//! OPA input (§5) → regorus decision → obligation/mutation. Exercises the object
+//! OPA input → regorus decision → obligation/mutation. Exercises the object
 //! read/deny path, per-key multi-delete filtering (blind spot #2), and single-prefix
-//! list rewrite (§5.1) against the shipped rego — no live backend needed (the hooks
+//! list rewrite against the shipped rego — no live backend needed (the hooks
 //! only read the routing table, they never open a backend connection).
 
 use std::sync::Arc;
 
 use http::{Extensions, HeaderMap, Method};
-use hyperfluid_s3_gateway::access::GatewayAccess;
-use hyperfluid_s3_gateway::audit::{self, AuditConfig};
-use hyperfluid_s3_gateway::auth::sts::StsAuthority;
-use hyperfluid_s3_gateway::auth::{Identity, StaticCredentialStore};
-use hyperfluid_s3_gateway::config::GatewayConfig;
-use hyperfluid_s3_gateway::gateway::Gateway;
-use hyperfluid_s3_gateway::identity::ResolvedPrincipal;
-use hyperfluid_s3_gateway::model::PrincipalType;
-use hyperfluid_s3_gateway::pdp::{Bundle, BundleStore, CachingPdp, GATEWAY_REGO, Pdp, RegorusPdp};
-use hyperfluid_s3_gateway::proxy::BackendRegistry;
+use s0::access::GatewayAccess;
+use s0::audit::{self, AuditConfig};
+use s0::auth::sts::StsAuthority;
+use s0::auth::{Identity, StaticCredentialStore};
+use s0::config::GatewayConfig;
+use s0::gateway::Gateway;
+use s0::identity::ResolvedPrincipal;
+use s0::model::PrincipalType;
+use s0::pdp::{Bundle, BundleStore, CachingPdp, GATEWAY_REGO, Pdp, RegorusPdp};
+use s0::proxy::BackendRegistry;
 use s3s::S3Request;
 use s3s::access::S3Access;
 use s3s::dto::{
@@ -82,7 +82,7 @@ async fn test_gateway() -> Arc<Gateway> {
         Arc::new(StaticCredentialStore::new()),
     ));
     let registry = Arc::new(BackendRegistry::from_config(&cfg).unwrap());
-    let audit = audit::spawn(AuditConfig {
+    let (audit, _audit_handle) = audit::spawn(AuditConfig {
         sink_url: cfg.audit.sink_url.clone(),
         spill_path: cfg.audit.spill_path.clone(),
         ..AuditConfig::default()
@@ -262,7 +262,7 @@ async fn list_multipart_uploads_is_narrowed_to_grant_prefix() {
 
 #[tokio::test]
 async fn multi_prefix_list_allows_and_stashes_fanout() {
-    use hyperfluid_s3_gateway::proxy::fanout::ListFanout;
+    use s0::proxy::fanout::ListFanout;
     let access = GatewayAccess::new(test_gateway().await);
     // `multi` holds list grants on two prefixes; an unbounded list is now allowed with
     // a fan-out obligation (previously it fail-closed).

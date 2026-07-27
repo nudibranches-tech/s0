@@ -1,12 +1,12 @@
-//! The OPA gate (§4.3) — the point of the project. Enforcement lives in the typed
+//! The OPA gate — the point of the project. Enforcement lives in the typed
 //! per-op hooks (which see the full parsed input), not in `check`:
 //!
-//! - `check` (pre-deserialization) is the **deny-by-default backstop** (§6.2): it
-//!   denies anonymous, denies any op not on the implemented allowlist (the 99 typed
-//!   hooks fail-OPEN, so an un-listed op MUST be rejected here), resolves the
+//! - `check` (pre-deserialization) is the **deny-by-default backstop**: it
+//!   denies anonymous, denies any op not on the implemented allowlist (the default
+//!   per-op hooks fail-OPEN, so an un-listed op MUST be rejected here), resolves the
 //!   end-user identity, and stashes it for the later stages.
-//! - The typed hooks (post-deserialization, `&mut`) build the OPA input (§5), call
-//!   the PDP, emit exactly one audit record per request (§6.6), and apply obligations
+//! - The typed hooks (post-deserialization, `&mut`) build the OPA input, call
+//!   the PDP, emit exactly one audit record per request, and apply obligations
 //!   (prefix rewrite) — closing the CopyObject / multi-delete / form-upload blind
 //!   spots because they authorize the *parsed* request.
 
@@ -26,7 +26,7 @@ use crate::proxy::fanout;
 
 /// The ops the gateway implements a typed hook for. `check` denies everything else
 /// (deny-by-default backstop — adding an op here and implementing its hook are one
-/// change, §6.2).
+/// change).
 const ALLOWED_OPS: &[&str] = &[
     "GetObject",
     "HeadObject",
@@ -73,9 +73,9 @@ impl GatewayAccess {
             .backend_of(&p.tenant)
             .unwrap_or((BackendId(String::new()), BackendKind::Ceph));
         // Org is the gateway's AUTHORITATIVE tenant->org binding, never the
-        // credential's self-declared org — audit attribution must not be drift-able
-        // (§6.6). Post-`check` the tenant is routable, so this is always resolved; an
-        // unresolved org yields an empty label the console drops fail-closed (§3.6).
+        // credential's self-declared org — audit attribution must not be drift-able.
+        // Post-`check` the tenant is routable, so this is always resolved; an
+        // unresolved org yields an empty label the control plane drops fail-closed.
         let organization_id = self
             .gw
             .registry
@@ -98,7 +98,7 @@ impl GatewayAccess {
         }
     }
 
-    /// Any PDP error fails closed to a deny (§6.2) — never allow on error.
+    /// Any PDP error fails closed to a deny — never allow on error.
     async fn decide(&self, input: &OpaInput) -> Decision {
         match self.gw.pdp.decide(input).await {
             Ok(d) => d,
@@ -206,7 +206,7 @@ impl GatewayAccess {
     }
 
     /// List-style path (ListObjects*, ListMultipartUploads): decide, classify the
-    /// obligation (§5.1), and audit. The caller applies the verdict to the request
+    /// obligation, and audit. The caller applies the verdict to the request
     /// (rewrite prefix, stash a fan-out obligation, or deny).
     async fn enforce_list(
         &self,
@@ -236,7 +236,7 @@ impl S3Access for GatewayAccess {
     async fn check(&self, cx: &mut S3AccessContext<'_>) -> S3Result<()> {
         // Gate rejections are logged for ops visibility of denied access *attempts*
         // (the access-key id is a semi-public identifier, never the secret). They are
-        // not emitted as decision-log records — those are per parsed object op (§6.6);
+        // not emitted as decision-log records — those are per parsed object op;
         // a dedicated gate-rejection audit event is a documented follow-up.
         let op = cx.s3_op().name().to_string();
         let access_key = match cx.credentials() {
@@ -247,7 +247,7 @@ impl S3Access for GatewayAccess {
             }
         };
         // Deny-by-default backstop: un-listed ops fail-open at their typed hook, so
-        // they MUST be rejected here (§6.2).
+        // they MUST be rejected here.
         if !ALLOWED_OPS.contains(&op.as_str()) {
             tracing::warn!(%op, %access_key, "gate deny: operation not permitted");
             return Err(s3_error!(
@@ -256,7 +256,7 @@ impl S3Access for GatewayAccess {
             ));
         }
         // The STS session token rides in the header for signed requests and in the
-        // query string for presigned URLs (§4.2) — presigned links flow through the
+        // query string for presigned URLs — presigned links flow through the
         // same OPA gate, so accept both.
         let token = session_token(cx.headers(), cx.uri());
         let principal = match self.gw.identity.resolve(&access_key, token.as_deref()) {
@@ -346,7 +346,7 @@ impl S3Access for GatewayAccess {
 
     async fn delete_objects(&self, req: &mut S3Request<DeleteObjectsInput>) -> S3Result<()> {
         // Blind spot #2: multi-delete keys live in the XML body — authorize EACH key,
-        // then filter the forwarded request to only the allowed keys (§5).
+        // then filter the forwarded request to only the allowed keys.
         let p = self.principal(req)?;
         if req.input.delete.objects.len() > self.gw.limits.max_delete_keys {
             return Err(s3_error!(
@@ -549,7 +549,7 @@ enum ListVerdict {
     Deny(String),
     /// Allowed as requested (whole-bucket or already-in-scope prefix).
     AllowAsIs,
-    /// Rewrite the request prefix to this single granted prefix (§5.1).
+    /// Rewrite the request prefix to this single granted prefix.
     Narrow(String),
     /// Allowed across several granted prefixes — the dispatcher fans out (ADR-004).
     FanOut(Vec<String>),
@@ -614,9 +614,30 @@ fn outcome_of(allow: bool) -> Outcome {
 fn request_meta<T>(req: &S3Request<T>) -> RequestMeta {
     RequestMeta {
         method: req.method.to_string(),
-        params: req.uri.query().map(str::to_string),
+        params: req.uri.query().map(redact_query),
         headers_subset: Default::default(),
     }
+}
+
+/// Redact credential-bearing presign params so an audit record never stores a
+/// replayable URL or bearer token. Param names are kept; only the values are dropped.
+fn redact_query(q: &str) -> String {
+    const REDACT: [&str; 3] = [
+        "x-amz-signature",
+        "x-amz-security-token",
+        "x-amz-credential",
+    ];
+    q.split('&')
+        .map(|p| {
+            let name = p.split('=').next().unwrap_or(p);
+            if REDACT.contains(&name.to_ascii_lowercase().as_str()) {
+                format!("{name}=REDACTED")
+            } else {
+                p.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 /// The STS session token from the `X-Amz-Security-Token` header (signed requests) or
@@ -698,7 +719,7 @@ mod tests {
             assert!(ALLOWED_OPS.contains(&op), "{op} must be on the allowlist");
         }
         // Ops we do not (or cannot yet) forward must NOT be allow-listed — they would
-        // fail-open at their default typed hook, so check() must reject them (§6.2).
+        // fail-open at their default typed hook, so check() must reject them.
         // PostObject is excluded on purpose: s3s_aws::Proxy has no post_object.
         for op in [
             "PutBucketAcl",
@@ -770,5 +791,16 @@ mod tests {
         // Neither.
         let uri: http::Uri = "/b/k?X-Amz-Signature=x".parse().unwrap();
         assert_eq!(session_token(&empty, &uri), None);
+    }
+
+    #[test]
+    fn redact_query_drops_credential_values() {
+        let q = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIA%2F..&X-Amz-Security-Token=jwt&X-Amz-Signature=abcd";
+        let r = redact_query(q);
+        assert!(r.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"));
+        assert!(r.contains("X-Amz-Signature=REDACTED"));
+        assert!(r.contains("X-Amz-Security-Token=REDACTED"));
+        assert!(r.contains("X-Amz-Credential=REDACTED"));
+        assert!(!r.contains("jwt") && !r.contains("abcd"));
     }
 }

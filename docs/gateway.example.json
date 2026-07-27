@@ -7,8 +7,8 @@
   },
   "pdp": { "mode": "embedded", "cache_capacity": 100000 },
   "audit": {
-    "sink_url": "http://console.internal/api/v1/decision-logs",
-    "spill_path": "/var/lib/hyperfluid-gateway/audit-spill.ndjson"
+    "sink_url": "http://controlplane.example.com/api/v1/decision-logs",
+    "spill_path": "/var/lib/s0/audit-spill.ndjson"
   },
   "limits": {
     "xml_max_body_size": 20971520,
@@ -21,9 +21,9 @@
   },
   "backends": [
     {
-      "id": "bay-eu-1",
+      "id": "backend-eu-1",
       "kind": "ceph",
-      "endpoint_url": "https://rgw.internal:7480",
+      "endpoint_url": "https://s3-backend.example.com:7480",
       "region": "us-east-1",
       "force_path_style": true
     }
@@ -32,21 +32,21 @@
     {
       "tenant": "acme",
       "organization_id": "org-acme",
-      "backend_id": "bay-eu-1",
+      "backend_id": "backend-eu-1",
       "owner_access_key": "REPLACE_WITH_PER_TENANT_BACKEND_KEY",
       "owner_secret_key": "REPLACE_WITH_PER_TENANT_BACKEND_SECRET"
     }
   ],
   "static_credentials": [],
-  "bundle_path": "/etc/hyperfluid-gateway/bundle.json",
-  "bundle_url": "http://console.internal/api/internal/v1/organizations/org-acme/ceph-bundle",
+  "bundle_path": "/etc/s0/bundle.json",
+  "bundle_url": "http://controlplane.example.com/api/v1/organizations/org-acme/bundle",
   "bundle_poll_secs": 30,
   "sts_mint": {
     "listen": "0.0.0.0:8015",
-    "issuer": "https://keycloak.internal/realms/acme",
-    "audience": "hyperfluid-gateway",
-    "jwks_uri": "https://keycloak.internal/realms/acme/protocol/openid-connect/certs",
-    "tenant_claim": "harbor",
+    "issuer": "https://idp.example.com/realms/acme",
+    "audience": "s0",
+    "jwks_uri": "https://idp.example.com/realms/acme/protocol/openid-connect/certs",
+    "tenant_claim": "tenant",
     "org_claim": "org",
     "groups_claim": "groups"
   }

@@ -1,8 +1,9 @@
-//! S3 front assembly + hyper serving loop (§4.1). Wires the auth, access, and proxy
+//! S3 front assembly + hyper serving loop. Wires the auth, access, and proxy
 //! layers onto an `s3s::S3Service` and serves it with graceful shutdown.
 //!
 //! Both `set_auth` and `set_access` are required: without `set_auth` the general
-//! `check` backstop is silently skipped (substrate trap), which would defeat §6.2.
+//! `check` backstop is silently skipped (a substrate trap), which would defeat the
+//! deny-by-default gate.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -33,7 +34,7 @@ pub fn build_service(gw: Arc<Gateway>) -> S3Service {
     builder.build()
 }
 
-/// Map the gateway's hardening limits onto `s3s::S3Config` (§9.1). `S3Config` is
+/// Map the gateway's hardening limits onto `s3s::S3Config`. `S3Config` is
 /// `#[non_exhaustive]`; mutate a `default()` rather than struct-literal it.
 fn s3_config(gw: &Gateway) -> S3Config {
     let mut cfg = S3Config::default();
@@ -49,11 +50,12 @@ pub async fn serve(gw: Arc<Gateway>, listen: SocketAddr) -> Result<()> {
     let listener = TcpListener::bind(listen).await?;
     tracing::info!(%listen, "gateway listening");
 
-    // s3s does not protect the HTTP layer (§9.1); we own connection bounding, the
+    // s3s does not protect the HTTP layer; we own connection bounding, the
     // header-read (slowloris) timeout, h2 keep-alive, and graceful drain.
+    // NOTE: the auto builder's h1 `header_read_timeout` needs a timer that does not
+    // survive `into_owned()` below, so it panics per connection; a reliable request
+    // read-timeout is a follow-up. The connection cap + h2 keep-alive remain.
     let mut http = ConnBuilder::new(TokioExecutor::new());
-    http.http1()
-        .header_read_timeout(Duration::from_secs(limits.header_read_timeout_secs));
     http.http2()
         .timer(TokioTimer::new())
         .keep_alive_interval(Some(Duration::from_secs(20)))

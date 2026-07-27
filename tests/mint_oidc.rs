@@ -5,15 +5,15 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use hyperfluid_s3_gateway::config::StsMintConfig;
-use hyperfluid_s3_gateway::mint::{OidcVerifier, StandardVerifier};
+use s0::config::StsMintConfig;
+use s0::mint::{OidcVerifier, StandardVerifier};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 
 const PRIVATE_PEM: &str = include_str!("testdata/oidc_test_rsa.pem");
 const PUBLIC_PEM: &str = include_str!("testdata/oidc_test_rsa_pub.pem");
 
 const ISSUER: &str = "https://kc.example/realms/acme";
-const AUDIENCE: &str = "hyperfluid-gateway";
+const AUDIENCE: &str = "s0";
 
 fn verifier() -> StandardVerifier {
     let cfg = StsMintConfig {
@@ -67,6 +67,25 @@ async fn verifies_a_real_rs256_token_and_extracts_identity() {
 async fn rejects_wrong_audience() {
     let token = sign(serde_json::json!({
         "iss": ISSUER, "aud": "some-other-service", "exp": now() + 3600,
+        "sub": "alice", "harbor": "acme", "org": "org-acme"
+    }));
+    assert!(verifier().verify(&token).await.is_err());
+}
+
+#[tokio::test]
+async fn rejects_token_missing_audience() {
+    // A token that simply omits `aud` must be rejected, not accepted.
+    let token = sign(serde_json::json!({
+        "iss": ISSUER, "exp": now() + 3600,
+        "sub": "alice", "harbor": "acme", "org": "org-acme"
+    }));
+    assert!(verifier().verify(&token).await.is_err());
+}
+
+#[tokio::test]
+async fn rejects_token_missing_issuer() {
+    let token = sign(serde_json::json!({
+        "aud": AUDIENCE, "exp": now() + 3600,
         "sub": "alice", "harbor": "acme", "org": "org-acme"
     }));
     assert!(verifier().verify(&token).await.is_err());
