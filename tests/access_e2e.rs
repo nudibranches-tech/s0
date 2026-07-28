@@ -173,7 +173,7 @@ async fn list_multipart_uploads_is_narrowed_to_grant_prefix() {
 
 #[tokio::test]
 async fn multi_prefix_list_allows_and_stashes_fanout() {
-    use s0::proxy::fanout::ListFanout;
+    use s0::proxy::obligations::ResponseObligations;
     let fx = common::fixture("e2e-fanout", bundle());
     let access = GatewayAccess::new(fx.gw.clone());
     // `multi` holds list grants on two prefixes; an unbounded list is now allowed with
@@ -189,11 +189,17 @@ async fn multi_prefix_list_allows_and_stashes_fanout() {
         Method::GET,
     );
     assert!(access.list_objects_v2(&mut req).await.is_ok());
-    let fo = req
-        .extensions
-        .get::<Arc<ListFanout>>()
+    let obligations = ResponseObligations::of(&req).expect("response obligations stashed");
+    let fo = obligations
+        .list_fanout
+        .as_ref()
         .expect("fan-out obligation stashed");
     assert_eq!(fo.prefixes, vec!["2024/".to_string(), "2025/".to_string()]);
+    assert!(
+        obligations.visible_buckets.is_none(),
+        "a list fan-out must not carry a bucket-visibility verdict; the two obligations \
+         travel in one extension but are not interchangeable"
+    );
 }
 
 #[tokio::test]

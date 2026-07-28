@@ -205,7 +205,6 @@ mod tests {
                                .join(format!("s0-gwcfg-{}.ndjson", uuid::Uuid::new_v4())) },
                 "limits": {
                     "xml_max_body_size": 20971520,
-                    "post_object_max_file_size": 5368709120u64,
                     "presigned_url_max_skew_time_secs": 900,
                     "max_delete_keys": max_delete_keys,
                     "max_list_fanout": 16,

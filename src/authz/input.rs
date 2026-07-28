@@ -30,6 +30,10 @@ pub const OPA_INPUT_FIELDS: &[&str] = &[
     "copy_source",
     "delete_keys",
     "object_tags",
+    "config_kind",
+    "requested_tags",
+    "acl_grants",
+    "bypass_governance",
     "request",
 ];
 
@@ -72,8 +76,71 @@ pub struct OpaInput {
     /// populated until the on-demand tag fetch is wired.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_tags: Option<BTreeMap<String, String>>,
+    /// Which bucket sub-resource a `{read,write}_bucket_config` decision is about:
+    /// `"policy"` or `"cors"`.
+    ///
+    /// The vocabulary deliberately does **not** split a verb per sub-resource, so
+    /// without this field `GetBucketPolicy` and `GetBucketCors` emit *byte-identical*
+    /// inputs — indistinguishable to a policy author, and (worse) sharing one
+    /// decision-cache entry, since the resource key is a digest of this document. It is
+    /// the discriminator for both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_kind: Option<String>,
+    /// The tag set a `write_object_tags` request is asking to **install** — the parsed
+    /// body, not the object's current tags (that is `object_tags`, which is on-demand
+    /// and still never populated).
+    ///
+    /// Emitted so a pushed policy can refuse a tag write that would set a key its own
+    /// ABAC conditions read — self-elevation, lesson 6. The shipped default module does
+    /// not read it yet; `reserved_tag_keys` is task S4-tagging's, and until it lands a
+    /// principal holding `write_object_tags` can set any key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_tags: Option<BTreeMap<String, String>>,
+    /// The access-control grants this request asks the backend to install: the canned
+    /// `x-amz-acl` and the five `x-amz-grant-*` headers, normalized (see
+    /// [`crate::access::headers`]).
+    ///
+    /// **Always serialized, and `[]` is a real assertion**, not an absence. A policy
+    /// that wants to say "this write may carry no ACL" writes
+    /// `count(input.acl_grants) == 0`, and a rego reference to an *undefined* field is
+    /// the silent deny-all this project exists to avoid — so the producer emits the
+    /// empty list rather than omitting the key.
+    ///
+    /// This is the field the M4 ACL retrofit exists for: until it landed, a
+    /// `PutObject` carrying `x-amz-acl: public-read` was authorized on bucket+key alone
+    /// and the header rode through to the backend unread.
+    #[serde(default)]
+    pub acl_grants: Vec<AclGrant>,
+    /// `x-amz-bypass-governance-retention` — the WORM defeat.
+    ///
+    /// Always serialized, for the same reason as [`Self::acl_grants`]. The gateway
+    /// refuses a request carrying it outright (there is no verb in the frozen
+    /// vocabulary that expresses "may override object-lock retention"), so a `true`
+    /// here is always accompanied by a denial; it is on the wire so the *attempt* is on
+    /// the record and so a future policy can refuse it earlier.
+    #[serde(default)]
+    pub bypass_governance: bool,
     #[serde(default)]
     pub request: RequestMeta,
+}
+
+/// One access-control grant a request asks the backend to install, normalized out of
+/// the canned ACL field and the `x-amz-grant-*` headers.
+///
+/// Two strings rather than a parsed grantee: the grantee expression is backend-defined
+/// (`id=`, `uri=`, `emailAddress=`, comma-separated lists), and a partial parse that
+/// the gateway and the backend disagree about is worse than none — the classification
+/// that matters (does this reach a *public* grantee?) is made in
+/// [`crate::access::headers`] on the raw text, in the over-matching direction.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AclGrant {
+    /// Where it came from: `"acl"` for the canned ACL, or the header name with the
+    /// `x-amz-` stripped — `"grant-read"`, `"grant-write"`, `"grant-read-acp"`,
+    /// `"grant-write-acp"`, `"grant-full-control"`.
+    pub source: String,
+    /// The canned ACL name (`"public-read"`), or the grantee expression verbatim.
+    pub value: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,6 +263,10 @@ mod tests {
             copy_source: None,
             delete_keys: None,
             object_tags: None,
+            config_kind: None,
+            requested_tags: None,
+            acl_grants: vec![],
+            bypass_governance: false,
             request: RequestMeta::default(),
         }
     }
@@ -221,6 +292,10 @@ mod tests {
             copy_source,
             delete_keys,
             object_tags,
+            config_kind,
+            requested_tags,
+            acl_grants,
+            bypass_governance,
             request,
         } = sample();
         let names = [
@@ -235,19 +310,18 @@ mod tests {
             stringify!(copy_source),
             stringify!(delete_keys),
             stringify!(object_tags),
+            stringify!(config_kind),
+            stringify!(requested_tags),
+            stringify!(acl_grants),
+            stringify!(bypass_governance),
             stringify!(request),
         ];
         // Bind every destructured value so an unused-variable warning cannot be the
         // reason someone reaches for `..`.
         let _ = (principal, backend, tenant, organization_id, action, bucket);
-        let _ = (
-            object,
-            prefix,
-            copy_source,
-            delete_keys,
-            object_tags,
-            request,
-        );
+        let _ = (object, prefix, copy_source, delete_keys, object_tags);
+        let _ = (config_kind, requested_tags, request);
+        let _ = (acl_grants, bypass_governance);
         assert_eq!(names.as_slice(), OPA_INPUT_FIELDS);
 
         // The membership assertion this doc comment asks for. `resource_key` is now a
@@ -313,6 +387,36 @@ mod tests {
         m.request.params = Some("list-type=2".into());
         assert_ne!(base, m.resource_key().unwrap(), "request");
 
+        // Both bucket-config ops map to the same verb on the same bucket, so this field
+        // is the ONLY thing separating a GetBucketPolicy decision from a GetBucketCors
+        // one. If it left the key, one cached verdict would serve both.
+        let mut policy = sample();
+        policy.action = Action::ReadBucketConfig;
+        policy.object = None;
+        policy.config_kind = Some("policy".into());
+        let mut cors = policy.clone();
+        cors.config_kind = Some("cors".into());
+        assert_ne!(
+            policy.resource_key().unwrap(),
+            cors.resource_key().unwrap(),
+            "a policy read and a cors read must not share a decision-cache entry"
+        );
+
+        let mut m = sample();
+        m.requested_tags = Some(BTreeMap::from([("tier".into(), "public".into())]));
+        assert_ne!(base, m.resource_key().unwrap(), "requested_tags");
+
+        let mut m = sample();
+        m.acl_grants = vec![AclGrant {
+            source: "acl".into(),
+            value: "public-read".into(),
+        }];
+        assert_ne!(base, m.resource_key().unwrap(), "acl_grants");
+
+        let mut m = sample();
+        m.bypass_governance = true;
+        assert_ne!(base, m.resource_key().unwrap(), "bypass_governance");
+
         // The regression this defect was filed for: same destination, different source.
         let mut a = sample();
         a.action = Action::WriteObjects;
@@ -349,6 +453,76 @@ mod tests {
             "object_tags must be excluded (has_on_demand_data bypasses the cache)"
         );
         assert!(m.has_on_demand_data());
+    }
+
+    #[test]
+    fn the_acl_retrofit_fields_enter_the_decision_cache_key_by_construction() {
+        // The property M1 bought by making `resource_key` a *digest of the document*
+        // rather than a hand-listed field set, asserted for the fields M4 added. This is
+        // the check that matters for the ACL retrofit specifically: if `acl_grants` were
+        // outside the key, a `PutObject` with `x-amz-acl: public-read` and a plain
+        // `PutObject` to the same bucket+key would share one decision-cache entry — so
+        // the first plain write would cache an allow and the ACL-bearing write would be
+        // served that allow without the PDP ever seeing the header. That is the original
+        // bug, reconstituted inside the cache.
+        //
+        // Written against the *derivation* (is the field on the exclusion list?) as well
+        // as empirically, because a future field is only safe if both stay true.
+        for field in ["acl_grants", "bypass_governance", "requested_tags"] {
+            assert!(
+                !RESOURCE_KEY_EXCLUDED.contains(&field),
+                "{field} must not be excluded from the decision-cache key"
+            );
+            assert!(OPA_INPUT_FIELDS.contains(&field));
+        }
+
+        let plain = {
+            let mut m = sample();
+            m.action = Action::WriteObjects;
+            m
+        };
+        let with_acl = {
+            let mut m = plain.clone();
+            m.acl_grants = vec![AclGrant {
+                source: "acl".into(),
+                value: "public-read".into(),
+            }];
+            m
+        };
+        assert_ne!(
+            plain.resource_key().unwrap(),
+            with_acl.resource_key().unwrap(),
+            "a write carrying an ACL must not share a decision-cache entry with the same \
+             write carrying none"
+        );
+
+        // And two *different* ACLs are two different questions.
+        let other_acl = {
+            let mut m = with_acl.clone();
+            m.acl_grants = vec![AclGrant {
+                source: "grant-read".into(),
+                value: "uri=\"http://acs.amazonaws.com/groups/global/AllUsers\"".into(),
+            }];
+            m
+        };
+        assert_ne!(
+            with_acl.resource_key().unwrap(),
+            other_acl.resource_key().unwrap()
+        );
+
+        let bypass = {
+            let mut m = plain.clone();
+            m.action = Action::DeleteObjects;
+            m
+        };
+        let mut bypass_on = bypass.clone();
+        bypass_on.bypass_governance = true;
+        assert_ne!(
+            bypass.resource_key().unwrap(),
+            bypass_on.resource_key().unwrap(),
+            "a governance-bypassing delete must not share a decision-cache entry with an \
+             ordinary delete of the same key"
+        );
     }
 
     #[test]

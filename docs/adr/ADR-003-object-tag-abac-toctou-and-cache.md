@@ -4,6 +4,13 @@
 - **Date**: 2026-07-15
 - **Owners**: gateway team (this repo)
 - **Related**: `src/authz/input.rs`, `src/pdp/cache.rs`, `src/pdp/mod.rs`, `policy/gateway/authz.rego`, `src/audit/record.rs`; ADR-001 (direct-path closure), ADR-002 (decision-log record shape)
+- **Extended by**: **ADR-008** — the tag-*mutation* half of this ADR is now implemented.
+  A tag write is decided against the **proposed** set (`requested_tags`), never the current
+  one; `write_object_tags` is a separate verb from `write_objects`; and the reserved-key
+  guard (`data.org_settings.reserved_tag_keys`, absence ⇒ **every tag write denied**) is
+  enforced PEP-side in `src/access/tagging.rs`. The tag-*read* half of this ADR is
+  unchanged: `object_tags` is still never populated, so the TOCTOU window below is still
+  not open.
 
 ## Context
 
@@ -201,8 +208,8 @@ can lift tag-based restrictions.** At gate-open:
   ops. This inventory is part of the ship-gate review so no tag-bearing input field ships
   unexamined.
 - Backend-side tag-driven behaviors (e.g. lifecycle expiration rules filtered by tags) are
-  configured via `manage_lifecycle`-gated ops and execute inside the backend, not as gateway
-  decisions — one more reason retention semantics do not belong to tag ABAC (D6, Class I).
+  configured via the lifecycle ops, which stay denied at the gate in the 29-op scope, and
+  execute inside the backend, not as gateway decisions — one more reason retention semantics do not belong to tag ABAC (D6, Class I).
 
 ### D6. The residual TOCTOU window: definition, and which deny classes tolerate it
 

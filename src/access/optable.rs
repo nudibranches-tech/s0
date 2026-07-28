@@ -77,11 +77,11 @@ pub enum DangerTier {
 
 /// The 13-verb grant vocabulary frozen in the master plan (§1.2).
 ///
-/// Held as strings rather than [`Action`] on purpose: `Action` still carries the
-/// original 5 verbs, and giving a *denied* op a typed verb it can never be decided
-/// against would be unverifiable fiction. `S2-verbs` widens `Action` to these 13 and
-/// this becomes a typed field; until then `op_table_verbs_are_from_the_frozen_set`
-/// and `enforced_verbs_exist_in_todays_action_vocabulary` keep the two honest.
+/// Held as strings rather than [`Action`] because the table classifies *denied* ops
+/// too, and several of those name a verb no hook builds today. [`Action`] now carries
+/// exactly these 13 (the vocabulary widened with the M4 op scope), and
+/// `the_frozen_vocabulary_and_the_action_enum_agree` holds the two sets equal, so the
+/// string form can no longer drift into fiction.
 pub const FROZEN_VERBS: &[&str] = &[
     "read_objects",
     "list_objects",
@@ -210,16 +210,27 @@ pub const OP_TABLE: &[OpSpec] = &[
         ResourceShape::Copy,
         DangerTier::Mutating,
         &[
-            "x-amz-acl / x-amz-grant-* headers",
-            "x-amz-tagging + x-amz-tagging-directive",
-            "object-lock headers",
+            "under the default `x-amz-tagging-directive: COPY` the destination inherits \
+             the SOURCE object's tags, which the gateway does not read — so a tag the \
+             policy conditions on can be moved onto a new key without a write_object_tags \
+             decision. Only a REPLACE directive (or an explicit x-amz-tagging) is \
+             authorized as a tag write",
+            "object-lock headers (mode, retain-until-date, legal-hold) are not inspected: \
+             a write grant can make the new object undeletable",
         ],
     ),
-    denied(
+    enforced(
         "CreateBucket",
         "create_bucket",
         ResourceShape::Bucket,
         DangerTier::Mutating,
+        &[
+            "object_ownership is not inspected: `ObjectWriter`/`BucketOwnerPreferred` \
+             re-enable ACLs on the new bucket. That is inert while the gateway refuses \
+             every ACL-bearing request, but it is a posture change nobody authorized",
+            "x-amz-bucket-object-lock-enabled and the LocationConstraint in \
+             CreateBucketConfiguration",
+        ],
     ),
     denied(
         "CreateBucketMetadataTableConfiguration",
@@ -233,17 +244,20 @@ pub const OP_TABLE: &[OpSpec] = &[
         ResourceShape::Object,
         DangerTier::Mutating,
         &[
-            "x-amz-acl / x-amz-grant-* headers",
-            "x-amz-tagging",
-            "object-lock headers",
+            "object-lock headers (mode, retain-until-date, legal-hold) are not inspected: \
+             a write grant can make the completed object undeletable",
         ],
     ),
     unauthorizable("CreateSession", ResourceShape::Bucket),
-    denied(
+    enforced(
         "DeleteBucket",
         "delete_bucket",
         ResourceShape::Bucket,
         DangerTier::Mutating,
+        &[
+            "the bucket's emptiness is the backend's business; the gateway does not \
+             re-check it and reports whatever RGW answers",
+        ],
     ),
     denied(
         "DeleteBucketAnalyticsConfiguration",
@@ -328,23 +342,25 @@ pub const OP_TABLE: &[OpSpec] = &[
         "delete_objects",
         ResourceShape::Object,
         DangerTier::Mutating,
-        &[
-            "version_id (a versioned delete is not distinguished from a delete marker)",
-            "x-amz-bypass-governance-retention",
-        ],
+        &["version_id (a versioned delete is not distinguished from a delete marker)"],
     ),
-    denied(
+    enforced(
         "DeleteObjectTagging",
         "write_object_tags",
         ResourceShape::Object,
         DangerTier::PostureAltering,
+        &[
+            "version_id (tags are removed from whichever version the id names)",
+            "the tags being removed are not read first, so a policy cannot condition on \
+             what is being cleared",
+        ],
     ),
     enforced(
         "DeleteObjects",
         "delete_objects",
         ResourceShape::ObjectBatch,
         DangerTier::Mutating,
-        &["per-key version_id", "x-amz-bypass-governance-retention"],
+        &["per-key version_id"],
     ),
     denied(
         "DeletePublicAccessBlock",
@@ -370,11 +386,12 @@ pub const OP_TABLE: &[OpSpec] = &[
         ResourceShape::BucketSubresource,
         DangerTier::Routine,
     ),
-    denied(
+    enforced(
         "GetBucketCors",
         "read_bucket_config",
         ResourceShape::Bucket,
         DangerTier::Routine,
+        &["the returned rules are not filtered; the decision is all-or-nothing"],
     ),
     denied(
         "GetBucketEncryption",
@@ -400,11 +417,15 @@ pub const OP_TABLE: &[OpSpec] = &[
         ResourceShape::Bucket,
         DangerTier::Routine,
     ),
-    denied(
+    enforced(
+        // `read_bucket`, not `read_bucket_config`: every S3 client probes this on
+        // connect, so treating it as configuration would make bucket existence
+        // require a config grant.
         "GetBucketLocation",
-        "read_bucket_config",
+        "read_bucket",
         ResourceShape::Bucket,
         DangerTier::Routine,
+        &["the response names the backend region, which is not tenant-specific"],
     ),
     denied(
         "GetBucketLogging",
@@ -436,11 +457,15 @@ pub const OP_TABLE: &[OpSpec] = &[
         ResourceShape::Bucket,
         DangerTier::Routine,
     ),
-    denied(
+    enforced(
         "GetBucketPolicy",
         "read_bucket_config",
         ResourceShape::Bucket,
         DangerTier::Routine,
+        &[
+            "the returned document names the tenant-owner ARN — information the \
+             ListBuckets owner-stripping decision otherwise withholds (open question 8)",
+        ],
     ),
     denied(
         "GetBucketPolicyStatus",
@@ -491,11 +516,17 @@ pub const OP_TABLE: &[OpSpec] = &[
         ResourceShape::Object,
         DangerTier::Routine,
     ),
-    denied(
+    enforced(
         "GetObjectAttributes",
         "read_objects",
         ResourceShape::Object,
         DangerTier::Routine,
+        &[
+            "ObjectParts reveals the multipart structure (part count, sizes, checksums) \
+             to any read-granted principal; the requested attribute list is not \
+             authorized separately — noted, not solved (M4 exit note)",
+            "version_id (an old version's attributes read under the current key's grant)",
+        ],
     ),
     denied(
         "GetObjectLegalHold",
@@ -515,11 +546,12 @@ pub const OP_TABLE: &[OpSpec] = &[
         ResourceShape::Object,
         DangerTier::Routine,
     ),
-    denied(
+    enforced(
         "GetObjectTagging",
         "read_object_tags",
         ResourceShape::Object,
         DangerTier::Routine,
+        &["version_id"],
     ),
     denied(
         "GetObjectTorrent",
@@ -533,11 +565,16 @@ pub const OP_TABLE: &[OpSpec] = &[
         ResourceShape::Bucket,
         DangerTier::Routine,
     ),
-    denied(
+    enforced(
         "HeadBucket",
         "read_bucket",
         ResourceShape::Bucket,
         DangerTier::Routine,
+        &[
+            "a HEAD response carries no body, so a denial is a bare 403: the client \
+             cannot distinguish 'no such bucket' from 'not yours'. That is the safe \
+             direction, and it is also why the deny reason only reaches the audit record",
+        ],
     ),
     enforced(
         "HeadObject",
@@ -570,11 +607,26 @@ pub const OP_TABLE: &[OpSpec] = &[
         ResourceShape::Bucket,
         DangerTier::Routine,
     ),
-    denied(
+    enforced(
         "ListBuckets",
         "list_buckets",
         ResourceShape::Account,
         DangerTier::Routine,
+        &[
+            "the merged listing is GATEWAY-ordered, not backend-ordered: the response is \
+             sorted by name gateway-side and paginated with a gateway-owned cursor, \
+             because RGW promises no stable order across ListBuckets pages (defect B-9)",
+            "one request drains the tenant's entire bucket list from the backend, bounded \
+             by limits.max_bucket_list_pages; a tenant over that bound is refused rather \
+             than under-reported",
+            "the Owner element is withheld wholesale rather than mapped to the caller — \
+             the backend reports the shared tenant-owner identity, which is not the \
+             requester's",
+            "creation_date and bucket_region ride through as the backend reported them",
+            "bucket_patterns is NOT implemented: a policy emitting it denies (there is no \
+             settled pattern grammar, and an unvalidated glob in a visibility allowlist \
+             widens rather than narrows)",
+        ],
     ),
     denied(
         "ListDirectoryBuckets",
@@ -588,7 +640,10 @@ pub const OP_TABLE: &[OpSpec] = &[
         ResourceShape::Listing,
         DangerTier::Routine,
         &[
-            "the response is not filtered; only the request prefix is narrowed, and a multi-prefix grant fails closed",
+            "the request prefix is narrowed and the response is re-filtered against it, but \
+             a multi-prefix grant still fails closed rather than fanning out",
+            "the upload id and initiation time of an in-scope upload are forwarded; only \
+             owner/initiator (the shared tenant-owner identity) are stripped",
         ],
     ),
     denied(
@@ -621,13 +676,25 @@ pub const OP_TABLE: &[OpSpec] = &[
         "read_objects",
         ResourceShape::Object,
         DangerTier::Routine,
-        &["the upload id is not bound to the principal that created it"],
+        &[
+            "the upload id is not bound to the principal that created it",
+            "part sizes, ETags and checksums are forwarded — they describe the object the \
+             caller already holds read on; only owner/initiator (the shared tenant-owner \
+             identity) are stripped",
+        ],
     ),
-    denied(
+    enforced(
         "PostObject",
         "write_objects",
         ResourceShape::Object,
         DangerTier::Mutating,
+        &[
+            "the file is aggregated into memory by s3s BEFORE check runs, so \
+             limits.post_object_max_file_size — not the decision — is what bounds an \
+             unauthorized allocation",
+            "success_action_redirect is forwarded as given",
+            "object-lock form fields are not inspected",
+        ],
     ),
     denied(
         "PutBucketAccelerateConfiguration",
@@ -647,11 +714,15 @@ pub const OP_TABLE: &[OpSpec] = &[
         ResourceShape::BucketSubresource,
         DangerTier::PostureAltering,
     ),
-    denied(
+    enforced(
         "PutBucketCors",
         "write_bucket_config",
         ResourceShape::Bucket,
         DangerTier::PostureAltering,
+        &[
+            "rule contents are bounded (limits.max_cors_rules) but not inspected: a \
+             write-config grant permits AllowedOrigin `*`",
+        ],
     ),
     denied(
         "PutBucketEncryption",
@@ -701,11 +772,19 @@ pub const OP_TABLE: &[OpSpec] = &[
         ResourceShape::Bucket,
         DangerTier::PostureAltering,
     ),
-    denied(
+    enforced(
         "PutBucketPolicy",
         "write_bucket_config",
         ResourceShape::Bucket,
         DangerTier::PostureAltering,
+        &[
+            "only the self-lockout shapes are rejected (a Deny on Principal `*`, or \
+             confirm_remove_self_bucket_access); a Deny naming the tenant-owner ARN \
+             explicitly is NOT detectable here, because RouteSnapshot deliberately \
+             carries no owner credential to compare against",
+            "an Allow statement widening access to another principal is forwarded — the \
+             bucket policy is a second, backend-side PDP this gateway does not evaluate",
+        ],
     ),
     denied(
         "PutBucketReplication",
@@ -743,9 +822,9 @@ pub const OP_TABLE: &[OpSpec] = &[
         ResourceShape::Object,
         DangerTier::Mutating,
         &[
-            "x-amz-acl / x-amz-grant-* headers",
-            "x-amz-tagging",
-            "object-lock headers",
+            "object-lock headers (mode, retain-until-date, legal-hold) are not inspected: \
+             a write grant can make an object undeletable. Note the asymmetry — the \
+             opposite direction, destroying a retained object, is refused in code",
         ],
     ),
     denied(
@@ -772,11 +851,19 @@ pub const OP_TABLE: &[OpSpec] = &[
         ResourceShape::Object,
         DangerTier::PostureAltering,
     ),
-    denied(
+    enforced(
         "PutObjectTagging",
         "write_object_tags",
         ResourceShape::Object,
         DangerTier::PostureAltering,
+        &[
+            "the reserved-key guard is only as good as the list the control plane \
+             publishes: a key a policy conditions on but which is absent from \
+             org_settings.reserved_tag_keys is writable by anyone holding \
+             write_object_tags. (An absent list denies every tag write, so the failure \
+             mode is a list that is present and incomplete, not a missing one.)",
+            "version_id",
+        ],
     ),
     denied(
         "PutPublicAccessBlock",
@@ -883,16 +970,17 @@ pub fn enforced_ops() -> Vec<&'static str> {
         .collect()
 }
 
-/// The verbs today's [`Action`] can actually express. Used by the coverage test to
-/// keep the table's `verb` column decidable for every enforced op; `S2-verbs` widens
-/// this to all of [`FROZEN_VERBS`].
-pub const TODAYS_ACTIONS: &[Action] = &[
-    Action::ReadObjects,
-    Action::ListObjects,
-    Action::WriteObjects,
-    Action::DeleteObjects,
-    Action::ManageLifecycle,
-];
+/// The typed verb for a table entry, or `None` when the entry names one [`Action`]
+/// cannot express (which, now that the two vocabularies are equal, means only the
+/// structurally unauthorizable ops).
+///
+/// This is what keeps an `Enforced` flip honest: a hook cannot build an `OpaInput` for
+/// a verb with no `Action`, so `enforced_verbs_are_expressible_as_actions` fails first.
+#[must_use]
+pub fn action_for(spec: &OpSpec) -> Option<Action> {
+    let verb = spec.verb?;
+    Action::ALL.iter().copied().find(|a| a.as_str() == verb)
+}
 
 #[cfg(test)]
 mod tests {
@@ -917,6 +1005,20 @@ mod tests {
             assert_eq!(spec(s.name).map(|f| f.name), Some(s.name));
         }
         assert!(spec("NoSuchOperation").is_none());
+    }
+
+    #[test]
+    fn the_frozen_vocabulary_and_the_action_enum_agree() {
+        // Two spellings of one vocabulary: the table's string column and the typed verb
+        // a hook decides against. While they could differ, an op could be flipped to
+        // Enforced naming a verb no `Action` expresses — which is a hook that cannot be
+        // written, discovered at the wrong time.
+        let mut typed: Vec<&str> = Action::ALL.iter().map(|a| a.as_str()).collect();
+        let mut frozen: Vec<&str> = FROZEN_VERBS.to_vec();
+        typed.sort_unstable();
+        frozen.sort_unstable();
+        assert_eq!(typed, frozen);
+        assert_eq!(frozen.len(), 13, "the vocabulary is frozen at 13 verbs");
     }
 
     #[test]

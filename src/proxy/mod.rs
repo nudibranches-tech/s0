@@ -7,7 +7,9 @@
 //! Canonicalize-before-forward holds by construction: the typed hook mutates
 //! `S3Request<Input>` and we forward that same value — there is no raw passthrough.
 
+pub mod bucketfilter;
 pub mod fanout;
+pub mod obligations;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -25,6 +27,7 @@ use crate::audit::{BackendOutcome, PendingAudit};
 use crate::config::{BackendConfig, GatewayConfig, LimitsConfig};
 use crate::error::{GatewayError, Result};
 use crate::model::{BackendId, BackendKind};
+use crate::proxy::obligations::{BucketVisibility, ResponseObligations};
 
 /// One tenant's routing: which backend, which per-tenant credential, which Org.
 struct TenantRoute {
@@ -260,13 +263,27 @@ impl S3GatewayState {
     pub fn limits(&self) -> arc_swap::Guard<Arc<LimitsConfig>> {
         self.limits.load()
     }
+
+    /// The two bounds a filtered `ListBuckets` page is cut with: `(page size, backend
+    /// pages this request may drain)`.
+    ///
+    /// Read as owned values rather than handed out as a guard because the caller holds
+    /// them across an `await` — and read *here*, from the live handle, so a config apply
+    /// lands rather than being frozen at service-assembly time.
+    fn bucket_listing_bounds(&self) -> (usize, usize) {
+        let limits = self.limits();
+        (
+            limits.max_buckets_per_page.max(1),
+            limits.max_bucket_list_pages.max(1),
+        )
+    }
 }
 
 /// The dispatching `impl S3` in front of the per-tenant proxies. Only the ops
 /// `OP_TABLE` marks `Coverage::Enforced` have an arm here; every other op is denied at
 /// `S3Access::check` before reaching this layer, and falls to the trait's
-/// `NotImplemented` default if it somehow does not — with the one exception handled by
-/// the explicit `post_object` override below.
+/// `NotImplemented` default if it somehow does not — with the one exception noted on
+/// [`GatewayS3::post_object`], whose trait default forwards rather than refusing.
 ///
 /// `tests/gate_invariants.rs` probes both halves of that claim: every enforced op has
 /// an arm, and a sample of denied ops still lands on `NotImplemented`.
@@ -412,8 +429,11 @@ impl S3 for GatewayS3 {
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
         self.forward(req, |proxy, req| async move {
             // Multi-prefix fan-out obligation stashed by the access layer (ADR-004)?
-            if let Some(fo) = req.extensions.get::<Arc<fanout::ListFanout>>().cloned() {
-                return fan_out_list_v2(proxy, req, &fo.prefixes).await;
+            let prefixes = ResponseObligations::of(&req)
+                .and_then(|o| o.list_fanout.clone())
+                .map(|f| f.prefixes);
+            if let Some(prefixes) = prefixes {
+                return fan_out_list_v2(proxy, req, &prefixes).await;
             }
             proxy.list_objects_v2(req).await
         })
@@ -474,36 +494,247 @@ impl S3 for GatewayS3 {
             .await
     }
 
+    /// Parts of one upload, with the identity fields stripped.
+    ///
+    /// The parts themselves disclose nothing new: the caller already holds `read_objects`
+    /// on this key, and part sizes and ETags describe the object it may read. `Owner` and
+    /// `Initiator` are different — under this gateway they always name the **shared
+    /// tenant-owner credential** every request is re-signed with, never the principal who
+    /// created the upload. Forwarding them publishes the backend identity the whole
+    /// re-signing design exists to keep off the wire, and answers a question the caller
+    /// did not ask, so they are dropped.
     async fn list_parts(
         &self,
         req: S3Request<ListPartsInput>,
     ) -> S3Result<S3Response<ListPartsOutput>> {
-        self.forward(req, |p, r| async move { p.list_parts(r).await })
-            .await
+        let mut resp = self
+            .forward(req, |p, r| async move { p.list_parts(r).await })
+            .await?;
+        resp.output.owner = None;
+        resp.output.initiator = None;
+        Ok(resp)
     }
 
+    /// In-flight uploads under the granted prefix, with the identity fields stripped and
+    /// the prefix re-applied.
+    ///
+    /// Two transforms, for two different reasons:
+    ///
+    /// - **`Owner` / `Initiator` are dropped**, for the reason on [`Self::list_parts`]:
+    ///   they name the tenant-owner credential, not the caller.
+    /// - **uploads outside the request's prefix are dropped.** The access hook narrows
+    ///   `prefix` to a granted scope and the backend is expected to honor it, but "the
+    ///   backend honored the filter" is not something this gateway can observe — and the
+    ///   keys of in-flight uploads are exactly what a prefix-scoped principal must not
+    ///   see. Re-applying the filter costs a string comparison per row and removes the
+    ///   assumption. The markers are left as the backend set them, so pagination still
+    ///   works; a page may simply come back short.
     async fn list_multipart_uploads(
         &self,
         req: S3Request<ListMultipartUploadsInput>,
     ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
-        self.forward(req, |p, r| async move { p.list_multipart_uploads(r).await })
+        let prefix = req.input.prefix.clone();
+        let mut resp = self
+            .forward(req, |p, r| async move { p.list_multipart_uploads(r).await })
+            .await?;
+        if let Some(uploads) = resp.output.uploads.as_mut() {
+            uploads.retain(|u| match (&prefix, &u.key) {
+                (Some(p), Some(k)) => k.starts_with(p.as_str()),
+                // No prefix on the request ⇒ a whole-bucket list grant, nothing to
+                // re-apply. A row with no key at all was never authorized against
+                // anything, so it goes.
+                (None, Some(_)) => true,
+                _ => false,
+            });
+            for upload in uploads.iter_mut() {
+                upload.owner = None;
+                upload.initiator = None;
+            }
+        }
+        Ok(resp)
+    }
+
+    /// Enumerate buckets — the one arm that **withholds** what the backend returned.
+    ///
+    /// Everything here follows from one fact: the forward is re-signed with the
+    /// per-`(backend, tenant)` owner credential, so the backend answers with the tenant's
+    /// entire bucket namespace regardless of the caller. The visibility obligation the
+    /// access hook installed is therefore not an optimization — it is the authorization.
+    ///
+    /// Three branches, in order:
+    ///
+    /// 1. **no obligation** ⇒ refuse. Only [`GatewayAccess::list_buckets`] installs one,
+    ///    so its absence means no decision was made about this request. This is the same
+    ///    fail-closed argument as the [`AuthzProof`](crate::access::AuthzProof), applied
+    ///    to a response transform: forwarding here would publish the namespace.
+    /// 2. **[`BucketVisibility::Nothing`]** ⇒ an empty listing, produced without touching
+    ///    the backend and without demanding a proof (there is nothing to fetch). This is
+    ///    the single branch serving both "denied" and "allowed with no grants", which is
+    ///    what makes them indistinguishable to the caller — see the hook for why that
+    ///    matters.
+    /// 3. otherwise ⇒ drain, filter, sort, page.
+    async fn list_buckets(
+        &self,
+        req: S3Request<ListBucketsInput>,
+    ) -> S3Result<S3Response<ListBucketsOutput>> {
+        let Some(visibility) =
+            ResponseObligations::of(&req).and_then(|o| o.visible_buckets.clone())
+        else {
+            return Err(s3_error!(
+                InternalError,
+                "list buckets reached the forward path with no bucket-visibility \
+                 obligation, which means no authorization decision was applied to it"
+            ));
+        };
+        if visibility == BucketVisibility::Nothing {
+            // `Some(vec![])`, not `None`: an S3 client reads a missing `<Buckets>` and a
+            // present-but-empty one differently, and the honest statement is "you have
+            // zero buckets", not "this field was not populated".
+            return Ok(S3Response::new(ListBucketsOutput {
+                buckets: Some(Vec::new()),
+                prefix: req.input.prefix.clone(),
+                ..Default::default()
+            }));
+        }
+        let (max_page, max_pages) = self.state.bucket_listing_bounds();
+        // A caller-supplied `max-buckets` is clamped, not honored: the page boundaries
+        // are the gateway's now, so an unbounded request must not turn into an unbounded
+        // response.
+        let page_size = req
+            .input
+            .max_buckets
+            .map_or(max_page, |m| (m.max(1) as usize).min(max_page));
+        self.forward(req, move |proxy, req| async move {
+            filtered_bucket_listing(proxy, req, &visibility, page_size, max_pages).await
+        })
+        .await
+    }
+
+    /// PostObject: the ONE `S3` method whose s3s default is not `NotImplemented` — it
+    /// re-dispatches through `put_object` (`s3_trait.rs:4401-4406`).
+    ///
+    /// M1 carried an explicit `NotImplemented` override here precisely because of that:
+    /// while the op was `Coverage::Denied`, inheriting the default would have let a form
+    /// upload *forward* on the strength of a trait default, out of reach of the "denied
+    /// ops fall to NotImplemented" argument the whole table rests on. Now that PostObject
+    /// is `Coverage::Enforced` the override is gone and this arm forwards deliberately —
+    /// but the hazard has not: for this one op, deleting the arm below does **not**
+    /// produce a 501, it produces a silent forward through `put_object`. What stops that
+    /// from being a fail-open is [`Self::forward`], which demands the [`AuthzProof`]
+    /// before any client exists; `tests/gate_invariants.rs::post_object_forwards_only_with_a_proof`
+    /// is the guard.
+    ///
+    /// `s3s_aws::Proxy` has no `post_object` either, so the forward lands on the same
+    /// default: the input is converted to a `PutObjectInput` and sent as a PUT. The
+    /// proof is checked against `OperationName` = `PostObject` before that conversion.
+    async fn post_object(
+        &self,
+        req: S3Request<PostObjectInput>,
+    ) -> S3Result<S3Response<PostObjectOutput>> {
+        self.forward(req, |p, r| async move { p.post_object(r).await })
             .await
     }
 
-    /// PostObject is `Coverage::Denied`, and this override is what makes that stick.
-    ///
-    /// It is the ONE `S3` method whose s3s default is not `NotImplemented`: it
-    /// re-dispatches through `put_object` (`s3_trait.rs:4401-4406`), so without this
-    /// arm a form upload would inherit a *forwarding* implementation from the very
-    /// trait the "denied ops fall to NotImplemented" argument relies on.
-    async fn post_object(
+    // ── bucket existence and lifecycle ──────────────────────────────────────────
+
+    async fn head_bucket(
         &self,
-        _req: S3Request<PostObjectInput>,
-    ) -> S3Result<S3Response<PostObjectOutput>> {
-        Err(s3_error!(
-            NotImplemented,
-            "form uploads are not forwarded by the gateway"
-        ))
+        req: S3Request<HeadBucketInput>,
+    ) -> S3Result<S3Response<HeadBucketOutput>> {
+        self.forward(req, |p, r| async move { p.head_bucket(r).await })
+            .await
+    }
+
+    async fn get_bucket_location(
+        &self,
+        req: S3Request<GetBucketLocationInput>,
+    ) -> S3Result<S3Response<GetBucketLocationOutput>> {
+        self.forward(req, |p, r| async move { p.get_bucket_location(r).await })
+            .await
+    }
+
+    async fn create_bucket(
+        &self,
+        req: S3Request<CreateBucketInput>,
+    ) -> S3Result<S3Response<CreateBucketOutput>> {
+        self.forward(req, |p, r| async move { p.create_bucket(r).await })
+            .await
+    }
+
+    async fn delete_bucket(
+        &self,
+        req: S3Request<DeleteBucketInput>,
+    ) -> S3Result<S3Response<DeleteBucketOutput>> {
+        self.forward(req, |p, r| async move { p.delete_bucket(r).await })
+            .await
+    }
+
+    // ── bucket sub-resources ────────────────────────────────────────────────────
+
+    async fn get_bucket_policy(
+        &self,
+        req: S3Request<GetBucketPolicyInput>,
+    ) -> S3Result<S3Response<GetBucketPolicyOutput>> {
+        self.forward(req, |p, r| async move { p.get_bucket_policy(r).await })
+            .await
+    }
+
+    async fn put_bucket_policy(
+        &self,
+        req: S3Request<PutBucketPolicyInput>,
+    ) -> S3Result<S3Response<PutBucketPolicyOutput>> {
+        self.forward(req, |p, r| async move { p.put_bucket_policy(r).await })
+            .await
+    }
+
+    async fn get_bucket_cors(
+        &self,
+        req: S3Request<GetBucketCorsInput>,
+    ) -> S3Result<S3Response<GetBucketCorsOutput>> {
+        self.forward(req, |p, r| async move { p.get_bucket_cors(r).await })
+            .await
+    }
+
+    async fn put_bucket_cors(
+        &self,
+        req: S3Request<PutBucketCorsInput>,
+    ) -> S3Result<S3Response<PutBucketCorsOutput>> {
+        self.forward(req, |p, r| async move { p.put_bucket_cors(r).await })
+            .await
+    }
+
+    // ── object tagging and attributes ───────────────────────────────────────────
+
+    async fn get_object_tagging(
+        &self,
+        req: S3Request<GetObjectTaggingInput>,
+    ) -> S3Result<S3Response<GetObjectTaggingOutput>> {
+        self.forward(req, |p, r| async move { p.get_object_tagging(r).await })
+            .await
+    }
+
+    async fn put_object_tagging(
+        &self,
+        req: S3Request<PutObjectTaggingInput>,
+    ) -> S3Result<S3Response<PutObjectTaggingOutput>> {
+        self.forward(req, |p, r| async move { p.put_object_tagging(r).await })
+            .await
+    }
+
+    async fn delete_object_tagging(
+        &self,
+        req: S3Request<DeleteObjectTaggingInput>,
+    ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
+        self.forward(req, |p, r| async move { p.delete_object_tagging(r).await })
+            .await
+    }
+
+    async fn get_object_attributes(
+        &self,
+        req: S3Request<GetObjectAttributesInput>,
+    ) -> S3Result<S3Response<GetObjectAttributesOutput>> {
+        self.forward(req, |p, r| async move { p.get_object_attributes(r).await })
+            .await
     }
 }
 
@@ -574,6 +805,78 @@ async fn fan_out_list_v2(
     output.is_truncated = Some(page.truncated);
     output.contents = Some(page.items);
     output.next_continuation_token = page.next.map(|c| c.encode());
+    Ok(S3Response::new(output))
+}
+
+/// Drain the backend's bucket list, intersect it with the principal's visibility, and
+/// return one gateway-cut page.
+///
+/// The drain is the part worth reading twice. A filtered listing cannot be produced
+/// page-by-page against the backend's pagination: entries are removed, so the backend's
+/// offsets stop describing the client's sequence, and the *order* the pages arrive in is
+/// not something RGW promises (defect B-9). So the whole list is read, sorted
+/// gateway-side, and paged from there. Two things bound it, and both fail loudly rather
+/// than truncating: a page cap, and a check that the backend's token actually advances —
+/// a backend echoing one token forever would otherwise spin here.
+///
+/// A short answer is never acceptable on this path. An authorization-filtered listing
+/// that quietly omitted buckets would look exactly like a revoked grant, which is the one
+/// thing a caller cannot debug.
+// ListBucketsOutput is constructed field-by-field: struct-update syntax on a
+// `#[non_exhaustive]`-adjacent generated DTO is unavailable, as in fan_out_list_v2.
+#[allow(clippy::field_reassign_with_default)]
+async fn filtered_bucket_listing(
+    proxy: Arc<Proxy>,
+    req: S3Request<ListBucketsInput>,
+    visibility: &BucketVisibility,
+    page_size: usize,
+    max_pages: usize,
+) -> S3Result<S3Response<ListBucketsOutput>> {
+    let cursor = decode_cursor(req.input.continuation_token.as_deref())?;
+    let name_prefix = req.input.prefix.clone();
+
+    let mut all: Vec<Bucket> = Vec::new();
+    let mut token: Option<String> = None;
+    for page in 0.. {
+        if page >= max_pages {
+            return Err(s3_error!(
+                ServiceUnavailable,
+                "this tenant's bucket list exceeds the {max_pages}-page drain bound; the \
+                 gateway will not answer a bucket listing it cannot filter completely"
+            ));
+        }
+        let mut sub = req.clone();
+        sub.input.continuation_token = token.clone();
+        // The backend's page size is its own business; the gateway's page is cut after
+        // filtering. Asking for the client's `max-buckets` here would just make the
+        // drain longer.
+        sub.input.max_buckets = None;
+        let out = proxy.list_buckets(sub).await?.output;
+        if let Some(buckets) = out.buckets {
+            all.extend(buckets);
+        }
+        match out.continuation_token {
+            Some(next) if !next.is_empty() && Some(&next) != token.as_ref() => token = Some(next),
+            // Either the backend is done, or it handed back the token it was given.
+            // The second is a backend bug; stopping is right either way, and the page
+            // cap above is what catches a backend that cycles between two tokens.
+            _ => break,
+        }
+    }
+
+    let page = bucketfilter::page(all, visibility, name_prefix.as_deref(), cursor, page_size)
+        .map_err(|e| s3_error!(InvalidArgument, "{e}"))?;
+
+    let mut output = ListBucketsOutput::default();
+    output.buckets = Some(page.buckets);
+    output.continuation_token = page.next.map(|c| c.encode());
+    output.prefix = name_prefix;
+    // `Owner` is withheld, not mapped. What the backend reports is the tenant-owner
+    // credential this gateway re-signed as — the same value for every principal in the
+    // tenant — so forwarding it would publish the shared backend identity, and
+    // substituting the caller would be inventing a canonical user id the backend never
+    // issued.
+    output.owner = None;
     Ok(S3Response::new(output))
 }
 

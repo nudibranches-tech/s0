@@ -163,18 +163,18 @@ async fn denied_ops_have_no_dispatch_arm() {
     expect_not_implemented(e.code(), "PutBucketAcl");
 
     let e = s3
-        .delete_bucket(bare_request(DeleteBucketInput::default()))
+        .get_bucket_versioning(bare_request(GetBucketVersioningInput::default()))
         .await
         .err()
         .unwrap();
-    expect_not_implemented(e.code(), "DeleteBucket");
+    expect_not_implemented(e.code(), "GetBucketVersioning");
 
     let e = s3
-        .list_buckets(bare_request(ListBucketsInput::default()))
+        .list_object_versions(bare_request(ListObjectVersionsInput::default()))
         .await
         .err()
         .unwrap();
-    expect_not_implemented(e.code(), "ListBuckets");
+    expect_not_implemented(e.code(), "ListObjectVersions");
 
     // The two structural denials.
     let e = s3
@@ -193,20 +193,32 @@ async fn denied_ops_have_no_dispatch_arm() {
 }
 
 #[tokio::test]
-async fn post_object_does_not_inherit_the_forwarding_default() {
+async fn post_object_forwards_only_with_a_proof() {
     // `post_object` is the one S3 method whose s3s default is not NotImplemented: it
-    // re-dispatches through `put_object`. Without GatewayS3's explicit override, a form
-    // upload would inherit a forwarding implementation from the very trait the
-    // "denied ops fall to NotImplemented" argument leans on.
+    // re-dispatches through `put_object`. For every other denied op, deleting its
+    // dispatch arm produces a 501; for this one it produces a silent *forward*. Now
+    // that PostObject is enforced, the M1 `NotImplemented` override that stood in the
+    // way is gone — so the only thing between a hook that did not authorize and the
+    // backend is the AuthzProof. The generic probe above walks every enforced op; this
+    // one exists by name because the failure mode here is unique and unobvious.
     let fx = common::fixture("gate-postobject", common::alice_bundle());
     let s3 = gateway_s3(&fx.gw);
     let mut req = fx.request("PostObject", PostObjectInput::default(), Method::POST);
     req.input.bucket = "reports".into();
     req.input.key = "2024/x".into();
     let Err(err) = s3.post_object(req).await else {
-        panic!("PostObject must not be forwarded")
+        panic!("a form upload with no authorization decision must not be forwarded")
     };
-    assert_eq!(*err.code(), S3ErrorCode::NotImplemented);
+    assert_ne!(
+        *err.code(),
+        S3ErrorCode::NotImplemented,
+        "PostObject is Enforced; it must have a real dispatch arm"
+    );
+    assert_eq!(*err.code(), S3ErrorCode::InternalError);
+    assert!(
+        format!("{err}").contains("authorization decision"),
+        "unexpected error: {err}"
+    );
 }
 
 // ── layer 3: the authorization proof ────────────────────────────────────────────

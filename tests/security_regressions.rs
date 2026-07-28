@@ -723,6 +723,135 @@ async fn an_obligation_this_binary_does_not_implement_denies_rather_than_being_i
     drop(Arc::clone(&fx.gw));
 }
 
+#[tokio::test]
+async fn a_policy_that_allows_a_bucket_listing_without_saying_which_buckets_shows_none() {
+    // The `visible_buckets` twin of the test above, and the reason its empty case is the
+    // OPPOSITE of `allowed_prefixes`'. A policy author who allows `list_buckets` and
+    // forgets the obligation has, in every other obligation's convention, said
+    // "unrestricted". Here that would publish the tenant's entire bucket namespace —
+    // because the forward is re-signed with the owner credential and the backend answers
+    // with all of it. So the absent obligation must mean *nothing*, and this is what
+    // holds it there.
+    let fx = common::fixture("sec-listbuckets-default", bundle());
+    let access = GatewayAccess::new(fx.gw.clone());
+
+    const ALLOW_WITH_NO_OBLIGATION: &str = concat!(
+        "package s0.gateway\n\n",
+        "decision := {\"allow\": true, \"reason\": \"allowed, and silent about buckets\", ",
+        "\"obligations\": {}}\n"
+    );
+    fx.gw
+        .pdp
+        .reload(Some(ALLOW_WITH_NO_OBLIGATION), &bundle())
+        .await
+        .expect("the pushed module is valid rego");
+
+    let mut req = fx.request_as(
+        "lister",
+        "ListBuckets",
+        ListBucketsInput::default(),
+        Method::GET,
+    );
+    access
+        .list_buckets(&mut req)
+        .await
+        .expect("an allowed enumeration is never an error");
+    assert_eq!(
+        s0::proxy::obligations::ResponseObligations::of(&req)
+            .and_then(|o| o.visible_buckets.clone())
+            .expect("a visibility obligation is always installed"),
+        s0::proxy::obligations::BucketVisibility::Nothing,
+        "an allow that names no visible buckets must show none — treating it as \
+         'unrestricted' would hand the whole tenant namespace to anyone the policy \
+         allowed to call ListBuckets at all"
+    );
+
+    // Positive control: the same push, with the obligation spelled out, does show them.
+    // A DIFFERENT principal, on purpose: the decision cache is keyed by bundle revision
+    // and the revision does not move across a `reload`, so re-asking as `lister` would be
+    // answered out of the entry above and this control would prove nothing.
+    const ALLOW_WITH_OBLIGATION: &str = concat!(
+        "package s0.gateway\n\n",
+        "decision := {\"allow\": true, \"reason\": \"allowed\", ",
+        "\"obligations\": {\"all_buckets_visible\": true}}\n"
+    );
+    fx.gw
+        .pdp
+        .reload(Some(ALLOW_WITH_OBLIGATION), &bundle())
+        .await
+        .expect("reload");
+    let mut req = fx.request_as(
+        "lister-control",
+        "ListBuckets",
+        ListBucketsInput::default(),
+        Method::GET,
+    );
+    access.list_buckets(&mut req).await.expect("allowed");
+    assert_eq!(
+        s0::proxy::obligations::ResponseObligations::of(&req)
+            .and_then(|o| o.visible_buckets.clone())
+            .expect("obligation"),
+        s0::proxy::obligations::BucketVisibility::All,
+        "the unfiltered path must still be reachable when a rego author types it out"
+    );
+}
+
+#[tokio::test]
+async fn a_must_understand_obligation_this_gateway_cannot_apply_denies() {
+    // `deny_unknown_fields` covers the case where the *field* is unknown. It cannot cover
+    // the reverse skew: a policy that needs an obligation applied, pushed to a fleet where
+    // some replicas are older. `must_understand` names what has to be honored, and a name
+    // this binary does not implement is a denial — so a premature policy push is a loud,
+    // uniform outage rather than a silent partial enforcement across the fleet.
+    let fx = common::fixture("sec-must-understand", bundle());
+    let access = GatewayAccess::new(fx.gw.clone());
+    let get = || GetObjectInput {
+        bucket: "reports".into(),
+        key: "2024/q1.csv".into(),
+        ..Default::default()
+    };
+
+    const DEMANDS_THE_FUTURE: &str = concat!(
+        "package s0.gateway\n\n",
+        "decision := {\"allow\": true, \"reason\": \"allowed\", ",
+        "\"obligations\": {\"must_understand\": [\"excluded_prefixes\"]}}\n"
+    );
+    fx.gw
+        .pdp
+        .reload(Some(DEMANDS_THE_FUTURE), &bundle())
+        .await
+        .expect("valid rego");
+    let mut req = fx.request_as("reader", "GetObject", get(), Method::GET);
+    let err = access.get_object(&mut req).await.expect_err(
+        "an obligation the policy declared mandatory and this binary cannot apply must \
+         deny, not be skipped",
+    );
+    assert_eq!(*err.code(), S3ErrorCode::AccessDenied);
+    assert!(
+        format!("{err}").contains("excluded_prefixes"),
+        "the refusal must name what is missing, or an operator cannot act on it: {err}"
+    );
+    assert!(req.extensions.get::<AuthzProof>().is_none());
+
+    // Positive control: naming an obligation this binary *does* implement is not a
+    // refusal, so the denial above is about capability rather than about the field.
+    const DEMANDS_THE_PRESENT: &str = concat!(
+        "package s0.gateway\n\n",
+        "decision := {\"allow\": true, \"reason\": \"allowed\", ",
+        "\"obligations\": {\"must_understand\": [\"narrow_prefix\"]}}\n"
+    );
+    fx.gw
+        .pdp
+        .reload(Some(DEMANDS_THE_PRESENT), &bundle())
+        .await
+        .expect("valid rego");
+    let mut req = fx.request_as("reader2", "GetObject", get(), Method::GET);
+    access
+        .get_object(&mut req)
+        .await
+        .expect("an implemented obligation named as mandatory is honored, not refused");
+}
+
 // ── the audit record must agree with what the client was told ───────────────────
 
 #[tokio::test]
@@ -857,17 +986,20 @@ async fn a_gate_denial_emits_exactly_one_audit_record() {
     let host = base.trim_start_matches("http://").to_string();
 
     // A denied operation, signed with a credential the gateway really knows — so the
-    // 403 is the gate's, not a signature failure's.
+    // 403 is the gate's, not a signature failure's. `GetBucketAcl` is outside the 29-op
+    // scope and stays denied; it replaced `DeleteBucket`, which this test used until
+    // M4 enforced it (a policy denial and a gate denial are both 403, and only the
+    // record distinguishes them — which is exactly what is under test).
     let status = send_signed(
         &base,
         &host,
-        "DELETE",
+        "GET",
         "/reports",
-        &[],
+        &[("acl", "")],
         Some((common::ACCESS_KEY, common::SECRET_KEY)),
     )
     .await;
-    assert_eq!(status, 403, "DeleteBucket is not enforced by this build");
+    assert_eq!(status, 403, "GetBucketAcl is not enforced by this build");
 
     let records = fx.await_audit_records(1).await;
     assert_eq!(
@@ -881,7 +1013,7 @@ async fn a_gate_denial_emits_exactly_one_audit_record() {
         .as_ref()
         .expect("a gate denial must carry the gate context, not a fabricated OpaInput");
     assert_eq!(gate.stage, GateStage::OperationNotEnforced);
-    assert_eq!(gate.operation, "DeleteBucket");
+    assert_eq!(gate.operation, "GetBucketAcl");
     assert_eq!(
         gate.access_key_id.as_deref(),
         Some(common::ACCESS_KEY),
@@ -1041,5 +1173,524 @@ async fn an_unauthenticated_scanner_cannot_flood_the_audit_sink() {
         fx.gw.audit.dropped_total(),
         0,
         "a rate-limited gate stream is not audit loss and must not be reported as such"
+    );
+}
+
+// ── M4 semantic caps and control-plane bodies ───────────────────────────────────
+//
+// Accepted review defect B-1: a cap implemented as `return Err(s3_error!(
+// InvalidRequest, …))` short-circuits ahead of every audit site, so an over-cap request
+// produces NO record at all and reaches the client as a 400 — a refusal on
+// authorization grounds, reported as a client formatting mistake and invisible to the
+// decision log. Every cap below is therefore a real Deny sub-decision on the op's own
+// verb. Each test asserts both halves: the request is refused, AND the refusal is on
+// the record as a decision (`gate: None`, a real `input`), not as a gate denial.
+
+/// The record a locally-decided refusal must leave. Returns it so callers can assert on
+/// the verb and the reason.
+async fn sole_denial_record(fx: &common::Fixture) -> s0::audit::AuditRecord {
+    let records = fx.await_audit_records(1).await;
+    assert_eq!(
+        records.len(),
+        1,
+        "a refused request must leave exactly one record: {records:#?}"
+    );
+    let rec = records.into_iter().next().unwrap();
+    assert!(
+        matches!(rec.gateway.outcome, Outcome::Denied) && !rec.result.allow,
+        "{rec:#?}"
+    );
+    assert!(
+        rec.gate.is_none(),
+        "a cap is a policy-layer refusal on a real resource, not a pre-policy gate \
+         denial: {rec:#?}"
+    );
+    assert!(
+        rec.input.is_some(),
+        "the record must name what was refused — bucket, key and verb: {rec:#?}"
+    );
+    assert!(
+        rec.result.reason.starts_with("deny (gateway):"),
+        "a refusal no policy was asked about must say so, or the trail reads as a policy \
+         verdict on a question that was never put: {rec:#?}"
+    );
+    rec
+}
+
+#[tokio::test]
+async fn an_over_cap_tag_set_is_denied_and_audited() {
+    let fx = common::fixture("sec-tag-cap", common::alice_bundle());
+    let access = GatewayAccess::new(fx.gw.clone());
+    // The default cap is AWS's own: 10 tags per object.
+    let tag_set: Vec<Tag> = (0..11)
+        .map(|i| Tag {
+            key: Some(format!("k{i}")),
+            value: Some("v".into()),
+        })
+        .collect();
+    let mut req = fx.request(
+        "PutObjectTagging",
+        PutObjectTaggingInput {
+            tagging: Tagging { tag_set },
+            ..common::ops::put_object_tagging_input()
+        },
+        Method::PUT,
+    );
+    let err = access
+        .put_object_tagging(&mut req)
+        .await
+        .expect_err("an over-cap tag set must be refused");
+    assert_eq!(
+        *err.code(),
+        S3ErrorCode::AccessDenied,
+        "a cap violation is a denial, not an InvalidRequest — the status class is what \
+         an operator triages on"
+    );
+    assert!(
+        req.extensions.get::<AuthzProof>().is_none(),
+        "a capped request must mint no proof"
+    );
+    let rec = sole_denial_record(&fx).await;
+    let input = rec.input.as_ref().unwrap();
+    assert_eq!(input.action.as_str(), "write_object_tags");
+    assert!(
+        rec.result.reason.contains("over the 10-tag cap"),
+        "{rec:#?}"
+    );
+}
+
+#[tokio::test]
+async fn a_tag_set_with_a_duplicate_key_is_refused() {
+    // A TagSet is a list, so it can carry one key twice. Folding it into a map keeps
+    // one of them and the backend keeps whichever *it* prefers — the policy would then
+    // have authorized a tag set the object never receives. Same class as the parser
+    // differentials the canonicalize-before-forward rule exists to prevent.
+    let fx = common::fixture("sec-tag-dup", common::alice_bundle());
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request(
+        "PutObjectTagging",
+        PutObjectTaggingInput {
+            tagging: Tagging {
+                tag_set: vec![
+                    Tag {
+                        key: Some("tier".into()),
+                        value: Some("internal".into()),
+                    },
+                    Tag {
+                        key: Some("tier".into()),
+                        value: Some("public".into()),
+                    },
+                ],
+            },
+            ..common::ops::put_object_tagging_input()
+        },
+        Method::PUT,
+    );
+    assert!(access.put_object_tagging(&mut req).await.is_err());
+    let rec = sole_denial_record(&fx).await;
+    assert!(rec.result.reason.contains("twice"), "{rec:#?}");
+
+    // Positive control: the same request with one tag is allowed and the tag set the
+    // PDP saw is the one being installed.
+    let fx = common::fixture("sec-tag-ok", common::alice_bundle());
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request(
+        "PutObjectTagging",
+        common::ops::put_object_tagging_input(),
+        Method::PUT,
+    );
+    access.put_object_tagging(&mut req).await.expect("allowed");
+    let captured = fx.capture.snapshot();
+    assert_eq!(
+        captured.last().expect("a capture").raw["requested_tags"]["tier"],
+        serde_json::json!("internal"),
+        "the tag set a write asks to install must reach the PDP, or a policy can never \
+         refuse a self-elevating tag write"
+    );
+}
+
+#[tokio::test]
+async fn a_bucket_name_outside_the_callers_tenant_is_refused() {
+    // RGW addresses a foreign tenant's bucket as `<tenant>:<bucket>`, and the gateway
+    // forwards re-signed as ITS tenant-owner credential — so a qualified name is a
+    // request to operate on someone else's namespace with our authority. Both the
+    // create and the delete half, because they are separate verbs and each is reached
+    // by its own hook.
+    let fx = common::fixture("sec-bucket-name", common::alice_bundle());
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request(
+        "CreateBucket",
+        CreateBucketInput {
+            bucket: "globex:secrets".into(),
+            ..Default::default()
+        },
+        Method::PUT,
+    );
+    let err = access
+        .create_bucket(&mut req)
+        .await
+        .expect_err("a tenant-qualified bucket name must never be created");
+    assert_eq!(*err.code(), S3ErrorCode::AccessDenied);
+    assert!(req.extensions.get::<AuthzProof>().is_none());
+    let rec = sole_denial_record(&fx).await;
+    assert!(
+        rec.result.reason.contains("another tenant's namespace"),
+        "{rec:#?}"
+    );
+
+    let fx = common::fixture("sec-bucket-name-del", common::alice_bundle());
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request(
+        "DeleteBucket",
+        DeleteBucketInput {
+            bucket: "globex:secrets".into(),
+            ..Default::default()
+        },
+        Method::DELETE,
+    );
+    assert!(access.delete_bucket(&mut req).await.is_err());
+    let _ = sole_denial_record(&fx).await;
+}
+
+#[tokio::test]
+async fn create_bucket_does_not_confer_delete_bucket() {
+    // Lesson 5, restated for the bucket lifecycle: a coarse `manage_bucket` verb was
+    // rejected precisely so that being allowed to make a bucket is not being allowed to
+    // destroy one.
+    let only_create = serde_json::json!({
+        "org_settings": { "freeze_writes": false },
+        "tenants": { "acme": {
+            "user_attributes": { "alice": { "groups": [], "attributes": [] } },
+            "bucket_attributes": {},
+            "s3_grants": { "alice": [
+                { "bucket": "scratch", "actions": ["create_bucket"], "prefixes": [] }
+            ] },
+            "group_grants": {}
+        }}
+    });
+    let fx = common::fixture("sec-create-not-delete", only_create);
+    let access = GatewayAccess::new(fx.gw.clone());
+
+    let mut req = fx.request(
+        "DeleteBucket",
+        DeleteBucketInput {
+            bucket: "scratch".into(),
+            ..Default::default()
+        },
+        Method::DELETE,
+    );
+    assert!(
+        access.delete_bucket(&mut req).await.is_err(),
+        "a create_bucket grant must not confer delete_bucket"
+    );
+
+    // Positive control, or the assertion above is satisfied by a deny-all bundle.
+    let mut req = fx.request(
+        "CreateBucket",
+        CreateBucketInput {
+            bucket: "scratch".into(),
+            ..Default::default()
+        },
+        Method::PUT,
+    );
+    access
+        .create_bucket(&mut req)
+        .await
+        .expect("create allowed");
+}
+
+#[tokio::test]
+async fn a_bucket_policy_that_locks_the_gateway_out_is_refused() {
+    // The gateway reaches the backend as the tenant-owner credential. A policy denying
+    // every principal denies that one too — and then the PutBucketPolicy that would
+    // undo it fails as well, so recovery is out-of-band backend administration.
+    let fx = common::fixture("sec-policy-lockout", common::alice_bundle());
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request(
+        "PutBucketPolicy",
+        PutBucketPolicyInput {
+            policy: common::ops::SELF_LOCKOUT_BUCKET_POLICY.into(),
+            ..common::ops::put_bucket_policy_input()
+        },
+        Method::PUT,
+    );
+    let err = access
+        .put_bucket_policy(&mut req)
+        .await
+        .expect_err("a self-lockout policy must not be forwarded");
+    assert_eq!(*err.code(), S3ErrorCode::AccessDenied);
+    assert!(req.extensions.get::<AuthzProof>().is_none());
+    let rec = sole_denial_record(&fx).await;
+    assert!(
+        rec.result.reason.contains("revoke the gateway's own"),
+        "{rec:#?}"
+    );
+    let input = rec.input.as_ref().unwrap();
+    assert_eq!(input.action.as_str(), "write_bucket_config");
+    assert_eq!(input.config_kind.as_deref(), Some("policy"));
+}
+
+#[tokio::test]
+async fn confirm_remove_self_bucket_access_is_refused() {
+    let fx = common::fixture("sec-policy-confirm", common::alice_bundle());
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request(
+        "PutBucketPolicy",
+        PutBucketPolicyInput {
+            confirm_remove_self_bucket_access: Some(true),
+            ..common::ops::put_bucket_policy_input()
+        },
+        Method::PUT,
+    );
+    assert!(access.put_bucket_policy(&mut req).await.is_err());
+    let rec = sole_denial_record(&fx).await;
+    assert!(
+        rec.result.reason.contains("confirm-remove-self"),
+        "{rec:#?}"
+    );
+}
+
+#[tokio::test]
+async fn an_unparseable_or_oversized_bucket_policy_is_refused() {
+    // `xml_max_body_size` is 20 MiB; AWS caps a bucket policy at 20 KB. A document this
+    // gateway parses needs its own bound, and a document it cannot parse is one whose
+    // lockout check it cannot perform — so it is refused rather than forwarded on trust.
+    let fx = common::fixture("sec-policy-size", common::alice_bundle());
+    let access = GatewayAccess::new(fx.gw.clone());
+    let huge = format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Sid":"{}","Effect":"Allow","Principal":"*","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::reports/*"]}}]}}"#,
+        "p".repeat(21 * 1024)
+    );
+    let mut req = fx.request(
+        "PutBucketPolicy",
+        PutBucketPolicyInput {
+            policy: huge,
+            ..common::ops::put_bucket_policy_input()
+        },
+        Method::PUT,
+    );
+    assert!(access.put_bucket_policy(&mut req).await.is_err());
+    let rec = sole_denial_record(&fx).await;
+    assert!(rec.result.reason.contains("over the"), "{rec:#?}");
+
+    let fx = common::fixture("sec-policy-garbage", common::alice_bundle());
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request(
+        "PutBucketPolicy",
+        PutBucketPolicyInput {
+            policy: "not json at all".into(),
+            ..common::ops::put_bucket_policy_input()
+        },
+        Method::PUT,
+    );
+    assert!(access.put_bucket_policy(&mut req).await.is_err());
+    let rec = sole_denial_record(&fx).await;
+    assert!(rec.result.reason.contains("not valid JSON"), "{rec:#?}");
+}
+
+#[tokio::test]
+async fn a_benign_bucket_policy_is_allowed() {
+    // The control every refusal above depends on: without it, "self-lockout policies
+    // are refused" would be equally true of a build that refuses all of them.
+    let fx = common::fixture("sec-policy-ok", common::alice_bundle());
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request(
+        "PutBucketPolicy",
+        common::ops::put_bucket_policy_input(),
+        Method::PUT,
+    );
+    access
+        .put_bucket_policy(&mut req)
+        .await
+        .expect("a policy that does not lock the gateway out is an ordinary write");
+    assert!(req.extensions.get::<AuthzProof>().is_some());
+}
+
+#[tokio::test]
+async fn a_bucket_config_read_does_not_confer_the_other_sub_resource() {
+    // Policy and CORS share one verb by the frozen vocabulary, so `config_kind` is the
+    // ONLY thing distinguishing them — in the policy input and, because the resource key
+    // is a digest of that input, in the decision cache. A build that dropped the field
+    // would serve one cached verdict for both documents.
+    let fx = common::fixture("sec-config-kind", common::alice_bundle());
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request(
+        "GetBucketPolicy",
+        GetBucketPolicyInput {
+            bucket: "reports".into(),
+            ..Default::default()
+        },
+        Method::GET,
+    );
+    access.get_bucket_policy(&mut req).await.expect("allowed");
+    let mut req = fx.request(
+        "GetBucketCors",
+        GetBucketCorsInput {
+            bucket: "reports".into(),
+            ..Default::default()
+        },
+        Method::GET,
+    );
+    access.get_bucket_cors(&mut req).await.expect("allowed");
+
+    let captured = fx.capture.snapshot();
+    let kinds: Vec<_> = captured
+        .iter()
+        .filter_map(|c| c.raw["config_kind"].as_str())
+        .collect();
+    assert_eq!(kinds, vec!["policy", "cors"]);
+    // And the two questions are genuinely different documents. Without `config_kind`
+    // they would be byte-identical, hence one resource key (a digest of the input) and
+    // one cache entry: a `GetBucketCors` answered by a `GetBucketPolicy` verdict.
+    assert_ne!(
+        captured[0].raw, captured[1].raw,
+        "a policy read and a cors read must not emit the same document"
+    );
+}
+
+#[tokio::test]
+async fn an_over_cap_multi_delete_is_denied_and_audited() {
+    // The cap that predates defect B-1 and had the shape the defect describes: it
+    // returned `InvalidRequest` ahead of `ReqCtx`, so an over-cap multi-delete left no
+    // audit record at all and reached the client as a 400. It refuses like every other
+    // cap now — one record, `Outcome::Denied`, no proof.
+    let fx = common::fixture("sec-delete-cap", common::alice_bundle());
+    let access = GatewayAccess::new(fx.gw.clone());
+    let objects: Vec<ObjectIdentifier> = (0..1001).map(|i| oid(&format!("2024/{i}"))).collect();
+    let mut req = fx.request(
+        "DeleteObjects",
+        DeleteObjectsInput {
+            bucket: "reports".into(),
+            delete: Delete {
+                objects,
+                ..Default::default()
+            },
+            ..common::ops::delete_objects_input()
+        },
+        Method::POST,
+    );
+    let err = access
+        .delete_objects(&mut req)
+        .await
+        .expect_err("an over-cap multi-delete must be refused");
+    assert_eq!(*err.code(), S3ErrorCode::AccessDenied);
+    assert!(req.extensions.get::<AuthzProof>().is_none());
+    let rec = sole_denial_record(&fx).await;
+    assert!(
+        rec.result.reason.contains("over the 1000-key cap"),
+        "{rec:#?}"
+    );
+    assert!(
+        rec.input.as_ref().unwrap().delete_keys.is_none(),
+        "an audit record must not copy the unbounded list that was refused for being \
+         unbounded: {rec:#?}"
+    );
+    assert_eq!(
+        fx.pdp_calls(),
+        0,
+        "the cap must refuse before 1001 policy questions are asked"
+    );
+}
+
+// ── the forward must send what the caller signed ────────────────────────────────
+
+/// A `list`-shaped header arrives as ONE header with comma-separated values, and s3s
+/// does not split it — so the forward re-encoded it as a single quoted element and the
+/// backend answered `400 InvalidArgument`.
+///
+/// Found by driving `boto3` through the gateway at a real MinIO backend, not by a unit
+/// test: `get_object_attributes(ObjectAttributes=["ETag"])` worked, `["ETag",
+/// "ObjectSize"]` did not, and both worked when the same client talked to MinIO
+/// directly. `s3s`'s `parse_list_header` (`http/de.rs:118-132`) iterates
+/// `headers.get_all(name)` and never splits on the comma, so
+/// `x-amz-object-attributes: ETag,ObjectSize` parses to the one-element list
+/// `["ETag,ObjectSize"]`; the AWS SDK then quotes any element containing a comma, and
+/// the backend receives `"ETag,ObjectSize"`.
+///
+/// This is not an authorization hole — the attribute list is not separately authorized,
+/// which is a recorded blind spot on `GetObjectAttributes` — but a gateway that changes
+/// a signed request's meaning is a gateway whose audit record describes something other
+/// than what the backend was asked, and that is worth pinning.
+#[tokio::test]
+async fn a_comma_separated_list_header_survives_the_forward_intact() {
+    let fx = common::fixture("comma-list", common::alice_bundle());
+    let access = GatewayAccess::new(fx.gw.clone());
+
+    let mut req = fx.request(
+        "GetObjectAttributes",
+        GetObjectAttributesInput {
+            bucket: "reports".into(),
+            key: "2024/x".into(),
+            // What `parse_list_header` actually produces for
+            // `x-amz-object-attributes: ETag,ObjectSize`.
+            object_attributes: vec![ObjectAttributes::from("ETag,ObjectSize".to_string())],
+            ..Default::default()
+        },
+        Method::GET,
+    );
+    access
+        .get_object_attributes(&mut req)
+        .await
+        .expect("an ordinary attributes read is allowed");
+    assert!(req.extensions.get::<AuthzProof>().is_some());
+    let attrs: Vec<&str> = req
+        .input
+        .object_attributes
+        .iter()
+        .map(ObjectAttributes::as_str)
+        .collect();
+    assert_eq!(
+        attrs,
+        vec!["ETag", "ObjectSize"],
+        "the comma list must be split before the forward re-encodes it, or the backend \
+         receives a single quoted element and rejects the request"
+    );
+
+    // The positive control that keeps this from being satisfied by a hook that rewrites
+    // everything: a single-attribute request is passed through untouched.
+    let mut req = fx.request(
+        "GetObjectAttributes",
+        GetObjectAttributesInput {
+            bucket: "reports".into(),
+            key: "2024/x".into(),
+            object_attributes: vec![ObjectAttributes::from_static(ObjectAttributes::ETAG)],
+            ..Default::default()
+        },
+        Method::GET,
+    );
+    access
+        .get_object_attributes(&mut req)
+        .await
+        .expect("allowed");
+    let attrs: Vec<&str> = req
+        .input
+        .object_attributes
+        .iter()
+        .map(ObjectAttributes::as_str)
+        .collect();
+    assert_eq!(attrs, vec!["ETag"]);
+
+    // And the same defect on the other list header this gateway forwards, so a fix that
+    // only covered the op it was found on would fail here.
+    let mut req = fx.request(
+        "ListObjectsV2",
+        ListObjectsV2Input {
+            bucket: "reports".into(),
+            prefix: Some("2024/".into()),
+            optional_object_attributes: Some(vec![OptionalObjectAttributes::from(
+                "RestoreStatus,RestoreStatus".to_string(),
+            )]),
+            ..Default::default()
+        },
+        Method::GET,
+    );
+    access.list_objects_v2(&mut req).await.expect("allowed");
+    assert_eq!(
+        req.input
+            .optional_object_attributes
+            .as_ref()
+            .map(Vec::len)
+            .unwrap_or_default(),
+        2
     );
 }

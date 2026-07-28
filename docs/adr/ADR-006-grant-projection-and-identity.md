@@ -28,8 +28,8 @@ does yet.
   projected into the control-plane RBAC policy (external) for **control-plane API**
   authorization. Data-plane bucket permissions are **bucket-entity CRUD only**
   (`bucket:create | bucket:read | bucket:update | bucket:delete`): there is **no**
-  `read_objects | list_objects | write_objects | delete_objects | manage_lifecycle`
-  permission, and **no object-prefix scope** anywhere in the grant model.
+  data-plane verb from the frozen 13 (`read_objects`, `list_objects`, … `write_bucket_config`)
+  as a permission, and **no object-prefix scope** anywhere in the grant model.
 - **The per-organization bundle** (implemented): a gzipped document polled by a
   per-organization OPA running the in-backend defense-in-depth policy (external). The real data
   shape carries exactly `tenants.<tenant>.user_attributes`, `tenants.<tenant>.bucket_attributes`
@@ -106,7 +106,7 @@ Grant := {
 | Field | Type | Semantics (as implemented in `authz.rego`) |
 |---|---|---|
 | `bucket` | string | Exact bucket name within the tenant (`bucket_matches`), or the literal `"*"` for all buckets in the tenant. No globbing — `"*"` is a whole-field sentinel, not a pattern. |
-| `actions` | array of string | Values drawn from the closed set `read_objects \| list_objects \| write_objects \| delete_objects \| manage_lifecycle` (`src/model.rs::Action::as_str`), or the single-element `["*"]` (`action_matches`). Unknown verbs are a projection bug: they can never match and MUST be rejected at build time, not emitted. |
+| `actions` | array of string | Values drawn from the closed **13-verb** set (`src/model.rs::Action::as_str`): object-scoped `read_objects \| write_objects \| delete_objects \| read_object_tags \| write_object_tags \| write_object_acl`, listing `list_objects`, bucket-scoped `read_bucket \| create_bucket \| delete_bucket \| read_bucket_config \| write_bucket_config`, account-scoped `list_buckets`; or the single-element `["*"]` (`action_matches`). `manage_lifecycle` was **deleted** — it was the only keyless verb and its rego branch was a whole-bucket allow waiting for an op to reach it. Unknown verbs are a projection bug: they can never match and MUST be rejected at build time, not emitted. |
 | `prefixes` | array of string | Raw object-key prefixes matched by `startswith(input.object, p)` (`object_in_scope`). Absent or empty ⇒ the grant scopes the whole bucket (`whole_bucket`). No wildcards, no regex; a `*` inside a prefix is a literal character. |
 
 The full **superset bundle** (target), with today's fields unchanged:
@@ -146,10 +146,12 @@ The full **superset bundle** (target), with today's fields unchanged:
    accident of string handling.
 3. An empty prefix after stripping means whole-bucket: emit `"prefixes": []` (or omit), never
    `"prefixes": [""]`.
-4. `manage_lifecycle` (and other keyless bucket-level ops) ignores `prefixes` by design —
-   `authz.rego`'s bucket-level rule checks only `(bucket, action)`. The projection MUST emit
-   `manage_lifecycle` grants with `"prefixes": []` so the data never implies a scoping the
-   policy does not apply.
+4. The **bucket-scoped verbs** (`read_bucket`, `create_bucket`, `delete_bucket`,
+   `read_bucket_config`, `write_bucket_config`) ignore `prefixes` by design — the request
+   carries no object key, so `authz.rego`'s `bucket_actions` rule checks only
+   `(bucket, action)`. The projection MUST emit those grants with `"prefixes": []` so the
+   data never implies a scoping the policy does not apply. This is sound only because they
+   are their own verbs: nothing here is reachable from a prefix-scoped `read_objects` grant.
 
 **What is deliberately NOT in the shape:** no `s3_deny` / `s3_prefix_deny` / negative grants.
 The deny surface stays what it is today: the per-bucket `denylist`, the org-global
@@ -175,6 +177,12 @@ Two membership invariants follow directly from the rego and bind the projection:
   non-member is inert (`member` fails; deny reason `"deny: principal not a tenant member"`) —
   fail-closed but a silent product bug. Same for group grants: they only take effect for tenant
   members.
+- **`list_buckets` is what makes a bucket list non-empty.** Bucket *visibility* is a response
+  obligation (ADR-007) whose absent value means **nothing visible**, so a projection that emits
+  object grants without the `list_buckets` verb produces a principal that can read and write its
+  buckets and sees an empty `aws s3 ls`. The shipped module reads visibility as "every bucket the
+  subject holds a grant on, gated on holding `list_buckets` somewhere"; the authoritative
+  derivation, including subtraction of deny grants, is the projection's.
 - **One group namespace.** Keys of `group_grants` MUST be byte-identical to the group strings
   the control plane puts in `user_attributes[sub].groups` and to the `groups` claim the STS mint
   copies from the OIDC token into the session (`SessionClaims.groups`, `src/auth/sts.rs`) — all
@@ -407,13 +415,13 @@ group-intersection rego tightening decision (R4). **F4** — production config f
 These items are implemented by the control plane against this repository's policy and identity
 contracts.
 
-- **Extend the permission catalog** with the object-operation family mapping 1:1 to the five
-  gateway actions (`read_objects`, `list_objects`, `write_objects`, `delete_objects`,
-  `manage_lifecycle`) and an object-prefix scope on grants (`/<tenant>/<bucket>/<prefix>`).
+- **Extend the permission catalog** with the operation family mapping 1:1 to the 13 frozen
+  gateway verbs (`src/model.rs::Action`) and an object-prefix scope on grants
+  (`/<tenant>/<bucket>/<prefix>`).
 - **Build the projection** emitting D1 exactly: roles pre-expanded into `s3_grants[sub]`;
   `group_grants[group]` keyed by the canonical group form; build-time validation — actions ⊆
   closed set or `["*"]`; bucket = name or `"*"`; prefixes bare, never `""`, `/`-terminated unless
-  a stem is intended; `manage_lifecycle` ⇒ `prefixes: []`; every granted sub present in
+  a stem is intended; bucket-scoped verbs ⇒ `prefixes: []`; every granted sub present in
   `user_attributes` (D2 invariants).
 - **Grow the bundle additively**: new keys under `tenants.<tenant>` only; `user_attributes` /
   `bucket_attributes` / `org_settings.freeze_writes` unchanged; a regression test proving the

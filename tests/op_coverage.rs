@@ -13,9 +13,10 @@
 use std::collections::BTreeSet;
 
 use s0::access::optable::{
-    Coverage, DangerTier, FROZEN_VERBS, GateDenial, OP_TABLE, TODAYS_ACTIONS, enforced_ops,
-    gate_op, spec,
+    Coverage, DangerTier, FROZEN_VERBS, GateDenial, OP_TABLE, action_for, enforced_ops, gate_op,
+    spec,
 };
+use s0::model::Action;
 
 /// The operation names `s3s` 0.14.1 can route, extracted from the pinned crate
 /// source. See the regeneration command on `OP_TABLE`. Checked in rather than derived
@@ -45,13 +46,19 @@ const TARGET_ENFORCED: [&str; 29] = [
     "PutObject",
     "UploadPart",
     "UploadPartCopy",
-    // the 14 M4 adds (S4-tier1/tier2/tagging/getattrs/acl-full/postobject/listbuckets)
+    // the 14 M4 adds (S4-tier1/tier2/tagging/getattrs/postobject/listbuckets).
+    //
+    // This list was written before the M4 scope was settled and named
+    // `GetBucketLifecycleConfiguration` / `DeleteBucketLifecycle`, which the settled
+    // scope drops (there is no `manage_lifecycle` verb any more — it was deleted for
+    // being a keyless whole-bucket allow), in favour of the write halves of the two
+    // config pairs: shipping `GetBucketPolicy`/`GetBucketCors` without their `Put`
+    // counterparts leaves an operator able to read a bucket's configuration and unable
+    // to fix it.
     "CreateBucket",
     "DeleteBucket",
-    "DeleteBucketLifecycle",
     "DeleteObjectTagging",
     "GetBucketCors",
-    "GetBucketLifecycleConfiguration",
     "GetBucketLocation",
     "GetBucketPolicy",
     "GetObjectAttributes",
@@ -60,6 +67,8 @@ const TARGET_ENFORCED: [&str; 29] = [
     "ListBuckets",
     "PostObject",
     "PutBucketCors",
+    "PutBucketPolicy",
+    "PutObjectTagging",
 ];
 
 fn s3s_op_names() -> Vec<&'static str> {
@@ -118,17 +127,19 @@ fn op_table_covers_every_s3s_operation_and_nothing_else() {
 }
 
 #[test]
-fn exactly_15_enforced_84_denied() {
-    // Tightened to 29/70 as M4's exit criterion (task S4-op-scope-test).
+fn exactly_29_enforced_70_denied() {
+    // 15 at the end of M1, +13 for the mechanical half of the M4 op scope, +ListBuckets
+    // — the one op that also filters a *response*. This is M4's exit criterion: the
+    // reviewed 29-op scope, and the other 70 still refused at the gate.
     let enforced = enforced_ops();
     let denied = OP_TABLE.len() - enforced.len();
     assert_eq!(
         enforced.len(),
-        15,
+        29,
         "enforced set changed to {enforced:?} — a Denied → Enforced flip needs two \
          reviewers, its hook, its dispatch arm, and this number updated"
     );
-    assert_eq!(denied, 84);
+    assert_eq!(denied, 70);
 }
 
 #[test]
@@ -214,17 +225,83 @@ fn op_table_verbs_are_from_the_frozen_vocabulary() {
 }
 
 #[test]
-fn enforced_verbs_exist_in_todays_action_vocabulary() {
-    // An Enforced op must be *decidable* now: its verb has to be one `Action` can
-    // express, or the hook could not build an OpaInput for it. S2-verbs widens
-    // `Action` to all 13 frozen verbs; until then this is the binding constraint on
-    // what may flip to Enforced.
+fn enforced_verbs_are_expressible_as_actions() {
+    // An Enforced op must be *decidable*: its verb has to be one `Action` can express,
+    // or the hook could not build an OpaInput for it.
     for s in OP_TABLE.iter().filter(|s| s.coverage == Coverage::Enforced) {
         let verb = s.verb.expect("an enforced op has a verb");
         assert!(
-            TODAYS_ACTIONS.iter().any(|a| a.as_str() == verb),
-            "{} is Enforced with verb {verb}, which today's Action cannot express",
+            action_for(s).is_some(),
+            "{} is Enforced with verb {verb}, which `Action` cannot express",
             s.name
+        );
+    }
+}
+
+#[test]
+fn the_write_set_matches_the_shipped_rego() {
+    // `freeze_writes` is the only kill switch the live bundle carries, and it is
+    // implemented twice: `Action::is_write` on the PEP side (which decides nothing
+    // today but is what a future write-side guard reads) and `write_actions` in the
+    // rego, which is what actually freezes. A verb one side calls a write and the other
+    // does not is a freeze that silently does not cover it.
+    let rego: &str = include_str!("../policy/gateway/authz.rego");
+    let start = rego
+        .find("write_actions := {")
+        .expect("the shipped rego must define write_actions");
+    let body = &rego[start..];
+    let end = body.find('}').expect("write_actions is not closed");
+    let mut from_rego: Vec<String> = body[..end]
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_string)
+        .collect();
+    let mut from_rust: Vec<String> = Action::ALL
+        .iter()
+        .filter(|a| a.is_write())
+        .map(|a| a.as_str().to_string())
+        .collect();
+    from_rego.sort();
+    from_rust.sort();
+    assert_eq!(
+        from_rego, from_rust,
+        "the rego's write_actions and Action::is_write disagree — freeze_writes covers \
+         a different set of verbs on each side"
+    );
+    assert_eq!(from_rust.len(), 7, "the frozen write set is 7 verbs");
+}
+
+#[test]
+fn every_bucket_scoped_verb_is_keyless_in_the_rego_too() {
+    // The bucket verbs ignore grant prefixes (there is no key to test one against).
+    // That is only sound while they are their own verbs — the moment an object verb
+    // joined this set, a `read_objects` grant scoped to `2024/` would confer
+    // whole-bucket access, which is precisely why `manage_lifecycle` was deleted.
+    let rego: &str = include_str!("../policy/gateway/authz.rego");
+    let start = rego
+        .find("bucket_actions := {")
+        .expect("the shipped rego must define bucket_actions");
+    let body = &rego[start..];
+    let end = body.find('}').expect("bucket_actions is not closed");
+    let mut from_rego: Vec<String> = body[..end]
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_string)
+        .collect();
+    let mut from_rust: Vec<String> = Action::ALL
+        .iter()
+        .filter(|a| a.is_bucket_scoped())
+        .map(|a| a.as_str().to_string())
+        .collect();
+    from_rego.sort();
+    from_rust.sort();
+    assert_eq!(from_rego, from_rust);
+    for verb in &from_rust {
+        assert!(
+            !verb.contains("objects"),
+            "{verb} is keyless in the rego but names objects"
         );
     }
 }
@@ -246,18 +323,60 @@ fn only_enforced_ops_carry_blind_spots() {
 }
 
 #[test]
-fn the_acl_header_blind_spot_is_recorded_on_every_op_that_has_it() {
-    // Regression guard for the retrofit S2-acl-deny closes: PutObject, CopyObject and
-    // CreateMultipartUpload all accept `x-amz-acl` / `x-amz-grant-*`, and today's
-    // hooks read only bucket and key. If someone lands the header deny, the fix is to
-    // delete these entries — not to leave a stale claim of blindness.
-    for op in ["PutObject", "CopyObject", "CreateMultipartUpload"] {
-        let s = spec(op).unwrap();
-        assert!(
-            s.blind_spots
-                .iter()
-                .any(|b| b.contains("x-amz-acl") || b.contains("x-amz-grant")),
-            "{op} must record the ACL-header blind spot until S2-acl-deny lands"
-        );
+fn the_acl_and_retention_blind_spots_are_closed_not_merely_unrecorded() {
+    // The inverse of the guard this replaces. Until the M4 retrofit, `PutObject`,
+    // `CopyObject`, `CreateMultipartUpload`, `CreateBucket` and `PostObject` were
+    // *required* to declare that they did not inspect `x-amz-acl` / `x-amz-grant-*`, and
+    // the two delete ops that they did not inspect `x-amz-bypass-governance-retention`.
+    // They do now (`s0::access::headers`, `s0::access::tagging`), so the entries had to
+    // go — and a stale claim of blindness is worse than none, because the blind-spot list
+    // is the document a reviewer reads before flipping an op on.
+    //
+    // This assertion is about the *table*. The behaviour it corresponds to is proved in
+    // `tests/request_riders.rs`, hook by hook and against a wildcard-granted principal.
+    for s in OP_TABLE {
+        if s.coverage != Coverage::Enforced {
+            continue;
+        }
+        for b in s.blind_spots {
+            let claim = b.to_ascii_lowercase();
+            // "x-amz-acl / x-amz-grant-* are not inspected" is now false. A blind spot
+            // may still *mention* ACLs to explain a residual (CreateBucket's
+            // object_ownership does), so the guard is on the header names themselves.
+            assert!(
+                !claim.contains("x-amz-acl") && !claim.contains("x-amz-grant-"),
+                "{} still claims the ACL headers are uninspected; they are screened in \
+                 code and authorized as write_object_acl. Delete the entry or fix the \
+                 hook: {b}",
+                s.name
+            );
+            assert!(
+                !claim.contains("bypass-governance"),
+                "{} still claims the governance-bypass header is uninspected; it is \
+                 refused in code: {b}",
+                s.name
+            );
+        }
     }
+
+    // The two claims that must NOT have been deleted along with them: the retrofit
+    // closed the ACL and the bypass, not object lock or the copy-inherited tag set.
+    assert!(
+        spec("PutObject")
+            .unwrap()
+            .blind_spots
+            .iter()
+            .any(|b| b.contains("object-lock")),
+        "PutObject still forwards object-lock headers unauthorized; that residual has to \
+         stay on the record"
+    );
+    assert!(
+        spec("CopyObject")
+            .unwrap()
+            .blind_spots
+            .iter()
+            .any(|b| b.contains("tagging-directive")),
+        "a COPY-directive copy still moves the source object's tags onto a new key \
+         without a tag-write decision"
+    );
 }

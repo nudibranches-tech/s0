@@ -39,6 +39,13 @@ struct Expect {
     narrow_prefix: Option<String>,
     #[serde(default)]
     allowed_prefixes: Option<Vec<String>>,
+    /// `ListBuckets`. Asserted as a **set**, and `Some(vec![])` is a real assertion —
+    /// "allowed to enumerate, nothing visible" is a distinct outcome from "denied", and
+    /// the corpus has to be able to say so.
+    #[serde(default)]
+    visible_buckets: Option<Vec<String>>,
+    #[serde(default)]
+    all_buckets_visible: Option<bool>,
     #[serde(default)]
     no_obligations: bool,
 }
@@ -113,8 +120,30 @@ fn check_case(case: &Case, d: &Decision) -> Vec<String> {
             ));
         }
     }
+    if let Some(vb) = &case.expect.visible_buckets {
+        let mut got = d.obligations.visible_buckets.clone();
+        got.sort();
+        let mut want = vb.clone();
+        want.sort();
+        if got != want {
+            out.push(format!(
+                "[{tag}] visible_buckets = {got:?} expected {want:?}"
+            ));
+        }
+    }
+    if let Some(all) = case.expect.all_buckets_visible
+        && d.obligations.all_buckets_visible != all
+    {
+        out.push(format!(
+            "[{tag}] all_buckets_visible = {} expected {all}",
+            d.obligations.all_buckets_visible
+        ));
+    }
     if case.expect.no_obligations
-        && (d.obligations.narrow_prefix.is_some() || !d.obligations.allowed_prefixes.is_empty())
+        && (d.obligations.narrow_prefix.is_some()
+            || !d.obligations.allowed_prefixes.is_empty()
+            || !d.obligations.visible_buckets.is_empty()
+            || d.obligations.all_buckets_visible)
     {
         out.push(format!(
             "[{tag}] expected no obligations, got {:?}",

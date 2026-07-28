@@ -188,12 +188,63 @@ impl Default for AuditFileConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct LimitsConfig {
     pub xml_max_body_size: usize,
+    /// Ceiling on the file part of a browser form upload (`PostObject`).
+    ///
+    /// This one is **not** an ordinary request cap: s3s aggregates the whole file into
+    /// memory during route resolution — before `check`, before the typed hook, before
+    /// any authorization happens at all (`s3s-0.14.1/src/ops/mod.rs:539-551`). So it
+    /// bounds what an *unauthorized* caller can make this process allocate, multiplied
+    /// by `max_connections`. s3s's own default is 5 GiB, which at 1024 connections is
+    /// not a bound at all; the default here is 64 MiB, on the grounds that the form-POST
+    /// path exists for browser uploads and anything larger belongs on `PutObject` or a
+    /// multipart upload, which stream.
+    ///
+    /// Defaulted (unlike its neighbours) so that a config which spells out `limits`
+    /// without naming this field gets the safe bound rather than s3s's 5 GiB.
+    #[serde(default = "default_post_object_max_file_size")]
     pub post_object_max_file_size: u64,
     pub presigned_url_max_skew_time_secs: u32,
     /// AWS semantic cap: `DeleteObjects` ≤ 1000 keys (enforced before OPA).
     pub max_delete_keys: usize,
+    /// AWS semantic cap: ≤ 10 tags per object (`PutObjectTagging`, and the tag set a
+    /// future `PutObject`/`PostObject` retrofit parses).
+    ///
+    /// A cap here is a **resource bound**, never a deny mechanism: exceeding it
+    /// produces a real `write_object_tags` Deny sub-decision that is audited, not a
+    /// bare `InvalidRequest` that short-circuits ahead of the audit call (plan defect
+    /// B-1). Set it to 0 and every tag write is refused *and recorded*.
+    #[serde(default = "default_max_tag_count")]
+    pub max_tag_count: usize,
+    /// Byte ceiling on a `PutBucketPolicy` document. AWS caps bucket policies at 20 KB;
+    /// `xml_max_body_size` (20 MiB) is four orders of magnitude too generous for a
+    /// control-plane body, and the gateway parses this one before forwarding it.
+    #[serde(default = "default_max_bucket_policy_bytes")]
+    pub max_bucket_policy_bytes: usize,
+    /// AWS semantic cap: ≤ 100 CORS rules per bucket (`PutBucketCors`).
+    #[serde(default = "default_max_cors_rules")]
+    pub max_cors_rules: usize,
     /// Multi-prefix list fan-out bound; above it the list fails closed.
     pub max_list_fanout: usize,
+    /// Page size ceiling for a **filtered** `ListBuckets`.
+    ///
+    /// The gateway owns this pagination outright — filtering the backend's answer makes
+    /// its `max-buckets` and `continuation-token` meaningless to the client — so a
+    /// caller-supplied `max-buckets` is clamped to this rather than honored. AWS's own
+    /// default page is 10 000; 1 000 keeps one response bounded in the same order as a
+    /// `ListObjectsV2` page.
+    #[serde(default = "default_max_buckets_per_page")]
+    pub max_buckets_per_page: usize,
+    /// How many backend `ListBuckets` pages one client request may drain.
+    ///
+    /// A filtered listing cannot be produced incrementally: the gateway sorts the whole
+    /// visible set before it can cut a stable page (see `proxy::bucketfilter`), so it
+    /// reads the tenant's bucket list to the end. This bounds that read. A tenant with
+    /// more buckets than this is **refused**, loudly — an under-reported bucket list is
+    /// indistinguishable from a revoked grant, and silently omitting buckets from an
+    /// authorization-filtered response is the failure mode this whole file exists to
+    /// avoid.
+    #[serde(default = "default_max_bucket_list_pages")]
+    pub max_bucket_list_pages: usize,
     /// Max concurrent connections (slowloris / resource-exhaustion guard).
     pub max_connections: usize,
     /// Header read timeout (slowloris).
@@ -217,10 +268,15 @@ impl Default for LimitsConfig {
     fn default() -> Self {
         LimitsConfig {
             xml_max_body_size: 20 * 1024 * 1024,
-            post_object_max_file_size: 5 * 1024 * 1024 * 1024,
+            post_object_max_file_size: default_post_object_max_file_size(),
             presigned_url_max_skew_time_secs: 900,
             max_delete_keys: 1000,
+            max_tag_count: default_max_tag_count(),
+            max_bucket_policy_bytes: default_max_bucket_policy_bytes(),
+            max_cors_rules: default_max_cors_rules(),
             max_list_fanout: 16,
+            max_buckets_per_page: default_max_buckets_per_page(),
+            max_bucket_list_pages: default_max_bucket_list_pages(),
             max_connections: 1024,
             header_read_timeout_secs: 15,
             backend_connect_timeout_secs: 5,
@@ -511,6 +567,31 @@ fn default_jwks_refresh_secs() -> u64 {
 fn default_backend_connect_timeout_secs() -> u64 {
     5
 }
+/// 64 MiB. See the field docs: s3s buffers this entire body in memory *before* the
+/// gateway authorizes anything, so it is an unauthenticated allocation bound.
+fn default_post_object_max_file_size() -> u64 {
+    64 * 1024 * 1024
+}
+/// AWS: 10 tags per object.
+fn default_max_tag_count() -> usize {
+    10
+}
+/// AWS: 20 KB per bucket policy.
+fn default_max_bucket_policy_bytes() -> usize {
+    20 * 1024
+}
+/// AWS: 100 CORS rules per bucket.
+fn default_max_buckets_per_page() -> usize {
+    1000
+}
+
+fn default_max_bucket_list_pages() -> usize {
+    64
+}
+
+fn default_max_cors_rules() -> usize {
+    100
+}
 fn default_sub_claim() -> String {
     "sub".into()
 }
@@ -533,6 +614,35 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_form_upload_buffer_is_bounded_well_below_the_substrate_default() {
+        // s3s aggregates a PostObject file into memory during route resolution —
+        // before `check`, before any authorization — so this number times
+        // `max_connections` is what an *unauthenticated* caller can make this process
+        // allocate. s3s's own default is 5 GiB, which at 1024 connections is not a
+        // bound at all.
+        let limits = LimitsConfig::default();
+        assert_eq!(limits.post_object_max_file_size, 64 * 1024 * 1024);
+        assert!(
+            limits.post_object_max_file_size < 5 * 1024 * 1024 * 1024,
+            "the s3s default must not be inherited"
+        );
+        // And it applies even to a config that spells out `limits` without naming it,
+        // which is how the dangerous value would otherwise creep back in.
+        let cfg: LimitsConfig = serde_json::from_str(
+            r#"{"xml_max_body_size":20971520,"presigned_url_max_skew_time_secs":900,
+                "max_delete_keys":1000,"max_list_fanout":16,"max_connections":1024,
+                "header_read_timeout_secs":15}"#,
+        )
+        .expect("limits without the field");
+        assert_eq!(cfg.post_object_max_file_size, 64 * 1024 * 1024);
+        // The control-plane body caps: AWS's own semantics, four orders of magnitude
+        // below `xml_max_body_size`.
+        assert_eq!(cfg.max_tag_count, 10);
+        assert_eq!(cfg.max_bucket_policy_bytes, 20 * 1024);
+        assert_eq!(cfg.max_cors_rules, 100);
+    }
 
     /// `expand_env` is what makes a single ConfigMap render a per-pod spill path.
     /// These run in one process, so each case uses a variable name of its own rather

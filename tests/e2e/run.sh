@@ -193,7 +193,7 @@ expect ok "AKIAOPEN GET open/pub/greeting.txt (still granted)" \
 info "revoking open-user's grant in the bundle; waiting for the 2s refresh"
 cat > "$STATE/bundle.json" <<'JSON'
 {
-  "org_settings": { "freeze_writes": false },
+  "org_settings": { "freeze_writes": false, "reserved_tag_keys": [] },
   "tenants": {
     "acme": {
       "user_attributes": { "open-user": { "groups": [], "attributes": [] }, "admin-user": { "groups": [], "attributes": [] } },

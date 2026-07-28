@@ -109,6 +109,32 @@ async fn capture_enforced_ops() -> (BTreeMap<String, serde_json::Value>, Vec<&'s
     );
     assert!(access.delete_objects(&mut req).await.is_ok());
 
+    // A write carrying **riders** — the M4 ACL/tag retrofit's wire shape. Without this
+    // the corpus would contain no document with a non-empty `acl_grants` or a
+    // header-derived `requested_tags`, so a policy author would never see either, and the
+    // drift gate could not tell that a canned ACL is emitted as `{source, value}`.
+    //
+    // Deliberately the *allowed* combination: `private` is the one canned ACL that
+    // confers nothing, and `tier` is outside the fixture's reserved namespace. The
+    // refusals this stage adds are screened in code before `decide`, so they emit no
+    // capture at all — which is itself the property being relied on.
+    let mut req = fx.request_on_route(
+        "PutObject",
+        s3s::dto::PutObjectInput {
+            bucket: "reports".into(),
+            key: "2024/x".into(),
+            acl: Some(s3s::dto::ObjectCannedACL::from_static(
+                s3s::dto::ObjectCannedACL::PRIVATE,
+            )),
+            tagging: Some("tier=internal".into()),
+            ..Default::default()
+        },
+    );
+    access
+        .put_object(&mut req)
+        .await
+        .expect("a no-op canned ACL and an unreserved tag key must still be allowed");
+
     assert_eq!(
         fx.capture.dropped(),
         0,

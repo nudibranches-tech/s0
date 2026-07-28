@@ -10,6 +10,7 @@
             "bob":   { "groups": [], "attributes": [] },
             "carol": { "groups": ["admins"], "attributes": [] },
             "dave":  { "groups": [], "attributes": [] },
+            "erin":  { "groups": [], "attributes": [] },
             "mallory": { "groups": [], "attributes": [] }
           },
           "bucket_attributes": {
@@ -28,6 +29,10 @@
             ],
             "dave": [
               { "bucket": "reports", "actions": ["read_objects", "list_objects"], "prefixes": ["logs/"] }
+            ],
+            "erin": [
+              { "bucket": "reports", "actions": ["read_bucket", "create_bucket", "read_bucket_config", "write_bucket_config"], "prefixes": [] },
+              { "bucket": "reports", "actions": ["write_objects", "read_object_tags", "write_object_tags"], "prefixes": ["2024/"] }
             ]
           },
           "group_grants": {
@@ -36,6 +41,37 @@
             ],
             "admins": []
           }
+        }
+      }
+    },
+    "buckets": {
+      "_comment": "The ACCOUNT scope (ListBuckets, input.bucket == \"\"). Enumeration is the list_buckets capability; visibility follows access. The only unfiltered path is a wildcard grant with no denylist entry anywhere in the tenant.",
+      "org_settings": { "freeze_writes": false },
+      "tenants": {
+        "acme": {
+          "user_attributes": {
+            "nora":  { "groups": [], "attributes": [] },
+            "omar":  { "groups": [], "attributes": [] },
+            "pia":   { "groups": [], "attributes": [] },
+            "quinn": { "groups": [], "attributes": [] },
+            "rhea":  { "groups": [], "attributes": [] },
+            "sam":   { "groups": [], "attributes": [] }
+          },
+          "bucket_attributes": {
+            "reports": { "denylist": {} },
+            "logs":    { "denylist": {} },
+            "secret":  { "denylist": { "quinn": true, "rhea": true } }
+          },
+          "s3_grants": {
+            "nora":  [ { "bucket": "*", "actions": ["*"], "prefixes": [] } ],
+            "omar":  [ { "bucket": "reports", "actions": ["list_buckets", "read_objects"], "prefixes": [] },
+                       { "bucket": "logs", "actions": ["read_objects"], "prefixes": [] } ],
+            "pia":   [ { "bucket": "reports", "actions": ["read_objects"], "prefixes": [] } ],
+            "quinn": [ { "bucket": "secret", "actions": ["list_buckets", "read_objects"], "prefixes": [] } ],
+            "rhea":  [ { "bucket": "*", "actions": ["list_buckets", "read_objects"], "prefixes": [] } ],
+            "sam":   [ { "bucket": "*", "actions": ["read_objects", "list_objects"], "prefixes": [] } ]
+          },
+          "group_grants": {}
         }
       }
     },
@@ -57,103 +93,159 @@
   },
   "cases": [
     { "name": "read within prefix grant", "bundle": "default",
-      "input": { "principal": {"sub":"alice","type":"user","attributes":{"groups":["analysts"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"read_objects", "bucket":"reports", "object":"2024/q1.csv", "request":{"method":"GET"} },
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"alice","type":"user","attributes":{"groups":["analysts"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"read_objects", "bucket":"reports", "object":"2024/q1.csv", "request":{"method":"GET"} },
       "expect": { "allow": true, "reason_contains": "grant matched" } },
 
     { "name": "read outside prefix grant denied", "bundle": "default",
-      "input": { "principal": {"sub":"alice","type":"user","attributes":{"groups":["analysts"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"read_objects", "bucket":"reports", "object":"2023/old.csv", "request":{"method":"GET"} },
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"alice","type":"user","attributes":{"groups":["analysts"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"read_objects", "bucket":"reports", "object":"2023/old.csv", "request":{"method":"GET"} },
       "expect": { "allow": false, "reason_contains": "no grant" } },
 
     { "name": "write denied when grant lacks write action", "bundle": "default",
-      "input": { "principal": {"sub":"alice","type":"user","attributes":{"groups":["analysts"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"write_objects", "bucket":"reports", "object":"2024/new.csv", "request":{"method":"PUT"} },
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"alice","type":"user","attributes":{"groups":["analysts"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"write_objects", "bucket":"reports", "object":"2024/new.csv", "request":{"method":"PUT"} },
       "expect": { "allow": false } },
 
     { "name": "whole-bucket read grant", "bundle": "default",
-      "input": { "principal": {"sub":"bob","type":"user","attributes":{"groups":[]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"read_objects", "bucket":"public", "object":"anything/here.txt", "request":{"method":"GET"} },
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"bob","type":"user","attributes":{"groups":[]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"read_objects", "bucket":"public", "object":"anything/here.txt", "request":{"method":"GET"} },
       "expect": { "allow": true } },
 
     { "name": "denylist beats membership", "bundle": "default",
-      "input": { "principal": {"sub":"bob","type":"user","attributes":{"groups":[]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"read_objects", "bucket":"reports", "object":"2024/q1.csv", "request":{"method":"GET"} },
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"bob","type":"user","attributes":{"groups":[]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"read_objects", "bucket":"reports", "object":"2024/q1.csv", "request":{"method":"GET"} },
       "expect": { "allow": false, "reason_contains": "denylist" } },
 
     { "name": "whole-bucket write grant", "bundle": "default",
-      "input": { "principal": {"sub":"bob","type":"user","attributes":{"groups":[]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"write_objects", "bucket":"public", "object":"upload/x.bin", "request":{"method":"PUT"} },
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"bob","type":"user","attributes":{"groups":[]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"write_objects", "bucket":"public", "object":"upload/x.bin", "request":{"method":"PUT"} },
       "expect": { "allow": true } },
 
     { "name": "wildcard bucket and action delete", "bundle": "default",
-      "input": { "principal": {"sub":"carol","type":"user","attributes":{"groups":["admins"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"delete_objects", "bucket":"reports", "object":"2024/q1.csv", "request":{"method":"DELETE"} },
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"carol","type":"user","attributes":{"groups":["admins"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"delete_objects", "bucket":"reports", "object":"2024/q1.csv", "request":{"method":"DELETE"} },
       "expect": { "allow": true } },
 
     { "name": "non-member denied", "bundle": "default",
-      "input": { "principal": {"sub":"eve","type":"user","attributes":{"groups":[]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"read_objects", "bucket":"public", "object":"x.txt", "request":{"method":"GET"} },
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"eve","type":"user","attributes":{"groups":[]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"read_objects", "bucket":"public", "object":"x.txt", "request":{"method":"GET"} },
       "expect": { "allow": false, "reason_contains": "not a tenant member" } },
 
     { "name": "group grant read within shared prefix", "bundle": "default",
-      "input": { "principal": {"sub":"alice","type":"user","attributes":{"groups":["analysts"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"read_objects", "bucket":"public", "object":"shared/report.csv", "request":{"method":"GET"} },
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"alice","type":"user","attributes":{"groups":["analysts"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"read_objects", "bucket":"public", "object":"shared/report.csv", "request":{"method":"GET"} },
       "expect": { "allow": true } },
 
     { "name": "group grant does not cover other prefixes", "bundle": "default",
-      "input": { "principal": {"sub":"alice","type":"user","attributes":{"groups":["analysts"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"read_objects", "bucket":"public", "object":"private/secret.csv", "request":{"method":"GET"} },
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"alice","type":"user","attributes":{"groups":["analysts"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"read_objects", "bucket":"public", "object":"private/secret.csv", "request":{"method":"GET"} },
       "expect": { "allow": false } },
 
     { "name": "token-claimed group is ignored; live bundle membership is authoritative", "bundle": "default",
-      "input": { "principal": {"sub":"mallory","type":"user","attributes":{"groups":["analysts"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"read_objects", "bucket":"public", "object":"shared/report.csv", "request":{"method":"GET"} },
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"mallory","type":"user","attributes":{"groups":["analysts"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"read_objects", "bucket":"public", "object":"shared/report.csv", "request":{"method":"GET"} },
       "expect": { "allow": false, "reason_contains": "no grant" } },
 
     { "name": "list unbounded with multiple prefix grants -> allowed_prefixes", "bundle": "default",
-      "input": { "principal": {"sub":"alice","type":"user","attributes":{"groups":["analysts"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"list_objects", "bucket":"reports", "request":{"method":"GET"} },
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"alice","type":"user","attributes":{"groups":["analysts"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"list_objects", "bucket":"reports", "request":{"method":"GET"} },
       "expect": { "allow": true, "allowed_prefixes": ["2024/", "2025/"] } },
 
     { "name": "list with in-scope prefix -> no narrowing", "bundle": "default",
-      "input": { "principal": {"sub":"alice","type":"user","attributes":{"groups":["analysts"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"list_objects", "bucket":"reports", "prefix":"2024/", "request":{"method":"GET"} },
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"alice","type":"user","attributes":{"groups":["analysts"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"list_objects", "bucket":"reports", "prefix":"2024/", "request":{"method":"GET"} },
       "expect": { "allow": true, "no_obligations": true } },
 
     { "name": "list with out-of-scope prefix denied", "bundle": "default",
-      "input": { "principal": {"sub":"alice","type":"user","attributes":{"groups":["analysts"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"list_objects", "bucket":"reports", "prefix":"other/", "request":{"method":"GET"} },
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"alice","type":"user","attributes":{"groups":["analysts"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"list_objects", "bucket":"reports", "prefix":"other/", "request":{"method":"GET"} },
       "expect": { "allow": false } },
 
     { "name": "list unbounded with single prefix grant -> narrow_prefix", "bundle": "default",
-      "input": { "principal": {"sub":"dave","type":"user","attributes":{"groups":[]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"list_objects", "bucket":"reports", "request":{"method":"GET"} },
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"dave","type":"user","attributes":{"groups":[]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"list_objects", "bucket":"reports", "request":{"method":"GET"} },
       "expect": { "allow": true, "narrow_prefix": "logs/" } },
 
     { "name": "list whole-bucket grant -> no narrowing", "bundle": "default",
-      "input": { "principal": {"sub":"bob","type":"user","attributes":{"groups":[]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"list_objects", "bucket":"public", "request":{"method":"GET"} },
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"bob","type":"user","attributes":{"groups":[]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"list_objects", "bucket":"public", "request":{"method":"GET"} },
       "expect": { "allow": true, "no_obligations": true } },
 
-    { "name": "manage_lifecycle allowed by wildcard grant", "bundle": "default",
-      "input": { "principal": {"sub":"carol","type":"user","attributes":{"groups":["admins"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"manage_lifecycle", "bucket":"reports", "request":{"method":"PUT"} },
-      "expect": { "allow": true } },
+    { "name": "read_bucket is its own verb, not a fall-through of read_objects", "bundle": "default",
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"erin","type":"user","attributes":{"groups":[]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"read_bucket", "bucket":"reports", "request":{"method":"HEAD"} },
+      "expect": { "allow": true, "no_obligations": true } },
 
-    { "name": "manage_lifecycle denied without grant", "bundle": "default",
-      "input": { "principal": {"sub":"alice","type":"user","attributes":{"groups":["analysts"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"manage_lifecycle", "bucket":"reports", "request":{"method":"PUT"} },
+    { "name": "a prefix-scoped object grant does NOT confer read_bucket", "bundle": "default",
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"alice","type":"user","attributes":{"groups":["analysts"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"read_bucket", "bucket":"reports", "request":{"method":"HEAD"} },
+      "expect": { "allow": false, "reason_contains": "no grant" } },
+
+    { "name": "create_bucket must not confer delete_bucket", "bundle": "default",
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"erin","type":"user","attributes":{"groups":[]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"delete_bucket", "bucket":"reports", "request":{"method":"DELETE"} },
       "expect": { "allow": false } },
 
+    { "name": "bucket policy read is read_bucket_config with config_kind policy", "bundle": "default",
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"erin","type":"user","attributes":{"groups":[]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"read_bucket_config", "bucket":"reports", "config_kind":"policy", "request":{"method":"GET","params":"policy="} },
+      "expect": { "allow": true, "no_obligations": true } },
+
+    { "name": "bucket cors write is write_bucket_config with config_kind cors", "bundle": "default",
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"erin","type":"user","attributes":{"groups":[]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"write_bucket_config", "bucket":"reports", "config_kind":"cors", "request":{"method":"PUT","params":"cors="} },
+      "expect": { "allow": true } },
+
+    { "name": "a config grant does not confer object writes", "bundle": "default",
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"erin","type":"user","attributes":{"groups":[]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"write_objects", "bucket":"reports", "object":"2023/outside.csv", "request":{"method":"PUT"} },
+      "expect": { "allow": false } },
+
+    { "name": "tag write carries the PROPOSED tag set and is scoped by prefix", "bundle": "default",
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"erin","type":"user","attributes":{"groups":[]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"write_object_tags", "bucket":"reports", "object":"2024/q1.csv", "requested_tags":{"tier":"internal"}, "request":{"method":"PUT","params":"tagging="} },
+      "expect": { "allow": true } },
+
+    { "name": "tag write outside the granted prefix is denied", "bundle": "default",
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"erin","type":"user","attributes":{"groups":[]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"write_object_tags", "bucket":"reports", "object":"2023/old.csv", "requested_tags":{"tier":"internal"}, "request":{"method":"PUT","params":"tagging="} },
+      "expect": { "allow": false } },
+
+    { "name": "write_object_acl is a separate verb an ordinary write grant does not confer", "bundle": "default",
+      "input": { "acl_grants":[{"source":"acl","value":"bucket-owner-read"}], "bypass_governance":false, "principal": {"sub":"erin","type":"user","attributes":{"groups":[]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"write_object_acl", "bucket":"reports", "object":"2024/q1.csv", "request":{"method":"PUT"} },
+      "expect": { "allow": false, "reason_contains": "no grant" } },
+
+    { "name": "a wildcard grant does confer write_object_acl, which is why public ACLs are refused in code", "bundle": "default",
+      "input": { "acl_grants":[{"source":"acl","value":"bucket-owner-read"}], "bypass_governance":false, "principal": {"sub":"carol","type":"user","attributes":{"groups":["admins"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"write_object_acl", "bucket":"reports", "object":"2024/q1.csv", "request":{"method":"PUT"} },
+      "expect": { "allow": true } },
+
     { "name": "object read with MISSING key denies (no keyless whole-bucket fallthrough)", "bundle": "default",
-      "input": { "principal": {"sub":"carol","type":"user","attributes":{"groups":["admins"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"read_objects", "bucket":"reports", "request":{"method":"GET"} },
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"carol","type":"user","attributes":{"groups":["admins"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"read_objects", "bucket":"reports", "request":{"method":"GET"} },
       "expect": { "allow": false } },
 
     { "name": "copy source read half allowed (carol)", "bundle": "default",
-      "input": { "principal": {"sub":"carol","type":"user","attributes":{"groups":["admins"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"read_objects", "bucket":"reports", "object":"2024/src.csv", "copy_source":{"bucket":"reports","key":"2024/src.csv"}, "request":{"method":"PUT"} },
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"carol","type":"user","attributes":{"groups":["admins"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"read_objects", "bucket":"reports", "object":"2024/src.csv", "copy_source":{"bucket":"reports","key":"2024/src.csv"}, "request":{"method":"PUT"} },
       "expect": { "allow": true } },
 
     { "name": "copy dest write half denied for read-only principal (alice)", "bundle": "default",
-      "input": { "principal": {"sub":"alice","type":"user","attributes":{"groups":["analysts"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"write_objects", "bucket":"reports", "object":"2024/dst.csv", "copy_source":{"bucket":"reports","key":"2024/src.csv"}, "request":{"method":"PUT"} },
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"alice","type":"user","attributes":{"groups":["analysts"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"write_objects", "bucket":"reports", "object":"2024/dst.csv", "copy_source":{"bucket":"reports","key":"2024/src.csv"}, "request":{"method":"PUT"} },
       "expect": { "allow": false } },
 
     { "name": "multi-delete per-key allowed (carol, key A)", "bundle": "default",
-      "input": { "principal": {"sub":"carol","type":"user","attributes":{"groups":["admins"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"delete_objects", "bucket":"reports", "object":"2024/a.csv", "request":{"method":"POST"} },
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"carol","type":"user","attributes":{"groups":["admins"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"delete_objects", "bucket":"reports", "object":"2024/a.csv", "request":{"method":"POST"} },
       "expect": { "allow": true } },
 
     { "name": "multi-delete per-key denied (alice, no delete grant)", "bundle": "default",
-      "input": { "principal": {"sub":"alice","type":"user","attributes":{"groups":["analysts"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"delete_objects", "bucket":"reports", "object":"2024/a.csv", "request":{"method":"POST"} },
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"alice","type":"user","attributes":{"groups":["analysts"]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"delete_objects", "bucket":"reports", "object":"2024/a.csv", "request":{"method":"POST"} },
       "expect": { "allow": false } },
 
     { "name": "write frozen by org kill-switch", "bundle": "frozen",
-      "input": { "principal": {"sub":"bob","type":"user","attributes":{"groups":[]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"write_objects", "bucket":"public", "object":"x.bin", "request":{"method":"PUT"} },
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"bob","type":"user","attributes":{"groups":[]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"write_objects", "bucket":"public", "object":"x.bin", "request":{"method":"PUT"} },
       "expect": { "allow": false, "reason_contains": "frozen" } },
 
     { "name": "read still allowed while writes frozen", "bundle": "frozen",
-      "input": { "principal": {"sub":"bob","type":"user","attributes":{"groups":[]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"read_objects", "bucket":"public", "object":"x.bin", "request":{"method":"GET"} },
-      "expect": { "allow": true } }
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"bob","type":"user","attributes":{"groups":[]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"read_objects", "bucket":"public", "object":"x.bin", "request":{"method":"GET"} },
+      "expect": { "allow": true } },
+
+    { "name": "a wildcard grant with no denylist anywhere is the only unfiltered listing", "bundle": "buckets",
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"nora","type":"user","attributes":{"groups":[]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"list_buckets", "bucket":"", "request":{"method":"GET"} },
+      "expect": { "allow": true, "all_buckets_visible": true } },
+
+    { "name": "visibility follows access: every bucket the subject holds any grant on", "bundle": "buckets",
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"omar","type":"user","attributes":{"groups":[]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"list_buckets", "bucket":"", "request":{"method":"GET"} },
+      "expect": { "allow": true, "visible_buckets": ["logs", "reports"], "all_buckets_visible": false } },
+
+    { "name": "enumeration needs the list_buckets capability, not merely access", "bundle": "buckets",
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"pia","type":"user","attributes":{"groups":[]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"list_buckets", "bucket":"", "request":{"method":"GET"} },
+      "expect": { "allow": false, "reason_contains": "no grant" } },
+
+    { "name": "allowed to enumerate, nothing visible", "bundle": "buckets",
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"quinn","type":"user","attributes":{"groups":[]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"list_buckets", "bucket":"", "request":{"method":"GET"} },
+      "expect": { "allow": true, "visible_buckets": [], "all_buckets_visible": false } },
+
+    { "name": "a denylist entry anywhere drops the unrestricted view back to named grants", "bundle": "buckets",
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"rhea","type":"user","attributes":{"groups":[]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"list_buckets", "bucket":"", "request":{"method":"GET"} },
+      "expect": { "allow": true, "visible_buckets": [], "all_buckets_visible": false } },
+
+    { "name": "the wildcard grant does not match the account scope", "bundle": "buckets",
+      "input": { "acl_grants":[], "bypass_governance":false, "principal": {"sub":"sam","type":"user","attributes":{"groups":[]}}, "backend":{"id":"bay-1","kind":"ceph"}, "tenant":"acme", "organization_id":"org-acme", "action":"list_buckets", "bucket":"", "request":{"method":"GET"} },
+      "expect": { "allow": false, "reason_contains": "no grant" } }
   ]
 }

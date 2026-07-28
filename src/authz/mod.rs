@@ -7,7 +7,8 @@ mod decision;
 mod input;
 
 pub use capture::{CaptureSink, CapturedInput};
-pub use decision::{Decision, Obligations};
+pub use decision::{Decision, IMPLEMENTED_OBLIGATIONS, Obligations};
 pub use input::{
-    Backend, CopySource, OPA_INPUT_FIELDS, OpaInput, Principal, PrincipalAttributes, RequestMeta,
+    AclGrant, Backend, CopySource, OPA_INPUT_FIELDS, OpaInput, Principal, PrincipalAttributes,
+    RequestMeta,
 };

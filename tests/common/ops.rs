@@ -1,4 +1,4 @@
-//! The 15 enforced operations, with a real typed input for each.
+//! The enforced operations, with a real typed input for each.
 //!
 //! Shared because three files need exactly the same list and getting it out of step is
 //! the failure mode: `gate_invariants.rs` probes every entry for a hook, a dispatch arm
@@ -59,6 +59,64 @@ pub fn delete_objects_input() -> DeleteObjectsInput {
     }
 }
 
+/// A syntactically real bucket policy that does **not** lock the gateway out.
+///
+/// It has to be real: the `PutBucketPolicy` hook parses the document and refuses one it
+/// cannot read, so `Policy::default()` (the empty string) would exercise the refusal
+/// path rather than the allow path in every probe that uses it.
+pub const BENIGN_BUCKET_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Sid":"TeamRead","Effect":"Allow","Principal":{"AWS":"arn:aws:iam::acme:user/alice"},"Action":["s3:GetObject"],"Resource":["arn:aws:s3:::reports/2024/*"]}]}"#;
+
+/// A policy whose `Deny` names every principal — which necessarily includes the
+/// tenant-owner credential the gateway itself re-signs with. The self-lockout shape.
+pub const SELF_LOCKOUT_BUCKET_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Sid":"DenyAll","Effect":"Deny","Principal":"*","Action":["s3:*"],"Resource":["arn:aws:s3:::reports/*"]}]}"#;
+
+pub fn put_bucket_policy_input() -> PutBucketPolicyInput {
+    PutBucketPolicyInput {
+        bucket: "reports".into(),
+        policy: BENIGN_BUCKET_POLICY.into(),
+        ..Default::default()
+    }
+}
+
+/// `PutBucketCorsInput` and `PutObjectTaggingInput` carry a required body and so have
+/// no `Default`.
+pub fn put_bucket_cors_input() -> PutBucketCorsInput {
+    PutBucketCorsInput {
+        bucket: "reports".into(),
+        cors_configuration: CORSConfiguration {
+            cors_rules: vec![CORSRule {
+                allowed_headers: None,
+                allowed_methods: vec!["GET".into()],
+                allowed_origins: vec!["https://console.example".into()],
+                expose_headers: None,
+                id: Some("console".into()),
+                max_age_seconds: Some(300),
+            }],
+        },
+        checksum_algorithm: None,
+        content_md5: None,
+        expected_bucket_owner: None,
+    }
+}
+
+pub fn put_object_tagging_input() -> PutObjectTaggingInput {
+    PutObjectTaggingInput {
+        bucket: "reports".into(),
+        key: "2024/x".into(),
+        tagging: Tagging {
+            tag_set: vec![Tag {
+                key: Some("tier".into()),
+                value: Some("internal".into()),
+            }],
+        },
+        checksum_algorithm: None,
+        content_md5: None,
+        expected_bucket_owner: None,
+        request_payer: None,
+        version_id: None,
+    }
+}
+
 /// Fail unless the operations a probe actually walked are exactly `OP_TABLE`'s
 /// enforced set.
 pub fn assert_matches_enforced_set(mut seen: Vec<&str>) {
@@ -104,11 +162,27 @@ macro_rules! each_enforced_op {
             $crate::common::ops::copy_object_input()
         );
         $probe!(
+            create_bucket,
+            "CreateBucket",
+            s3s::dto::CreateBucketInput {
+                bucket: "reports".into(),
+                ..Default::default()
+            }
+        );
+        $probe!(
             create_multipart_upload,
             "CreateMultipartUpload",
             s3s::dto::CreateMultipartUploadInput {
                 bucket: "reports".into(),
                 key: "2024/x".into(),
+                ..Default::default()
+            }
+        );
+        $probe!(
+            delete_bucket,
+            "DeleteBucket",
+            s3s::dto::DeleteBucketInput {
+                bucket: "reports".into(),
                 ..Default::default()
             }
         );
@@ -122,9 +196,42 @@ macro_rules! each_enforced_op {
             }
         );
         $probe!(
+            delete_object_tagging,
+            "DeleteObjectTagging",
+            s3s::dto::DeleteObjectTaggingInput {
+                bucket: "reports".into(),
+                key: "2024/x".into(),
+                ..Default::default()
+            }
+        );
+        $probe!(
             delete_objects,
             "DeleteObjects",
             $crate::common::ops::delete_objects_input()
+        );
+        $probe!(
+            get_bucket_cors,
+            "GetBucketCors",
+            s3s::dto::GetBucketCorsInput {
+                bucket: "reports".into(),
+                ..Default::default()
+            }
+        );
+        $probe!(
+            get_bucket_location,
+            "GetBucketLocation",
+            s3s::dto::GetBucketLocationInput {
+                bucket: "reports".into(),
+                ..Default::default()
+            }
+        );
+        $probe!(
+            get_bucket_policy,
+            "GetBucketPolicy",
+            s3s::dto::GetBucketPolicyInput {
+                bucket: "reports".into(),
+                ..Default::default()
+            }
         );
         $probe!(
             get_object,
@@ -136,6 +243,35 @@ macro_rules! each_enforced_op {
             }
         );
         $probe!(
+            get_object_attributes,
+            "GetObjectAttributes",
+            s3s::dto::GetObjectAttributesInput {
+                bucket: "reports".into(),
+                key: "2024/x".into(),
+                object_attributes: vec![s3s::dto::ObjectAttributes::from_static(
+                    s3s::dto::ObjectAttributes::OBJECT_SIZE
+                )],
+                ..Default::default()
+            }
+        );
+        $probe!(
+            get_object_tagging,
+            "GetObjectTagging",
+            s3s::dto::GetObjectTaggingInput {
+                bucket: "reports".into(),
+                key: "2024/x".into(),
+                ..Default::default()
+            }
+        );
+        $probe!(
+            head_bucket,
+            "HeadBucket",
+            s3s::dto::HeadBucketInput {
+                bucket: "reports".into(),
+                ..Default::default()
+            }
+        );
+        $probe!(
             head_object,
             "HeadObject",
             s3s::dto::HeadObjectInput {
@@ -143,6 +279,11 @@ macro_rules! each_enforced_op {
                 key: "2024/x".into(),
                 ..Default::default()
             }
+        );
+        $probe!(
+            list_buckets,
+            "ListBuckets",
+            s3s::dto::ListBucketsInput::default()
         );
         $probe!(
             list_multipart_uploads,
@@ -182,6 +323,25 @@ macro_rules! each_enforced_op {
             }
         );
         $probe!(
+            post_object,
+            "PostObject",
+            s3s::dto::PostObjectInput {
+                bucket: "reports".into(),
+                key: "2024/x".into(),
+                ..Default::default()
+            }
+        );
+        $probe!(
+            put_bucket_cors,
+            "PutBucketCors",
+            $crate::common::ops::put_bucket_cors_input()
+        );
+        $probe!(
+            put_bucket_policy,
+            "PutBucketPolicy",
+            $crate::common::ops::put_bucket_policy_input()
+        );
+        $probe!(
             put_object,
             "PutObject",
             s3s::dto::PutObjectInput {
@@ -189,6 +349,11 @@ macro_rules! each_enforced_op {
                 key: "2024/x".into(),
                 ..Default::default()
             }
+        );
+        $probe!(
+            put_object_tagging,
+            "PutObjectTagging",
+            $crate::common::ops::put_object_tagging_input()
         );
         $probe!(
             upload_part,

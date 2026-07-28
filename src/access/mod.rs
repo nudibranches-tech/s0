@@ -23,17 +23,42 @@
 //! Those are two of the three fail-closed layers; the third is [`proof`], which stops
 //! a hook that forgets to authorize from reaching the backend at all. They only work
 //! together: the table without the proof proves the hook *exists*, not that it *ran*.
+//!
+//! ## Riders
+//!
+//! "Authorizes the parsed request" was, until M4, a claim about `(bucket, key)` only. The
+//! rest of the parsed request — the canned ACL, the five `x-amz-grant-*` headers, an
+//! inline `x-amz-tagging`, `x-amz-bypass-governance-retention` — rode through unread, so
+//! a `PutObject` with `x-amz-acl: public-read` was allowed on the strength of the key and
+//! made the object world-readable. [`headers`] and [`tagging`] close that, and the
+//! enforcement has two distinct shapes, on purpose:
+//!
+//! - **screened in code** ([`GatewayAccess::screen_riders`]) — a *public* ACL, an
+//!   unrecognized canned ACL, a governance bypass, a reserved tag key. No grant may
+//!   authorize these, so no PDP question is asked and no bundle can reach them.
+//! - **decomposed into their own verbs** ([`GatewayAccess::authorize_riders`]) — a
+//!   non-public ACL takes a `write_object_acl` decision on the same object, an inline tag
+//!   set takes a `write_object_tags` one. Still one audit record for the request, the way
+//!   a copy's two halves are one record.
+//!
+//! The answer is a **denial, never a silent strip**; see [`headers`] for the argument and
+//! ADR-008 for the decision.
 
+pub mod headers;
 pub mod optable;
 pub mod proof;
+pub mod tagging;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use http::Extensions;
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::dto::*;
-use s3s::{S3Request, S3Result, s3_error};
+use s3s::{S3Error, S3Request, S3Result, s3_error};
 
+use crate::access::headers::{AclDisposition, AclFields, RequestRiders};
+use crate::access::tagging::ReservedTagKeys;
 use crate::audit::{
     AuditRecord, BackendOutcome, GateContext, GateStage, GatewayMeta, Outcome, PendingAudit,
 };
@@ -42,16 +67,39 @@ use crate::authz::{Backend, CopySource as AuthzCopySource, Decision, OpaInput, R
 use crate::gateway::Gateway;
 use crate::identity::ResolvedPrincipal;
 use crate::model::Action;
-use crate::proxy::{RouteSnapshot, fanout};
+use crate::proxy::RouteSnapshot;
+use crate::proxy::obligations::{BucketVisibility, ResponseObligations};
 
 pub use optable::{Coverage, DangerTier, GateDenial, OP_TABLE, OpSpec, ResourceShape};
 pub use proof::AuthzProof;
 
-// PostObject is `Coverage::Denied` in OP_TABLE: `s3s_aws::Proxy` has no `post_object`,
-// so a form upload cannot be forwarded. Enforcing it would authorize + audit an
-// "Allowed" write that then 501s — a misleading record. The `post_object` hook below is
-// retained (it authorizes the parsed form key, blind spot #3); flip the table entry
-// once form-upload forwarding lands (PostObject→PutObject conversion).
+/// The ACL fields of an object-shaped s3s input, as [`AclFields`].
+///
+/// A macro rather than a trait because the five input types share these fields by
+/// coincidence of the S3 API, not by any relationship s3s expresses — and a macro that
+/// names every field explicitly is what makes "the hook forgot one" a compile error at
+/// the call site rather than a silent `None`.
+macro_rules! object_acl_fields {
+    ($i:expr) => {
+        AclFields {
+            canned: $i.acl.as_ref().map(|a| a.as_str()),
+            full_control: $i.grant_full_control.as_deref(),
+            read: $i.grant_read.as_deref(),
+            // Object ACLs have no WRITE permission — only bucket ACLs do.
+            write: None,
+            read_acp: $i.grant_read_acp.as_deref(),
+            write_acp: $i.grant_write_acp.as_deref(),
+        }
+    };
+}
+
+/// The value of `OpaInput::config_kind` for the two bucket sub-resources in scope.
+///
+/// Both map to the same verb (`{read,write}_bucket_config`) by the frozen vocabulary,
+/// so this string is the only thing that tells a policy — and the decision cache —
+/// which document is being read or written.
+const CONFIG_KIND_POLICY: &str = "policy";
+const CONFIG_KIND_CORS: &str = "cors";
 
 /// The exact s3s operation name for this request. Only reachable in `check`
 /// (`cx.s3_op()`), so `check` stashes it and the typed hooks read it from there
@@ -129,8 +177,31 @@ impl<'a> ReqCtx<'a> {
             copy_source: None,
             delete_keys: None,
             object_tags: None,
+            config_kind: None,
+            requested_tags: None,
+            acl_grants: vec![],
+            bypass_governance: false,
             request: self.meta.clone(),
         }
+    }
+
+    /// The base input for an object-shaped decision, with the request's riders attached.
+    ///
+    /// One place rather than four, because the failure mode of the old code was precisely
+    /// that each write hook built its own input and none of them carried the ACL.
+    fn write_input(
+        &self,
+        action: Action,
+        bucket: String,
+        object: String,
+        riders: &RequestRiders,
+    ) -> OpaInput {
+        let mut input = self.base_input(action, bucket);
+        input.object = Some(object);
+        input.acl_grants = riders.acl.clone();
+        input.requested_tags = riders.tags.clone();
+        input.bypass_governance = riders.bypass_governance;
+        input
     }
 
     /// Record that this request was authorized. The forward path refuses to touch a
@@ -251,18 +322,30 @@ impl GatewayAccess {
         ));
     }
 
-    /// The single-object path (get/head/put/delete-one/post-form). One decision, one
-    /// audit record.
-    async fn enforce_object(
-        &self,
-        cx: &mut ReqCtx<'_>,
-        action: Action,
-        bucket: String,
-        object: String,
-    ) -> S3Result<()> {
-        let mut input = cx.base_input(action, bucket);
-        input.object = Some(object);
+    /// Ask the PDP about one prepared input, then act on the answer: hold the record
+    /// and mint the proof on allow, emit the record and refuse on deny.
+    ///
+    /// Every single-decision hook funnels through here, so "audited exactly once, and a
+    /// proof exists only on the allow side" is one branch to read rather than one per
+    /// op — which is what makes adding an op the ~15-line diff it should be.
+    async fn enforce(&self, cx: &mut ReqCtx<'_>, input: OpaInput) -> S3Result<()> {
         let decision = self.decide(cx, &input).await;
+        // An obligation the policy declared mandatory and this binary cannot apply is a
+        // denial, not a warning. `deny_unknown_fields` on `Obligations` covers the case
+        // where the *field* is unknown; this covers the case where the field is known,
+        // the value parsed, and the op has no way to honor it — a restriction that
+        // silently did not happen is the fail-open shape this project exists to avoid.
+        //
+        // Gated on `allow` so a request the policy refused outright is recorded with the
+        // policy's own reason: it was already denied, and reporting the obligation
+        // instead would put a misleading cause on the record.
+        if decision.allow
+            && let Some(reason) = unimplemented_obligations(&decision)
+        {
+            let decision = Decision::deny(reason.clone());
+            self.audit_denied(input, &decision, vec![]);
+            return Err(s3_error!(AccessDenied, "{reason}"));
+        }
         let (allow, reason) = (decision.allow, decision.reason.clone());
         if allow {
             self.audit_pending(cx, input, &decision, vec![]);
@@ -274,14 +357,268 @@ impl GatewayAccess {
         }
     }
 
+    /// A refusal the **gateway** decided rather than the PDP: a semantic cap, a body it
+    /// will not forward, a bucket name outside the caller's tenant.
+    ///
+    /// It writes an audit record and answers `AccessDenied`, and both halves are the
+    /// point (accepted review defect B-1). The obvious spelling —
+    /// `return Err(s3_error!(InvalidRequest, "…"))` before the enforce call — returns
+    /// ahead of every audit site, so an over-cap request left **no** evidence at all and
+    /// reached the client as a 400: a refusal on authorization grounds reported as a
+    /// client formatting mistake, invisible to the decision log. A cap is a resource
+    /// bound whose violation is a real Deny sub-decision on the op's own verb.
+    ///
+    /// The reason is prefixed so the record says **which layer** refused: the rego's own
+    /// reasons all read `deny: …`/`allow: …`, and a record that merely said
+    /// "over the 10-tag cap" would look like a policy verdict for a question no policy
+    /// was asked. A structured `verdict_source` on the record would be better than a
+    /// string convention and belongs with the next audit-shape change.
+    fn refuse(&self, input: OpaInput, reason: String) -> S3Error {
+        self.deny(input, format!("deny (gateway): {reason}"))
+    }
+
+    /// Record a refusal against `input` and answer 403, with the reason verbatim.
+    ///
+    /// The un-prefixed sibling of [`Self::refuse`], for a denial the **policy** produced
+    /// even though no single `enforce` call did: a composite verdict over several
+    /// sub-decisions (a copy's two halves, a write plus the `write_object_acl` its
+    /// `x-amz-acl` header requires). Prefixing those with `deny (gateway):` would claim
+    /// the gateway made a call the PDP actually made.
+    fn deny(&self, input: OpaInput, reason: String) -> S3Error {
+        let decision = Decision::deny(reason.clone());
+        self.audit_denied(input, &decision, vec![]);
+        s3_error!(AccessDenied, "{reason}")
+    }
+
+    /// The reserved-key list currently published by the control plane.
+    ///
+    /// Read from the live bundle on each tag write rather than cached: the bundle is the
+    /// revocation channel, and a list held in a long-lived field would keep enforcing a
+    /// reservation the control plane has since changed. Tag writes are rare enough that
+    /// a JSON lookup per write is not a hot path.
+    fn reserved_tag_keys(&self) -> ReservedTagKeys {
+        ReservedTagKeys::from_bundle(&self.gw.bundles.current().data)
+    }
+
+    /// Refuse — **in code, ahead of and independent of any policy** — the riders no grant
+    /// may authorize.
+    ///
+    /// Three refusals, in this order:
+    ///
+    /// 1. **`x-amz-bypass-governance-retention`.** Object-lock governance mode exists so
+    ///    that a retained object cannot be destroyed; the bypass header is the documented
+    ///    way to destroy it anyway. AWS gates it on its own IAM action
+    ///    (`s3:BypassGovernanceRetention`) and the 13-verb vocabulary frozen in the master
+    ///    plan (§1.2) has **no equivalent** — so there is no grant that could express
+    ///    "may defeat WORM", and inventing one here would be a cross-repo contract change
+    ///    made unilaterally by a PEP. Until the vocabulary gains a verb, the honest answer
+    ///    is that this gateway does not broker retention overrides. The attempt is still
+    ///    put on the record (`input.bypass_governance`), which is the point: in a
+    ///    regulated deployment "who tried to bypass retention" is a question the audit
+    ///    trail must be able to answer.
+    /// 2. **A public ACL.** See [`headers`] — a wildcard grant confers `write_object_acl`
+    ///    and the default access model seeds one for every Owner, so a policy-only guard
+    ///    would leave public exposure one flag away.
+    /// 3. **A reserved tag key**, including the shipped default in which *every* key is
+    ///    reserved because the control plane has published no list. See [`tagging`].
+    fn screen_riders(&self, riders: &RequestRiders) -> Result<(), String> {
+        if riders.bypass_governance {
+            return Err(
+                "the request carries x-amz-bypass-governance-retention, which would \
+                 override object-lock retention; no verb in this gateway's grant \
+                 vocabulary expresses that authority, so it is refused in code rather \
+                 than left to a policy that has no way to say yes"
+                    .to_string(),
+            );
+        }
+        if let AclDisposition::Refused(why) = headers::classify(&riders.acl) {
+            return Err(why);
+        }
+        if let Some(tags) = &riders.tags {
+            self.reserved_tag_keys().check(tags)?;
+        }
+        Ok(())
+    }
+
+    /// Authorize the riders as **separate verbs on the same object**, after the gateway's
+    /// own screening and before the write itself is recorded.
+    ///
+    /// This is the modelling decision at the centre of the retrofit. A `PutObject`
+    /// carrying `x-amz-acl` is two requests: write these bytes, and set who may read them.
+    /// AWS says so too (`s3:PutObject` + `s3:PutObjectAcl`), and folding the second into
+    /// the first is what made the header invisible. Same for an inline `x-amz-tagging`,
+    /// which is a `PutObjectTagging` wearing a `PutObject`'s clothes — and which must go
+    /// through `write_object_tags` precisely because a tag can satisfy an ABAC condition.
+    ///
+    /// `Some(reason)` ⇒ refuse. Returns rather than denying inline so the caller records
+    /// **one** audit entry against the primary input, the way `enforce_copy` does: a
+    /// request produces one record, whatever it decomposed into.
+    async fn authorize_riders(
+        &self,
+        cx: &mut ReqCtx<'_>,
+        input: &OpaInput,
+        riders: &RequestRiders,
+    ) -> Option<String> {
+        if headers::classify(&riders.acl) == AclDisposition::RequiresAclVerb {
+            let mut acl_input = input.clone();
+            acl_input.action = Action::WriteObjectAcl;
+            if !self.decide(cx, &acl_input).await.allow {
+                return Some(format!(
+                    "deny: the request carries {} access-control grant(s) \
+                     (x-amz-acl / x-amz-grant-*), which require write_object_acl on this \
+                     object; no grant matches",
+                    riders.acl.len()
+                ));
+            }
+        }
+        if riders.tags.is_some() {
+            let mut tag_input = input.clone();
+            tag_input.action = Action::WriteObjectTags;
+            if !self.decide(cx, &tag_input).await.allow {
+                return Some(
+                    "deny: the request carries an inline tag set (x-amz-tagging), which \
+                     requires write_object_tags on this object; no grant matches"
+                        .to_string(),
+                );
+            }
+        }
+        None
+    }
+
+    /// The write path for an object op that can carry riders: screen them, authorize them
+    /// as their own verbs, then decide the write itself.
+    ///
+    /// The fast path is unchanged — a request with no ACL, no inline tags and no bypass
+    /// header costs exactly one decision, as it did before the retrofit.
+    async fn enforce_object_write(
+        &self,
+        cx: &mut ReqCtx<'_>,
+        action: Action,
+        bucket: String,
+        object: String,
+        riders: Result<RequestRiders, String>,
+    ) -> S3Result<()> {
+        // The riders are parsed from `&req.input` *before* the `ReqCtx` takes its mutable
+        // borrow, so a malformed one arrives here as an `Err` rather than as an early
+        // return the audit path never saw (defect B-1: a refusal with no record is not a
+        // refusal anyone can review).
+        let riders = match riders {
+            Ok(r) => r,
+            Err(why) => {
+                let mut input = cx.base_input(action, bucket);
+                input.object = Some(object);
+                return Err(self.refuse(input, why));
+            }
+        };
+        let input = cx.write_input(action, bucket, object, &riders);
+        if let Err(why) = self.screen_riders(&riders) {
+            return Err(self.refuse(input, why));
+        }
+        if let Some(why) = self.authorize_riders(cx, &input, &riders).await {
+            return Err(self.deny(input, why));
+        }
+        self.enforce(cx, input).await
+    }
+
+    /// The single-object path (get/head/put/delete-one/post-form/tagging). One
+    /// decision, one audit record.
+    async fn enforce_object(
+        &self,
+        cx: &mut ReqCtx<'_>,
+        action: Action,
+        bucket: String,
+        object: String,
+    ) -> S3Result<()> {
+        let mut input = cx.base_input(action, bucket);
+        input.object = Some(object);
+        self.enforce(cx, input).await
+    }
+
+    /// The keyless bucket path (head/location/create/delete). There is no object and no
+    /// prefix, so the decision is exactly "this verb, on this bucket, for this
+    /// principal" — and grant prefixes cannot narrow it, which is why these verbs are
+    /// separate from the object ones rather than a keyless fall-through of them.
+    async fn enforce_bucket(
+        &self,
+        cx: &mut ReqCtx<'_>,
+        action: Action,
+        bucket: String,
+    ) -> S3Result<()> {
+        debug_assert!(action.is_bucket_scoped());
+        let input = cx.base_input(action, bucket);
+        self.enforce(cx, input).await
+    }
+
+    /// The bucket sub-resource path (policy, cors). Same verb pair for every
+    /// sub-resource; `config_kind` is what a policy discriminates on, and what keeps
+    /// two different documents from sharing one decision-cache entry.
+    async fn enforce_bucket_config(
+        &self,
+        cx: &mut ReqCtx<'_>,
+        action: Action,
+        bucket: String,
+        config_kind: &str,
+    ) -> S3Result<()> {
+        let mut input = cx.base_input(action, bucket);
+        input.config_kind = Some(config_kind.to_string());
+        self.enforce(cx, input).await
+    }
+
+    /// The account-scoped enumeration path (`ListBuckets`), and the first decision in
+    /// this gateway whose verdict is applied to a **response**.
+    ///
+    /// It answers with a [`BucketVisibility`] rather than a `S3Result<()>` because a
+    /// refusal here is not a 403 — see [`GatewayAccess::list_buckets`] for why. Three
+    /// things are settled before it returns, in this order, and every one of them writes
+    /// exactly one audit record:
+    ///
+    /// 1. the PDP denied ⇒ nothing is visible, recorded as the denial it is;
+    /// 2. the PDP allowed but the obligation cannot be applied (ambiguous, or a
+    ///    `must_understand` this binary does not implement) ⇒ nothing is visible,
+    ///    recorded as a gateway-side deny naming the obligation. The classification
+    ///    happens **before** the audit call on purpose (plan defect B-3): the previous
+    ///    shape errored out of obligation handling ahead of every audit site, so a
+    ///    refused `ListBuckets` left no record at all;
+    /// 3. the PDP allowed with a usable obligation ⇒ that visibility, the record is
+    ///    held for the forward leg, and the proof is minted.
+    async fn enforce_bucket_listing(&self, cx: &mut ReqCtx<'_>) -> BucketVisibility {
+        // `bucket: ""` is the account scope. The rego MUST gate every bucket-scoped rule
+        // on `input.bucket != ""`, or a `"bucket": "*"` grant matches the empty string
+        // and the per-bucket denylist is keyed on a bucket nobody named (plan defect
+        // B-2). `policy/gateway/authz.rego` does; `the_wildcard_grant_does_not_match_the
+        // _account_scope` in the corpus is the guard.
+        let input = cx.base_input(Action::ListBuckets, String::new());
+        let decision = self.decide(cx, &input).await;
+        match classify_bucket_listing(&decision) {
+            BucketListing::Withhold(reason) => {
+                let denial = Decision::deny(reason);
+                self.audit_denied(input, &denial, vec![]);
+                BucketVisibility::Nothing
+            }
+            BucketListing::Show(visibility) => {
+                self.audit_pending(cx, input, &decision, vec![]);
+                cx.prove();
+                visibility
+            }
+        }
+    }
+
     /// Copy-style path (CopyObject, UploadPartCopy): authorize BOTH the source read
     /// and the dest write (blind spot #1). One request-level audit record.
+    ///
+    /// `riders` are the destination's: a `CopyObject` carrying `x-amz-acl` sets the ACL of
+    /// the *new* object, and one carrying `x-amz-tagging` with
+    /// `x-amz-tagging-directive: REPLACE` sets its tags. They are screened and authorized
+    /// exactly as they are on a plain write — the copy path had the same hole and it was
+    /// the more dangerous of the two, because the destination bucket need not be the
+    /// source's.
     async fn enforce_copy(
         &self,
         cx: &mut ReqCtx<'_>,
         source: &CopySource,
         dest_bucket: String,
         dest_key: String,
+        riders: RequestRiders,
     ) -> S3Result<()> {
         let (src_bucket, src_key) = match source {
             CopySource::Bucket { bucket, key, .. } => (bucket.to_string(), key.to_string()),
@@ -292,17 +629,30 @@ impl GatewayAccess {
                 ));
             }
         };
-        let mut src_input = cx.base_input(Action::ReadObjects, src_bucket.clone());
-        src_input.object = Some(src_key.clone());
+        let mut dst_input = cx.write_input(Action::WriteObjects, dest_bucket, dest_key, &riders);
+        dst_input.copy_source = Some(AuthzCopySource {
+            bucket: src_bucket.clone(),
+            key: src_key.clone(),
+        });
+        // Screened before either half is asked about: a public ACL on the destination is
+        // refused whatever the answers would have been, and refusing early keeps the
+        // record's reason the one the client is given.
+        if let Err(why) = self.screen_riders(&riders) {
+            return Err(self.refuse(dst_input, why));
+        }
+
+        let mut src_input = cx.base_input(Action::ReadObjects, src_bucket);
+        src_input.object = Some(src_key);
         let src_allow = self.decide(cx, &src_input).await.allow;
 
-        let mut dst_input = cx.base_input(Action::WriteObjects, dest_bucket);
-        dst_input.object = Some(dest_key);
-        dst_input.copy_source = Some(AuthzCopySource {
-            bucket: src_bucket,
-            key: src_key,
-        });
         let dst_allow = self.decide(cx, &dst_input).await.allow;
+
+        if src_allow
+            && dst_allow
+            && let Some(why) = self.authorize_riders(cx, &dst_input, &riders).await
+        {
+            return Err(self.deny(dst_input, why));
+        }
 
         let allow = src_allow && dst_allow;
         let decision = if allow {
@@ -468,25 +818,70 @@ impl S3Access for GatewayAccess {
             .await
     }
 
+    /// Write an object — and, if the request says so, decide who may read it.
+    ///
+    /// Until the M4 retrofit this hook read `bucket` and `key` and nothing else, so
+    /// `x-amz-acl: public-read` reached RGW unexamined and the object became
+    /// world-readable behind an audit record that said "allowed write". See
+    /// [`headers`] for the classification and for why the answer is a denial rather than
+    /// a silent strip.
     async fn put_object(&self, req: &mut S3Request<PutObjectInput>) -> S3Result<()> {
         let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
+        let max_tags = self.gw.limits().max_tag_count;
+        let riders = RequestRiders::parse(
+            object_acl_fields!(req.input),
+            req.input.tagging.as_deref(),
+            false,
+            max_tags,
+        );
         let mut cx = ReqCtx::new(req)?;
-        self.enforce_object(&mut cx, Action::WriteObjects, bucket, key)
+        self.enforce_object_write(&mut cx, Action::WriteObjects, bucket, key, riders)
             .await
     }
 
+    /// Browser form upload. Blind spot #3: the key is in the parsed multipart body, not
+    /// in the path, so only a hook that reads the *parsed* request can authorize it.
+    ///
+    /// This is the one op that breaks the "check sees no body" invariant, and not by
+    /// choice: s3s aggregates the whole file into memory during route resolution, ahead
+    /// of `check` and of everything here (`s3s-0.14.1/src/ops/mod.rs:539-551`). So an
+    /// unauthenticated caller can make this process allocate up to
+    /// `limits.post_object_max_file_size` before a single authorization step runs; that
+    /// default is lowered to 64 MiB for exactly this reason. Nothing in this hook can
+    /// move that bound — by the time it runs, the allocation already happened.
+    ///
+    /// Its `acl` and `tagging` arrive as **form fields**, not headers, which is the other
+    /// reason the strip escape hatch is not implemented: they are covered by the signed
+    /// POST policy document, so rewriting the form after signature verification would
+    /// forward a body that no longer matches the policy the caller signed — an opaque 403
+    /// from RGW instead of an honest one from here.
     async fn post_object(&self, req: &mut S3Request<PostObjectInput>) -> S3Result<()> {
-        // Blind spot #3: the form-upload key is in the parsed body — authorize it.
         let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
+        let max_tags = self.gw.limits().max_tag_count;
+        let riders = RequestRiders::parse(
+            object_acl_fields!(req.input),
+            req.input.tagging.as_deref(),
+            false,
+            max_tags,
+        );
         let mut cx = ReqCtx::new(req)?;
-        self.enforce_object(&mut cx, Action::WriteObjects, bucket, key)
+        self.enforce_object_write(&mut cx, Action::WriteObjects, bucket, key, riders)
             .await
     }
 
+    /// Delete one object — refusing outright to defeat its retention.
+    ///
+    /// `x-amz-bypass-governance-retention` used to ride through unread, which on a bucket
+    /// with object lock in governance mode meant a `delete_objects` grant silently
+    /// included "and may destroy retained records". See [`Self::screen_riders`].
     async fn delete_object(&self, req: &mut S3Request<DeleteObjectInput>) -> S3Result<()> {
         let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
+        let riders = Ok(RequestRiders {
+            bypass_governance: req.input.bypass_governance_retention.unwrap_or(false),
+            ..RequestRiders::default()
+        });
         let mut cx = ReqCtx::new(req)?;
-        self.enforce_object(&mut cx, Action::DeleteObjects, bucket, key)
+        self.enforce_object_write(&mut cx, Action::DeleteObjects, bucket, key, riders)
             .await
     }
 
@@ -496,13 +891,9 @@ impl S3Access for GatewayAccess {
         // Read once: two loads could straddle a config apply and report a cap the
         // request was not actually measured against.
         let max_delete_keys = self.gw.limits().max_delete_keys;
-        if req.input.delete.objects.len() > max_delete_keys {
-            return Err(s3_error!(
-                InvalidRequest,
-                "delete request exceeds {max_delete_keys} keys"
-            ));
-        }
         let bucket = req.input.bucket.clone();
+        let bypass_governance = req.input.bypass_governance_retention.unwrap_or(false);
+        let key_count = req.input.delete.objects.len();
         let all_keys: Vec<String> = req
             .input
             .delete
@@ -511,6 +902,36 @@ impl S3Access for GatewayAccess {
             .map(|o| o.key.clone())
             .collect();
         let mut cx = ReqCtx::new(req)?;
+        // Defect B-1, on the cap that predates it: this used to `return Err(s3_error!(
+        // InvalidRequest, …))` above, ahead of `ReqCtx` and therefore ahead of every
+        // audit site — so an over-cap multi-delete left no record at all. It refuses
+        // like every other cap now. `delete_keys` is deliberately NOT recorded here:
+        // the request is over the bound precisely because it carries too many, and an
+        // audit record is not the place to copy an unbounded list.
+        if key_count > max_delete_keys {
+            let input = cx.base_input(Action::DeleteObjects, bucket);
+            return Err(self.refuse(
+                input,
+                format!(
+                    "delete request carries {key_count} keys, over the {max_delete_keys}-key cap"
+                ),
+            ));
+        }
+        // The bypass header covers the WHOLE batch, so it is screened once, before any
+        // key is decided — and it refuses the whole request rather than being applied to
+        // the keys that happened to be allowed. A partially-honored WORM bypass is not a
+        // thing this gateway should be able to produce.
+        if bypass_governance {
+            let mut input = cx.base_input(Action::DeleteObjects, bucket);
+            input.bypass_governance = true;
+            let why = self
+                .screen_riders(&RequestRiders {
+                    bypass_governance: true,
+                    ..RequestRiders::default()
+                })
+                .expect_err("a bypass rider is always refused");
+            return Err(self.refuse(input, why));
+        }
 
         let mut allowed: Vec<String> = Vec::new();
         let mut denied: Vec<String> = Vec::new();
@@ -549,11 +970,46 @@ impl S3Access for GatewayAccess {
     async fn copy_object(&self, req: &mut S3Request<CopyObjectInput>) -> S3Result<()> {
         let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
         let source = req.input.copy_source.clone();
+        let max_tags = self.gw.limits().max_tag_count;
+        // `x-amz-tagging` only takes effect under `x-amz-tagging-directive: REPLACE`;
+        // under the default `COPY` the destination inherits the *source object's* tags,
+        // which the gateway does not read (that is `object_tags`, ADR-003's gated
+        // on-demand fetch, still unwired). So: a REPLACE directive is a tag write and is
+        // authorized as one — including a REPLACE with no header, which installs the
+        // empty set. A header sent under a COPY directive is authorized too rather than
+        // ignored, because the caller asked for it and the gateway does not silently
+        // decide a request meant less than it said. What rides through unauthorized is
+        // the inherited set under COPY, and that is on the op's blind-spot list.
+        let replace = req
+            .input
+            .tagging_directive
+            .as_ref()
+            .map(TaggingDirective::as_str)
+            == Some(TaggingDirective::REPLACE);
+        let tagging = match (replace, req.input.tagging.as_deref()) {
+            (true, Some(t)) => Some(t),
+            (true, None) => Some(""),
+            (false, t) => t,
+        };
+        let riders = RequestRiders::parse(object_acl_fields!(req.input), tagging, false, max_tags);
         let mut cx = ReqCtx::new(req)?;
-        self.enforce_copy(&mut cx, &source, bucket, key).await
+        let riders = match riders {
+            Ok(r) => r,
+            Err(why) => {
+                let mut input = cx.base_input(Action::WriteObjects, bucket);
+                input.object = Some(key);
+                return Err(self.refuse(input, why));
+            }
+        };
+        self.enforce_copy(&mut cx, &source, bucket, key, riders)
+            .await
     }
 
     async fn list_objects_v2(&self, req: &mut S3Request<ListObjectsV2Input>) -> S3Result<()> {
+        // Same s3s comma-list defect as `get_object_attributes`; see `split_comma_list`.
+        if let Some(opt) = req.input.optional_object_attributes.as_mut() {
+            split_comma_list(opt);
+        }
         let (bucket, prefix) = (req.input.bucket.clone(), req.input.prefix.clone());
         // Fan-out re-paginates raw keys; delimiter (folder) listing across multiple
         // prefixes is a follow-up (ADR-004). Decided *before* the enforce call so the
@@ -578,14 +1034,17 @@ impl S3Access for GatewayAccess {
                 Ok(())
             }
             ListVerdict::FanOut(prefixes) => {
-                req.extensions
-                    .insert(Arc::new(fanout::ListFanout { prefixes }));
+                ResponseObligations::fanout(prefixes).install(&mut req.extensions);
                 Ok(())
             }
         }
     }
 
     async fn list_objects(&self, req: &mut S3Request<ListObjectsInput>) -> S3Result<()> {
+        // Same s3s comma-list defect as `get_object_attributes`; see `split_comma_list`.
+        if let Some(opt) = req.input.optional_object_attributes.as_mut() {
+            split_comma_list(opt);
+        }
         let (bucket, prefix) = (req.input.bucket.clone(), req.input.prefix.clone());
         let verdict = {
             let mut cx = ReqCtx::new(req)?;
@@ -602,13 +1061,23 @@ impl S3Access for GatewayAccess {
 
     // ── Multipart upload lifecycle (write on the key), plus its copy + list ops ──
 
+    /// Begin a multipart upload. The ACL and tag set are fixed **here**, at creation, not
+    /// at `CompleteMultipartUpload` — so this is the only hook in the multipart lifecycle
+    /// where they can be authorized, and it was the one that did not look.
     async fn create_multipart_upload(
         &self,
         req: &mut S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<()> {
         let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
+        let max_tags = self.gw.limits().max_tag_count;
+        let riders = RequestRiders::parse(
+            object_acl_fields!(req.input),
+            req.input.tagging.as_deref(),
+            false,
+            max_tags,
+        );
         let mut cx = ReqCtx::new(req)?;
-        self.enforce_object(&mut cx, Action::WriteObjects, bucket, key)
+        self.enforce_object_write(&mut cx, Action::WriteObjects, bucket, key, riders)
             .await
     }
 
@@ -651,7 +1120,10 @@ impl S3Access for GatewayAccess {
         let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
         let source = req.input.copy_source.clone();
         let mut cx = ReqCtx::new(req)?;
-        self.enforce_copy(&mut cx, &source, bucket, key).await
+        // No riders: `UploadPartCopy` carries no ACL, tag or retention fields — the part's
+        // destination object was created (and its ACL fixed) by `CreateMultipartUpload`.
+        self.enforce_copy(&mut cx, &source, bucket, key, RequestRiders::default())
+            .await
     }
 
     async fn list_multipart_uploads(
@@ -671,7 +1143,377 @@ impl S3Access for GatewayAccess {
         };
         list_verdict_single(verdict, &mut req.input.prefix)
     }
+
+    /// Enumerate the caller's buckets — the first operation whose *response* the gateway
+    /// filters, and the only hook here that does not answer a refusal with a 403.
+    ///
+    /// ### Why the answer is never `AccessDenied`
+    ///
+    /// A `ListBuckets` response discloses names, and the empty response discloses
+    /// nothing. So the two ways of ending up with nothing to show —
+    ///
+    /// - the principal may not enumerate at all, and
+    /// - the principal may enumerate and holds no bucket grants
+    ///
+    /// — must be **indistinguishable**, or the status code is an oracle that answers
+    /// "does this credential hold `list_buckets` in this tenant?" for anyone who asks.
+    /// Both therefore return `200` with an empty `<Buckets/>`, through the same branch,
+    /// and neither contacts the backend — so they cost the same wall-clock time as well
+    /// as carrying the same bytes. The distinction is preserved exactly where it belongs:
+    /// in the audit record, which says `Denied` for the first and `Allowed` for the
+    /// second.
+    ///
+    /// This is not a weakening of deny-by-default. The *default*, with no obligation at
+    /// all, is [`BucketVisibility::Nothing`] — the empty listing — and a bucket becomes
+    /// visible only by being named in an obligation a policy emitted. What changed is the
+    /// shape of the refusal, not its strictness.
+    ///
+    /// ### Why the hook returns `Ok(())` on a denial
+    ///
+    /// Because the empty response has to be produced *somewhere*, and an `S3Access` hook
+    /// cannot produce a response — only a verdict. The dispatcher does it, from the
+    /// obligation installed here. What keeps that from being a hole:
+    /// `GatewayS3::list_buckets` refuses outright if no visibility obligation is present
+    /// (so a hook that never ran cannot forward), and the `Nothing` branch it takes here
+    /// contacts no backend and reads no data — it constructs an empty listing and returns.
+    /// No [`AuthzProof`] is minted on this path, and none is needed, because nothing is
+    /// fetched.
+    async fn list_buckets(&self, req: &mut S3Request<ListBucketsInput>) -> S3Result<()> {
+        let visibility = {
+            let mut cx = ReqCtx::new(req)?;
+            self.enforce_bucket_listing(&mut cx).await
+        };
+        ResponseObligations::buckets(visibility).install(&mut req.extensions);
+        Ok(())
+    }
+
+    // ── bucket existence and lifecycle (M4 tier 1: client compatibility) ─────────
+
+    async fn head_bucket(&self, req: &mut S3Request<HeadBucketInput>) -> S3Result<()> {
+        let bucket = req.input.bucket.clone();
+        let mut cx = ReqCtx::new(req)?;
+        self.enforce_bucket(&mut cx, Action::ReadBucket, bucket)
+            .await
+    }
+
+    async fn get_bucket_location(
+        &self,
+        req: &mut S3Request<GetBucketLocationInput>,
+    ) -> S3Result<()> {
+        // `read_bucket`, not `read_bucket_config`: every SDK probes this on connect, so
+        // charging it to the configuration verb would make ordinary use require a
+        // config grant.
+        let bucket = req.input.bucket.clone();
+        let mut cx = ReqCtx::new(req)?;
+        self.enforce_bucket(&mut cx, Action::ReadBucket, bucket)
+            .await
+    }
+
+    /// Create a bucket **inside the caller's own tenant**, and nowhere else.
+    ///
+    /// Two independent things bind the name to the tenant, and both are needed:
+    ///
+    /// 1. the decision is asked with `input.tenant` taken from the [`RouteSnapshot`]
+    ///    `check` resolved — never from anything the caller sent — and grants are keyed
+    ///    per tenant in the bundle, so a `create_bucket` grant cannot exist for a tenant
+    ///    the principal does not belong to;
+    /// 2. the forward is re-signed with *that* tenant's owner credential, so RGW places
+    ///    the bucket in that tenant's namespace.
+    ///
+    /// What is left is the name itself: RGW addresses a foreign tenant's bucket as
+    /// `<tenant>:<bucket>`, so a name carrying that qualifier would ask the backend for
+    /// somebody else's namespace under our own credential. [`tenant_local_bucket_name`]
+    /// refuses it before the question is even asked.
+    /// A bucket ACL on the create is refused outright, whatever the principal holds.
+    ///
+    /// Not by the [`Self::screen_riders`] tiering, and not by a `write_object_acl`
+    /// sub-decision, because neither is the right question: this is a *bucket* ACL, and
+    /// the frozen 13-verb vocabulary has no bucket-ACL verb. `PutBucketAcl` is
+    /// `Coverage::Denied` — the gateway does not do bucket ACLs at all — so accepting one
+    /// as a create-time rider would enable through the back door precisely the operation
+    /// the table refuses at the front. `x-amz-grant-write` exists only here, which is its
+    /// own reason to be careful: it is the one grant header that hands out *write*.
+    async fn create_bucket(&self, req: &mut S3Request<CreateBucketInput>) -> S3Result<()> {
+        let bucket = req.input.bucket.clone();
+        let acl = AclFields {
+            canned: req.input.acl.as_ref().map(BucketCannedACL::as_str),
+            full_control: req.input.grant_full_control.as_deref(),
+            read: req.input.grant_read.as_deref(),
+            write: req.input.grant_write.as_deref(),
+            read_acp: req.input.grant_read_acp.as_deref(),
+            write_acp: req.input.grant_write_acp.as_deref(),
+        }
+        .grants();
+        let mut cx = ReqCtx::new(req)?;
+        if let Err(why) = tenant_local_bucket_name(&bucket) {
+            let input = cx.base_input(Action::CreateBucket, bucket);
+            return Err(self.refuse(input, why));
+        }
+        if headers::classify(&acl) != AclDisposition::NoGrant {
+            let mut input = cx.base_input(Action::CreateBucket, bucket);
+            input.acl_grants = acl.clone();
+            return Err(self.refuse(
+                input,
+                "the request sets a bucket ACL (x-amz-acl / x-amz-grant-*). This gateway \
+                 does not authorize bucket ACLs at all — PutBucketAcl is denied at the \
+                 gate — and there is no bucket-ACL verb in its grant vocabulary, so a \
+                 create-time ACL cannot be authorized and is refused"
+                    .to_string(),
+            ));
+        }
+        let mut input = cx.base_input(Action::CreateBucket, bucket);
+        // A no-op canned `private` still reaches the PDP and the audit record: what the
+        // caller asked for is a fact about the request.
+        input.acl_grants = acl;
+        self.enforce(&mut cx, input).await
+    }
+
+    /// Delete a bucket, under the same tenant binding as [`Self::create_bucket`] — and
+    /// under a *different verb*, deliberately: create must never confer delete.
+    async fn delete_bucket(&self, req: &mut S3Request<DeleteBucketInput>) -> S3Result<()> {
+        let bucket = req.input.bucket.clone();
+        let mut cx = ReqCtx::new(req)?;
+        if let Err(why) = tenant_local_bucket_name(&bucket) {
+            let input = cx.base_input(Action::DeleteBucket, bucket);
+            return Err(self.refuse(input, why));
+        }
+        self.enforce_bucket(&mut cx, Action::DeleteBucket, bucket)
+            .await
+    }
+
+    // ── bucket sub-resources (M4 tier 2: operator needs) ────────────────────────
+
+    async fn get_bucket_policy(&self, req: &mut S3Request<GetBucketPolicyInput>) -> S3Result<()> {
+        let bucket = req.input.bucket.clone();
+        let mut cx = ReqCtx::new(req)?;
+        self.enforce_bucket_config(
+            &mut cx,
+            Action::ReadBucketConfig,
+            bucket,
+            CONFIG_KIND_POLICY,
+        )
+        .await
+    }
+
+    /// Write a bucket policy — a second, backend-side PDP the gateway does not evaluate.
+    ///
+    /// Two refusals happen before the authorization question, both audited as real
+    /// `write_bucket_config` denials rather than as `InvalidRequest` (defect B-1):
+    ///
+    /// - **size.** `xml_max_body_size` is 20 MiB; AWS caps a bucket policy at 20 KB, and
+    ///   this document is parsed here, so `limits.max_bucket_policy_bytes` bounds it.
+    /// - **self-lockout.** The gateway reaches the backend as the tenant-owner
+    ///   credential. A policy that denies that principal takes the *bucket* away from
+    ///   the gateway — including the ability to put a corrected policy back. See
+    ///   [`bucket_policy_locks_out_the_gateway`] for what is and is not detectable.
+    async fn put_bucket_policy(&self, req: &mut S3Request<PutBucketPolicyInput>) -> S3Result<()> {
+        let bucket = req.input.bucket.clone();
+        let policy = req.input.policy.clone();
+        let confirm_remove_self = req.input.confirm_remove_self_bucket_access;
+        let max_bytes = self.gw.limits().max_bucket_policy_bytes;
+        let mut cx = ReqCtx::new(req)?;
+        // The input a refusal is recorded against: the same verb, bucket and
+        // config_kind the allow path would have asked about, so a capped request and a
+        // policy-denied one are the same shape in the decision log.
+        let refused = |cx: &ReqCtx<'_>| {
+            let mut input = cx.base_input(Action::WriteBucketConfig, bucket.clone());
+            input.config_kind = Some(CONFIG_KIND_POLICY.to_string());
+            input
+        };
+        if policy.len() > max_bytes {
+            let why = format!(
+                "bucket policy document is {} bytes, over the {max_bytes}-byte cap",
+                policy.len()
+            );
+            return Err(self.refuse(refused(&cx), why));
+        }
+        if confirm_remove_self == Some(true) {
+            return Err(self.refuse(
+                refused(&cx),
+                "x-amz-confirm-remove-self-bucket-access asks to drop the credential the \
+                 gateway itself reaches this bucket with"
+                    .to_string(),
+            ));
+        }
+        if let Err(why) = bucket_policy_locks_out_the_gateway(&policy) {
+            return Err(self.refuse(refused(&cx), why));
+        }
+        self.enforce_bucket_config(
+            &mut cx,
+            Action::WriteBucketConfig,
+            bucket,
+            CONFIG_KIND_POLICY,
+        )
+        .await
+    }
+
+    async fn get_bucket_cors(&self, req: &mut S3Request<GetBucketCorsInput>) -> S3Result<()> {
+        let bucket = req.input.bucket.clone();
+        let mut cx = ReqCtx::new(req)?;
+        self.enforce_bucket_config(&mut cx, Action::ReadBucketConfig, bucket, CONFIG_KIND_CORS)
+            .await
+    }
+
+    async fn put_bucket_cors(&self, req: &mut S3Request<PutBucketCorsInput>) -> S3Result<()> {
+        let bucket = req.input.bucket.clone();
+        let rules = req.input.cors_configuration.cors_rules.len();
+        let max_rules = self.gw.limits().max_cors_rules;
+        let mut cx = ReqCtx::new(req)?;
+        if rules > max_rules {
+            let mut input = cx.base_input(Action::WriteBucketConfig, bucket);
+            input.config_kind = Some(CONFIG_KIND_CORS.to_string());
+            return Err(self.refuse(
+                input,
+                format!("cors configuration carries {rules} rules, over the {max_rules}-rule cap"),
+            ));
+        }
+        self.enforce_bucket_config(&mut cx, Action::WriteBucketConfig, bucket, CONFIG_KIND_CORS)
+            .await
+    }
+
+    // ── object tagging and attributes (M4 tier 3) ───────────────────────────────
+
+    async fn get_object_tagging(&self, req: &mut S3Request<GetObjectTaggingInput>) -> S3Result<()> {
+        let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
+        let mut cx = ReqCtx::new(req)?;
+        self.enforce_object(&mut cx, Action::ReadObjectTags, bucket, key)
+            .await
+    }
+
+    /// Install a tag set.
+    ///
+    /// The tags ride to the PDP as `requested_tags` — the **proposed** set, never the
+    /// object's current one — because a tag write is an ABAC input: a principal that can
+    /// set the key its own grant conditions read can elevate itself. Deciding against the
+    /// current set would authorize the state the object is leaving, not the one it is
+    /// entering.
+    ///
+    /// That is necessary and not sufficient, so the reserved-key guard runs here too and
+    /// runs *first*: see [`tagging`] for why an absent `reserved_tag_keys` list refuses
+    /// every tag write rather than reserving nothing.
+    async fn put_object_tagging(&self, req: &mut S3Request<PutObjectTaggingInput>) -> S3Result<()> {
+        let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
+        let tag_set = req.input.tagging.tag_set.clone();
+        let max_tags = self.gw.limits().max_tag_count;
+        let mut cx = ReqCtx::new(req)?;
+        let refused = |cx: &ReqCtx<'_>, tags: Option<&BTreeMap<String, String>>| {
+            let mut input = cx.base_input(Action::WriteObjectTags, bucket.clone());
+            input.object = Some(key.clone());
+            input.requested_tags = tags.cloned();
+            input
+        };
+        let tags = match parse_tag_set(&tag_set, max_tags) {
+            Ok(t) => t,
+            Err(why) => return Err(self.refuse(refused(&cx, None), why)),
+        };
+        if let Err(why) = self.reserved_tag_keys().check(&tags) {
+            return Err(self.refuse(refused(&cx, Some(&tags)), why));
+        }
+        let input = refused(&cx, Some(&tags));
+        self.enforce(&mut cx, input).await
+    }
+
+    /// Clear an object's tag set.
+    ///
+    /// No `requested_tags`: the request names no tags, it removes whatever is there.
+    /// Reading the current set first would be an on-demand backend fetch, which is
+    /// ADR-003's gated `object_tags` path and is deliberately not wired.
+    ///
+    /// It is still a **tag write**, so it is refused while tagging is inert. That is not
+    /// pedantry: removing a tag changes the ABAC facts about an object just as setting one
+    /// does, and a deployment whose control plane has not yet said which keys a policy may
+    /// depend on cannot tell which removals matter.
+    async fn delete_object_tagging(
+        &self,
+        req: &mut S3Request<DeleteObjectTaggingInput>,
+    ) -> S3Result<()> {
+        let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
+        let mut cx = ReqCtx::new(req)?;
+        if let Some(why) = self.reserved_tag_keys().inert_reason() {
+            let mut input = cx.base_input(Action::WriteObjectTags, bucket);
+            input.object = Some(key);
+            return Err(self.refuse(input, why));
+        }
+        self.enforce_object(&mut cx, Action::WriteObjectTags, bucket, key)
+            .await
+    }
+
+    /// `read_objects`, same verb as `GetObject`: it answers questions about the object
+    /// a reader could answer by reading it. The one thing it adds is `ObjectParts` —
+    /// the multipart structure — which any read-granted principal now sees. Recorded as
+    /// a blind spot; not solved here.
+    async fn get_object_attributes(
+        &self,
+        req: &mut S3Request<GetObjectAttributesInput>,
+    ) -> S3Result<()> {
+        split_comma_list(&mut req.input.object_attributes);
+        let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
+        let mut cx = ReqCtx::new(req)?;
+        self.enforce_object(&mut cx, Action::ReadObjects, bucket, key)
+            .await
+    }
 }
+
+/// Re-split a header list s3s parsed as one element per *repeated header* back into one
+/// element per comma-separated value.
+///
+/// Found by driving `boto3` through the gateway at a real backend, not by a unit test —
+/// which is the point of the client-compatibility matrix. AWS clients send a
+/// `list`-shaped header as a single header with comma-separated values
+/// (`x-amz-object-attributes: ETag,ObjectSize`), but `s3s`'s `parse_list_header`
+/// (`http/de.rs:118-132`) iterates `headers.get_all(name)` and never splits on the comma,
+/// so it produces the one-element list `["ETag,ObjectSize"]`. The forward then re-encodes
+/// that element through the AWS SDK, which **quotes any element containing a comma** — so
+/// the backend receives `x-amz-object-attributes: "ETag,ObjectSize"` and answers
+/// `400 InvalidArgument`. Verified end to end: one attribute works through the gateway,
+/// two do not, and both work when the same client talks to the backend directly.
+///
+/// The rewrite is a canonicalization, not an authorization decision: the requested
+/// attribute list is not separately authorized (recorded as a blind spot on
+/// `GetObjectAttributes`), and splitting can only make the forwarded value *more* faithful
+/// to what the caller signed. It happens in the hook rather than the dispatch arm so the
+/// canonicalize-before-forward invariant still holds — the value the PDP saw, the value on
+/// the audit record and the value forwarded are the same one.
+fn split_comma_list<T: HeaderListItem>(values: &mut Vec<T>) {
+    if !values.iter().any(|v| v.as_str().contains(',')) {
+        return;
+    }
+    *values = values
+        .iter()
+        .flat_map(|v| {
+            v.as_str()
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .map(T::from_string)
+        .collect();
+}
+
+/// The s3s enum-newtypes that appear in a `list`-shaped header. Neither implements
+/// `AsRef<str>`, so this is the smallest common surface [`split_comma_list`] needs.
+trait HeaderListItem {
+    fn as_str(&self) -> &str;
+    fn from_string(s: String) -> Self;
+}
+
+macro_rules! header_list_item {
+    ($t:ty) => {
+        impl HeaderListItem for $t {
+            fn as_str(&self) -> &str {
+                <$t>::as_str(self)
+            }
+            fn from_string(s: String) -> Self {
+                Self::from(s)
+            }
+        }
+    };
+}
+
+header_list_item!(ObjectAttributes);
+header_list_item!(OptionalObjectAttributes);
 
 /// What to do with a list request after the PDP decision.
 enum ListVerdict {
@@ -710,6 +1552,9 @@ fn classify_list(decision: &Decision, max_fanout: usize, fanout: Fanout) -> List
     if !decision.allow {
         return ListVerdict::Deny(decision.reason.clone());
     }
+    if let Some(reason) = unimplemented_obligations(decision) {
+        return ListVerdict::Deny(reason);
+    }
     // Defense in depth: the shipped rego sets at most one obligation.
     if decision.obligations.narrow_prefix.is_some()
         && !decision.obligations.allowed_prefixes.is_empty()
@@ -741,6 +1586,64 @@ fn classify_list(decision: &Decision, max_fanout: usize, fanout: Fanout) -> List
     ListVerdict::AllowAsIs
 }
 
+/// What to do with a `ListBuckets` after the PDP decision.
+enum BucketListing {
+    /// Show nothing, and record `reason` as the denial. The client cannot tell this
+    /// from an allowed listing with an empty visible set — deliberately.
+    Withhold(String),
+    /// Forward, and filter the response to this visibility.
+    Show(BucketVisibility),
+}
+
+/// Turn a decision into a bucket-visibility verdict.
+///
+/// Every branch that is not an explicit, unambiguous grant of visibility ends in
+/// [`BucketListing::Withhold`]. In particular an **absent** obligation does — that is
+/// the asymmetry documented on [`crate::authz::Obligations::visible_buckets`], and it is
+/// what makes a policy that forgot to say anything about bucket visibility safe rather
+/// than catastrophic.
+fn classify_bucket_listing(decision: &Decision) -> BucketListing {
+    if !decision.allow {
+        return BucketListing::Withhold(decision.reason.clone());
+    }
+    if let Some(reason) = unimplemented_obligations(decision) {
+        return BucketListing::Withhold(reason);
+    }
+    let obligations = &decision.obligations;
+    if obligations.all_buckets_visible && !obligations.visible_buckets.is_empty() {
+        // Two obligations describing the same response, disagreeing. Picking either one
+        // is a guess about which the author meant, and the wrong guess publishes the
+        // tenant's namespace.
+        return BucketListing::Withhold(
+            "deny (gateway): ambiguous bucket-visibility obligation — all_buckets_visible \
+             was set together with a visible_buckets list"
+                .to_string(),
+        );
+    }
+    if obligations.all_buckets_visible {
+        return BucketListing::Show(BucketVisibility::All);
+    }
+    // `only` collapses the empty set to `Nothing`, so "allowed, nothing granted" and
+    // "allowed, these buckets granted" are the same code path with different data.
+    BucketListing::Show(BucketVisibility::only(
+        obligations.visible_buckets.iter().cloned().collect(),
+    ))
+}
+
+/// The deny reason for a decision carrying a `must_understand` this binary cannot
+/// honor, or `None` when every named obligation is implemented.
+fn unimplemented_obligations(decision: &Decision) -> Option<String> {
+    let missing = decision.obligations.unimplemented();
+    if missing.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "deny (gateway): the policy requires obligation(s) {} which this gateway does \
+         not implement; upgrade the gateway before pushing a policy that depends on them",
+        missing.join(", ")
+    ))
+}
+
 /// Apply a list verdict for ops without fan-out dispatch (v1 list, multipart list).
 fn list_verdict_single(verdict: ListVerdict, prefix: &mut Option<String>) -> S3Result<()> {
     match verdict {
@@ -759,6 +1662,132 @@ fn list_verdict_single(verdict: ListVerdict, prefix: &mut Option<String>) -> S3R
             InternalError,
             "fan-out verdict reached an operation with no fan-out dispatch"
         )),
+    }
+}
+
+/// Refuse a bucket name that can address anything outside the caller's own tenant.
+///
+/// Ceph RGW addresses a foreign tenant's bucket as `<tenant>:<bucket>`, and the gateway
+/// forwards re-signed as *its* tenant-owner credential — so a name carrying a tenant
+/// qualifier is a request to operate on another namespace with our authority. The
+/// character set below is the S3 bucket alphabet, which excludes `:` and `/`; anything
+/// else is refused before the decision is asked for.
+///
+/// s3s's own path parser applies the same rules today, but its validator is pluggable
+/// (`s3s::validation::NameValidation`), and a tenant-confinement property must not rest
+/// on a substrate default this repository does not own. It is also not reachable for
+/// `CreateBucket` bodies in general: the check is here, next to the two ops for which
+/// the name decides which namespace is written.
+fn tenant_local_bucket_name(name: &str) -> Result<(), String> {
+    if !(3..=63).contains(&name.len()) {
+        return Err(format!(
+            "bucket name must be 3–63 characters, got {}",
+            name.len()
+        ));
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-' || *c == '.'))
+    {
+        return Err(format!(
+            "bucket name contains {bad:?}, which is outside the S3 bucket alphabet; a \
+             qualified name such as <tenant>:<bucket> would address another tenant's \
+             namespace and is refused"
+        ));
+    }
+    let first_last_ok =
+        |c: Option<char>| c.is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+    if !first_last_ok(name.chars().next()) || !first_last_ok(name.chars().last()) {
+        return Err("bucket name must start and end with a letter or digit".to_string());
+    }
+    Ok(())
+}
+
+/// The tag set a `PutObjectTagging` asks to install, as the map the PDP sees.
+///
+/// Two refusals, both of them about the PDP and the backend seeing the same thing:
+///
+/// - **the cap** (`limits.max_tag_count`, AWS's own limit is 10);
+/// - **duplicate keys.** A `TagSet` is a list, so it can carry one key twice. Folding
+///   it into a map silently keeps one of them, and the backend keeps whichever *it*
+///   prefers — a parser differential in which the policy authorizes a tag set the object
+///   never receives. A tag with no key is refused for the same reason.
+fn parse_tag_set(tag_set: &[Tag], max_tags: usize) -> Result<BTreeMap<String, String>, String> {
+    if tag_set.len() > max_tags {
+        return Err(format!(
+            "tag set carries {} tags, over the {max_tags}-tag cap",
+            tag_set.len()
+        ));
+    }
+    let mut tags = BTreeMap::new();
+    for tag in tag_set {
+        let Some(key) = tag.key.clone() else {
+            return Err("tag set carries a tag with no key".to_string());
+        };
+        if tags
+            .insert(key.clone(), tag.value.clone().unwrap_or_default())
+            .is_some()
+        {
+            return Err(format!(
+                "tag set carries the key {key:?} twice; the gateway will not authorize a \
+                 tag set it cannot resolve the same way the backend will"
+            ));
+        }
+    }
+    Ok(tags)
+}
+
+/// Refuse a bucket policy that would take this bucket away from the gateway itself.
+///
+/// The gateway reaches the backend as the **tenant-owner** credential. A bucket policy
+/// denying that principal is a self-lockout: every later request through the gateway
+/// fails, *including* the `PutBucketPolicy` that would undo it, so the only recovery is
+/// out-of-band backend administration. The vocabulary already puts this behind
+/// `write_bucket_config`; this is the additional body check.
+///
+/// What it catches: a document that does not parse, a `Statement` that is not a list of
+/// objects, and any `Effect: Deny` whose `Principal` is the wildcard — which
+/// necessarily includes the gateway's own credential. What it deliberately does **not**
+/// catch: a `Deny` naming the tenant-owner ARN explicitly. The hook cannot: `RouteSnapshot`
+/// carries no owner credential by construction (owner secrets must never reach
+/// `req.extensions`), so there is nothing here to compare an ARN against. That residual
+/// is recorded as the op's blind spot rather than papered over with a guess.
+fn bucket_policy_locks_out_the_gateway(doc: &str) -> Result<(), String> {
+    let parsed: serde_json::Value = serde_json::from_str(doc)
+        .map_err(|e| format!("bucket policy document is not valid JSON: {e}"))?;
+    let statements = match &parsed["Statement"] {
+        serde_json::Value::Array(v) => v.clone(),
+        // A single-statement policy may be an object rather than a list.
+        obj @ serde_json::Value::Object(_) => vec![obj.clone()],
+        _ => {
+            return Err("bucket policy document has no Statement".to_string());
+        }
+    };
+    for stmt in &statements {
+        let effect = stmt["Effect"].as_str().unwrap_or_default();
+        if !effect.eq_ignore_ascii_case("Deny") {
+            continue;
+        }
+        if principal_is_wildcard(&stmt["Principal"]) {
+            return Err(
+                "bucket policy contains a Deny on every principal, which would revoke the \
+                 gateway's own tenant-owner access to this bucket — including the ability \
+                 to put a corrected policy back"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `"*"`, `{"AWS": "*"}` and `{"AWS": ["*", …]}` — the three spellings of "everybody",
+/// which is the one Deny principal that provably includes the gateway.
+fn principal_is_wildcard(principal: &serde_json::Value) -> bool {
+    match principal {
+        serde_json::Value::String(s) => s == "*",
+        serde_json::Value::Array(items) => items.iter().any(principal_is_wildcard),
+        serde_json::Value::Object(map) => map.values().any(principal_is_wildcard),
+        _ => false,
     }
 }
 
@@ -869,14 +1898,21 @@ mod tests {
         ] {
             assert!(optable::gate_op(op).is_ok(), "{op} must pass the gate");
         }
-        // Ops we do not (or cannot yet) forward must be refused — they would fail-open
-        // at their default typed hook, so check() must reject them. PostObject is
-        // excluded on purpose: s3s_aws::Proxy has no post_object.
+        // The form upload is now one of them: its key lives in the parsed multipart
+        // body, so only a typed hook can authorize it, and its s3s trait default
+        // *forwards* rather than refusing.
+        assert!(optable::gate_op("PostObject").is_ok());
+        // ListBuckets is now one of them: it is the only op whose response the gateway
+        // rewrites, so its hook is what installs the visibility obligation the
+        // dispatcher applies.
+        assert!(optable::gate_op("ListBuckets").is_ok());
+        // Ops with no hook must be refused — they would fail-open at their default
+        // typed hook, so check() must reject them.
         for op in [
             "PutBucketAcl",
-            "DeleteBucket",
-            "GetBucketPolicy",
-            "PostObject",
+            "PutObjectAcl",
+            "ListObjectVersions",
+            "RestoreObject",
         ] {
             assert_eq!(
                 optable::gate_op(op),
@@ -899,7 +1935,7 @@ mod tests {
     fn list_single_prefix_narrows() {
         let d = allow_with(Obligations {
             narrow_prefix: Some("2024/".into()),
-            allowed_prefixes: vec![],
+            ..Obligations::default()
         });
         assert!(
             matches!(classify_list(&d, 16, Fanout::Supported), ListVerdict::Narrow(np) if np == "2024/")
@@ -915,8 +1951,8 @@ mod tests {
     #[test]
     fn list_multi_prefix_within_bound_fans_out_sorted() {
         let d = allow_with(Obligations {
-            narrow_prefix: None,
             allowed_prefixes: vec!["2025/".into(), "2024/".into()],
+            ..Obligations::default()
         });
         assert!(matches!(
             classify_list(&d, 16, Fanout::Supported),
@@ -927,8 +1963,8 @@ mod tests {
     #[test]
     fn list_multi_prefix_over_bound_fails_closed() {
         let d = allow_with(Obligations {
-            narrow_prefix: None,
             allowed_prefixes: vec!["a/".into(), "b/".into(), "c/".into()],
+            ..Obligations::default()
         });
         assert!(matches!(
             classify_list(&d, 2, Fanout::Supported),
@@ -953,8 +1989,8 @@ mod tests {
         // sites — a v1/multipart list, and a v2 list carrying a delimiter — must show
         // up here as `Deny`, carrying the message the client is about to be given.
         let d = allow_with(Obligations {
-            narrow_prefix: None,
             allowed_prefixes: vec!["2024/".into(), "2025/".into()],
+            ..Obligations::default()
         });
         for why in [NO_FANOUT_ON_THIS_OP, NO_FANOUT_WITH_DELIMITER] {
             match classify_list(&d, 16, Fanout::Unsupported(why)) {
@@ -977,6 +2013,120 @@ mod tests {
             classify_list(&d, 16, Fanout::Supported),
             ListVerdict::FanOut(_)
         ));
+    }
+
+    // ── ListBuckets: the response-obligation classifier ─────────────────────────
+
+    fn withheld(d: &Decision) -> String {
+        match classify_bucket_listing(d) {
+            BucketListing::Withhold(reason) => reason,
+            BucketListing::Show(v) => {
+                panic!("expected the listing to be withheld, got {v:?}")
+            }
+        }
+    }
+
+    fn shown(d: &Decision) -> BucketVisibility {
+        match classify_bucket_listing(d) {
+            BucketListing::Show(v) => v,
+            BucketListing::Withhold(reason) => {
+                panic!("expected a listing, got a refusal: {reason}")
+            }
+        }
+    }
+
+    #[test]
+    fn an_allow_with_no_visibility_obligation_shows_nothing() {
+        // THE default that makes this safe. Every request is re-signed with the
+        // tenant-owner credential, so the backend answers ListBuckets with the whole
+        // tenant namespace; a policy that allowed the enumeration and said nothing about
+        // visibility must therefore yield an empty listing, never an unfiltered one.
+        assert_eq!(
+            shown(&allow_with(Obligations::default())),
+            BucketVisibility::Nothing
+        );
+    }
+
+    #[test]
+    fn a_named_visible_set_becomes_an_exact_filter() {
+        let vis = shown(&allow_with(Obligations {
+            visible_buckets: vec!["reports".into(), "logs".into()],
+            ..Obligations::default()
+        }));
+        assert!(vis.admits("reports") && vis.admits("logs"));
+        assert!(!vis.admits("secrets"));
+        assert!(
+            !vis.admits("reports-archive"),
+            "visible_buckets is a set of names, not a set of prefixes"
+        );
+    }
+
+    #[test]
+    fn only_an_explicit_all_buckets_visible_forwards_the_listing_unfiltered() {
+        assert_eq!(
+            shown(&allow_with(Obligations {
+                all_buckets_visible: true,
+                ..Obligations::default()
+            })),
+            BucketVisibility::All
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_visibility_obligation_shows_nothing() {
+        // Two obligations describing one response and disagreeing. Resolving it either
+        // way is a guess, and one of the guesses publishes the tenant's namespace.
+        let reason = withheld(&allow_with(Obligations {
+            all_buckets_visible: true,
+            visible_buckets: vec!["reports".into()],
+            ..Obligations::default()
+        }));
+        assert!(reason.contains("ambiguous"), "{reason}");
+    }
+
+    #[test]
+    fn a_denied_enumeration_and_an_empty_grant_set_are_the_same_answer() {
+        // Requirement: the caller must not be able to tell "you may not enumerate" from
+        // "you may, and you hold nothing". Both are Nothing, so both produce the same
+        // empty listing through the same branch at the same cost. What separates them is
+        // the audit record, which is where the distinction belongs.
+        let denied = Decision::deny("no grant matches action/scope");
+        assert!(matches!(
+            classify_bucket_listing(&denied),
+            BucketListing::Withhold(_)
+        ));
+        assert_eq!(
+            shown(&allow_with(Obligations::default())),
+            BucketVisibility::Nothing
+        );
+    }
+
+    #[test]
+    fn a_must_understand_this_binary_cannot_honor_denies_every_shape() {
+        // The rollout ordering guard, on all three verdict paths: a policy may declare an
+        // obligation mandatory, and a gateway too old to apply it must refuse rather than
+        // skip it. Pushing such a policy before the binary is a self-inflicted outage,
+        // which is exactly why it must be loud.
+        let d = allow_with(Obligations {
+            visible_buckets: vec!["reports".into()],
+            must_understand: vec!["excluded_prefixes".into()],
+            ..Obligations::default()
+        });
+        assert!(withheld(&d).contains("excluded_prefixes"));
+        assert!(matches!(
+            classify_list(&d, 16, Fanout::Supported),
+            ListVerdict::Deny(reason) if reason.contains("excluded_prefixes")
+        ));
+        assert!(unimplemented_obligations(&d).is_some());
+
+        // Positive control: a name this binary does implement is not a refusal.
+        let ok = allow_with(Obligations {
+            all_buckets_visible: true,
+            must_understand: vec!["all_buckets_visible".into()],
+            ..Obligations::default()
+        });
+        assert_eq!(shown(&ok), BucketVisibility::All);
+        assert!(unimplemented_obligations(&ok).is_none());
     }
 
     #[test]

@@ -5,36 +5,116 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The data-plane object operations the gateway authorizes. This is the target
-/// grant vocabulary — deliberately coarser than the 99 S3
-/// ops: every supported S3 op maps onto exactly one of these actions (a write to
-/// `write_objects`, etc.), and `CopyObject` maps to two (source read + dest write).
+/// The grant vocabulary the gateway authorizes against — the **13 frozen verbs**.
+///
+/// Deliberately coarser than the 99 S3 ops: every enforced S3 op maps onto exactly one
+/// of these (a `PutObject` to `write_objects`, a `HeadBucket` to `read_bucket`), and
+/// `CopyObject` maps to two (source read + dest write). The set is frozen: it is the
+/// vocabulary the grant projection emits and the rego matches on, so adding a verb is a
+/// cross-repo contract change, not a local edit.
+///
+/// `manage_lifecycle` was **deleted** rather than kept as a spare. It was the only
+/// keyless verb, and its rego branch granted the whole bucket ignoring prefixes — a
+/// latent whole-bucket allow that would start matching the moment any lifecycle op
+/// landed. The bucket-scoped verbs below replace it explicitly.
+///
+/// Policy-vs-CORS is **not** split into separate verbs: both are
+/// `read_bucket_config` / `write_bucket_config`, discriminated by
+/// [`crate::authz::OpaInput::config_kind`]. A verb per sub-resource would multiply the
+/// vocabulary without making any grant more expressive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Action {
+    // object-scoped: the decision is made against a bucket + one key
     ReadObjects,
-    ListObjects,
     WriteObjects,
     DeleteObjects,
-    ManageLifecycle,
+    ReadObjectTags,
+    WriteObjectTags,
+    WriteObjectAcl,
+    // listing: bucket + prefix, and the *response* is in scope
+    ListObjects,
+    // bucket-scoped: no key, so `prefixes` cannot narrow them
+    ReadBucket,
+    CreateBucket,
+    DeleteBucket,
+    ReadBucketConfig,
+    WriteBucketConfig,
+    // account-scoped
+    ListBuckets,
 }
 
 impl Action {
+    /// Every verb, in declaration order. Exhaustively matched in [`Action::as_str`], so
+    /// a new variant is a compile error there, and cross-checked against
+    /// `optable::FROZEN_VERBS` and the rego's own write set by test.
+    pub const ALL: &'static [Action] = &[
+        Action::ReadObjects,
+        Action::WriteObjects,
+        Action::DeleteObjects,
+        Action::ReadObjectTags,
+        Action::WriteObjectTags,
+        Action::WriteObjectAcl,
+        Action::ListObjects,
+        Action::ReadBucket,
+        Action::CreateBucket,
+        Action::DeleteBucket,
+        Action::ReadBucketConfig,
+        Action::WriteBucketConfig,
+        Action::ListBuckets,
+    ];
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Action::ReadObjects => "read_objects",
-            Action::ListObjects => "list_objects",
             Action::WriteObjects => "write_objects",
             Action::DeleteObjects => "delete_objects",
-            Action::ManageLifecycle => "manage_lifecycle",
+            Action::ReadObjectTags => "read_object_tags",
+            Action::WriteObjectTags => "write_object_tags",
+            Action::WriteObjectAcl => "write_object_acl",
+            Action::ListObjects => "list_objects",
+            Action::ReadBucket => "read_bucket",
+            Action::CreateBucket => "create_bucket",
+            Action::DeleteBucket => "delete_bucket",
+            Action::ReadBucketConfig => "read_bucket_config",
+            Action::WriteBucketConfig => "write_bucket_config",
+            Action::ListBuckets => "list_buckets",
         }
     }
 
     /// Writes are subject to the org-global `freeze_writes` kill-switch.
+    ///
+    /// This set MUST equal the rego's `write_actions`, or `freeze_writes` — the only
+    /// kill switch the live bundle carries — stops covering a verb on one side while
+    /// still claiming to on the other. `write_set_matches_the_shipped_rego` in
+    /// `tests/op_coverage.rs` extracts the rego's set from the shipped module and
+    /// compares it here, so a divergence fails the build rather than surfacing as a
+    /// freeze that did not freeze.
     pub const fn is_write(self) -> bool {
         matches!(
             self,
-            Action::WriteObjects | Action::DeleteObjects | Action::ManageLifecycle
+            Action::WriteObjects
+                | Action::DeleteObjects
+                | Action::WriteObjectTags
+                | Action::WriteObjectAcl
+                | Action::CreateBucket
+                | Action::DeleteBucket
+                | Action::WriteBucketConfig
+        )
+    }
+
+    /// True for the verbs decided against a bucket with **no object key**. They ignore
+    /// grant prefixes by construction (there is no key to test a prefix against), which
+    /// is why they are separate verbs rather than a keyless fall-through of the object
+    /// verbs — a `read_objects` grant scoped to `2024/` must never confer `HeadBucket`.
+    pub const fn is_bucket_scoped(self) -> bool {
+        matches!(
+            self,
+            Action::ReadBucket
+                | Action::CreateBucket
+                | Action::DeleteBucket
+                | Action::ReadBucketConfig
+                | Action::WriteBucketConfig
         )
     }
 }

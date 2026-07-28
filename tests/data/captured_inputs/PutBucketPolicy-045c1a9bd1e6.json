@@ -1,0 +1,24 @@
+{
+  "acl_grants": [],
+  "action": "write_bucket_config",
+  "backend": {
+    "id": "bay-1",
+    "kind": "ceph"
+  },
+  "bucket": "reports",
+  "bypass_governance": false,
+  "config_kind": "policy",
+  "organization_id": "org-acme",
+  "principal": {
+    "attributes": {
+      "groups": []
+    },
+    "sub": "alice",
+    "type": "user"
+  },
+  "request": {
+    "method": "PUT",
+    "params": "policy="
+  },
+  "tenant": "acme"
+}

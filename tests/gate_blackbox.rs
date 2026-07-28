@@ -7,7 +7,7 @@
 //! through s3s's own route resolution, into the real `check`.
 //!
 //! It is table-driven off `data/s3s-0.14.1-routes.tsv`, which is extracted from the
-//! pinned s3s crate's own `resolve_route`. That is what makes "all 84 denied ops"
+//! pinned s3s crate's own `resolve_route`. That is what makes "all 70 denied ops"
 //! affordable: an SDK exposes one typed builder per operation, so the tail would be one
 //! hand-written call per op with no new information per call — and the SDK cannot
 //! express `PostObject` at all.
@@ -118,6 +118,10 @@ async fn send(base: &str, route: &Route) -> Response {
 /// reachable, and the only operation whose s3s default *forwards* (through
 /// `put_object`) rather than returning `NotImplemented`.
 fn post_object_request() -> RawRequest {
+    post_object_request_for("2024/q1.csv")
+}
+
+fn post_object_request_for(key: &str) -> RawRequest {
     const BOUNDARY: &str = "s0blackboxboundary";
     let now = chrono::Utc::now();
     let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
@@ -137,7 +141,7 @@ fn post_object_request() -> RawRequest {
             { "x-amz-date": amz_date },
             { "x-amz-credential": credential },
             { "x-amz-algorithm": "AWS4-HMAC-SHA256" },
-            { "key": "2024/q1.csv" },
+            { "key": key },
         ]
     })
     .to_string();
@@ -154,7 +158,7 @@ fn post_object_request() -> RawRequest {
     // fields and the request is rejected before it reaches the gate.
     let body = format!(
         "\r\n{}{}{}{}{}{}{}--{BOUNDARY}--\r\n",
-        field("key", "2024/q1.csv"),
+        field("key", key),
         field("policy", &policy_b64),
         field("x-amz-algorithm", "AWS4-HMAC-SHA256"),
         field("x-amz-credential", &credential),
@@ -247,7 +251,7 @@ async fn every_denied_op_403s_over_real_http() {
         checked, expected,
         "the set of ops driven over HTTP and OP_TABLE's denied set disagree"
     );
-    assert_eq!(checked.len(), 84);
+    assert_eq!(checked.len(), 70);
     drop(fx);
 }
 
@@ -341,6 +345,116 @@ async fn an_enforced_op_passes_the_gate_and_reaches_the_forward_path() {
 }
 
 #[tokio::test]
+async fn a_form_upload_is_authorized_on_its_form_carried_key() {
+    // PostObject is the one enforced op no SDK can express and the one whose key lives
+    // in the multipart body rather than the path — so this is the only place the whole
+    // chain is observable: s3s's pre-`check` multipart parse, the gate, the typed hook
+    // reading `input.key`, and the forward. It is also the op whose trait default
+    // *forwards*, so "denied ops fall to NotImplemented" never protected it.
+    let (base, fx) = spawn_gateway("blackbox-postobject", common::alice_bundle()).await;
+    let route = routes::route("PostObject");
+
+    // `2024/q1.csv` is inside alice's granted prefix: allowed, so it reaches the
+    // forward, where the configured backend (port 1) is not listening.
+    let resp = send(&base, route).await;
+    assert_ne!(
+        resp.status, 403,
+        "an allowed form upload was refused at the gate: {}",
+        resp.body
+    );
+
+    // The same request for a key outside the grant must be denied — by the policy, on
+    // the strength of the key the *form* carried. If the hook read anything else, this
+    // would be indistinguishable from the allow above.
+    let outside = post_object_request_for("2023/outside.csv");
+    let host = base.trim_start_matches("http://").to_string();
+    let mut headers = outside.headers.clone();
+    headers.push(("host".into(), host));
+    let mut builder = reqwest::Client::new()
+        .request(
+            outside.method.parse().expect("http method"),
+            outside.url(&base),
+        )
+        .timeout(Duration::from_secs(10))
+        .body(outside.body.clone());
+    for (k, v) in &headers {
+        builder = builder.header(k.as_str(), v.as_str());
+    }
+    let resp = builder.send().await.expect("response");
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(status, 403, "{body}");
+    assert!(
+        !body.contains("is not permitted by the gateway"),
+        "this must be a policy denial on the form key, not a gate denial: {body}"
+    );
+    drop(fx);
+}
+
+#[tokio::test]
+async fn a_bucket_listing_a_principal_may_not_make_is_an_empty_200_over_real_http() {
+    // The one enforced operation whose refusal is NOT a 403, asserted where it is
+    // actually observable: a real signed request, through the real serving path, with a
+    // real status line.
+    //
+    // Both principals below end up with nothing to show — one because the PDP denied the
+    // enumeration outright, one because the only bucket it was granted is one it is
+    // denylisted from — and the two answers must be byte-identical. A 403 for either
+    // would be an oracle reporting whether a credential holds `list_buckets` in this
+    // tenant; and since neither reaches the backend (port 1, closed), a *forwarded*
+    // listing would surface here as a 503 rather than as a 200.
+    let bundle = serde_json::json!({
+        "org_settings": { "freeze_writes": false },
+        "tenants": { "acme": {
+            "user_attributes": { "alice": { "groups": [], "attributes": [] } },
+            "bucket_attributes": { "reports": { "denylist": { "alice": true } } },
+            "s3_grants": { "alice": [
+                { "bucket": "reports", "actions": ["list_buckets"], "prefixes": [] }
+            ] },
+            "group_grants": {}
+        }}
+    });
+    let (base, fx) = spawn_gateway("blackbox-listbuckets-empty", bundle).await;
+    let resp = send(&base, routes::route("ListBuckets")).await;
+    assert_eq!(
+        resp.status, 200,
+        "an empty bucket listing must be an empty listing, never a 403 and never a \
+         backend error: {}",
+        resp.body
+    );
+    assert!(
+        !resp.body.contains("<Bucket>"),
+        "no bucket may appear in this listing: {}",
+        resp.body
+    );
+    assert!(
+        !resp.body.contains("<Owner>"),
+        "the tenant-owner identity must not ride out on a bucket listing: {}",
+        resp.body
+    );
+    drop(fx);
+
+    // The control that gives the assertion its meaning: with a grant that *does* make a
+    // bucket visible, the same request reaches the forward path — and fails there,
+    // because the configured backend is not listening. Without this, "200 with no
+    // buckets" would also be true of a gateway whose ListBuckets did nothing at all.
+    let (base, fx) = spawn_gateway("blackbox-listbuckets-visible", common::alice_bundle()).await;
+    let resp = send(&base, routes::route("ListBuckets")).await;
+    assert_ne!(
+        resp.status, 200,
+        "a principal with a visible bucket must reach the backend, so with no backend \
+         listening this cannot succeed: {}",
+        resp.body
+    );
+    assert_ne!(
+        resp.status, 403,
+        "…and it must not be refused at the gate either: {}",
+        resp.body
+    );
+    drop(fx);
+}
+
+#[tokio::test]
 async fn a_policy_denial_is_still_a_403_on_an_enforced_op() {
     // The other half of the control: an enforced op outside the granted prefix is
     // denied by the PDP, not by the gate. Same status, different layer — and the layer
@@ -363,6 +477,71 @@ async fn a_policy_denial_is_still_a_403_on_an_enforced_op() {
     assert!(
         !body.contains("is not permitted by the gateway"),
         "this must be a policy denial, not a gate denial: {body}"
+    );
+    drop(fx);
+}
+
+#[tokio::test]
+async fn a_public_acl_header_is_refused_over_real_http() {
+    // The hook-level suite (`tests/request_riders.rs`) builds `PutObjectInput` directly,
+    // so it proves the *decision* but assumes the *parse*: that `x-amz-acl` on the wire
+    // really lands in `PutObjectInput::acl`. This closes that assumption over real HTTP,
+    // through s3s's own header parsing, on the exact request `aws s3 cp --acl
+    // public-read` produces.
+    //
+    // It matters here specifically because everything the gateway does not read is
+    // reconstructed onto the forward from the parsed input — so "did the header parse?"
+    // and "is the header enforced?" are the same question with opposite answers.
+    let (base, fx) = spawn_gateway("blackbox-acl", common::alice_bundle()).await;
+    let host = base.trim_start_matches("http://").to_string();
+
+    let put = |acl: Option<&'static str>| {
+        let mut r = RawRequest::new("PUT", "/reports/2024/q1.csv");
+        if let Some(acl) = acl {
+            r = r.header("x-amz-acl", acl);
+        }
+        r
+    };
+
+    for acl in ["public-read", "public-read-write", "authenticated-read"] {
+        let r = put(Some(acl));
+        let signed = r.sign(&host, common::ACCESS_KEY, common::SECRET_KEY);
+        let mut builder = reqwest::Client::new()
+            .put(r.url(&base))
+            .timeout(Duration::from_secs(10))
+            .body(r.body.clone());
+        for (k, v) in &signed {
+            builder = builder.header(k.as_str(), v.as_str());
+        }
+        let resp = builder.send().await.expect("response");
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        assert_eq!(status, 403, "x-amz-acl: {acl} must be refused: {body}");
+        assert!(
+            body.contains("<Code>AccessDenied</Code>") && body.contains(acl),
+            "the refusal must name the ACL it refused, or an operator cannot tell it \
+             from an ordinary policy denial: {body}"
+        );
+    }
+
+    // The positive control that makes the three assertions above mean something: the
+    // byte-identical request without the header reaches the forward path (and fails
+    // there, against the closed backend port), so the 403s are about the ACL.
+    let r = put(None);
+    let signed = r.sign(&host, common::ACCESS_KEY, common::SECRET_KEY);
+    let mut builder = reqwest::Client::new()
+        .put(r.url(&base))
+        .timeout(Duration::from_secs(10))
+        .body(r.body.clone());
+    for (k, v) in &signed {
+        builder = builder.header(k.as_str(), v.as_str());
+    }
+    let resp = builder.send().await.expect("response");
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    assert_ne!(
+        status, 403,
+        "the same PutObject without an ACL header must be allowed: {body}"
     );
     drop(fx);
 }

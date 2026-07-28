@@ -98,12 +98,25 @@ fn require_opa() -> Option<String> {
     Some(version)
 }
 
-/// Normalize a decision to the comparable core: allow + obligations (order-insensitive
-/// on allowed_prefixes). Reason strings are engine-formatted and excluded.
-fn core(d: &Decision) -> (bool, Option<String>, Vec<String>) {
+/// Normalize a decision to the comparable core: allow + **every** obligation
+/// (order-insensitive on the two set-valued ones, which the PEP sorts anyway). Reason
+/// strings are engine-formatted and excluded.
+///
+/// Every obligation has to be in here. An obligation the two engines could disagree
+/// about without this gate noticing is an obligation the gate does not cover — and for
+/// `visible_buckets` a disagreement is a difference in which buckets a principal is shown.
+fn core(d: &Decision) -> (bool, Option<String>, Vec<String>, Vec<String>, bool) {
     let mut prefixes = d.obligations.allowed_prefixes.clone();
     prefixes.sort();
-    (d.allow, d.obligations.narrow_prefix.clone(), prefixes)
+    let mut buckets = d.obligations.visible_buckets.clone();
+    buckets.sort();
+    (
+        d.allow,
+        d.obligations.narrow_prefix.clone(),
+        prefixes,
+        buckets,
+        d.obligations.all_buckets_visible,
+    )
 }
 
 fn opa_decision(bundle: &serde_json::Value, input: &serde_json::Value) -> Decision {

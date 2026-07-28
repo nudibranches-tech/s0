@@ -49,22 +49,63 @@ pub fn scratch(tag: &str) -> PathBuf {
     d
 }
 
-/// The grant fixture most tests run against: `alice` may read/list/write/delete under
-/// `reports/2024/`, and nothing else anywhere.
+/// The grant fixture most tests run against: `alice` may read/list/write/delete objects
+/// (and their tags) under `reports/2024/`, and operate on the `reports` bucket itself —
+/// including enumerating her buckets, of which `reports` is the only visible one.
+/// Nothing anywhere else.
+///
+/// Two grants, not one, because the two halves of the vocabulary scope differently: the
+/// object verbs are narrowed by `prefixes`, while the bucket verbs have no key to test a
+/// prefix against and are therefore emitted with `"prefixes": []` — the shape the
+/// projection is required to produce (ADR-006), so the fixture models the contract
+/// rather than a convenient approximation of it.
+///
+/// `org_settings.reserved_tag_keys` is **published** here, because the shipped default
+/// for an absent list is to refuse every tag write (`access::tagging`). A fixture without
+/// it would exercise the inert path on every tagging op and hide the live one; the
+/// inert path has its own bundle, [`bundle_without_reserved_tag_keys`], and its own named
+/// tests.
 pub fn alice_bundle() -> serde_json::Value {
     serde_json::json!({
-        "org_settings": { "freeze_writes": false },
+        "org_settings": {
+            "freeze_writes": false,
+            // A platform-owned namespace, the shape a real control plane emits: policy
+            // conditions live under it, so no S3 caller may write into it.
+            "reserved_tag_keys": ["hyperfluid/*"]
+        },
         "tenants": { "acme": {
             "user_attributes": { "alice": { "groups": [], "attributes": [] } },
             "bucket_attributes": { "reports": { "denylist": {} } },
             "s3_grants": { "alice": [
                 { "bucket": "reports",
-                  "actions": ["read_objects", "list_objects", "write_objects", "delete_objects"],
-                  "prefixes": ["2024/"] }
+                  "actions": ["read_objects", "list_objects", "write_objects", "delete_objects",
+                              "read_object_tags", "write_object_tags"],
+                  "prefixes": ["2024/"] },
+                { "bucket": "reports",
+                  "actions": ["read_bucket", "create_bucket", "delete_bucket",
+                              "read_bucket_config", "write_bucket_config", "list_buckets"],
+                  "prefixes": [] }
             ] },
             "group_grants": {}
         }}
     })
+}
+
+/// [`alice_bundle`] with the reserved-key list **removed** — the state every deployment
+/// is in until hyperfluid publishes one.
+///
+/// Tag writes are inert under it: `PutObjectTagging`, `DeleteObjectTagging` and an inline
+/// `x-amz-tagging` on a write are all refused. That is the plan's stated default
+/// (open question 5, resolved to `["*"]`), and it needs its own fixture precisely because
+/// it is a *default*: a test that only ever ran against a published list would not notice
+/// if absence started meaning "reserve nothing".
+pub fn bundle_without_reserved_tag_keys() -> serde_json::Value {
+    let mut bundle = alice_bundle();
+    bundle["org_settings"]
+        .as_object_mut()
+        .expect("org_settings")
+        .remove("reserved_tag_keys");
+    bundle
 }
 
 /// The gateway config every fixture shares. `backend_endpoint` decides how far an
@@ -170,8 +211,17 @@ pub struct Fixture {
 /// `build` hard-codes `capture: None` (see `authz::capture`), which is the property
 /// that keeps capture out of every deployed binary.
 pub fn fixture(tag: &str, bundle: serde_json::Value) -> Fixture {
+    // Port 1 is closed, deliberately: a request that reaches the forward path fails
+    // loudly instead of quietly succeeding against something real, so "was this
+    // forwarded?" is observable without a backend.
+    fixture_with_backend(tag, bundle, "http://127.0.0.1:1")
+}
+
+/// [`fixture`] pointed at a backend that answers — for the tests that must observe what
+/// the gateway does to a *response*.
+pub fn fixture_with_backend(tag: &str, bundle: serde_json::Value, endpoint: &str) -> Fixture {
     let dir = scratch(tag);
-    let cfg = GatewayConfig::from_json(&config_json(&dir, "http://127.0.0.1:1")).expect("config");
+    let cfg = GatewayConfig::from_json(&config_json(&dir, endpoint)).expect("config");
     let bundles = Arc::new(BundleStore::new(Bundle::new("rev-1", bundle.clone())));
     let engine = RegorusPdp::new(GATEWAY_REGO, &bundle).expect("regorus");
     let pdp_calls = Arc::new(AtomicUsize::new(0));
