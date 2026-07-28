@@ -13,7 +13,7 @@
 # It is evaluated once per parsed request (or per sub-decision: one multi-delete
 # key, or the source-read / dest-write halves of a copy — the PEP decomposes those
 # blind-spot ops into separate questions). The engine reads the single rule
-# `data.s0.gateway.decision`.
+# `data.s3.authz.decision`.
 #
 # ── input ──────────────────────────────────────────────────────────────────────
 #   input.principal.{sub,type,attributes.groups,attributes.<extra>}
@@ -69,7 +69,7 @@
 # Deny-by-default. Membership is necessary but NOT sufficient: an explicit
 # data-plane grant must match the (action, bucket, object|prefix).
 
-package s0.gateway
+package s3.authz
 
 import future.keywords.contains
 import future.keywords.if

@@ -31,7 +31,10 @@ pub trait CredentialStore: Send + Sync {
 
 #[derive(Debug, Clone)]
 pub struct StaticCredential {
-    pub secret_access_key: String,
+    /// A [`Secret`](crate::secret::Secret) rather than a `String` for the same reason
+    /// the config field is: this struct derives `Debug` and lives in a map that is
+    /// trivially reachable from a log line.
+    pub secret_access_key: crate::secret::Secret<String>,
     pub principal_sub: String,
     pub tenant: String,
     pub organization_id: String,
@@ -120,7 +123,7 @@ impl CredentialStore for StaticCredentialStore {
         self.by_access_key
             .load()
             .get(access_key_id)
-            .map(|c| c.secret_access_key.clone())
+            .map(|c| c.secret_access_key.expose().clone())
     }
 
     fn resolve(&self, access_key_id: &str) -> Option<ResolvedPrincipal> {

@@ -10,7 +10,8 @@ mod embedded;
 mod sidecar;
 
 pub use bundle::{
-    Bundle, BundleStore, DECISION_RULE, GATEWAY_REGO, ParsedBundle, content_revision, parse_bundle,
+    Bundle, BundleStore, DECISION_RULE, GATEWAY_REGO, ParsedBundle, content_revision,
+    decision_rule_path, parse_bundle,
 };
 pub use cache::CachingPdp;
 pub use embedded::RegorusPdp;

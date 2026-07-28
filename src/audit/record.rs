@@ -21,18 +21,33 @@ use serde::{Deserialize, Serialize};
 
 use crate::authz::{Decision, OpaInput};
 
-/// Label keys. The record-type label lets the control plane route gateway records to
-/// the right decision-log extractor; the org-id label is the trusted, fail-closed org
-/// attribution.
-pub const LABEL_RECORD_TYPE: &str = "s0.dev/record-type";
-pub const LABEL_ORG_ID: &str = "s0.dev/organization-id";
-pub const RECORD_TYPE_VALUE: &str = "s3-gateway";
+/// Label keys — **a cross-repo contract, not a naming preference.**
+///
+/// The platform's decision-log ingest dispatches on these exact strings:
+/// `S3GatewayDecisionLogMetadataExtractor::is_handled` matches
+/// `hyperfluid.nudibranches.tech/data-dock-type == "s3-gateway"`, and
+/// `get_organization_id` reads `hyperfluid.nudibranches.tech/organization-id`
+/// (`hf_module_console_api/src/hf_console/domain/audit_logs/models/decision_log.rs`,
+/// with the org key defined once in `hf_lib_domain_core/src/labels.rs`).
+///
+/// A record whose labels do not match falls off the end of the dispatch chain with
+/// `"No metadata extractor found for decision log"` — warn-logged and **dropped**,
+/// while the ingest endpoint still answers 201. So the producer never learns, and an
+/// entire regulated trail (including the M4 ACL and WORM refusal records, whose whole
+/// value is that they arrive) disappears with every test in both repos green.
+///
+/// `tests/cross_repo_contract.rs` holds these equal to the literals the platform
+/// actually ships. Do not change them without changing that test and the extractor.
+pub const LABEL_DATA_DOCK_TYPE: &str = "hyperfluid.nudibranches.tech/data-dock-type";
+pub const LABEL_ORG_ID: &str = "hyperfluid.nudibranches.tech/organization-id";
+/// The value the extractor routes on.
+pub const DATA_DOCK_TYPE_VALUE: &str = "s3-gateway";
 
-pub const DECISION_PATH: &str = "s0/gateway/decision";
+pub const DECISION_PATH: &str = "s3/authz/decision";
 
 /// The `path` of a gate record. Deliberately **not** [`DECISION_PATH`]: no policy was
 /// evaluated, so claiming the decision entrypoint ran would be false.
-pub const GATE_PATH: &str = "s0/gateway/gate";
+pub const GATE_PATH: &str = "s3/authz/gate";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditRecord {
@@ -172,7 +187,10 @@ impl AuditRecord {
         gateway: GatewayMeta,
     ) -> Self {
         let mut labels = BTreeMap::new();
-        labels.insert(LABEL_RECORD_TYPE.to_string(), RECORD_TYPE_VALUE.to_string());
+        labels.insert(
+            LABEL_DATA_DOCK_TYPE.to_string(),
+            DATA_DOCK_TYPE_VALUE.to_string(),
+        );
         labels.insert(LABEL_ORG_ID.to_string(), input.organization_id.clone());
         AuditRecord {
             decision_id,
@@ -202,7 +220,10 @@ impl AuditRecord {
         requested_by: String,
     ) -> Self {
         let mut labels = BTreeMap::new();
-        labels.insert(LABEL_RECORD_TYPE.to_string(), RECORD_TYPE_VALUE.to_string());
+        labels.insert(
+            LABEL_DATA_DOCK_TYPE.to_string(),
+            DATA_DOCK_TYPE_VALUE.to_string(),
+        );
         AuditRecord {
             decision_id,
             path: GATE_PATH.to_string(),
@@ -300,8 +321,10 @@ mod tests {
             Some("org-acme")
         );
         assert_eq!(
-            rec.labels.get(super::LABEL_RECORD_TYPE).map(String::as_str),
-            Some(RECORD_TYPE_VALUE)
+            rec.labels
+                .get(super::LABEL_DATA_DOCK_TYPE)
+                .map(String::as_str),
+            Some(DATA_DOCK_TYPE_VALUE)
         );
         // Round-trips through the spill format.
         let json = serde_json::to_string(&rec).unwrap();
@@ -358,7 +381,7 @@ mod tests {
             json["labels"].get(LABEL_ORG_ID).is_none(),
             "an unattributable request must not claim an organization: {json}"
         );
-        assert_eq!(json["labels"][LABEL_RECORD_TYPE], RECORD_TYPE_VALUE);
+        assert_eq!(json["labels"][LABEL_DATA_DOCK_TYPE], DATA_DOCK_TYPE_VALUE);
         // Rate-limit bookkeeping is omitted when nothing was suppressed.
         assert!(json["gate"].get("suppressed_since_last").is_none());
 

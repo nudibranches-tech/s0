@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// One policy decision. Deserialized directly from the rego rule
-/// `data.s0.gateway.decision`, so its shape mirrors the rego object.
+/// `data.s3.authz.decision`, so its shape mirrors the rego object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Decision {
     pub allow: bool,

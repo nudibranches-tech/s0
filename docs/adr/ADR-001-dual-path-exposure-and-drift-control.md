@@ -151,7 +151,7 @@ hand-written policies over that one data source.
 |---|---|---|---|
 | In-backend hook | the in-backend defense-in-depth policy (external) | Backend request: identity shape, bucket. No request body — structurally cannot see copy-source, multi-delete keys, or the POST form key | Defense-in-depth, backend-only; membership + denylist |
 | Analytics-engine PEP | an external analytics-engine PEP policy | SQL-logical: `catalog.schema.table[.column]`; never an S3 key | Defense-in-depth: row/column masking |
-| Gateway | `s0.gateway` — `policy/gateway/authz.rego` (this repo) | Full parsed input superset (`src/authz/input.rs`) | **The** object-authz and audit path, for all backends |
+| Gateway | `s3.authz` — `policy/gateway/authz.rego` (this repo) | Full parsed input superset (`src/authz/input.rs`) | **The** object-authz and audit path, for all backends |
 
 **Suite architecture:**
 

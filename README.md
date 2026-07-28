@@ -163,10 +163,13 @@ records of real access. Suppression is counted here and on the next emitted gate
 | the policy is tested against the *emitted* input, never a hand-written one | every fixture in [`tests/data/captured_inputs/`](tests/data/captured_inputs) is recorded at `GatewayAccess::decide`, the single funnel every PDP question passes through ([`authz/capture.rs`](src/authz/capture.rs)) |
 | a renamed or dropped input field fails the build | `OpaInput` and its nested types carry `deny_unknown_fields`; every capture must satisfy `to_value(from_value::<OpaInput>(raw)?) == raw`, and adding a field is a compile error until `OPA_INPUT_FIELDS` is updated ([`tests/fixture_drift.rs`](tests/fixture_drift.rs)) |
 | a policy cannot read a field the gateway never sends | every `input.<path>` in the shipped rego must resolve in a captured input — the exact failure that once left 35 rego tests green over a deny-all production |
-| every denied op is refused over real HTTP | all 84 are driven as signed requests through the real `check`, table-driven off s3s's own route table ([`tests/gate_blackbox.rs`](tests/gate_blackbox.rs)) |
+| every denied op is refused over real HTTP | all 70 are driven as signed requests through the real `check`, table-driven off s3s's own route table ([`tests/gate_blackbox.rs`](tests/gate_blackbox.rs)) |
 | the embedded engine cannot be licensed by an absent oracle | the dual-engine parity gate **fails** rather than skips when `opa` is missing, and the oracle version is pinned to production's in CI, docker-compose and the test itself ([`tests/parity.rs`](tests/parity.rs)) |
 | a session credential outlives its master key's rotation, and no longer | the `kid` in `HFST<kid>.<sid>` selects the deriving key and is bound into the token's JWS header, so retiring a key revokes both halves and no credential can be walked onto another key ([`src/auth/sts.rs`](src/auth/sts.rs)) |
 | a config reload cannot land a request on a backend it was not authorized against | routes, credentials and caps are `ArcSwap`ped whole; `proxy_for` takes the request's `RouteSnapshot` and refuses if the table has since disagreed, and a swap drops the pooled clients so a rotated owner key stops signing ([`src/proxy/mod.rs`](src/proxy/mod.rs)) |
+| the strings s0 shares with the platform cannot drift in prose | the rego package / decision entrypoint (`data.s3.authz.decision`) and the audit-log routing labels are pinned and re-read from the platform's own sources; a mismatch names the other repo and the file ([`tests/cross_repo_contract.rs`](tests/cross_repo_contract.rs)) |
+| the two repositories agree in fact, not only in spelling | the platform's **real serialized bundle** is replayed through s0's own `parse_bundle` → `reload` → `decide` path and must produce an **allow** for a granted read — a matching string that still evaluates to `undefined` is exactly the deny-all bug, and only an allow rules it out ([`tests/cross_repo_contract.rs`](tests/cross_repo_contract.rs)) |
+| a configured secret cannot be printed | every plaintext credential is a `Secret<String>` whose `Debug` renders `Secret(<redacted>)` and which has no `Display` and no `Serialize`, so a new secret field is safe by type rather than by memory ([`src/secret.rs`](src/secret.rs)) |
 
 ## Build / test / run
 
@@ -179,9 +182,33 @@ regorus engine, so it *fails* when its oracle is missing rather than skipping;
 cargo build
 cargo test              # unit + typed-hook e2e + golden decision corpus + dual-engine parity
                         # + the gate over real HTTP for all 99 s3s operations
+                        # + the cross-repo contract with the platform (see below)
 S0_CAPTURE_REGENERATE=1 cargo test --test golden_capture   # re-record the captured corpus
 bash tests/e2e/run.sh   # real-stack: aws-cli -> gateway -> MinIO (needs Docker)
+
+# Cross-repo contract: verify the rego entrypoint and audit labels against the
+# platform's real sources rather than against a pinned copy of them.
+HYPERFLUID_REPO=/path/to/hyperfluid S0_REQUIRE_HYPERFLUID=1 \
+  cargo test --test cross_repo_contract
 ```
+
+s0 shares two strings with the platform it plugs into: the rego package it evaluates
+(`data.s3.authz.decision`) and the labels the platform's decision-log ingest dispatches
+on. Both have gone wrong before, and both fail *silently* — a wrong entrypoint evaluates
+to `undefined` and denies everything; wrong labels make every audit record fall off the
+end of the ingest dispatch chain and get dropped behind a `201`. So
+[`tests/cross_repo_contract.rs`](tests/cross_repo_contract.rs) pins them and, when a
+platform checkout is present, re-reads them from its actual sources. Without one it
+skips **loudly** and the pins are still enforced against s0's own constants; with
+`S0_REQUIRE_HYPERFLUID=1` the absence is a hard failure instead.
+
+Comparing strings is not enough on its own — a string that matches and still evaluates
+to `undefined` is the bug. So the same file also replays the platform's **real**
+bundle ([`tests/data/platform/s3_gateway_bundle.json`](tests/data/platform/s3_gateway_bundle.json),
+the byte output of the platform's own projection and serializer, module included)
+through s0's production loading path and asserts a granted read comes back **allow**.
+That test needs no platform checkout; the checkout is what keeps the capture honest, by
+holding its module byte-identical to the one hyperfluid ships.
 
 Run against a config (see [`docs/gateway.example.json`](docs/gateway.example.json) and
 [`docs/bundle.example.json`](docs/bundle.example.json)):

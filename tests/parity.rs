@@ -132,7 +132,7 @@ fn opa_decision(bundle: &serde_json::Value, input: &serde_json::Value) -> Decisi
         .arg(&bundle_path)
         .arg("-i")
         .arg(&input_path)
-        .arg("data.s0.gateway.decision")
+        .arg("data.s3.authz.decision")
         .output()
         .expect("run opa eval");
     assert!(
@@ -191,9 +191,11 @@ async fn regorus_matches_opa_over_corpus() {
     );
     // The oracle must have *evaluated* something. `opa_decision` degrades an
     // undefined result to a deny, so if the entrypoint path ever stops resolving —
-    // `data.s0.gateway.decision` is renamed by plan task 27 — every case would answer
-    // deny and parity would hold trivially against a regorus that is denying for real
-    // reasons. That failure is invisible without this line.
+    // `data.s3.authz.decision` moves, or the module's `package` line does — every case
+    // would answer deny and parity would hold trivially against a regorus that is
+    // denying for real reasons. That failure is invisible without this line.
+    // `cross_repo_contract.rs` is the other half: it holds this name equal to the one
+    // the platform actually ships.
     assert!(
         opa_allowed > 0,
         "opa allowed 0 of {} corpus cases: the oracle is answering `undefined`, most \

@@ -1,6 +1,13 @@
 //! Gateway configuration. Secrets (STS keys, per-tenant backend credentials) are
 //! expected from a secret store in production; here they load from a JSON file
 //! referenced by `$GATEWAY_CONFIG` so the binary is runnable end-to-end.
+//!
+//! **Every plaintext credential in this file is a [`Secret<String>`]**, not a `String`.
+//! These structs `derive(Debug)` and are reachable from a `tracing` call, a panic
+//! payload, or any error type that wraps them — and this deployment ships JSON logs
+//! into a shared pipeline. `Secret` makes the redaction a property of the type rather
+//! than of whoever writes the next log line, so a *new* secret field is safe by
+//! default instead of safe by memory. See `src/secret.rs`.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -11,6 +18,7 @@ use serde::Deserialize;
 
 use crate::error::{GatewayError, Result};
 use crate::model::BackendKind;
+use crate::secret::Secret;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GatewayConfig {
@@ -92,7 +100,7 @@ pub struct StsMintConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct StaticCredentialConfig {
     pub access_key_id: String,
-    pub secret_access_key: String,
+    pub secret_access_key: Secret<String>,
     pub principal_sub: String,
     pub tenant: String,
     pub organization_id: String,
@@ -106,19 +114,19 @@ pub struct StsConfig {
     /// one-entry `master_keys` ring under `auth::sts::DEFAULT_KID`; mutually
     /// exclusive with it.
     #[serde(default)]
-    pub master_key_hex: Option<String>,
+    pub master_key_hex: Option<Secret<String>>,
     /// The master-key **ring**: `kid -> hex key`. The `kid` lands in every access-key
     /// id this gateway mints (`HFST<kid>.<sid>`), which is what lets a key be retired
     /// without invalidating the sessions it already minted. See the rotation procedure
     /// in [`crate::auth::sts`].
     #[serde(default)]
-    pub master_keys: std::collections::BTreeMap<String, String>,
+    pub master_keys: std::collections::BTreeMap<String, Secret<String>>,
     /// Which ring entry mints new sessions. Required with `master_keys`, and never
     /// inferred: "whichever key sorts first" is not a decision an operator made.
     #[serde(default)]
     pub current_kid: Option<String>,
     /// Hex-encoded signing key (≥32 bytes) authenticating session tokens.
-    pub signing_key_hex: String,
+    pub signing_key_hex: Secret<String>,
     #[serde(default = "default_session_ttl_secs")]
     pub session_ttl_secs: u64,
 }
@@ -127,7 +135,7 @@ impl StsConfig {
     /// The configured ring as `(kid -> hex key, current kid)`, normalizing the
     /// single-key form. Shape errors are raised at load by
     /// [`GatewayConfig::validate`], so this cannot be reached with an invalid pair.
-    pub fn key_ring(&self) -> (std::collections::BTreeMap<String, String>, String) {
+    pub fn key_ring(&self) -> (std::collections::BTreeMap<String, Secret<String>>, String) {
         match &self.master_key_hex {
             Some(hex) if self.master_keys.is_empty() => (
                 std::collections::BTreeMap::from([(
@@ -317,7 +325,7 @@ pub struct TenantConfig {
     pub organization_id: String,
     pub backend_id: String,
     pub owner_access_key: String,
-    pub owner_secret_key: String,
+    pub owner_secret_key: Secret<String>,
 }
 
 /// This process's identity, for anything that must not be shared between replicas.
@@ -814,7 +822,7 @@ mod tests {
             .sts
             .key_ring();
         assert_eq!(current, crate::auth::sts::DEFAULT_KID);
-        assert_eq!(ring[crate::auth::sts::DEFAULT_KID], "aa");
+        assert_eq!(ring[crate::auth::sts::DEFAULT_KID].expose(), "aa");
     }
 
     #[test]
@@ -855,6 +863,76 @@ mod tests {
             "organization_id": "org-acme",
         }]);
         assert!(GatewayConfig::from_json(&cfg.to_string()).is_ok());
+    }
+
+    /// M0 issue 3: "plaintext secrets reachable via `{:?}`".
+    ///
+    /// A loaded `GatewayConfig` is one `tracing::debug!(?cfg)` — or one panic whose
+    /// payload includes it — away from a JSON log pipeline. This asserts on the whole
+    /// rendered config rather than field by field, so a secret field added later is
+    /// covered without anyone remembering to extend this test.
+    #[test]
+    fn no_debug_rendering_of_the_config_contains_a_secret() {
+        const MASTER: &str = "d0d0caca0000000000000000000000000000000000000000000000000000beef";
+        const SIGNING: &str = "5ec2e7ba5e0000000000000000000000000000000000000000000000deadbeef";
+        const OWNER: &str = "OWNER-SECRET-Wj4rXk9zQ2";
+        const STATIC: &str = "STATIC-SECRET-Pq7mLt3v";
+
+        let mut cfg = example();
+        cfg["sts"]["master_keys"] = serde_json::json!({ "k0": MASTER });
+        cfg["sts"]["current_kid"] = serde_json::json!("k0");
+        cfg["sts"]["signing_key_hex"] = serde_json::json!(SIGNING);
+        for t in cfg["tenants"].as_array_mut().unwrap() {
+            t["owner_secret_key"] = serde_json::json!(OWNER);
+        }
+        cfg["static_credentials"] = serde_json::json!([{
+            "access_key_id": "AKIAEXAMPLE",
+            "secret_access_key": STATIC,
+            "principal_sub": "alice",
+            "tenant": "acme",
+            "organization_id": "org-acme",
+        }]);
+        let loaded = GatewayConfig::from_json(&cfg.to_string()).expect("loads");
+
+        // The values are really in there — otherwise this test proves nothing.
+        assert_eq!(loaded.sts.signing_key_hex.expose(), SIGNING);
+        assert_eq!(loaded.tenants[0].owner_secret_key.expose(), OWNER);
+        assert_eq!(
+            loaded.static_credentials[0].secret_access_key.expose(),
+            STATIC
+        );
+        assert_eq!(loaded.sts.key_ring().0["k0"].expose(), MASTER);
+
+        // …and no rendering of the config, at any depth or in any format, shows them.
+        let renderings = [
+            format!("{loaded:?}"),
+            format!("{loaded:#?}"),
+            format!("{:?}", loaded.sts),
+            format!("{:#?}", loaded.sts),
+            format!("{:?}", loaded.tenants),
+            format!("{:?}", loaded.static_credentials),
+            format!("{:?}", loaded.sts.key_ring()),
+            // The shape an error type that wraps a config produces.
+            format!("{:?}", Some(&loaded)),
+        ];
+        for rendered in renderings {
+            for secret in [MASTER, SIGNING, OWNER, STATIC] {
+                assert!(
+                    !rendered.contains(secret),
+                    "a plaintext secret is reachable through Debug: {rendered}"
+                );
+            }
+            assert!(
+                rendered.contains("<redacted>"),
+                "the redaction marker should be visible where a secret was: {rendered}"
+            );
+        }
+
+        // The static-credential table built from the config carries the same property:
+        // it derives `Debug` and is held for the process's lifetime.
+        let creds = crate::auth::credentials_from_config(&loaded);
+        let rendered = format!("{creds:?}");
+        assert!(!rendered.contains(STATIC), "{rendered}");
     }
 
     #[test]

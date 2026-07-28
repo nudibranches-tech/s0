@@ -28,12 +28,15 @@ use crate::config::{BackendConfig, GatewayConfig, LimitsConfig};
 use crate::error::{GatewayError, Result};
 use crate::model::{BackendId, BackendKind};
 use crate::proxy::obligations::{BucketVisibility, ResponseObligations};
+use crate::secret::Secret;
 
 /// One tenant's routing: which backend, which per-tenant credential, which Org.
 struct TenantRoute {
     backend: Arc<BackendConfig>,
     owner_access_key: String,
-    owner_secret_key: String,
+    /// Stays a [`Secret`] all the way from the config to the SigV4 signer, so no
+    /// intermediate struct can print it — see `src/secret.rs`.
+    owner_secret_key: Secret<String>,
     organization_id: String,
 }
 
@@ -167,7 +170,7 @@ impl BackendRegistry {
         let proxy = Arc::new(build_proxy(
             &route.backend,
             &route.owner_access_key,
-            &route.owner_secret_key,
+            route.owner_secret_key.expose(),
             self.timeouts.clone(),
         ));
         pool.insert(key, proxy.clone());

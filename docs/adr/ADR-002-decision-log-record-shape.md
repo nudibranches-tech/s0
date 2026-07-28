@@ -35,7 +35,7 @@ What is implemented in this repo:
   failure never fails the request).
 - The `input` and `result` payloads are the live authorization types: `src/authz/input.rs` (the
   OPA input contract) and `src/authz/decision.rs` (the verdict deserialized from
-  `data.s0.gateway.decision` in `policy/gateway/authz.rego`).
+  `data.s3.authz.decision` in `policy/gateway/authz.rego`).
 
 This ADR freezes that record shape as the wire contract and specifies what a control-plane
 consumer must do, so both sides build against one agreed schema and no existing consumer
@@ -51,7 +51,7 @@ The gateway emits records in the shape the sink already ingests, implemented ver
 | Field | Type | Value / semantics |
 |---|---|---|
 | `decision_id` | string | Gateway-generated UUID, unique per record. **Idempotency key** for ingest (see D5). |
-| `path` | string | Constant `"s0/gateway/decision"` (`DECISION_PATH`) — the slash form of the single rego rule the PDP evaluates, `data.s0.gateway.decision` (`policy/gateway/authz.rego`, package `s0.gateway`). OPA decision-log convention. |
+| `path` | string | Constant `"s3/authz/decision"` (`DECISION_PATH`) — the slash form of the single rego rule the PDP evaluates, `data.s3.authz.decision` (`policy/gateway/authz.rego`, package `s3.authz`). OPA decision-log convention. |
 | `input` | object | The **full OPA input** (`src/authz/input.rs::OpaInput`) in *request-level* form (see D4): `principal{sub,type,attributes}`, `backend{id,kind}`, `tenant`, `organization_id`, `action`, `bucket`, `object?`, `prefix?`, `copy_source?`, `delete_keys?`, `object_tags?`, `request{method,params?,headers_subset?}`. |
 | `result` | object | The aggregate PDP verdict (`src/authz/decision.rs::Decision`): `allow: bool`, `reason: string` (always present — deny reasons are first-class), `obligations{narrow_prefix?, allowed_prefixes?}`. Obligations expose any list-narrowing rewrite the PEP applied, so the audit trail shows *what was actually enumerated*, not just that a list was allowed. |
 | `requested_by` | string | `input.principal.sub` — the **end-user** OIDC `sub` (never a shared/service identity, engines included). Denormalized copy of `input.principal.sub`; `AuditRecord::new` sets it from the input by construction. In stock OPA this field carries the PDP client address; for the `s3-gateway` record type this ADR fixes its meaning as the principal, mirroring how each record type defines its own principal source. |
@@ -83,16 +83,27 @@ Every required content element maps onto a concrete field:
 | copy-source | `input.copy_source` |
 | decision + reason | `result.allow` + `result.reason` |
 | status | `gateway.outcome` + `gateway.backend_status` |
-| org in a trusted field | `labels["s0.dev/organization-id"]` (D2) |
+| org in a trusted field | `labels["hyperfluid.nudibranches.tech/organization-id"]` (D2) |
 
 ### D2. Discriminator and trusted org attribution: labels
 
-Constants in `src/audit/record.rs`:
+Constants in `src/audit/record.rs`. These are **the platform's** label names, not names s0
+chose — the ingest side dispatches on them literally, and a record that spells them any other
+way is warn-logged and discarded while the endpoint still answers 201:
 
-- `labels["s0.dev/record-type"] = "s3-gateway"` — the discriminator a consumer routes on, the
-  same mechanism the sink already uses for its other record types.
-- `labels["s0.dev/organization-id"] = <org-id>` — the trusted org attribution the fail-closed
-  rule reads.
+- `labels["hyperfluid.nudibranches.tech/data-dock-type"] = "s3-gateway"` (`LABEL_DATA_DOCK_TYPE`
+  / `DATA_DOCK_TYPE_VALUE`) — the discriminator the consumer routes on
+  (`S3GatewayDecisionLogMetadataExtractor::is_handled`), the same mechanism the sink already
+  uses for its Trino and console record types.
+- `labels["hyperfluid.nudibranches.tech/organization-id"] = <org-id>` (`LABEL_ORG_ID`) — the
+  trusted org attribution the fail-closed rule reads
+  (`S3GatewayDecisionLogMetadataExtractor::get_organization_id`, keyed on the platform's
+  `ORGANIZATION_ID_LABEL`).
+
+Both are held equal to the platform's own literals by `tests/cross_repo_contract.rs`, which
+reads the extractor source directly. Renaming either one in one repo alone is the exact defect
+this ADR's "drop-rate metric/alert" paragraph anticipated, except that it is now caught at
+build time instead of by an alert.
 
 The trusted org can be carried either in a label or in an input field. We choose the **label**,
 and the reasoning is load-bearing:
@@ -102,10 +113,11 @@ and the reasoning is load-bearing:
    claimed by such a consumer and stored as the wrong variant, silently corrupting the audit
    stream. The input contract has no `resource` envelope (`src/authz/input.rs` carries
    `organization_id` at the top level), and the gateway **MUST never emit `input.resource.*`** —
-   with that invariant, plus a distinct `path` (`s0/gateway/decision`) and a distinct record-type
-   label, gateway records match **no** other consumer. Until the S3 consumer lands they are
-   dropped-with-a-warning (safe, fail-closed, no misattribution); once it lands, routing order is
-   immaterial because the match sets are disjoint.
+   with that invariant, plus a distinct `path` (`s3/authz/decision`) and a distinct
+   `data-dock-type` label value, gateway records match **no** other consumer. Routing order is
+   immaterial because the match sets are disjoint: Trino keys on `data-dock-type == "trino"`,
+   console on a `console/` path plus `input.resource.organization_id`, and the gateway on
+   `data-dock-type == "s3-gateway"`.
 2. **Trust is a property of the producer, not the JSON.** The org value is populated by the
    gateway from its own deployment configuration — the per-org bundle subscription
    (`/organizations/{organization_id}/ceph-bundle`) and the backend/tenant registry — never from
@@ -174,7 +186,7 @@ Implemented in `src/audit/sink.rs`, held as contract:
 ```json
 {
   "decision_id": "018f3c84-5b1e-7c2a-9d4f-6e8a0b1c2d3e",
-  "path": "s0/gateway/decision",
+  "path": "s3/authz/decision",
   "input": {
     "principal": {
       "sub": "8d6a3f2e-1b4c-4a5d-9e8f-0c7b6a5d4e3f",
@@ -193,8 +205,8 @@ Implemented in `src/audit/sink.rs`, held as contract:
   "requested_by": "8d6a3f2e-1b4c-4a5d-9e8f-0c7b6a5d4e3f",
   "timestamp": "2026-07-15T14:03:22.481Z",
   "labels": {
-    "s0.dev/record-type": "s3-gateway",
-    "s0.dev/organization-id": "3f8e2c1a-9d4b-4f6e-8a2d-7c5b9e0f1a2b"
+    "hyperfluid.nudibranches.tech/data-dock-type": "s3-gateway",
+    "hyperfluid.nudibranches.tech/organization-id": "3f8e2c1a-9d4b-4f6e-8a2d-7c5b9e0f1a2b"
   },
   "gateway": {
     "backend_id": "backend-eu-central-1",
@@ -210,7 +222,7 @@ Implemented in `src/audit/sink.rs`, held as contract:
 ```json
 {
   "decision_id": "018f3c84-9a2b-7e4d-8c1f-2b3a4d5e6f70",
-  "path": "s0/gateway/decision",
+  "path": "s3/authz/decision",
   "input": {
     "principal": {
       "sub": "8d6a3f2e-1b4c-4a5d-9e8f-0c7b6a5d4e3f",
@@ -236,8 +248,8 @@ Implemented in `src/audit/sink.rs`, held as contract:
   "requested_by": "8d6a3f2e-1b4c-4a5d-9e8f-0c7b6a5d4e3f",
   "timestamp": "2026-07-15T14:04:10.912Z",
   "labels": {
-    "s0.dev/record-type": "s3-gateway",
-    "s0.dev/organization-id": "3f8e2c1a-9d4b-4f6e-8a2d-7c5b9e0f1a2b"
+    "hyperfluid.nudibranches.tech/data-dock-type": "s3-gateway",
+    "hyperfluid.nudibranches.tech/organization-id": "3f8e2c1a-9d4b-4f6e-8a2d-7c5b9e0f1a2b"
   },
   "gateway": {
     "backend_id": "backend-eu-central-1",
@@ -345,8 +357,8 @@ matter as much as allow.
 ## Control-plane integration (out of scope for this repository)
 
 A control-plane consumer of the S3 record type must: match **exclusively** on
-`labels["s0.dev/record-type"] == "s3-gateway"`; read org from
-`labels["s0.dev/organization-id"]`, fail-closed exactly like the existing consumers (unreadable
+`labels["hyperfluid.nudibranches.tech/data-dock-type"] == "s3-gateway"`; read org from
+`labels["hyperfluid.nudibranches.tech/organization-id"]`, fail-closed exactly like the existing consumers (unreadable
 org ⇒ discard, never guess); take the principal from `requested_by` and validate
 `requested_by == input.principal.sub`, discarding on mismatch; ignore unknown fields (I6); store a
 new decision variant carrying the full S3 detail (`allow`, `reason`, `obligations`, `action`,

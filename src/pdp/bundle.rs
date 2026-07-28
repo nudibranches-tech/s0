@@ -19,7 +19,28 @@ use serde::{Deserialize, Serialize};
 pub const GATEWAY_REGO: &str = include_str!("../../policy/gateway/authz.rego");
 
 /// The rule the engines evaluate.
-pub const DECISION_RULE: &str = "data.s0.gateway.decision";
+///
+/// **This name is a cross-repo contract.** The platform ships the authoritative module
+/// as `package s3.authz` and pins this entrypoint as `S3_AUTHZ_ENTRYPOINT`
+/// (`hf_module_console_api/.../vauban/s3_gateway_projection/bundle.rs`). If s0 queries
+/// any other rule, a pushed bundle evaluates to **undefined** — which fails closed to a
+/// deny on every request, with no error anywhere and every test in both repos green.
+/// That is the failure that cost the previous attempt 35 green tests over a deny-all
+/// production policy. `tests/cross_repo_contract.rs` holds the two equal.
+pub const DECISION_RULE: &str = "data.s3.authz.decision";
+
+/// [`DECISION_RULE`] in OPA's Data API / decision-log path form:
+/// `data.s3.authz.decision` → `s3/authz/decision`.
+///
+/// Derived rather than written out a second time — the sidecar's URL and the audit
+/// record's `path` are two places that would otherwise each hold their own copy of the
+/// entrypoint and drift from it independently.
+pub fn decision_rule_path() -> String {
+    DECISION_RULE
+        .strip_prefix("data.")
+        .unwrap_or(DECISION_RULE)
+        .replace('.', "/")
+}
 
 /// A parsed bundle: the policy data and, optionally, the policy module pushed with it.
 #[derive(Debug, Clone)]
@@ -120,9 +141,9 @@ mod tests {
 
     #[test]
     fn wrapped_bundle_splits_policy_and_data() {
-        let raw = r#"{ "policy": "package s0.gateway", "data": { "org_settings": {} } }"#;
+        let raw = r#"{ "policy": "package s3.authz", "data": { "org_settings": {} } }"#;
         let parsed = parse_bundle(raw).unwrap();
-        assert_eq!(parsed.policy.as_deref(), Some("package s0.gateway"));
+        assert_eq!(parsed.policy.as_deref(), Some("package s3.authz"));
         assert_eq!(parsed.data["org_settings"], serde_json::json!({}));
     }
 

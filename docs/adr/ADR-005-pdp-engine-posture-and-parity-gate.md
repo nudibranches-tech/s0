@@ -81,7 +81,7 @@ that subset.
   the day-one abstraction. Its contract: any error or undefined result must surface as a deny,
   never an allow.
 - `src/pdp/sidecar.rs` — `SidecarPdp`: POSTs `{"input": …}` to OPA's Data API at
-  `/v1/data/s0/gateway/decision`; request timeout; non-2xx or transport error → `Err` (PEP
+  `/v1/data/s3/authz/decision`; request timeout; non-2xx or transport error → `Err` (PEP
   denies); missing/undefined `result` → explicit `Decision::deny("opa: undefined decision")`.
 - `src/pdp/embedded.rs` — `RegorusPdp`: data-less base `Engine` with the policy loaded and
   `set_strict_builtin_errors(false)`; per bundle revision it clones the base, `add_data`s the
@@ -92,7 +92,7 @@ that subset.
   are never cached.
 - `src/pdp/bundle.rs` — `GATEWAY_REGO` (the compiled-in default policy, `include_str!`-embedded
   — it is the local-dev policy and the parity oracle; in production the platform pushes the
-  active policy as part of the bundle), `DECISION_RULE = "data.s0.gateway.decision"`,
+  active policy as part of the bundle), `DECISION_RULE = "data.s3.authz.decision"`,
   `Bundle { revision, data }`, lock-free `BundleStore`.
 - `src/config.rs` — `PdpConfig::Sidecar { base_url, cache_capacity, timeout_ms }` (shipping
   default) vs `PdpConfig::Embedded { cache_capacity }` — the config swap the posture promises.
@@ -146,7 +146,7 @@ defense-in-depth path (those layers are kept deliberately distinct), and a non-l
 instance forfeits the latency figure the posture is priced on.
 
 `SidecarPdp` (`src/pdp/sidecar.rs`) is the implementation: OPA Data API, decision path fixed
-to `/v1/data/s0/gateway/decision` (matching `DECISION_RULE` in `src/pdp/bundle.rs`). Failure
+to `/v1/data/s3/authz/decision` (matching `DECISION_RULE` in `src/pdp/bundle.rs`). Failure
 mapping is fail-closed per the trait contract (`src/pdp/mod.rs`): transport error, timeout
 (`timeout_ms`, default 2000 — a failure bound, not the latency target of ≤ 2ms), or non-2xx →
 `Err` → the PEP denies; an OPA-undefined result → an explicit deny `Decision` with reason

@@ -52,7 +52,23 @@ jobs:
       - name: verify the parity oracle
         run: opa version
 
-      - name: test (unit + e2e + corpus + parity)
+      # Cross-repo contract gate (`tests/cross_repo_contract.rs`): the rego package /
+      # decision entrypoint and the audit-log label literals that s0 shares with the
+      # hyperfluid platform. Three production defects came from those strings drifting
+      # with nothing checking them — a deny-all gateway and a 100%-dropped audit trail,
+      # both invisible because each repo only tested itself.
+      #
+      # This workflow deliberately does NOT set S0_REQUIRE_HYPERFLUID: s0-gas is a
+      # standalone repository and cannot check out the private platform repo, so the
+      # half of that file which reads hyperfluid's real sources skips here — loudly, on
+      # stderr, never silently. What still runs is the half that holds s0's own
+      # constants equal to the pinned platform literals, so nothing can drift from the
+      # s0 side unnoticed.
+      #
+      # Any pipeline that HAS both checkouts (the platform-side integration/release
+      # gate) must run this with `HYPERFLUID_REPO=<path> S0_REQUIRE_HYPERFLUID=1`, or
+      # it is running a gate that passes by absence.
+      - name: test (unit + e2e + corpus + parity + cross-repo contract)
         run: cargo test --all-targets
 
   # S3 protocol conformance (Ceph s3-tests / MinIO Mint) per supported backend

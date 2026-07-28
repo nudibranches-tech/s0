@@ -679,7 +679,7 @@ async fn an_obligation_this_binary_does_not_implement_denies_rather_than_being_i
     // module compiles and the verdict is `allow`; the only thing this binary cannot do
     // is honor the obligation.
     const FUTURE_OBLIGATION: &str = concat!(
-        "package s0.gateway\n\n",
+        "package s3.authz\n\n",
         "decision := {\"allow\": true, \"reason\": \"allowed, minus a deny-grant\", ",
         "\"obligations\": {\"excluded_prefixes\": [\"2024/payroll/\"]}}\n"
     );
@@ -704,7 +704,7 @@ async fn an_obligation_this_binary_does_not_implement_denies_rather_than_being_i
     // Same push, minus the unknown key: the refusal is about the obligation, not about
     // pushing a module at all.
     const KNOWN_OBLIGATION: &str = concat!(
-        "package s0.gateway\n\n",
+        "package s3.authz\n\n",
         "decision := {\"allow\": true, \"reason\": \"allowed\", ",
         "\"obligations\": {\"narrow_prefix\": \"2024/\"}}\n"
     );
@@ -736,7 +736,7 @@ async fn a_policy_that_allows_a_bucket_listing_without_saying_which_buckets_show
     let access = GatewayAccess::new(fx.gw.clone());
 
     const ALLOW_WITH_NO_OBLIGATION: &str = concat!(
-        "package s0.gateway\n\n",
+        "package s3.authz\n\n",
         "decision := {\"allow\": true, \"reason\": \"allowed, and silent about buckets\", ",
         "\"obligations\": {}}\n"
     );
@@ -771,7 +771,7 @@ async fn a_policy_that_allows_a_bucket_listing_without_saying_which_buckets_show
     // and the revision does not move across a `reload`, so re-asking as `lister` would be
     // answered out of the entry above and this control would prove nothing.
     const ALLOW_WITH_OBLIGATION: &str = concat!(
-        "package s0.gateway\n\n",
+        "package s3.authz\n\n",
         "decision := {\"allow\": true, \"reason\": \"allowed\", ",
         "\"obligations\": {\"all_buckets_visible\": true}}\n"
     );
@@ -812,7 +812,7 @@ async fn a_must_understand_obligation_this_gateway_cannot_apply_denies() {
     };
 
     const DEMANDS_THE_FUTURE: &str = concat!(
-        "package s0.gateway\n\n",
+        "package s3.authz\n\n",
         "decision := {\"allow\": true, \"reason\": \"allowed\", ",
         "\"obligations\": {\"must_understand\": [\"excluded_prefixes\"]}}\n"
     );
@@ -836,7 +836,7 @@ async fn a_must_understand_obligation_this_gateway_cannot_apply_denies() {
     // Positive control: naming an obligation this binary *does* implement is not a
     // refusal, so the denial above is about capability rather than about the field.
     const DEMANDS_THE_PRESENT: &str = concat!(
-        "package s0.gateway\n\n",
+        "package s3.authz\n\n",
         "decision := {\"allow\": true, \"reason\": \"allowed\", ",
         "\"obligations\": {\"must_understand\": [\"narrow_prefix\"]}}\n"
     );

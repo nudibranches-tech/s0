@@ -17,8 +17,8 @@ mod sink;
 pub use backend::{AuditBackend, ControlPlaneBackend, HF_EVENT, StdoutNdjsonBackend};
 pub use pending::PendingAudit;
 pub use record::{
-    AuditRecord, BackendOutcome, GATE_PATH, GateContext, GateStage, GatewayMeta, LABEL_ORG_ID,
-    Outcome, RECORD_TYPE_VALUE,
+    AuditRecord, BackendOutcome, DATA_DOCK_TYPE_VALUE, DECISION_PATH, GATE_PATH, GateContext,
+    GateStage, GatewayMeta, LABEL_DATA_DOCK_TYPE, LABEL_ORG_ID, Outcome,
 };
 pub use sink::{
     AuditBackendKind, AuditConfig, AuditHandle, AuditMetrics, AuditSink, spawn, spawn_with_backend,

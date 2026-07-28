@@ -136,11 +136,11 @@ fn build_sts(cfg: &GatewayConfig) -> Result<StsAuthority> {
     let (ring, current_kid) = cfg.sts.key_ring();
     let mut master_keys = std::collections::BTreeMap::new();
     for (kid, hex_key) in &ring {
-        let key = hex::decode(hex_key)
+        let key = hex::decode(hex_key.expose())
             .map_err(|e| GatewayError::Config(format!("sts master key {kid}: {e}")))?;
         master_keys.insert(kid.clone(), key);
     }
-    let signing = hex::decode(&cfg.sts.signing_key_hex)
+    let signing = hex::decode(cfg.sts.signing_key_hex.expose())
         .map_err(|e| GatewayError::Config(format!("sts signing_key_hex: {e}")))?;
     let authority = StsAuthority::with_key_ring(master_keys, &current_kid, signing)?;
     tracing::info!(

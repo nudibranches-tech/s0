@@ -145,7 +145,7 @@ mod tests {
         }
     }
 
-    const DENY_ALL: &str = "package s0.gateway\n\ndecision := {\"allow\": false, \"reason\": \"test deny-all\", \"obligations\": {}}\n";
+    const DENY_ALL: &str = "package s3.authz\n\ndecision := {\"allow\": false, \"reason\": \"test deny-all\", \"obligations\": {}}\n";
 
     #[tokio::test]
     async fn pushed_policy_overrides_default_and_survives_data_reload() {

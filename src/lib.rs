@@ -17,6 +17,7 @@
 //! - [`server`]   — S3 front + hyper serving.
 //! - [`admin`]    — health / readiness / metrics, on a listener of its own.
 //! - [`shutdown`] — the one signal every listener drains on.
+//! - [`secret`]   — `Secret<T>`: a configured credential that cannot be printed.
 
 pub mod access;
 pub mod admin;
@@ -32,5 +33,6 @@ pub mod mint;
 pub mod model;
 pub mod pdp;
 pub mod proxy;
+pub mod secret;
 pub mod server;
 pub mod shutdown;
