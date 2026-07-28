@@ -8,12 +8,23 @@ and submit changes.
 
 - A stable Rust toolchain. The crate uses **edition 2024**, so the minimum
   supported Rust version (MSRV) is **1.85**.
-- [Open Policy Agent](https://www.openpolicyagent.org/) (`opa`) on your `PATH`
-  to run the full test suite. The dual-engine parity test
-  ([`tests/parity.rs`](tests/parity.rs)) replays the golden corpus through both
-  the embedded regorus engine and a real `opa` binary; it **skips** (and the
-  suite stays green) when `opa` is absent, so install it to actually exercise
-  the gate.
+- [Open Policy Agent](https://www.openpolicyagent.org/) (`opa`) **1.13.1** on your
+  `PATH` — the same version production deploys, and the version CI installs. The
+  dual-engine parity test ([`tests/parity.rs`](tests/parity.rs)) replays the golden
+  corpus through both the embedded regorus engine and a real `opa` binary, and it is
+  the only check that licenses the embedded engine to serve traffic. It therefore
+  **fails** rather than skips when `opa` is missing:
+
+  ```bash
+  curl -sSL -o ~/.local/bin/opa \
+    https://openpolicyagent.org/downloads/v1.13.1/opa_linux_amd64_static
+  chmod +x ~/.local/bin/opa
+  ```
+
+  The major version matters: OPA ≥ 1.0 parses rego **v1**, 0.x parses **v0**, so a
+  0.x binary is a different oracle rather than an older one. If you genuinely cannot
+  install it, `S0_ALLOW_NO_OPA=1 cargo test` degrades the gate to "regorus alone" and
+  says so on stderr — do not merge on that basis.
 - [Docker](https://www.docker.com/) to run the real-stack end-to-end suite
   ([`tests/e2e/run.sh`](tests/e2e/run.sh)).
 

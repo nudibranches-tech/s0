@@ -31,7 +31,12 @@ moka = { version = "0.12.15", features = ["future"] }
 regorus = "0.10.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "gzip", "http2", "charset"] }
 s3s = "=0.14.1"
-s3s-aws = "0.14"
+# Pinned as hard as `s3s` itself, and for a stronger reason: the gate's safety argument
+# ("an operation with no hook falls through to NotImplemented") is a claim about which
+# methods s3s-aws's generated `Proxy` impl overrides. A patch bump that overrode one more
+# would open a forwarding path with no test failing. Guarded by
+# `op_coverage::the_reference_op_list_matches_the_pinned_s3s_version`.
+s3s-aws = "=0.14.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = "0.11.0"

@@ -55,11 +55,13 @@ pub trait OidcVerifier: Send + Sync {
 enum KeySource {
     /// Static RS256 public key (PEM).
     Pem(DecodingKey),
-    /// JWKS endpoint; keys cached, refreshed on a `kid` miss (rotation).
+    /// JWKS endpoint; keys cached, refreshed periodically in the background and on a
+    /// `kid` miss (rotation).
     Jwks {
         uri: String,
         client: reqwest::Client,
         cache: ArcSwap<JwkSet>,
+        refresh_interval: Duration,
     },
 }
 
@@ -81,8 +83,18 @@ impl StandardVerifier {
             ),
             (None, Some(uri)) => KeySource::Jwks {
                 uri: uri.clone(),
-                client: reqwest::Client::new(),
+                // A JWKS fetch can happen inline in a mint request (kid miss), so an
+                // unbounded client lets one hung IdP hang every credential request
+                // behind it. Bounded here, at the only construction site.
+                client: reqwest::Client::builder()
+                    .timeout(Duration::from_secs(cfg.jwks_timeout_secs))
+                    .connect_timeout(
+                        Duration::from_secs(cfg.jwks_timeout_secs).min(Duration::from_secs(3)),
+                    )
+                    .build()
+                    .map_err(|e| GatewayError::Config(format!("jwks http client: {e}")))?,
                 cache: ArcSwap::from_pointee(empty_jwks()),
+                refresh_interval: Duration::from_secs(cfg.jwks_refresh_secs),
             },
             (None, None) => {
                 return Err(GatewayError::Config(
@@ -103,10 +115,71 @@ impl StandardVerifier {
         })
     }
 
+    /// Keep the JWKS cache warm in the background.
+    ///
+    /// Refresh-on-`kid`-miss alone is a cold cache: the first request after a key
+    /// rotation pays an inline IdP fetch and *fails* if the IdP is briefly
+    /// unreachable — for every replica independently, which is exactly when a
+    /// rotation looks like a fleet-wide mint outage. A no-op for a PEM key source or
+    /// a zero interval. Returns the task handle so the caller can abort it on
+    /// shutdown; dropping it detaches the task.
+    pub fn spawn_jwks_refresh(self: &Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
+        let KeySource::Jwks {
+            refresh_interval, ..
+        } = &self.key_source
+        else {
+            return None;
+        };
+        let interval = *refresh_interval;
+        if interval.is_zero() {
+            return None;
+        }
+        let verifier = self.clone();
+        Some(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                // The first tick completes immediately, so the cache is warm before
+                // the first mint request rather than one interval later.
+                ticker.tick().await;
+                match verifier.refresh_jwks().await {
+                    Ok(n) => tracing::debug!(keys = n, "jwks refreshed"),
+                    // Never fatal: the miss-driven path still works, and the previous
+                    // key set stays in force.
+                    Err(e) => tracing::warn!(%e, "jwks refresh failed; keeping cached keys"),
+                }
+            }
+        }))
+    }
+
+    /// Fetch and install the current key set. Returns the number of keys installed.
+    async fn refresh_jwks(&self) -> Result<usize> {
+        let KeySource::Jwks {
+            uri, client, cache, ..
+        } = &self.key_source
+        else {
+            return Ok(0);
+        };
+        let fresh = fetch_jwks(client, uri).await?;
+        // An empty key set would revoke every token this replica can verify. That is
+        // never a legitimate rotation state, so treat it as a bad answer and keep what
+        // we have (the kid-miss path still refreshes on a real rotation).
+        if fresh.keys.is_empty() && !cache.load().keys.is_empty() {
+            return Err(GatewayError::Sts(
+                "jwks endpoint returned an empty key set; keeping cached keys".into(),
+            ));
+        }
+        let n = fresh.keys.len();
+        cache.store(Arc::new(fresh));
+        Ok(n)
+    }
+
     async fn decoding_key(&self, token: &str) -> Result<DecodingKey> {
         match &self.key_source {
             KeySource::Pem(k) => Ok(k.clone()),
-            KeySource::Jwks { uri, client, cache } => {
+            KeySource::Jwks {
+                uri, client, cache, ..
+            } => {
                 let kid = decode_header(token)
                     .map_err(|e| GatewayError::Sts(format!("oidc header: {e}")))?
                     .kid
@@ -285,16 +358,49 @@ fn json_error(status: StatusCode, msg: &str) -> Response<Full<Bytes>> {
         .expect("response")
 }
 
-/// Serve the mint on its own listener (control plane, separate from the S3 data plane).
+/// How long in-flight mint requests get to finish after the shutdown signal. Minting
+/// is a token verification plus an HMAC — anything still running past this is stuck.
+const MINT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Serve the mint on its own listener (control plane, separate from the S3 data
+/// plane) until SIGTERM/Ctrl-C, then drain.
 pub async fn serve(mint: Arc<Mint>, listen: SocketAddr) -> Result<()> {
+    serve_with_shutdown(mint, listen, crate::shutdown::signal()).await
+}
+
+/// As [`serve`], with a caller-supplied shutdown trigger.
+///
+/// The mint gets the same treatment as the S3 listener, and for the same reason: it
+/// used to be an infinite accept loop with no signal handling, so on every rolling
+/// update its task was aborted mid-request when the runtime dropped. The visible
+/// symptom is sporadic credential-issuing failures on each deploy — indistinguishable
+/// from an IdP problem, and retried by clients into a thundering herd.
+pub async fn serve_with_shutdown(
+    mint: Arc<Mint>,
+    listen: SocketAddr,
+    shutdown: impl std::future::Future<Output = ()> + Send,
+) -> Result<()> {
     let listener = TcpListener::bind(listen).await?;
     tracing::info!(%listen, "sts mint listening");
     let http = ConnBuilder::new(TokioExecutor::new());
+    let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+    tokio::pin!(shutdown);
+
     loop {
-        let (stream, _) = match listener.accept().await {
+        // Accept inside the select, or an idle mint never observes the signal.
+        let accepted = tokio::select! {
+            r = listener.accept() => r,
+            _ = &mut shutdown => {
+                tracing::info!("shutdown signal; draining mint connections");
+                break;
+            }
+        };
+        let (stream, _) = match accepted {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(%e, "mint accept failed");
+                // Back off rather than busy-spin on a persistent accept error.
+                tracing::warn!(%e, "mint accept failed; backing off");
+                tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
         };
@@ -306,10 +412,19 @@ pub async fn serve(mint: Arc<Mint>, listen: SocketAddr) -> Result<()> {
         let conn = http
             .serve_connection(TokioIo::new(stream), svc)
             .into_owned();
+        let conn = graceful.watch(conn);
         tokio::spawn(async move {
             let _ = conn.await;
         });
     }
+
+    tokio::select! {
+        _ = graceful.shutdown() => tracing::info!("mint connections drained"),
+        _ = tokio::time::sleep(MINT_DRAIN_TIMEOUT) => {
+            tracing::warn!(timeout = ?MINT_DRAIN_TIMEOUT, "mint drain timed out");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

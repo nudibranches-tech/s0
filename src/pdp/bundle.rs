@@ -39,7 +39,10 @@ pub fn parse_bundle(raw: &str) -> Result<ParsedBundle, String> {
         serde_json::from_str(raw).map_err(|e| format!("parse bundle: {e}"))?;
     if let serde_json::Value::Object(map) = &value {
         if map.contains_key("data") {
-            let policy = map.get("policy").and_then(|p| p.as_str()).map(str::to_string);
+            let policy = map
+                .get("policy")
+                .and_then(|p| p.as_str())
+                .map(str::to_string);
             let data = map.get("data").cloned().unwrap_or(serde_json::Value::Null);
             return Ok(ParsedBundle { policy, data });
         }
@@ -69,11 +72,18 @@ impl Bundle {
 
 /// Stable revision derived from raw bundle content: a content change is a new
 /// revision, which is exactly the cache-invalidation signal.
+///
+/// **SHA-256, not `DefaultHasher`.** `DefaultHasher`'s output is explicitly not
+/// guaranteed stable across Rust releases, so a rebuild on a different toolchain
+/// would re-hash identical bundle bytes to a different revision — invalidating every
+/// cached decision fleet-wide mid-rollout, and (worse) making two replicas of a
+/// rolling update disagree about whether they hold the same policy. Pinned by
+/// `tests/golden_hash.rs`.
 pub fn content_revision(raw: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    raw.hash(&mut h);
-    format!("{:016x}", h.finish())
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(raw.as_bytes());
+    hex::encode(h.finalize())
 }
 
 /// Hot-swappable current bundle, shared by every engine instance and the decision

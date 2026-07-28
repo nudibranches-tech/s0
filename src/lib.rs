@@ -15,8 +15,11 @@
 //! - [`audit`]    — one reasoned decision record per request.
 //! - [`gateway`]  — assembled shared context.
 //! - [`server`]   — S3 front + hyper serving.
+//! - [`admin`]    — health / readiness / metrics, on a listener of its own.
+//! - [`shutdown`] — the one signal every listener drains on.
 
 pub mod access;
+pub mod admin;
 pub mod audit;
 pub mod auth;
 pub mod authz;
@@ -30,3 +33,4 @@ pub mod model;
 pub mod pdp;
 pub mod proxy;
 pub mod server;
+pub mod shutdown;

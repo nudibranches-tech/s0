@@ -11,6 +11,7 @@ pub mod sts;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use s3s::auth::{S3Auth, SecretKey};
 use s3s::{S3Result, s3_error};
 
@@ -37,9 +38,21 @@ pub struct StaticCredential {
     pub groups: Vec<String>,
 }
 
+/// The static credential table: one immutable snapshot, swapped wholesale.
+pub type StaticCredentials = HashMap<String, StaticCredential>;
+
+/// The long-lived static keys, behind an [`ArcSwap`] so a rotated credential list can
+/// be applied without restarting (plan task 10).
+///
+/// The swap lives **inside** the store rather than around it because
+/// `Identity::new` erases the concrete handle into `Arc<dyn CredentialStore>`
+/// immediately (plan defect A-8): an `ArcSwap<Arc<dyn CredentialStore>>` held by the
+/// caller would not reach the copy `Identity` is holding. Callers keep an
+/// `Arc<StaticCredentialStore>` and call [`replace`](Self::replace); every reader,
+/// including the one behind the trait object, sees the new table on its next lookup.
 #[derive(Debug, Default)]
 pub struct StaticCredentialStore {
-    by_access_key: HashMap<String, StaticCredential>,
+    by_access_key: ArcSwap<StaticCredentials>,
 }
 
 impl StaticCredentialStore {
@@ -47,20 +60,72 @@ impl StaticCredentialStore {
         Self::default()
     }
 
-    pub fn insert(&mut self, access_key_id: impl Into<String>, cred: StaticCredential) {
-        self.by_access_key.insert(access_key_id.into(), cred);
+    /// Build from config. Rejects nothing: `GatewayConfig::validate` has already
+    /// refused STS-namespace collisions and org/tenant disagreements, and duplicating
+    /// that here would let the two drift.
+    pub fn from_config(cfg: &crate::config::GatewayConfig) -> Self {
+        let store = Self::new();
+        store.replace(credentials_from_config(cfg));
+        store
     }
+
+    /// Install a new credential table. Readers in flight finish against the table they
+    /// started with; the next lookup sees this one.
+    pub fn replace(&self, creds: StaticCredentials) {
+        self.by_access_key.store(Arc::new(creds));
+    }
+
+    /// How many credentials are currently installed.
+    pub fn len(&self) -> usize {
+        self.by_access_key.load().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Copy-on-write single insert. For construction and tests; `replace` is the
+    /// hot-reload path.
+    pub fn insert(&self, access_key_id: impl Into<String>, cred: StaticCredential) {
+        let key = access_key_id.into();
+        self.by_access_key.rcu(|current| {
+            let mut next = StaticCredentials::clone(current);
+            next.insert(key.clone(), cred.clone());
+            next
+        });
+    }
+}
+
+/// The credential table a config describes.
+pub fn credentials_from_config(cfg: &crate::config::GatewayConfig) -> StaticCredentials {
+    cfg.static_credentials
+        .iter()
+        .map(|c| {
+            (
+                c.access_key_id.clone(),
+                StaticCredential {
+                    secret_access_key: c.secret_access_key.clone(),
+                    principal_sub: c.principal_sub.clone(),
+                    tenant: c.tenant.clone(),
+                    organization_id: c.organization_id.clone(),
+                    groups: c.groups.clone(),
+                },
+            )
+        })
+        .collect()
 }
 
 impl CredentialStore for StaticCredentialStore {
     fn secret(&self, access_key_id: &str) -> Option<String> {
         self.by_access_key
+            .load()
             .get(access_key_id)
             .map(|c| c.secret_access_key.clone())
     }
 
     fn resolve(&self, access_key_id: &str) -> Option<ResolvedPrincipal> {
         self.by_access_key
+            .load()
             .get(access_key_id)
             .map(|c| ResolvedPrincipal {
                 sub: c.principal_sub.clone(),
@@ -94,10 +159,18 @@ impl Identity {
         self.sts.clone()
     }
 
+    /// The two credential namespaces are disjoint **by construction**, not by
+    /// configuration: anything carrying the STS prefix is answered by the STS
+    /// authority alone, even when it is malformed or names a retired key id.
+    ///
+    /// `GatewayConfig::validate` also rejects a static credential in the STS
+    /// namespace, but that guard protects one config-loading path; this one holds for
+    /// every store a `CredentialStore` impl could ever be.
     fn secret_key(&self, access_key_id: &str) -> Option<String> {
-        self.sts
-            .secret_for_access_key(access_key_id)
-            .or_else(|| self.creds.secret(access_key_id))
+        if StsAuthority::is_sts_access_key(access_key_id) {
+            return self.sts.secret_for_access_key(access_key_id);
+        }
+        self.creds.secret(access_key_id)
     }
 
     /// Resolve the end-user identity from the presented credential + optional session
@@ -108,7 +181,7 @@ impl Identity {
         access_key_id: &str,
         security_token: Option<&str>,
     ) -> Result<ResolvedPrincipal> {
-        if StsAuthority::sid_from_access_key(access_key_id).is_some() {
+        if StsAuthority::is_sts_access_key(access_key_id) {
             let token = security_token
                 .ok_or_else(|| GatewayError::Sts("sts credential without session token".into()))?;
             let claims = self.sts.verify_session(access_key_id, token)?;
@@ -163,7 +236,7 @@ mod tests {
 
     fn identity() -> (Identity, StsAuthority) {
         let sts = StsAuthority::new(vec![3u8; 32], vec![5u8; 32]).unwrap();
-        let mut store = StaticCredentialStore::new();
+        let store = StaticCredentialStore::new();
         store.insert(
             "AKIASTATIC",
             StaticCredential {
@@ -208,8 +281,8 @@ mod tests {
 
     #[test]
     fn sts_key_without_token_is_rejected() {
-        let (id, _) = identity();
-        let ak = StsAuthority::access_key_id("sid-1");
+        let (id, sts) = identity();
+        let ak = sts.access_key_id("sid-1");
         assert!(id.resolve(&ak, None).is_err());
     }
 
@@ -223,10 +296,36 @@ mod tests {
     fn secret_key_path_covers_both_kinds() {
         let (id, sts) = identity();
         assert_eq!(id.secret_key("AKIASTATIC").as_deref(), Some("shhh"));
-        let ak = StsAuthority::access_key_id("sid-9");
+        let ak = sts.access_key_id("sid-9");
         assert_eq!(
             id.secret_key(&ak).as_deref(),
-            Some(sts.derive_secret("sid-9").as_str())
+            sts.derive_secret(sts.current_kid(), "sid-9").as_deref()
         );
+    }
+
+    #[test]
+    fn a_static_credential_cannot_shadow_the_sts_namespace() {
+        // The config loader rejects this at startup; here the store is built by hand,
+        // which is exactly the case the loader does not cover. An access key in the
+        // STS namespace must be answered by the STS authority even when it is
+        // malformed — falling through to the store would let whoever can write the
+        // credential list hand out a credential the gateway then treats as a session.
+        let sts = StsAuthority::new(vec![3u8; 32], vec![5u8; 32]).unwrap();
+        let squatted = format!("{}sid-1", sts::STS_PREFIX); // the pre-key-ring shape
+        let store = StaticCredentialStore::new();
+        store.insert(
+            squatted.clone(),
+            StaticCredential {
+                secret_access_key: "attacker-chosen".into(),
+                principal_sub: "root".into(),
+                tenant: "acme".into(),
+                organization_id: "org-acme".into(),
+                groups: vec![],
+            },
+        );
+        let id = Identity::new(Arc::new(sts), Arc::new(store));
+        assert_eq!(id.secret_key(&squatted), None);
+        assert!(id.resolve(&squatted, None).is_err());
+        assert!(id.resolve(&squatted, Some("any-token")).is_err());
     }
 }

@@ -11,24 +11,20 @@
 //! (the backend LIST call in production, a fake in tests) and merges + paginates.
 
 use std::future::Future;
-use std::hash::{Hash, Hasher};
 
 /// A gateway-owned continuation cursor. `scope_hash` binds the cursor to the exact
 /// granted-prefix set, so a grant change between pages is detected rather than
 /// silently serving a stale scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cursor {
-    pub scope_hash: u64,
+    /// Lowercase hex SHA-256 of the granted-prefix set — see [`scope_hash`].
+    pub scope_hash: String,
     pub last_key: String,
 }
 
 impl Cursor {
     pub fn encode(&self) -> String {
-        format!(
-            "v1.{:016x}.{}",
-            self.scope_hash,
-            hex::encode(&self.last_key)
-        )
+        format!("v1.{}.{}", self.scope_hash, hex::encode(&self.last_key))
     }
 
     pub fn decode(s: &str) -> Option<Cursor> {
@@ -36,19 +32,41 @@ impl Cursor {
         if parts.next()? != "v1" {
             return None;
         }
-        let scope_hash = u64::from_str_radix(parts.next()?, 16).ok()?;
+        // Validate the shape rather than accepting any token: a cursor whose scope
+        // half is not a hash cannot match a real scope, so it must be rejected as
+        // malformed instead of silently failing the scope comparison later.
+        let scope_hash = parts.next()?;
+        if scope_hash.len() != 64 || !scope_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
         let last_key = String::from_utf8(hex::decode(parts.next()?).ok()?).ok()?;
         Some(Cursor {
-            scope_hash,
+            scope_hash: scope_hash.to_string(),
             last_key,
         })
     }
 }
 
-pub fn scope_hash(prefixes: &[String]) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    prefixes.hash(&mut h);
-    h.finish()
+/// Bind a cursor to the exact prefix set it was issued against.
+///
+/// **SHA-256, not `DefaultHasher`.** `DefaultHasher` is not stable across Rust
+/// releases: a rebuild on a different toolchain re-hashes the same grants to a
+/// different value, so every outstanding list cursor is rejected mid-rollout — and,
+/// while two replicas of a rolling update run different toolchains, whether a cursor
+/// survives depends on which pod answers. Pinned by `tests/golden_hash.rs`.
+///
+/// The encoding is length-prefixed so the prefix set is unambiguous: `["a", "b"]`
+/// and `["ab"]` must not hash alike, or a grant change would go undetected.
+pub fn scope_hash(prefixes: &[String]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"s0.fanout.scope.v1\n");
+    h.update((prefixes.len() as u64).to_be_bytes());
+    for p in prefixes {
+        h.update((p.len() as u64).to_be_bytes());
+        h.update(p.as_bytes());
+    }
+    hex::encode(h.finalize())
 }
 
 /// Obligation stashed by the access layer (in the request extensions) when a list is
@@ -264,18 +282,36 @@ mod tests {
     #[tokio::test]
     async fn cursor_round_trips_through_encode_decode() {
         let c = Cursor {
-            scope_hash: 0xdead_beef,
+            scope_hash: scope_hash(&["2024/".to_string()]),
             last_key: "2024/report.a.b".into(),
         };
         assert_eq!(Cursor::decode(&c.encode()), Some(c));
         assert!(Cursor::decode("garbage").is_none());
+        // A well-formed envelope whose scope half is not a hash is malformed, not a
+        // cursor for some other scope.
+        assert!(Cursor::decode("v1.notahash.32303234").is_none());
+    }
+
+    #[test]
+    fn scope_hash_is_unambiguous_across_prefix_boundaries() {
+        // Length-prefixed, so a concatenation cannot collide with a split.
+        assert_ne!(
+            scope_hash(&["a".to_string(), "b".to_string()]),
+            scope_hash(&["ab".to_string()])
+        );
+        // Order is part of the scope: the fan-out concatenates in prefix order.
+        assert_ne!(
+            scope_hash(&["a/".to_string(), "b/".to_string()]),
+            scope_hash(&["b/".to_string(), "a/".to_string()])
+        );
     }
 
     #[tokio::test]
     async fn scope_change_is_rejected() {
         let prefixes = vec!["2024/".to_string()];
         let stale = Cursor {
-            scope_hash: scope_hash(&prefixes) ^ 1,
+            // A cursor issued while a *different* prefix set was granted.
+            scope_hash: scope_hash(&["2023/".to_string()]),
             last_key: "2024/a".into(),
         };
         let store = BTreeMap::from([("2024/", vec!["2024/a", "2024/b"])]);

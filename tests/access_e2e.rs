@@ -3,144 +3,43 @@
 //! read/deny path, per-key multi-delete filtering (blind spot #2), and single-prefix
 //! list rewrite against the shipped rego — no live backend needed (the hooks
 //! only read the routing table, they never open a backend connection).
+//!
+//! The *security* properties these paths carry (copy exfiltration, verb separation,
+//! unbounded listing) live in `tests/security_regressions.rs`; this file is the happy
+//! path plus the fail-closed backstop.
+
+mod common;
 
 use std::sync::Arc;
 
-use http::{Extensions, HeaderMap, Method};
-use s0::access::GatewayAccess;
-use s0::audit::{self, AuditConfig};
-use s0::auth::sts::StsAuthority;
-use s0::auth::{Identity, StaticCredentialStore};
-use s0::config::GatewayConfig;
-use s0::gateway::Gateway;
+use http::Method;
+use s0::access::{GatewayAccess, OperationName};
 use s0::identity::ResolvedPrincipal;
-use s0::model::PrincipalType;
-use s0::pdp::{Bundle, BundleStore, CachingPdp, GATEWAY_REGO, Pdp, RegorusPdp};
-use s0::proxy::BackendRegistry;
-use s3s::S3Request;
+use s0::proxy::RouteSnapshot;
 use s3s::access::S3Access;
 use s3s::dto::{
     CreateMultipartUploadInput, Delete, DeleteObjectsInput, GetObjectInput,
     ListMultipartUploadsInput, ListObjectsV2Input, ObjectIdentifier,
 };
 
+/// `alice` is prefix-scoped to `reports/2024/`; `multi` holds list grants on two
+/// prefixes, which is what drives the fan-out obligation.
 fn bundle() -> serde_json::Value {
-    serde_json::json!({
-        "org_settings": { "freeze_writes": false },
-        "tenants": { "acme": {
-            "user_attributes": {
-                "alice": { "groups": [], "attributes": [] },
-                "multi": { "groups": [], "attributes": [] }
-            },
-            "bucket_attributes": { "reports": { "denylist": {} } },
-            "s3_grants": {
-                "alice": [
-                    { "bucket": "reports",
-                      "actions": ["read_objects", "list_objects", "write_objects", "delete_objects"],
-                      "prefixes": ["2024/"] }
-                ],
-                "multi": [
-                    { "bucket": "reports", "actions": ["list_objects"], "prefixes": ["2024/", "2025/"] }
-                ]
-            },
-            "group_grants": {}
-        }}
-    })
-}
-
-fn config_json() -> String {
-    let spill = std::env::temp_dir().join("gw-e2e-audit.ndjson");
-    serde_json::json!({
-        "listen": "127.0.0.1:0",
-        "sts": { "master_key_hex": "00".repeat(32), "signing_key_hex": "11".repeat(32) },
-        "pdp": { "mode": "embedded" },
-        "audit": { "sink_url": "http://127.0.0.1:59999/none", "spill_path": spill },
-        "backends": [
-            { "id": "bay-1", "kind": "ceph", "endpoint_url": "http://127.0.0.1:7480" }
-        ],
-        "tenants": [
-            { "tenant": "acme", "organization_id": "org-acme", "backend_id": "bay-1",
-              "owner_access_key": "OWNER", "owner_secret_key": "OWNERSECRET" }
-        ],
-        "bundle_path": "/dev/null"
-    })
-    .to_string()
-}
-
-async fn test_gateway() -> Arc<Gateway> {
-    let cfg = GatewayConfig::from_json(&config_json()).expect("config");
-    let data = bundle();
-    let bundles = Arc::new(BundleStore::new(Bundle::new("rev-1", data.clone())));
-    let regorus = RegorusPdp::new(GATEWAY_REGO, &data).expect("regorus");
-    let pdp: Arc<dyn Pdp> = Arc::new(CachingPdp::new(
-        Arc::new(regorus) as Arc<dyn Pdp>,
-        bundles.clone(),
-        1000,
-    ));
-    let identity = Arc::new(Identity::new(
-        Arc::new(StsAuthority::new(vec![0u8; 32], vec![1u8; 32]).unwrap()),
-        Arc::new(StaticCredentialStore::new()),
-    ));
-    let registry = Arc::new(BackendRegistry::from_config(&cfg).unwrap());
-    let (audit, _audit_handle) = audit::spawn(AuditConfig {
-        sink_url: cfg.audit.sink_url.clone(),
-        spill_path: cfg.audit.spill_path.clone(),
-        ..AuditConfig::default()
-    });
-    Arc::new(Gateway {
-        identity,
-        pdp,
-        audit,
-        registry,
-        limits: cfg.limits.clone(),
-        bundles,
-    })
-}
-
-fn alice() -> ResolvedPrincipal {
-    ResolvedPrincipal {
-        sub: "alice".into(),
-        principal_type: PrincipalType::User,
-        groups: vec![],
-        tenant: "acme".into(),
-        organization_id: "org-acme".into(),
-    }
-}
-
-fn multi() -> ResolvedPrincipal {
-    ResolvedPrincipal {
-        sub: "multi".into(),
-        principal_type: PrincipalType::User,
-        groups: vec![],
-        tenant: "acme".into(),
-        organization_id: "org-acme".into(),
-    }
-}
-
-fn request<T>(input: T, method: Method) -> S3Request<T> {
-    request_as(alice(), input, method)
-}
-
-fn request_as<T>(principal: ResolvedPrincipal, input: T, method: Method) -> S3Request<T> {
-    let mut extensions = Extensions::new();
-    extensions.insert(Arc::new(principal));
-    S3Request {
-        input,
-        method,
-        uri: "/".parse().unwrap(),
-        headers: HeaderMap::new(),
-        extensions,
-        credentials: None,
-        region: None,
-        service: None,
-        trailing_headers: None,
-    }
+    let mut b = common::alice_bundle();
+    b["tenants"]["acme"]["user_attributes"]["multi"] =
+        serde_json::json!({ "groups": [], "attributes": [] });
+    b["tenants"]["acme"]["s3_grants"]["multi"] = serde_json::json!([
+        { "bucket": "reports", "actions": ["list_objects"], "prefixes": ["2024/", "2025/"] }
+    ]);
+    b
 }
 
 #[tokio::test]
 async fn get_object_within_grant_is_allowed() {
-    let access = GatewayAccess::new(test_gateway().await);
-    let mut req = request(
+    let fx = common::fixture("e2e-get-allow", bundle());
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request(
+        "GetObject",
         GetObjectInput {
             bucket: "reports".into(),
             key: "2024/q1.csv".into(),
@@ -153,8 +52,10 @@ async fn get_object_within_grant_is_allowed() {
 
 #[tokio::test]
 async fn get_object_outside_grant_is_denied() {
-    let access = GatewayAccess::new(test_gateway().await);
-    let mut req = request(
+    let fx = common::fixture("e2e-get-deny", bundle());
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request(
+        "GetObject",
         GetObjectInput {
             bucket: "reports".into(),
             key: "2023/old.csv".into(),
@@ -167,7 +68,8 @@ async fn get_object_outside_grant_is_denied() {
 
 #[tokio::test]
 async fn multi_delete_filters_to_authorized_keys() {
-    let access = GatewayAccess::new(test_gateway().await);
+    let fx = common::fixture("e2e-multidelete", bundle());
+    let access = GatewayAccess::new(fx.gw.clone());
     let oid = |key: &str| ObjectIdentifier {
         e_tag: None,
         key: key.into(),
@@ -175,7 +77,8 @@ async fn multi_delete_filters_to_authorized_keys() {
         size: None,
         version_id: None,
     };
-    let mut req = request(
+    let mut req = fx.request(
+        "DeleteObjects",
         DeleteObjectsInput {
             bucket: "reports".into(),
             bypass_governance_retention: None,
@@ -204,8 +107,10 @@ async fn multi_delete_filters_to_authorized_keys() {
 
 #[tokio::test]
 async fn unbounded_list_is_narrowed_to_grant_prefix() {
-    let access = GatewayAccess::new(test_gateway().await);
-    let mut req = request(
+    let fx = common::fixture("e2e-list-narrow", bundle());
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request(
+        "ListObjectsV2",
         ListObjectsV2Input {
             bucket: "reports".into(),
             prefix: None,
@@ -219,8 +124,10 @@ async fn unbounded_list_is_narrowed_to_grant_prefix() {
 
 #[tokio::test]
 async fn create_multipart_upload_within_grant_is_allowed() {
-    let access = GatewayAccess::new(test_gateway().await);
-    let mut req = request(
+    let fx = common::fixture("e2e-cmu-allow", bundle());
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request(
+        "CreateMultipartUpload",
         CreateMultipartUploadInput {
             bucket: "reports".into(),
             key: "2024/big.bin".into(),
@@ -233,8 +140,10 @@ async fn create_multipart_upload_within_grant_is_allowed() {
 
 #[tokio::test]
 async fn create_multipart_upload_outside_prefix_is_denied() {
-    let access = GatewayAccess::new(test_gateway().await);
-    let mut req = request(
+    let fx = common::fixture("e2e-cmu-deny", bundle());
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request(
+        "CreateMultipartUpload",
         CreateMultipartUploadInput {
             bucket: "reports".into(),
             key: "2023/big.bin".into(),
@@ -247,8 +156,10 @@ async fn create_multipart_upload_outside_prefix_is_denied() {
 
 #[tokio::test]
 async fn list_multipart_uploads_is_narrowed_to_grant_prefix() {
-    let access = GatewayAccess::new(test_gateway().await);
-    let mut req = request(
+    let fx = common::fixture("e2e-lmu", bundle());
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request(
+        "ListMultipartUploads",
         ListMultipartUploadsInput {
             bucket: "reports".into(),
             prefix: None,
@@ -263,11 +174,13 @@ async fn list_multipart_uploads_is_narrowed_to_grant_prefix() {
 #[tokio::test]
 async fn multi_prefix_list_allows_and_stashes_fanout() {
     use s0::proxy::fanout::ListFanout;
-    let access = GatewayAccess::new(test_gateway().await);
+    let fx = common::fixture("e2e-fanout", bundle());
+    let access = GatewayAccess::new(fx.gw.clone());
     // `multi` holds list grants on two prefixes; an unbounded list is now allowed with
     // a fan-out obligation (previously it fail-closed).
-    let mut req = request_as(
-        multi(),
+    let mut req = fx.request_as(
+        "multi",
+        "ListObjectsV2",
         ListObjectsV2Input {
             bucket: "reports".into(),
             prefix: None,
@@ -281,4 +194,35 @@ async fn multi_prefix_list_allows_and_stashes_fanout() {
         .get::<Arc<ListFanout>>()
         .expect("fan-out obligation stashed");
     assert_eq!(fo.prefixes, vec!["2024/".to_string(), "2025/".to_string()]);
+}
+
+#[tokio::test]
+async fn a_hook_without_the_check_context_fails_closed() {
+    // The typed hooks read the principal, the route snapshot and the op name that
+    // `check` stashed. If any is missing, `check` did not run — the hook must error,
+    // never fall back to a default route or an empty org (which would silently
+    // mis-attribute, and in the route's case mis-target, the decision).
+    let fx = common::fixture("e2e-failclosed", bundle());
+    let access = GatewayAccess::new(fx.gw.clone());
+    let input = || GetObjectInput {
+        bucket: "reports".into(),
+        key: "2024/q1.csv".into(),
+        ..Default::default()
+    };
+
+    let mut req = fx.request("GetObject", input(), Method::GET);
+    req.extensions.remove::<Arc<RouteSnapshot>>();
+    assert!(access.get_object(&mut req).await.is_err());
+
+    let mut req = fx.request("GetObject", input(), Method::GET);
+    req.extensions.remove::<OperationName>();
+    assert!(access.get_object(&mut req).await.is_err());
+
+    let mut req = fx.request("GetObject", input(), Method::GET);
+    req.extensions.remove::<Arc<ResolvedPrincipal>>();
+    assert!(access.get_object(&mut req).await.is_err());
+
+    // Control: with the full context the same request is allowed.
+    let mut req = fx.request("GetObject", input(), Method::GET);
+    assert!(access.get_object(&mut req).await.is_ok());
 }

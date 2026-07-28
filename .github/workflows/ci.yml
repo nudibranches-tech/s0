@@ -30,14 +30,27 @@ jobs:
       - name: build
         run: cargo build --all-targets
 
-      # Dual-engine parity gate: the embedded regorus fast path may only
-      # serve traffic if it agrees with OPA over the golden decision corpus. The
-      # tests/parity.rs harness skips when `opa` is absent, so installing it here is
-      # what makes the gate enforce.
+      # Dual-engine parity gate: the embedded regorus fast path may only serve traffic
+      # if it agrees with OPA over the golden decision corpus.
+      #
+      # The version is pinned to what production deploys (openpolicyagent/opa:1.13.1)
+      # and must equal `EXPECTED_OPA_VERSION` in tests/parity.rs — the OPA major
+      # version selects the rego dialect (>=1.0 parses v1, 0.x parses v0), so an oracle
+      # on the wrong side of that line is answering different questions than the
+      # deployed engine. `parity::the_opa_oracle_is_pinned_to_the_production_version_everywhere`
+      # fails if this line and that constant drift apart.
+      #
+      # Note that `S0_ALLOW_NO_OPA` is deliberately NOT set anywhere in this workflow:
+      # if the install below silently fails, the parity test panics instead of
+      # reporting a green gate it never ran.
       - name: install OPA (parity gate)
         uses: open-policy-agent/setup-opa@v2
         with:
-          version: "0.70.0"
+          version: "1.13.1"
+
+      # Fail here, with an obvious message, rather than 200 lines later inside cargo.
+      - name: verify the parity oracle
+        run: opa version
 
       - name: test (unit + e2e + corpus + parity)
         run: cargo test --all-targets

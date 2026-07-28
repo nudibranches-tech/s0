@@ -1,8 +1,9 @@
 //! Decision cache — correct by construction.
 //!
 //! The key embeds the bundle revision, the full principal (so a differing group set
-//! never reuses another principal's verdict), and the resource tuple (backend, tenant,
-//! bucket, action, object/prefix). A revocation bumps the revision, so stale entries
+//! never reuses another principal's verdict), and a digest of *every other field* of
+//! the input ([`OpaInput::resource_key`] — derived, not enumerated, so a field the
+//! policy can read is never outside the key). A revocation bumps the revision, so stale entries
 //! are simply never looked up again — no TTL, no invalidation. Decisions whose input
 //! carries on-demand data (object tags) are never cached: their freshness is not
 //! bounded by the revision.
@@ -36,10 +37,8 @@ impl CachingPdp {
         // Full principal in the key: two tokens for the same `sub` but different
         // groups must not share a verdict.
         let principal = serde_json::to_string(&input.principal)?;
-        Ok(format!(
-            "{revision}\u{1f}{principal}\u{1f}{}",
-            input.resource_key()
-        ))
+        let resource = input.resource_key()?;
+        Ok(format!("{revision}\u{1f}{principal}\u{1f}{resource}"))
     }
 }
 

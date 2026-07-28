@@ -1,0 +1,26 @@
+{
+  "action": "write_objects",
+  "backend": {
+    "id": "bay-1",
+    "kind": "ceph"
+  },
+  "bucket": "reports",
+  "copy_source": {
+    "bucket": "reports",
+    "key": "2024/src.csv"
+  },
+  "object": "2024/dst.csv",
+  "organization_id": "org-acme",
+  "principal": {
+    "attributes": {
+      "groups": []
+    },
+    "sub": "alice",
+    "type": "user"
+  },
+  "request": {
+    "method": "PUT",
+    "params": "partNumber=1&uploadId=upload-1"
+  },
+  "tenant": "acme"
+}

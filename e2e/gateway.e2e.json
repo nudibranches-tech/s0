@@ -1,5 +1,6 @@
 {
   "listen": "127.0.0.1:8014",
+  "admin_listen": "127.0.0.1:8016",
   "sts": {
     "master_key_hex": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     "signing_key_hex": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",

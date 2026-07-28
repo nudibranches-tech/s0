@@ -1,0 +1,22 @@
+{
+  "action": "write_objects",
+  "backend": {
+    "id": "bay-1",
+    "kind": "ceph"
+  },
+  "bucket": "reports",
+  "object": "2024/x",
+  "organization_id": "org-acme",
+  "principal": {
+    "attributes": {
+      "groups": []
+    },
+    "sub": "alice",
+    "type": "user"
+  },
+  "request": {
+    "method": "DELETE",
+    "params": "uploadId=upload-1"
+  },
+  "tenant": "acme"
+}

@@ -1,0 +1,21 @@
+{
+  "action": "list_objects",
+  "backend": {
+    "id": "bay-1",
+    "kind": "ceph"
+  },
+  "bucket": "reports",
+  "organization_id": "org-acme",
+  "principal": {
+    "attributes": {
+      "groups": []
+    },
+    "sub": "alice",
+    "type": "user"
+  },
+  "request": {
+    "method": "GET",
+    "params": "list-type=2"
+  },
+  "tenant": "acme"
+}

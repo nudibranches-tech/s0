@@ -23,9 +23,18 @@ COPY --from=builder /usr/local/bin/s0 /usr/local/bin/s0
 # S3 data-plane listener (and the STS mint listener, when configured).
 EXPOSE 8014
 EXPOSE 8015
+# Admin: /healthz, /readyz, /metrics. This image is distroless — there is no shell, so
+# an `exec` probe is impossible and these endpoints are the only way to health-check a
+# pod. Keep the port off the ingress: it is unauthenticated by design (a probe cannot
+# sign SigV4).
+EXPOSE 8016
 
 # The gateway reads its JSON config from $GATEWAY_CONFIG; mount it at runtime,
 # e.g. `-v /etc/s0-gas:/etc/s0-gas -e GATEWAY_CONFIG=/etc/s0-gas/gateway.json`.
+# The config may reference ${VAR} / ${VAR:-default} from the environment. The audit
+# spill path MUST be pod-unique (`audit-spill-${POD_NAME}.ndjson`, POD_NAME from the
+# downward API) on node-local scratch: a spill volume shared between replicas is
+# unsupported and loses records. Allow >45s of termination grace for the drain.
 USER nonroot:nonroot
 
 ENTRYPOINT ["/usr/local/bin/s0"]

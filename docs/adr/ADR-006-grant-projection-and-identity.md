@@ -228,15 +228,20 @@ control plane **fronts the gateway's mint** instead of a backend STS. Reasoning:
 
 **The minted session (normative, as implemented in `src/auth/sts.rs`):**
 
-- Access-key id `HFST<sid>` (`STS_PREFIX`); the `sid` is generated random at the mint endpoint
-  (≥128-bit entropy — R5).
-- Secret `= hex(HMAC-SHA256(master_key, sid))` (`derive_secret`) — deterministic, no per-session
-  secret at rest, no hot-path store lookup; `S3Auth::get_secret_key` re-derives from the
-  access-key id alone (`secret_for_access_key`, wired in `src/auth/mod.rs`).
+- Access-key id `HFST<kid>.<sid>` (`STS_PREFIX`, `KID_SEP`); the `sid` is generated random at the
+  mint endpoint (≥128-bit entropy — R5) and the `kid` names the master key that derived the
+  secret. Decomposition splits on the **first** separator, so a `sid` may contain one and a
+  `kid` may not (enforced in `StsAuthority::with_key_ring`).
+- Secret `= hex(HMAC-SHA256(master_keys[kid], kid ‖ 0x00 ‖ sid))` (`derive_secret`) —
+  deterministic, no per-session secret at rest, no hot-path store lookup; `S3Auth::get_secret_key`
+  re-derives from the access-key id alone (`secret_for_access_key`, wired in `src/auth/mod.rs`).
+  The `kid` is inside the MAC message as well as selecting the key, so the same material filed
+  under two ids yields two distinct secrets and retiring an id is a real revocation.
 - Claims ride in a signed HS256 token in `X-Amz-Security-Token`
   (`SessionClaims { sub, typ, groups, tenant, org, sid, exp }`), MAC'd with a **signing key
-  distinct from the master key** (both ≥32 bytes, enforced in `StsAuthority::new`) and bound to
-  the access-key id (`verify_session` rejects `claims.sid != sid` and expired tokens).
+  distinct from every master key** (all ≥32 bytes, enforced in `StsAuthority::with_key_ring`) and
+  bound to the access-key id (`verify_session` rejects `claims.sid != sid`, expired tokens, a
+  `kid` no longer in the ring, and a JWS `kid` header that disagrees with the access-key id's).
 - The response triple is `AssumeRoleWithWebIdentity`-shaped (`SessionCredentials`), so the `aws`
   CLI / SDKs / rclone work unchanged.
 - **Revocation stays live in policy, not in the credential**: an unexpired session whose grant
@@ -349,10 +354,14 @@ one identity across the platform.
 - **I4 — Revocation latency is bounded and known**: grant mutation → bundle bytes change → new
   `content_revision` → cache miss (D3). The bound is builder latency + gateway poll interval, and
   it is the policy-freshness bound; the control plane documents and monitors it.
-- **I5 — Key custody.** The STS `master_key` derives every session secret; the `signing_key`
-  authenticates every claims token. Compromise of the master key ≈ mint authority. They are
-  distinct by construction (`StsAuthority`) and must be provisioned from a secrets manager/KMS
-  with a rotation procedure (F2); they never leave the gateway (credentials never leave the site).
+- **I5 — Key custody.** The STS master keys derive every session secret; the `signing_key`
+  authenticates every claims token. Compromise of a master key ≈ mint authority. They are
+  distinct by construction (`StsAuthority`) and must be provisioned from a secrets manager/KMS;
+  they never leave the gateway (credentials never leave the site). Master-key rotation is
+  online — add a `kid`, repoint `current_kid`, wait one `session_ttl_secs`, drop the old entry
+  (procedure in `src/auth/sts.rs`). **Signing-key** rotation is not yet online: the token names
+  its master key but not its signing key, so replacing the signing key invalidates every live
+  session. Rotate it in a window, or add a JWS-header-selected signing ring first.
 - **I6 — Credential domains stay disjoint.** The gateway honors only `HFST` sessions and its own
   static store (`src/auth/mod.rs`); backend-minted or tenant-owner creds are unknown access-key
   ids at the gateway (auth fail), and gateway creds are meaningless at the backend. Cross-domain
