@@ -14,12 +14,16 @@ use std::time::Duration;
 
 use crate::error::GatewayError;
 use crate::pdp::{Bundle, BundleStore, Pdp, content_revision, parse_bundle};
+use crate::secret::Secret;
 
 pub enum BundleSource {
     File(PathBuf),
     Http {
         client: reqwest::Client,
         url: String,
+        /// The credential presented on every fetch, or `None` when the endpoint needs
+        /// none. See [`BundleSource::http`].
+        shared_secret: Option<Secret<String>>,
     },
 }
 
@@ -28,7 +32,25 @@ impl BundleSource {
     /// *whole* request, so a control plane that accepts the connection and never
     /// answers cannot wedge the single refresh task and silently stop revocation
     /// from landing.
-    pub fn http(url: String, timeout: Duration) -> Result<Self, GatewayError> {
+    ///
+    /// `shared_secret` is the platform `X-Shared-Secret`
+    /// ([`crate::internal::SHARED_SECRET_HEADER`] — the same header, the same value,
+    /// the same idiom as every other console↔component internal call). It is
+    /// **optional**: s0 must stay runnable against a plain file or an unauthenticated
+    /// URL, and refusing to poll without a credential would break every deployment
+    /// that does not have one. But it is not *conditionally* sent — when it is
+    /// configured it rides on every request this source ever makes, including the
+    /// retries after a failure, because a poller that drops the credential on some
+    /// path is a poller that silently stops receiving revocations.
+    ///
+    /// Why a header and not a query parameter or basic auth: a query parameter lands
+    /// in the control plane's access log and in every proxy in between, which is the
+    /// same class of leak `Secret<T>` exists to prevent on this side.
+    pub fn http(
+        url: String,
+        timeout: Duration,
+        shared_secret: Option<Secret<String>>,
+    ) -> Result<Self, GatewayError> {
         let client = reqwest::Client::builder()
             .gzip(true)
             .timeout(timeout)
@@ -37,7 +59,11 @@ impl BundleSource {
             .connect_timeout(timeout.min(Duration::from_secs(5)))
             .build()
             .map_err(|e| GatewayError::Config(format!("bundle http client: {e}")))?;
-        Ok(BundleSource::Http { client, url })
+        Ok(BundleSource::Http {
+            client,
+            url,
+            shared_secret,
+        })
     }
 
     /// True when the source is the control plane rather than a local file. Readiness
@@ -46,14 +72,55 @@ impl BundleSource {
         matches!(self, BundleSource::Http { .. })
     }
 
+    /// True when this source presents a credential. Reported so an operator can tell
+    /// an authenticated poll from an unauthenticated one without reading the config.
+    pub fn is_authenticated(&self) -> bool {
+        matches!(
+            self,
+            BundleSource::Http {
+                shared_secret: Some(_),
+                ..
+            }
+        )
+    }
+
     async fn fetch(&self) -> Result<String, String> {
         match self {
             BundleSource::File(path) => tokio::fs::read_to_string(path)
                 .await
                 .map_err(|e| e.to_string()),
-            BundleSource::Http { client, url } => {
-                let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
+            BundleSource::Http {
+                client,
+                url,
+                shared_secret,
+            } => {
+                let mut request = client.get(url);
+                if let Some(secret) = shared_secret {
+                    request = request.header(
+                        crate::internal::SHARED_SECRET_HEADER,
+                        secret.expose().as_str(),
+                    );
+                }
+                let resp = request.send().await.map_err(|e| e.to_string())?;
                 if !resp.status().is_success() {
+                    // 401/403 is worth calling out by name: it is the shape a rotated
+                    // or unrendered `bundle_shared_secret` takes, and it is otherwise
+                    // indistinguishable from a control-plane outage in the logs.
+                    if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                        || resp.status() == reqwest::StatusCode::FORBIDDEN
+                    {
+                        return Err(format!(
+                            "status {} — the bundle endpoint rejected this gateway's \
+                             credential (bundle_shared_secret {}); revocation is NOT \
+                             landing",
+                            resp.status(),
+                            if shared_secret.is_some() {
+                                "is set and was sent"
+                            } else {
+                                "is not set, so nothing was sent"
+                            }
+                        ));
+                    }
                     return Err(format!("status {}", resp.status()));
                 }
                 resp.text().await.map_err(|e| e.to_string())
@@ -182,4 +249,98 @@ async fn refresh_once(
     bundles.store(Bundle::new(revision.clone(), parsed.data));
     tracing::info!(%revision, "bundle reloaded");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A one-shot HTTP server that records the request head and answers with `body`.
+    /// Returns its URL and a handle yielding the headers it saw.
+    ///
+    /// Raw TCP rather than a mock client: the claim under test is "the credential is
+    /// on the wire", and a stub that intercepts before the socket cannot prove it.
+    async fn capture_one_request(
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<BTreeMap<String, String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            // Read until the end of the request head. There is no request body.
+            loop {
+                let n = stream.read(&mut chunk).await.expect("read");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let head = String::from_utf8_lossy(&buf).to_string();
+            let headers = head
+                .lines()
+                .skip(1)
+                .filter_map(|l| l.split_once(':'))
+                .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+                .collect::<BTreeMap<_, _>>();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.expect("write");
+            stream.flush().await.expect("flush");
+            headers
+        });
+        (format!("http://{addr}/bundle"), handle)
+    }
+
+    /// P2's s0 half: the bundle endpoint is authenticated, and this poller presents
+    /// the credential. Asserted on the bytes that reach the socket.
+    #[tokio::test]
+    async fn a_configured_bundle_credential_is_sent_on_the_wire() {
+        let (url, seen) = capture_one_request(r#"{"data":{}}"#).await;
+        let source = BundleSource::http(
+            url,
+            Duration::from_secs(5),
+            Some(Secret::from("BUNDLE-SHARED-SECRET")),
+        )
+        .expect("source");
+        assert!(source.is_authenticated());
+        let body = source.fetch().await.expect("fetch");
+        assert_eq!(body, r#"{"data":{}}"#);
+
+        let headers = seen.await.expect("server task");
+        assert_eq!(
+            headers
+                .get(&crate::internal::SHARED_SECRET_HEADER.to_ascii_lowercase())
+                .map(String::as_str),
+            Some("BUNDLE-SHARED-SECRET"),
+            "the bundle poll carried no credential: {headers:?}"
+        );
+    }
+
+    /// …and an unconfigured one sends nothing, so a gateway pointed at a plain file
+    /// server or a dev URL still works. This is the half that makes the field
+    /// genuinely optional rather than optional-in-the-schema-only.
+    #[tokio::test]
+    async fn an_unconfigured_bundle_credential_sends_no_header() {
+        let (url, seen) = capture_one_request(r#"{"data":{}}"#).await;
+        let source = BundleSource::http(url, Duration::from_secs(5), None).expect("source");
+        assert!(!source.is_authenticated());
+        source.fetch().await.expect("fetch");
+        let headers = seen.await.expect("server task");
+        assert!(
+            !headers.contains_key(&crate::internal::SHARED_SECRET_HEADER.to_ascii_lowercase()),
+            "an unconfigured poller sent an auth header: {headers:?}"
+        );
+    }
 }

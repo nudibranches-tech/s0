@@ -57,6 +57,12 @@
   "bundle_url": "http://controlplane.example.com/api/v1/organizations/org-acme/bundle",
   "bundle_poll_secs": 30,
   "bundle_timeout_secs": 10,
+  "bundle_shared_secret": "REPLACE_WITH_PLATFORM_SHARED_SECRET",
+  "internal": {
+    "listen": "0.0.0.0:8017",
+    "shared_secret": "REPLACE_WITH_PLATFORM_SHARED_SECRET",
+    "max_session_ttl_secs": 3600
+  },
   "sts_mint": {
     "listen": "0.0.0.0:8015",
     "issuer": "https://idp.example.com/realms/acme",

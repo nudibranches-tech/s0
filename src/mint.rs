@@ -268,16 +268,38 @@ pub struct Mint {
 }
 
 /// AssumeRoleWithWebIdentity-shaped response.
-#[derive(Debug, Serialize)]
-struct MintedCredentials {
+///
+/// Public and shared with [`crate::internal`] on purpose: the console-mediated
+/// session endpoint answers with **this** type rather than a second credential shape,
+/// so a session minted through either door is indistinguishable on the wire as well
+/// as in the key ring. hyperfluid's `MintedSession` deserializes exactly these four
+/// field names; they are pinned from both sides by `tests/cross_repo_contract.rs`.
+///
+/// No `Debug`: three of its four fields are a live credential, and the strongest
+/// available guarantee that they never reach a log line is that `{:?}` on this type
+/// does not compile. (Its hyperfluid counterpart makes the same choice, for the same
+/// stated reason.)
+#[derive(Serialize)]
+pub struct MintedCredentials {
     #[serde(rename = "AccessKeyId")]
-    access_key_id: String,
+    pub access_key_id: String,
     #[serde(rename = "SecretAccessKey")]
-    secret_access_key: String,
+    pub secret_access_key: String,
     #[serde(rename = "SessionToken")]
-    session_token: String,
+    pub session_token: String,
     #[serde(rename = "Expiration")]
-    expiration: u64,
+    pub expiration: u64,
+}
+
+impl From<crate::auth::sts::SessionCredentials> for MintedCredentials {
+    fn from(creds: crate::auth::sts::SessionCredentials) -> Self {
+        MintedCredentials {
+            access_key_id: creds.access_key_id,
+            secret_access_key: creds.secret_access_key,
+            session_token: creds.session_token,
+            expiration: creds.expires_at,
+        }
+    }
 }
 
 impl Mint {
@@ -302,13 +324,7 @@ impl Mint {
             sid: sid.to_string(),
             exp: now + self.ttl.as_secs(),
         };
-        let creds = self.sts.mint(sid, claims)?;
-        Ok(MintedCredentials {
-            access_key_id: creds.access_key_id,
-            secret_access_key: creds.secret_access_key,
-            session_token: creds.session_token,
-            expiration: creds.expires_at,
-        })
+        Ok(self.sts.mint(sid, claims)?.into())
     }
 
     async fn route(&self, req: Request<Incoming>) -> Response<Full<Bytes>> {

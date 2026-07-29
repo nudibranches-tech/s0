@@ -16,6 +16,8 @@
 //! - [`gateway`]  — assembled shared context.
 //! - [`server`]   — S3 front + hyper serving.
 //! - [`admin`]    — health / readiness / metrics, on a listener of its own.
+//! - [`internal`] — the **authenticated** console-mediated session mint, on a
+//!   listener of its own (never the admin listener, never the data plane).
 //! - [`shutdown`] — the one signal every listener drains on.
 //! - [`secret`]   — `Secret<T>`: a configured credential that cannot be printed.
 
@@ -29,6 +31,7 @@ pub mod config;
 pub mod error;
 pub mod gateway;
 pub mod identity;
+pub mod internal;
 pub mod mint;
 pub mod model;
 pub mod pdp;

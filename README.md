@@ -108,6 +108,32 @@ key, so replacing it invalidates live sessions. Rotate it in a window.
 | [`audit`](src/audit) | one reasoned decision record per request, async, non-blocking, disk-spill |
 | [`gateway`](src/gateway.rs) / [`server`](src/server.rs) | assembly + hardened hyper serving |
 | [`admin`](src/admin.rs) / [`shutdown`](src/shutdown.rs) | `/healthz` `/readyz` `/metrics` on their own port; one signal, ordered drain |
+| [`internal`](src/internal.rs) | the **authenticated** control-plane surface: `POST /internal/v1/sts/sessions`, on a port of its own |
+
+## Listeners
+
+Four, on four ports, with three different auth postures. **Which posture applies is a
+property of the socket, never of the path** — the one design rule here, because a port
+where "is this authenticated?" is answered by a route match is how a mint ends up
+answering anonymously.
+
+| Port | What | Authentication | Exposure |
+|---|---|---|---|
+| `listen` (8014) | the S3 data plane | SigV4, per-request authorization | Ingress-fronted; public |
+| `admin_listen` (8016) | `/healthz` `/readyz` `/metrics` | **none, by construction** — a kubelet probe cannot present a secret | Service (scraping/probes) only. Never the ingress. |
+| `sts_mint.listen` (8015) | OIDC → session (the badge desk) | bearer OIDC token | optional; absent unless configured |
+| `internal.listen` (8017) | `POST /internal/v1/sts/sessions` | `X-Shared-Secret`, constant-time | **the console only.** Never the ingress, never the data plane. |
+
+The internal listener is absent unless `internal` is present in the config: no section,
+no bind, no port. A missing or empty `internal.shared_secret` **refuses every request**
+— there is no unauthenticated mode — and says so at `error` level once at startup.
+Fence it with a NetworkPolicy admitting the console namespace and nothing else; the
+secret is the second line, not the first.
+
+`bundle_shared_secret` is the other half of the same idiom: when set, every bundle poll
+carries the same `X-Shared-Secret` header. Optional, so s0 still runs against a plain
+file or an unauthenticated URL — but when the control plane requires it and it is
+absent, the poll 401s and the log says so by name (revocation is not landing).
 
 ## Running more than one replica
 
@@ -118,7 +144,7 @@ single-replica deployment exercises:
 |---|---|
 | **the audit spill is per-pod** | The spill is read-whole / POST / delete-whole, which is only correct for a single writer. Give each pod its own path — `"spill_path": "/var/lib/s0/audit-spill-${POD_NAME}.ndjson"`, interpolated at config load — on node-local scratch (`emptyDir`). **A shared RWX volume is unsupported.** If two pods do land on one path, the second detects the `.owner` marker, relocates to its own file and logs an error, rather than deleting records it never read ([`audit/sink.rs`](src/audit/sink.rs)). |
 | **readiness means "has polled the control plane"** | Not "holds a bundle revision" — a revision is seeded from the local file at boot, so that check passes on a pod that has never reached the control plane and would put a stale-policy replica into the Service. `/readyz` gates on ≥1 successful poll, and fails from the moment SIGTERM arrives so the pod leaves the Service *before* it stops accepting. |
-| **the grace period must exceed ~45s** | SIGTERM ⇒ readiness fails ⇒ S3 front drains (≤30s) ⇒ mint drains ⇒ audit worker drains (≤10s) ⇒ admin listener stops last. The kubernetes default of 30s truncates the audit drain and loses records; set `terminationGracePeriodSeconds: 60`. |
+| **the grace period must exceed ~45s** | SIGTERM ⇒ readiness fails ⇒ S3 front drains (≤30s) ⇒ the internal API and the mint drain ⇒ audit worker drains (≤10s) ⇒ admin listener stops last. The kubernetes default of 30s truncates the audit drain and loses records; set `terminationGracePeriodSeconds: 60`. |
 
 Probe the admin port (default `:8016`, unauthenticated — keep it off the ingress; the
 image is distroless so an `exec` probe is impossible):

@@ -1,12 +1,21 @@
 //! Gateway entrypoint: init observability, load config, build the gateway, start the
-//! live bundle refresher, the admin listener and the STS mint, and serve.
+//! live bundle refresher, the admin listener, the STS mint and the authenticated
+//! internal API, and serve.
+//!
+//! Four listeners, on four ports, with three different auth postures — which is the
+//! point, not an accident: the S3 data plane (SigV4, Ingress-fronted), the admin
+//! listener (**unauthenticated**, probes and metrics), the OIDC mint, and the internal
+//! API (platform shared secret, credential minting). Whether a request is
+//! authenticated is a property of the socket it arrived on, never of the path it
+//! asked for. See `s0::internal` for the full argument.
 //!
 //! Shutdown ordering is deliberate and is the whole reason this is not three detached
 //! `tokio::spawn`s:
 //!
 //! 1. SIGTERM ⇒ `/readyz` starts failing, so kubernetes takes this pod out of the
 //!    Service while it is still able to answer in-flight requests.
-//! 2. The S3 front and the mint stop accepting and drain their connections.
+//! 2. The S3 front, the mint and the internal API stop accepting and drain their
+//!    connections.
 //! 3. The audit worker drains, so records already emitted are shipped or spilled.
 //! 4. The admin listener stops last, so probes and a final scrape keep working for
 //!    the whole drain.
@@ -22,11 +31,14 @@ use s0::admin::{self, AdminState};
 use s0::bundle_refresh::{self, BundleHealth, BundleSource};
 use s0::config::GatewayConfig;
 use s0::error::Result;
+use s0::internal::{self, InternalApi};
 use s0::mint::{self, Mint, StandardVerifier};
 use s0::{gateway::Gateway, server, shutdown};
 
 /// Budget for the mint's own drain once the S3 front is down.
 const MINT_JOIN_TIMEOUT: Duration = Duration::from_secs(15);
+/// Same budget for the console-mediated session endpoint, which drains the same way.
+const INTERNAL_JOIN_TIMEOUT: Duration = Duration::from_secs(15);
 /// Budget for the audit worker to ship or spill everything queued.
 const AUDIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// Budget for the admin listener, which is only ever serving probes.
@@ -49,11 +61,23 @@ async fn main() -> Result<()> {
     let (gateway, audit_handle) = Gateway::build(&config)?;
 
     let source = match &config.bundle_url {
-        Some(url) => {
-            BundleSource::http(url.clone(), Duration::from_secs(config.bundle_timeout_secs))?
-        }
+        Some(url) => BundleSource::http(
+            url.clone(),
+            Duration::from_secs(config.bundle_timeout_secs),
+            config.bundle_shared_secret.clone(),
+        )?,
         None => BundleSource::File(config.bundle_path.clone()),
     };
+    if source.is_remote() && !source.is_authenticated() {
+        // Not fatal — s0 must stay runnable against an unauthenticated URL — but the
+        // control-plane bundle endpoint carries the org's grant rules and answers 304,
+        // which makes it a change-detection oracle over the grant table. An operator
+        // running against hyperfluid should be presenting a credential.
+        tracing::warn!(
+            "polling the bundle endpoint WITHOUT a credential; set bundle_shared_secret \
+             if the control plane requires one"
+        );
+    }
     let health = Arc::new(BundleHealth::new(source.is_remote()));
     bundle_refresh::spawn(
         gateway.pdp.clone(),
@@ -124,7 +148,41 @@ async fn main() -> Result<()> {
         None => None,
     };
 
+    // The console-mediated session endpoint: authenticated, on a listener of its own.
+    // Absent from the config ⇒ no task, no bind, no port — byte-identical to a build
+    // that predates it. See `s0::internal` for why it is not a route on the admin
+    // listener.
+    let internal_task = match &config.internal {
+        Some(internal_cfg) => {
+            let api = Arc::new(InternalApi::new(
+                internal_cfg,
+                gateway.identity.sts(),
+                gateway.registry.clone(),
+            ));
+            let internal_listen = internal_cfg.listen;
+            Some(tokio::spawn(async move {
+                if let Err(e) =
+                    internal::serve_with_shutdown(api, internal_listen, shutdown::signal()).await
+                {
+                    tracing::error!(%e, %internal_listen, "internal api exited");
+                }
+            }))
+        }
+        None => None,
+    };
+
     server::serve(gateway, listen).await?;
+
+    // The internal API saw the same signal; let it finish its own drain rather than
+    // being aborted with the runtime — an aborted mint looks to the console like an
+    // unexplained credential failure on every deploy.
+    if let Some(task) = internal_task
+        && tokio::time::timeout(INTERNAL_JOIN_TIMEOUT, task)
+            .await
+            .is_err()
+    {
+        tracing::error!("internal api drain timed out");
+    }
 
     // The S3 front has drained. Let the mint finish its own drain (it saw the same
     // signal) rather than aborting it with the runtime.

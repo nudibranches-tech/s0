@@ -57,10 +57,57 @@ pub struct GatewayConfig {
     /// factor or polls queue up behind each other.
     #[serde(default = "default_bundle_timeout_secs")]
     pub bundle_timeout_secs: u64,
+    /// Credential presented on every bundle fetch, when the bundle is polled from
+    /// the control plane.
+    ///
+    /// **Optional on purpose.** s0 must stay runnable against a plain file or an
+    /// unauthenticated URL (development, and any operator running it outside
+    /// hyperfluid), so a missing value is not an error — it is "this source needs no
+    /// credential". But when it *is* set it is sent on every request, never on the
+    /// first one only and never conditionally: see [`crate::bundle_refresh`].
+    ///
+    /// Rejected at load when `bundle_url` is unset, because a credential that is
+    /// never sent reads exactly like a credential that is.
+    #[serde(default)]
+    pub bundle_shared_secret: Option<Secret<String>>,
     /// Optional STS mint (the badge desk). When present, a control-plane server
     /// runs on its own listener and issues gateway session creds from OIDC tokens.
     #[serde(default)]
     pub sts_mint: Option<StsMintConfig>,
+    /// Optional **authenticated** internal surface: the console-mediated session
+    /// endpoint. Absent by default, so a gateway that does not carry this section
+    /// behaves byte-identically to one built before it existed — no listener is
+    /// bound, no port is opened, nothing is served.
+    #[serde(default)]
+    pub internal: Option<InternalApiConfig>,
+}
+
+/// The authenticated internal control-plane surface (`POST
+/// /internal/v1/sts/sessions`).
+///
+/// Deliberately **its own listener**, not a route on the admin listener and not a
+/// route on the S3 data plane. See [`crate::internal`] for the full argument; the
+/// short form is that the admin listener is unauthenticated by construction (probes
+/// cannot carry a secret) and mixing an authenticated credential-minting route onto
+/// the same port makes "is this request authenticated?" a routing question — which is
+/// how fail-open surfaces are built.
+#[derive(Debug, Clone, Deserialize)]
+pub struct InternalApiConfig {
+    #[serde(default = "default_internal_listen")]
+    pub listen: SocketAddr,
+    /// The platform `X-Shared-Secret`. **Optional in the schema, mandatory in
+    /// effect**: absent, empty or whitespace-only, every request to this listener is
+    /// refused. It is not a load-time error because that would crash-loop a pod whose
+    /// *data plane* is healthy and serving — refusing to mint is the smaller failure,
+    /// and it is loud (an `error!` at startup and a 401 per request) rather than
+    /// silent. It is never a reason to allow.
+    #[serde(default)]
+    pub shared_secret: Option<Secret<String>>,
+    /// Ceiling on a minted session's lifetime, in seconds. The caller asks for a
+    /// duration; anything above this is **clamped down** to it (never refused — see
+    /// [`crate::internal`] for why) and logged.
+    #[serde(default = "default_max_session_ttl_secs")]
+    pub max_session_ttl_secs: u64,
 }
 
 /// OIDC → gateway-credentials mint. Backend-agnostic: verifies a Keycloak token and
@@ -452,6 +499,74 @@ impl GatewayConfig {
                     .into(),
             ));
         }
+        // A bundle credential with no remote source is never sent. Left to run, it is
+        // indistinguishable from an authenticated poll — an operator would believe the
+        // bundle endpoint is being called with a credential when it is not being called
+        // at all.
+        if self.bundle_shared_secret.is_some() && self.bundle_url.is_none() {
+            return Err(GatewayError::Config(
+                "bundle_shared_secret is set but bundle_url is not; the credential would \
+                 never be sent (the bundle is being re-read from bundle_path)"
+                    .into(),
+            ));
+        }
+        self.validate_internal_listener()?;
+        Ok(())
+    }
+
+    /// The credential-minting listener may not share a port with anything else this
+    /// process serves.
+    ///
+    /// Both collisions are real config mistakes with the same shape — a
+    /// copy-pasted port — and both are catastrophic in the same direction:
+    ///
+    /// * **The admin listener** answers `/healthz`, `/readyz` and `/metrics` with no
+    ///   authentication at all, because a kubernetes probe cannot present a secret.
+    ///   Its port is published on the Service for scraping. Sharing it would put a
+    ///   credential mint behind whatever the probe port's network posture happens to be.
+    /// * **The S3 listener** is the data plane. It is fronted by an Ingress and is
+    ///   reachable from the public internet on `<org>.s3-gw.<domain>`. A minting route
+    ///   there is a credential-issuing endpoint on the open internet.
+    ///
+    /// Refusing at load rather than at bind time: `TcpListener::bind` would fail on a
+    /// real collision anyway, but only *after* the data plane is already serving, and
+    /// only for the loser of the race.
+    fn validate_internal_listener(&self) -> Result<()> {
+        let Some(i) = &self.internal else {
+            return Ok(());
+        };
+        if i.listen.port() == self.admin_listen.port() {
+            return Err(GatewayError::Config(format!(
+                "internal.listen {} shares a port with admin_listen {}; the admin \
+                 listener is UNAUTHENTICATED by design (a probe cannot present a \
+                 secret) and a credential-minting endpoint must never share it",
+                i.listen, self.admin_listen
+            )));
+        }
+        if i.listen.port() == self.listen.port() {
+            return Err(GatewayError::Config(format!(
+                "internal.listen {} shares a port with the S3 data-plane listener {}; \
+                 the data plane is fronted by an Ingress and a credential-minting \
+                 endpoint must never be reachable from it",
+                i.listen, self.listen
+            )));
+        }
+        if let Some(m) = &self.sts_mint
+            && i.listen.port() == m.listen.port()
+        {
+            return Err(GatewayError::Config(format!(
+                "internal.listen {} shares a port with sts_mint.listen {}",
+                i.listen, m.listen
+            )));
+        }
+        if i.max_session_ttl_secs == 0 {
+            return Err(GatewayError::Config(
+                "internal.max_session_ttl_secs must be > 0; a zero ceiling clamps every \
+                 minted session to nothing and is not a way to disable the endpoint \
+                 (omit the `internal` section for that)"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 
@@ -559,6 +674,19 @@ fn default_session_ttl_secs() -> u64 {
 }
 fn default_admin_listen() -> SocketAddr {
     SocketAddr::from(([0, 0, 0, 0], 8016))
+}
+/// 8017: next to the admin port and deliberately *not* it. `0.0.0.0` because the
+/// caller is the console, in a different pod — loopback would make the endpoint
+/// unreachable and the whole console-mediated path dead. Reachability is fenced by
+/// the Service/NetworkPolicy (operator side) and by authentication (here), never by
+/// the bind address.
+fn default_internal_listen() -> SocketAddr {
+    SocketAddr::from(([0, 0, 0, 0], 8017))
+}
+/// One hour, matching `default_session_ttl_secs` and the console's own
+/// `DurationSeconds=3600` on the legacy RGW path.
+fn default_max_session_ttl_secs() -> u64 {
+    3600
 }
 fn default_bundle_poll_secs() -> u64 {
     30
@@ -877,8 +1005,16 @@ mod tests {
         const SIGNING: &str = "5ec2e7ba5e0000000000000000000000000000000000000000000000deadbeef";
         const OWNER: &str = "OWNER-SECRET-Wj4rXk9zQ2";
         const STATIC: &str = "STATIC-SECRET-Pq7mLt3v";
+        // The two machine-to-machine credentials added for P2/P3. Both are the
+        // platform shared secret — the single most reusable credential on the
+        // cluster — so a `{:?}` that printed either of them would be worse than any
+        // of the four above.
+        const BUNDLE: &str = "BUNDLE-SHARED-SECRET-Kx8nQ2";
+        const INTERNAL: &str = "INTERNAL-SHARED-SECRET-Vb5tR9";
 
         let mut cfg = example();
+        cfg["bundle_shared_secret"] = serde_json::json!(BUNDLE);
+        cfg["internal"]["shared_secret"] = serde_json::json!(INTERNAL);
         cfg["sts"]["master_keys"] = serde_json::json!({ "k0": MASTER });
         cfg["sts"]["current_kid"] = serde_json::json!("k0");
         cfg["sts"]["signing_key_hex"] = serde_json::json!(SIGNING);
@@ -902,6 +1038,18 @@ mod tests {
             STATIC
         );
         assert_eq!(loaded.sts.key_ring().0["k0"].expose(), MASTER);
+        assert_eq!(
+            loaded.bundle_shared_secret.as_ref().map(|s| s.expose()),
+            Some(&BUNDLE.to_string())
+        );
+        assert_eq!(
+            loaded
+                .internal
+                .as_ref()
+                .and_then(|i| i.shared_secret.as_ref())
+                .map(|s| s.expose()),
+            Some(&INTERNAL.to_string())
+        );
 
         // …and no rendering of the config, at any depth or in any format, shows them.
         let renderings = [
@@ -912,11 +1060,13 @@ mod tests {
             format!("{:?}", loaded.tenants),
             format!("{:?}", loaded.static_credentials),
             format!("{:?}", loaded.sts.key_ring()),
+            format!("{:?}", loaded.internal),
+            format!("{:?}", loaded.bundle_shared_secret),
             // The shape an error type that wraps a config produces.
             format!("{:?}", Some(&loaded)),
         ];
         for rendered in renderings {
-            for secret in [MASTER, SIGNING, OWNER, STATIC] {
+            for secret in [MASTER, SIGNING, OWNER, STATIC, BUNDLE, INTERNAL] {
                 assert!(
                     !rendered.contains(secret),
                     "a plaintext secret is reachable through Debug: {rendered}"
@@ -933,6 +1083,81 @@ mod tests {
         let creds = crate::auth::credentials_from_config(&loaded);
         let rendered = format!("{creds:?}");
         assert!(!rendered.contains(STATIC), "{rendered}");
+    }
+
+    /// The credential mint may not land on the unauthenticated probe port, on the
+    /// Ingress-fronted data plane, or on the OIDC mint.
+    #[test]
+    fn the_internal_listener_may_not_share_a_port_with_anything_else() {
+        let collide = |port: u16| -> String {
+            let mut cfg = example();
+            cfg["internal"]["listen"] = serde_json::json!(format!("0.0.0.0:{port}"));
+            GatewayConfig::from_json(&cfg.to_string())
+                .expect_err("a port collision must not load")
+                .to_string()
+        };
+        assert!(collide(8016).contains("admin_listen"), "{}", collide(8016));
+        assert!(
+            collide(8016).contains("UNAUTHENTICATED"),
+            "the message must say WHY"
+        );
+        assert!(collide(8014).contains("data-plane"), "{}", collide(8014));
+        assert!(collide(8015).contains("sts_mint"), "{}", collide(8015));
+
+        // A zero ceiling is not a way to disable the endpoint; it would clamp every
+        // session to nothing.
+        let mut cfg = example();
+        cfg["internal"]["max_session_ttl_secs"] = serde_json::json!(0);
+        assert!(
+            GatewayConfig::from_json(&cfg.to_string())
+                .expect_err("zero ttl cap")
+                .to_string()
+                .contains("max_session_ttl_secs")
+        );
+    }
+
+    /// Omitting the whole section is the "off" state: no listener, and the config that
+    /// every gateway runs today (which has never heard of the field) still loads.
+    #[test]
+    fn the_internal_listener_is_absent_unless_configured() {
+        let mut cfg = example();
+        cfg.as_object_mut().unwrap().remove("internal");
+        cfg.as_object_mut().unwrap().remove("bundle_shared_secret");
+        let loaded = GatewayConfig::from_json(&cfg.to_string()).expect("loads without them");
+        assert!(loaded.internal.is_none());
+        assert!(loaded.bundle_shared_secret.is_none());
+
+        // And when it is present without a secret it still loads — refusing every
+        // request is a *runtime* posture, not a crash loop that would take the healthy
+        // data plane down with it.
+        let mut cfg = example();
+        cfg["internal"]
+            .as_object_mut()
+            .unwrap()
+            .remove("shared_secret");
+        let loaded = GatewayConfig::from_json(&cfg.to_string()).expect("loads without a secret");
+        let internal = loaded.internal.expect("section present");
+        assert!(internal.shared_secret.is_none());
+        assert_eq!(internal.listen.port(), 8017);
+        assert_eq!(internal.max_session_ttl_secs, 3600);
+    }
+
+    /// A bundle credential that is never sent reads exactly like one that is.
+    #[test]
+    fn a_bundle_credential_without_a_bundle_url_is_refused() {
+        let mut cfg = example();
+        cfg.as_object_mut().unwrap().remove("bundle_url");
+        let err = GatewayConfig::from_json(&cfg.to_string())
+            .expect_err("a credential with no remote source must not load")
+            .to_string();
+        assert!(err.contains("bundle_shared_secret"), "{err}");
+        assert!(err.contains("never be sent"), "{err}");
+
+        // Positive control: dropping both loads (the dev/file-source deployment).
+        let mut cfg = example();
+        cfg.as_object_mut().unwrap().remove("bundle_url");
+        cfg.as_object_mut().unwrap().remove("bundle_shared_secret");
+        assert!(GatewayConfig::from_json(&cfg.to_string()).is_ok());
     }
 
     #[test]
