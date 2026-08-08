@@ -208,7 +208,7 @@ can lift tag-based restrictions.** At gate-open:
   ops. This inventory is part of the ship-gate review so no tag-bearing input field ships
   unexamined.
 - Backend-side tag-driven behaviors (e.g. lifecycle expiration rules filtered by tags) are
-  configured via the lifecycle ops, which stay denied at the gate in the 29-op scope, and
+  configured via the lifecycle ops, which stay denied at the gate in the enforced scope, and
   execute inside the backend, not as gateway decisions — one more reason retention semantics do not belong to tag ABAC (D6, Class I).
 
 ### D6. The residual TOCTOU window: definition, and which deny classes tolerate it

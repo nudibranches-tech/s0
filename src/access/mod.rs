@@ -33,16 +33,21 @@
 //! made the object world-readable. [`headers`] and [`tagging`] close that, and the
 //! enforcement has two distinct shapes, on purpose:
 //!
-//! - **screened in code** ([`GatewayAccess::screen_riders`]) — a *public* ACL, an
-//!   unrecognized canned ACL, a governance bypass, a reserved tag key. No grant may
-//!   authorize these, so no PDP question is asked and no bundle can reach them.
-//! - **decomposed into their own verbs** ([`GatewayAccess::authorize_riders`]) — a
-//!   non-public ACL takes a `write_object_acl` decision on the same object, an inline tag
-//!   set takes a `write_object_tags` one. Still one audit record for the request, the way
-//!   a copy's two halves are one record.
+//! - **screened in code** ([`GatewayAccess::screen_riders`]) — **any** ACL that confers
+//!   anything on anyone (public or named), an unrecognized canned ACL, a governance
+//!   bypass, a reserved tag key. No grant may authorize these, so no PDP question is
+//!   asked and no bundle can reach them.
+//! - **decomposed into its own verb** ([`GatewayAccess::authorize_riders`]) — an inline
+//!   tag set takes a `write_object_tags` decision on the same object. Still one audit
+//!   record for the request, the way a copy's two halves are one record.
 //!
 //! The answer is a **denial, never a silent strip**; see [`headers`] for the argument and
 //! ADR-008 for the decision.
+//!
+//! ACL decomposition was the second bullet until 2026-08-08: a conferring ACL took its
+//! own `write_object_acl` decision. That verb was removed with the rest of the
+//! control-plane vocabulary, so conferring ACLs joined the first bullet — refused in
+//! code, on every write path, with a real `Deny` record. See [`headers`].
 
 pub mod headers;
 pub mod optable;
@@ -57,7 +62,7 @@ use s3s::access::{S3Access, S3AccessContext};
 use s3s::dto::*;
 use s3s::{S3Error, S3Request, S3Result, s3_error};
 
-use crate::access::headers::{AclDisposition, AclFields, RequestRiders};
+use crate::access::headers::RequestRiders;
 use crate::access::tagging::ReservedTagKeys;
 use crate::audit::{
     AuditRecord, BackendOutcome, GateContext, GateStage, GatewayMeta, Outcome, PendingAudit,
@@ -73,15 +78,15 @@ use crate::proxy::obligations::{BucketVisibility, ResponseObligations};
 pub use optable::{Coverage, DangerTier, GateDenial, OP_TABLE, OpSpec, ResourceShape};
 pub use proof::AuthzProof;
 
-/// The ACL fields of an object-shaped s3s input, as [`AclFields`].
+/// The ACL fields of an object-shaped s3s input, as [`headers::AclFields`].
 ///
-/// A macro rather than a trait because the five input types share these fields by
+/// A macro rather than a trait because the four input types share these fields by
 /// coincidence of the S3 API, not by any relationship s3s expresses — and a macro that
 /// names every field explicitly is what makes "the hook forgot one" a compile error at
 /// the call site rather than a silent `None`.
 macro_rules! object_acl_fields {
     ($i:expr) => {
-        AclFields {
+        crate::access::headers::AclFields {
             canned: $i.acl.as_ref().map(|a| a.as_str()),
             full_control: $i.grant_full_control.as_deref(),
             read: $i.grant_read.as_deref(),
@@ -92,14 +97,6 @@ macro_rules! object_acl_fields {
         }
     };
 }
-
-/// The value of `OpaInput::config_kind` for the two bucket sub-resources in scope.
-///
-/// Both map to the same verb (`{read,write}_bucket_config`) by the frozen vocabulary,
-/// so this string is the only thing that tells a policy — and the decision cache —
-/// which document is being read or written.
-const CONFIG_KIND_POLICY: &str = "policy";
-const CONFIG_KIND_CORS: &str = "cors";
 
 /// The exact s3s operation name for this request. Only reachable in `check`
 /// (`cx.s3_op()`), so `check` stashes it and the typed hooks read it from there
@@ -177,7 +174,6 @@ impl<'a> ReqCtx<'a> {
             copy_source: None,
             delete_keys: None,
             object_tags: None,
-            config_kind: None,
             requested_tags: None,
             acl_grants: vec![],
             bypass_governance: false,
@@ -381,9 +377,9 @@ impl GatewayAccess {
     ///
     /// The un-prefixed sibling of [`Self::refuse`], for a denial the **policy** produced
     /// even though no single `enforce` call did: a composite verdict over several
-    /// sub-decisions (a copy's two halves, a write plus the `write_object_acl` its
-    /// `x-amz-acl` header requires). Prefixing those with `deny (gateway):` would claim
-    /// the gateway made a call the PDP actually made.
+    /// sub-decisions (a copy's two halves; a write plus the `write_object_tags` its
+    /// inline `x-amz-tagging` requires). Prefixing those with `deny (gateway):` would
+    /// claim the gateway made a call the PDP actually made.
     fn deny(&self, input: OpaInput, reason: String) -> S3Error {
         let decision = Decision::deny(reason.clone());
         self.audit_denied(input, &decision, vec![]);
@@ -408,17 +404,22 @@ impl GatewayAccess {
     /// 1. **`x-amz-bypass-governance-retention`.** Object-lock governance mode exists so
     ///    that a retained object cannot be destroyed; the bypass header is the documented
     ///    way to destroy it anyway. AWS gates it on its own IAM action
-    ///    (`s3:BypassGovernanceRetention`) and the 13-verb vocabulary frozen in the master
-    ///    plan (§1.2) has **no equivalent** — so there is no grant that could express
-    ///    "may defeat WORM", and inventing one here would be a cross-repo contract change
-    ///    made unilaterally by a PEP. Until the vocabulary gains a verb, the honest answer
-    ///    is that this gateway does not broker retention overrides. The attempt is still
-    ///    put on the record (`input.bypass_governance`), which is the point: in a
-    ///    regulated deployment "who tried to bypass retention" is a question the audit
-    ///    trail must be able to answer.
-    /// 2. **A public ACL.** See [`headers`] — a wildcard grant confers `write_object_acl`
-    ///    and the default access model seeds one for every Owner, so a policy-only guard
-    ///    would leave public exposure one flag away.
+    ///    (`s3:BypassGovernanceRetention`) and the gateway's grant vocabulary has **no
+    ///    equivalent** — so there is no grant that could express "may defeat WORM", and
+    ///    inventing one here would be a cross-repo contract change made unilaterally by
+    ///    a PEP. Until the vocabulary gains a verb, the honest answer is that this
+    ///    gateway does not broker retention overrides. The attempt is still put on the
+    ///    record (`input.bypass_governance`), which is the point: in a regulated
+    ///    deployment "who tried to bypass retention" is a question the audit trail must
+    ///    be able to answer.
+    /// 2. **Any conferring ACL** — public *or* named. See [`headers`]. Public exposure
+    ///    was always refused here because a wildcard grant conferred `write_object_acl`
+    ///    and the default access model seeds one for every Owner. Since 2026-08-08 the
+    ///    named case is refused too, for a different and simpler reason: the verb is
+    ///    gone, because an object ACL grants access hyperfluid never projected and
+    ///    therefore cannot show or revoke. Both refusals come back as
+    ///    [`headers::AclDisposition::refusal`], so a tier added to that enum later is
+    ///    screened by this line without it changing.
     /// 3. **A reserved tag key**, including the shipped default in which *every* key is
     ///    reserved because the control plane has published no list. See [`tagging`].
     fn screen_riders(&self, riders: &RequestRiders) -> Result<(), String> {
@@ -431,8 +432,8 @@ impl GatewayAccess {
                     .to_string(),
             );
         }
-        if let AclDisposition::Refused(why) = headers::classify(&riders.acl) {
-            return Err(why);
+        if let Some(why) = headers::classify(&riders.acl).refusal() {
+            return Err(why.to_string());
         }
         if let Some(tags) = &riders.tags {
             self.reserved_tag_keys().check(tags)?;
@@ -443,12 +444,16 @@ impl GatewayAccess {
     /// Authorize the riders as **separate verbs on the same object**, after the gateway's
     /// own screening and before the write itself is recorded.
     ///
-    /// This is the modelling decision at the centre of the retrofit. A `PutObject`
-    /// carrying `x-amz-acl` is two requests: write these bytes, and set who may read them.
-    /// AWS says so too (`s3:PutObject` + `s3:PutObjectAcl`), and folding the second into
-    /// the first is what made the header invisible. Same for an inline `x-amz-tagging`,
-    /// which is a `PutObjectTagging` wearing a `PutObject`'s clothes — and which must go
-    /// through `write_object_tags` precisely because a tag can satisfy an ABAC condition.
+    /// This is the modelling decision at the centre of the retrofit. An inline
+    /// `x-amz-tagging` is a `PutObjectTagging` wearing a `PutObject`'s clothes, and it
+    /// must go through `write_object_tags` precisely because a tag can satisfy an ABAC
+    /// condition — which is also why `write_object_tags` was *not* merged into
+    /// `write_objects` when the vocabulary shrank.
+    ///
+    /// The ACL used to be decomposed the same way, onto `write_object_acl`. It is now
+    /// screened in [`Self::screen_riders`] instead: there is no verb left to decompose
+    /// onto, and "no grant matches" would have been a misleading reason for a request no
+    /// grant could ever match.
     ///
     /// `Some(reason)` ⇒ refuse. Returns rather than denying inline so the caller records
     /// **one** audit entry against the primary input, the way `enforce_copy` does: a
@@ -459,18 +464,6 @@ impl GatewayAccess {
         input: &OpaInput,
         riders: &RequestRiders,
     ) -> Option<String> {
-        if headers::classify(&riders.acl) == AclDisposition::RequiresAclVerb {
-            let mut acl_input = input.clone();
-            acl_input.action = Action::WriteObjectAcl;
-            if !self.decide(cx, &acl_input).await.allow {
-                return Some(format!(
-                    "deny: the request carries {} access-control grant(s) \
-                     (x-amz-acl / x-amz-grant-*), which require write_object_acl on this \
-                     object; no grant matches",
-                    riders.acl.len()
-                ));
-            }
-        }
         if riders.tags.is_some() {
             let mut tag_input = input.clone();
             tag_input.action = Action::WriteObjectTags;
@@ -549,21 +542,6 @@ impl GatewayAccess {
         self.enforce(cx, input).await
     }
 
-    /// The bucket sub-resource path (policy, cors). Same verb pair for every
-    /// sub-resource; `config_kind` is what a policy discriminates on, and what keeps
-    /// two different documents from sharing one decision-cache entry.
-    async fn enforce_bucket_config(
-        &self,
-        cx: &mut ReqCtx<'_>,
-        action: Action,
-        bucket: String,
-        config_kind: &str,
-    ) -> S3Result<()> {
-        let mut input = cx.base_input(action, bucket);
-        input.config_kind = Some(config_kind.to_string());
-        self.enforce(cx, input).await
-    }
-
     /// The account-scoped enumeration path (`ListBuckets`), and the first decision in
     /// this gateway whose verdict is applied to a **response**.
     ///
@@ -587,7 +565,11 @@ impl GatewayAccess {
         // and the per-bucket denylist is keyed on a bucket nobody named (plan defect
         // B-2). `policy/gateway/authz.rego` does; `the_wildcard_grant_does_not_match_the
         // _account_scope` in the corpus is the guard.
-        let input = cx.base_input(Action::ListBuckets, String::new());
+        //
+        // `Action::Read` in the ACCOUNT shape. It is the same verb `HeadBucket` uses in
+        // the bucket shape, and the empty bucket is the only thing that tells the two
+        // apart — which is why every rego rule reading it carries a shape gate.
+        let input = cx.base_input(Action::Read, String::new());
         let decision = self.decide(cx, &input).await;
         match classify_bucket_listing(&decision) {
             BucketListing::Withhold(reason) => {
@@ -712,7 +694,7 @@ impl S3Access for GatewayAccess {
     async fn check(&self, cx: &mut S3AccessContext<'_>) -> S3Result<()> {
         // Every branch below emits an audit record as well as a log line. It used to
         // emit only the log line, which meant the decision log held zero evidence of
-        // the entire deny-by-default surface — all 84 gate-denied ops, every anonymous
+        // the entire deny-by-default surface — all 76 gate-denied ops, every anonymous
         // request, and every credential that resolved to nothing — so "was this
         // gateway probed?" was unanswerable from the audit trail. The access-key id is
         // a semi-public identifier and is recorded; the secret never is.
@@ -1187,196 +1169,56 @@ impl S3Access for GatewayAccess {
         Ok(())
     }
 
-    // ── bucket existence and lifecycle (M4 tier 1: client compatibility) ─────────
+    // ── bucket existence (M4 tier 1: client compatibility) ──────────────────────
+    //
+    // What is NOT here, since 2026-08-08, and deliberately: `create_bucket`,
+    // `delete_bucket`, `{get,put}_bucket_policy` and `{get,put}_bucket_cors`. They were
+    // enforced hooks from M4 until the settlement made the gateway data-plane only, and
+    // they were REMOVED rather than stubbed — a stub would have been a hook that returns
+    // `Ok(())`, which is the s3s fail-OPEN default wearing a comment. With no hook and no
+    // dispatch arm, `OP_TABLE` marks each `Coverage::Denied`, `check` refuses it before
+    // deserialization, and even a bug in `check` lands on s3s's `NotImplemented`.
+    // `tests/gate_invariants.rs::denied_ops_have_no_dispatch_arm` holds that.
+    //
+    // Bucket existence, policy, CORS and quota are properties of the MANAGED resource —
+    // the `HFBucket` CR — and they are changed through the console and the operator, so
+    // that no bucket exists without a CR behind it. See `optable::NON_GATEWAY_VERBS`.
 
     async fn head_bucket(&self, req: &mut S3Request<HeadBucketInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
         let mut cx = ReqCtx::new(req)?;
-        self.enforce_bucket(&mut cx, Action::ReadBucket, bucket)
-            .await
+        self.enforce_bucket(&mut cx, Action::Read, bucket).await
     }
 
     async fn get_bucket_location(
         &self,
         req: &mut S3Request<GetBucketLocationInput>,
     ) -> S3Result<()> {
-        // `read_bucket`, not `read_bucket_config`: every SDK probes this on connect, so
-        // charging it to the configuration verb would make ordinary use require a
-        // config grant.
+        // The existence verb, not a configuration one: every SDK probes this on connect,
+        // so charging it to anything else would make ordinary use require a grant nobody
+        // would know to give. Same verb, and same answer, as HeadBucket and ListBuckets.
         let bucket = req.input.bucket.clone();
         let mut cx = ReqCtx::new(req)?;
-        self.enforce_bucket(&mut cx, Action::ReadBucket, bucket)
-            .await
-    }
-
-    /// Create a bucket **inside the caller's own tenant**, and nowhere else.
-    ///
-    /// Two independent things bind the name to the tenant, and both are needed:
-    ///
-    /// 1. the decision is asked with `input.tenant` taken from the [`RouteSnapshot`]
-    ///    `check` resolved — never from anything the caller sent — and grants are keyed
-    ///    per tenant in the bundle, so a `create_bucket` grant cannot exist for a tenant
-    ///    the principal does not belong to;
-    /// 2. the forward is re-signed with *that* tenant's owner credential, so RGW places
-    ///    the bucket in that tenant's namespace.
-    ///
-    /// What is left is the name itself: RGW addresses a foreign tenant's bucket as
-    /// `<tenant>:<bucket>`, so a name carrying that qualifier would ask the backend for
-    /// somebody else's namespace under our own credential. [`tenant_local_bucket_name`]
-    /// refuses it before the question is even asked.
-    /// A bucket ACL on the create is refused outright, whatever the principal holds.
-    ///
-    /// Not by the [`Self::screen_riders`] tiering, and not by a `write_object_acl`
-    /// sub-decision, because neither is the right question: this is a *bucket* ACL, and
-    /// the frozen 13-verb vocabulary has no bucket-ACL verb. `PutBucketAcl` is
-    /// `Coverage::Denied` — the gateway does not do bucket ACLs at all — so accepting one
-    /// as a create-time rider would enable through the back door precisely the operation
-    /// the table refuses at the front. `x-amz-grant-write` exists only here, which is its
-    /// own reason to be careful: it is the one grant header that hands out *write*.
-    async fn create_bucket(&self, req: &mut S3Request<CreateBucketInput>) -> S3Result<()> {
-        let bucket = req.input.bucket.clone();
-        let acl = AclFields {
-            canned: req.input.acl.as_ref().map(BucketCannedACL::as_str),
-            full_control: req.input.grant_full_control.as_deref(),
-            read: req.input.grant_read.as_deref(),
-            write: req.input.grant_write.as_deref(),
-            read_acp: req.input.grant_read_acp.as_deref(),
-            write_acp: req.input.grant_write_acp.as_deref(),
-        }
-        .grants();
-        let mut cx = ReqCtx::new(req)?;
-        if let Err(why) = tenant_local_bucket_name(&bucket) {
-            let input = cx.base_input(Action::CreateBucket, bucket);
-            return Err(self.refuse(input, why));
-        }
-        if headers::classify(&acl) != AclDisposition::NoGrant {
-            let mut input = cx.base_input(Action::CreateBucket, bucket);
-            input.acl_grants = acl.clone();
-            return Err(self.refuse(
-                input,
-                "the request sets a bucket ACL (x-amz-acl / x-amz-grant-*). This gateway \
-                 does not authorize bucket ACLs at all — PutBucketAcl is denied at the \
-                 gate — and there is no bucket-ACL verb in its grant vocabulary, so a \
-                 create-time ACL cannot be authorized and is refused"
-                    .to_string(),
-            ));
-        }
-        let mut input = cx.base_input(Action::CreateBucket, bucket);
-        // A no-op canned `private` still reaches the PDP and the audit record: what the
-        // caller asked for is a fact about the request.
-        input.acl_grants = acl;
-        self.enforce(&mut cx, input).await
-    }
-
-    /// Delete a bucket, under the same tenant binding as [`Self::create_bucket`] — and
-    /// under a *different verb*, deliberately: create must never confer delete.
-    async fn delete_bucket(&self, req: &mut S3Request<DeleteBucketInput>) -> S3Result<()> {
-        let bucket = req.input.bucket.clone();
-        let mut cx = ReqCtx::new(req)?;
-        if let Err(why) = tenant_local_bucket_name(&bucket) {
-            let input = cx.base_input(Action::DeleteBucket, bucket);
-            return Err(self.refuse(input, why));
-        }
-        self.enforce_bucket(&mut cx, Action::DeleteBucket, bucket)
-            .await
-    }
-
-    // ── bucket sub-resources (M4 tier 2: operator needs) ────────────────────────
-
-    async fn get_bucket_policy(&self, req: &mut S3Request<GetBucketPolicyInput>) -> S3Result<()> {
-        let bucket = req.input.bucket.clone();
-        let mut cx = ReqCtx::new(req)?;
-        self.enforce_bucket_config(
-            &mut cx,
-            Action::ReadBucketConfig,
-            bucket,
-            CONFIG_KIND_POLICY,
-        )
-        .await
-    }
-
-    /// Write a bucket policy — a second, backend-side PDP the gateway does not evaluate.
-    ///
-    /// Two refusals happen before the authorization question, both audited as real
-    /// `write_bucket_config` denials rather than as `InvalidRequest` (defect B-1):
-    ///
-    /// - **size.** `xml_max_body_size` is 20 MiB; AWS caps a bucket policy at 20 KB, and
-    ///   this document is parsed here, so `limits.max_bucket_policy_bytes` bounds it.
-    /// - **self-lockout.** The gateway reaches the backend as the tenant-owner
-    ///   credential. A policy that denies that principal takes the *bucket* away from
-    ///   the gateway — including the ability to put a corrected policy back. See
-    ///   [`bucket_policy_locks_out_the_gateway`] for what is and is not detectable.
-    async fn put_bucket_policy(&self, req: &mut S3Request<PutBucketPolicyInput>) -> S3Result<()> {
-        let bucket = req.input.bucket.clone();
-        let policy = req.input.policy.clone();
-        let confirm_remove_self = req.input.confirm_remove_self_bucket_access;
-        let max_bytes = self.gw.limits().max_bucket_policy_bytes;
-        let mut cx = ReqCtx::new(req)?;
-        // The input a refusal is recorded against: the same verb, bucket and
-        // config_kind the allow path would have asked about, so a capped request and a
-        // policy-denied one are the same shape in the decision log.
-        let refused = |cx: &ReqCtx<'_>| {
-            let mut input = cx.base_input(Action::WriteBucketConfig, bucket.clone());
-            input.config_kind = Some(CONFIG_KIND_POLICY.to_string());
-            input
-        };
-        if policy.len() > max_bytes {
-            let why = format!(
-                "bucket policy document is {} bytes, over the {max_bytes}-byte cap",
-                policy.len()
-            );
-            return Err(self.refuse(refused(&cx), why));
-        }
-        if confirm_remove_self == Some(true) {
-            return Err(self.refuse(
-                refused(&cx),
-                "x-amz-confirm-remove-self-bucket-access asks to drop the credential the \
-                 gateway itself reaches this bucket with"
-                    .to_string(),
-            ));
-        }
-        if let Err(why) = bucket_policy_locks_out_the_gateway(&policy) {
-            return Err(self.refuse(refused(&cx), why));
-        }
-        self.enforce_bucket_config(
-            &mut cx,
-            Action::WriteBucketConfig,
-            bucket,
-            CONFIG_KIND_POLICY,
-        )
-        .await
-    }
-
-    async fn get_bucket_cors(&self, req: &mut S3Request<GetBucketCorsInput>) -> S3Result<()> {
-        let bucket = req.input.bucket.clone();
-        let mut cx = ReqCtx::new(req)?;
-        self.enforce_bucket_config(&mut cx, Action::ReadBucketConfig, bucket, CONFIG_KIND_CORS)
-            .await
-    }
-
-    async fn put_bucket_cors(&self, req: &mut S3Request<PutBucketCorsInput>) -> S3Result<()> {
-        let bucket = req.input.bucket.clone();
-        let rules = req.input.cors_configuration.cors_rules.len();
-        let max_rules = self.gw.limits().max_cors_rules;
-        let mut cx = ReqCtx::new(req)?;
-        if rules > max_rules {
-            let mut input = cx.base_input(Action::WriteBucketConfig, bucket);
-            input.config_kind = Some(CONFIG_KIND_CORS.to_string());
-            return Err(self.refuse(
-                input,
-                format!("cors configuration carries {rules} rules, over the {max_rules}-rule cap"),
-            ));
-        }
-        self.enforce_bucket_config(&mut cx, Action::WriteBucketConfig, bucket, CONFIG_KIND_CORS)
-            .await
+        self.enforce_bucket(&mut cx, Action::Read, bucket).await
     }
 
     // ── object tagging and attributes (M4 tier 3) ───────────────────────────────
 
+    /// `read_objects`, same verb as `GetObject` — merged 2026-08-08.
+    ///
+    /// Reading an object's tags is strictly less than reading the object itself: anyone
+    /// who can `GetObject` can read the bytes the tags describe. A separate
+    /// `read_object_tags` verb therefore bought no containment and cost a grant an
+    /// administrator had to know to give, which in practice meant tag reads 403'd for
+    /// principals who could already download the object.
+    ///
+    /// The WRITE direction is **not** merged, and the asymmetry is the whole point: a
+    /// tag can satisfy an ABAC condition, so writing one can elevate. See
+    /// [`Action::WriteObjectTags`].
     async fn get_object_tagging(&self, req: &mut S3Request<GetObjectTaggingInput>) -> S3Result<()> {
         let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
         let mut cx = ReqCtx::new(req)?;
-        self.enforce_object(&mut cx, Action::ReadObjectTags, bucket, key)
+        self.enforce_object(&mut cx, Action::ReadObjects, bucket, key)
             .await
     }
 
@@ -1665,44 +1507,6 @@ fn list_verdict_single(verdict: ListVerdict, prefix: &mut Option<String>) -> S3R
     }
 }
 
-/// Refuse a bucket name that can address anything outside the caller's own tenant.
-///
-/// Ceph RGW addresses a foreign tenant's bucket as `<tenant>:<bucket>`, and the gateway
-/// forwards re-signed as *its* tenant-owner credential — so a name carrying a tenant
-/// qualifier is a request to operate on another namespace with our authority. The
-/// character set below is the S3 bucket alphabet, which excludes `:` and `/`; anything
-/// else is refused before the decision is asked for.
-///
-/// s3s's own path parser applies the same rules today, but its validator is pluggable
-/// (`s3s::validation::NameValidation`), and a tenant-confinement property must not rest
-/// on a substrate default this repository does not own. It is also not reachable for
-/// `CreateBucket` bodies in general: the check is here, next to the two ops for which
-/// the name decides which namespace is written.
-fn tenant_local_bucket_name(name: &str) -> Result<(), String> {
-    if !(3..=63).contains(&name.len()) {
-        return Err(format!(
-            "bucket name must be 3–63 characters, got {}",
-            name.len()
-        ));
-    }
-    if let Some(bad) = name
-        .chars()
-        .find(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-' || *c == '.'))
-    {
-        return Err(format!(
-            "bucket name contains {bad:?}, which is outside the S3 bucket alphabet; a \
-             qualified name such as <tenant>:<bucket> would address another tenant's \
-             namespace and is refused"
-        ));
-    }
-    let first_last_ok =
-        |c: Option<char>| c.is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
-    if !first_last_ok(name.chars().next()) || !first_last_ok(name.chars().last()) {
-        return Err("bucket name must start and end with a letter or digit".to_string());
-    }
-    Ok(())
-}
-
 /// The tag set a `PutObjectTagging` asks to install, as the map the PDP sees.
 ///
 /// Two refusals, both of them about the PDP and the backend seeing the same thing:
@@ -1735,60 +1539,6 @@ fn parse_tag_set(tag_set: &[Tag], max_tags: usize) -> Result<BTreeMap<String, St
         }
     }
     Ok(tags)
-}
-
-/// Refuse a bucket policy that would take this bucket away from the gateway itself.
-///
-/// The gateway reaches the backend as the **tenant-owner** credential. A bucket policy
-/// denying that principal is a self-lockout: every later request through the gateway
-/// fails, *including* the `PutBucketPolicy` that would undo it, so the only recovery is
-/// out-of-band backend administration. The vocabulary already puts this behind
-/// `write_bucket_config`; this is the additional body check.
-///
-/// What it catches: a document that does not parse, a `Statement` that is not a list of
-/// objects, and any `Effect: Deny` whose `Principal` is the wildcard — which
-/// necessarily includes the gateway's own credential. What it deliberately does **not**
-/// catch: a `Deny` naming the tenant-owner ARN explicitly. The hook cannot: `RouteSnapshot`
-/// carries no owner credential by construction (owner secrets must never reach
-/// `req.extensions`), so there is nothing here to compare an ARN against. That residual
-/// is recorded as the op's blind spot rather than papered over with a guess.
-fn bucket_policy_locks_out_the_gateway(doc: &str) -> Result<(), String> {
-    let parsed: serde_json::Value = serde_json::from_str(doc)
-        .map_err(|e| format!("bucket policy document is not valid JSON: {e}"))?;
-    let statements = match &parsed["Statement"] {
-        serde_json::Value::Array(v) => v.clone(),
-        // A single-statement policy may be an object rather than a list.
-        obj @ serde_json::Value::Object(_) => vec![obj.clone()],
-        _ => {
-            return Err("bucket policy document has no Statement".to_string());
-        }
-    };
-    for stmt in &statements {
-        let effect = stmt["Effect"].as_str().unwrap_or_default();
-        if !effect.eq_ignore_ascii_case("Deny") {
-            continue;
-        }
-        if principal_is_wildcard(&stmt["Principal"]) {
-            return Err(
-                "bucket policy contains a Deny on every principal, which would revoke the \
-                 gateway's own tenant-owner access to this bucket — including the ability \
-                 to put a corrected policy back"
-                    .to_string(),
-            );
-        }
-    }
-    Ok(())
-}
-
-/// `"*"`, `{"AWS": "*"}` and `{"AWS": ["*", …]}` — the three spellings of "everybody",
-/// which is the one Deny principal that provably includes the gateway.
-fn principal_is_wildcard(principal: &serde_json::Value) -> bool {
-    match principal {
-        serde_json::Value::String(s) => s == "*",
-        serde_json::Value::Array(items) => items.iter().any(principal_is_wildcard),
-        serde_json::Value::Object(map) => map.values().any(principal_is_wildcard),
-        _ => false,
-    }
 }
 
 fn request_meta<T>(req: &S3Request<T>) -> RequestMeta {

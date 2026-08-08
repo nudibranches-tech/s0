@@ -7,7 +7,7 @@
 //! through s3s's own route resolution, into the real `check`.
 //!
 //! It is table-driven off `data/s3s-0.14.1-routes.tsv`, which is extracted from the
-//! pinned s3s crate's own `resolve_route`. That is what makes "all 70 denied ops"
+//! pinned s3s crate's own `resolve_route`. That is what makes "all 76 denied ops"
 //! affordable: an SDK exposes one typed builder per operation, so the tail would be one
 //! hand-written call per op with no new information per call — and the SDK cannot
 //! express `PostObject` at all.
@@ -251,7 +251,13 @@ async fn every_denied_op_403s_over_real_http() {
         checked, expected,
         "the set of ops driven over HTTP and OP_TABLE's denied set disagree"
     );
-    assert_eq!(checked.len(), 70);
+    assert_eq!(
+        checked.len(),
+        76,
+        "70 until 2026-08-08, when the six control-plane ops (CreateBucket, DeleteBucket \
+         and the bucket policy/CORS pairs) went back to Denied — and this is the test \
+         that proves the removal reached the WIRE, not just the table"
+    );
     drop(fx);
 }
 

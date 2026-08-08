@@ -656,55 +656,19 @@ impl S3 for GatewayS3 {
             .await
     }
 
-    async fn create_bucket(
-        &self,
-        req: S3Request<CreateBucketInput>,
-    ) -> S3Result<S3Response<CreateBucketOutput>> {
-        self.forward(req, |p, r| async move { p.create_bucket(r).await })
-            .await
-    }
-
-    async fn delete_bucket(
-        &self,
-        req: S3Request<DeleteBucketInput>,
-    ) -> S3Result<S3Response<DeleteBucketOutput>> {
-        self.forward(req, |p, r| async move { p.delete_bucket(r).await })
-            .await
-    }
-
-    // ── bucket sub-resources ────────────────────────────────────────────────────
-
-    async fn get_bucket_policy(
-        &self,
-        req: S3Request<GetBucketPolicyInput>,
-    ) -> S3Result<S3Response<GetBucketPolicyOutput>> {
-        self.forward(req, |p, r| async move { p.get_bucket_policy(r).await })
-            .await
-    }
-
-    async fn put_bucket_policy(
-        &self,
-        req: S3Request<PutBucketPolicyInput>,
-    ) -> S3Result<S3Response<PutBucketPolicyOutput>> {
-        self.forward(req, |p, r| async move { p.put_bucket_policy(r).await })
-            .await
-    }
-
-    async fn get_bucket_cors(
-        &self,
-        req: S3Request<GetBucketCorsInput>,
-    ) -> S3Result<S3Response<GetBucketCorsOutput>> {
-        self.forward(req, |p, r| async move { p.get_bucket_cors(r).await })
-            .await
-    }
-
-    async fn put_bucket_cors(
-        &self,
-        req: S3Request<PutBucketCorsInput>,
-    ) -> S3Result<S3Response<PutBucketCorsOutput>> {
-        self.forward(req, |p, r| async move { p.put_bucket_cors(r).await })
-            .await
-    }
+    // ── bucket lifecycle and sub-resources: NO ARMS, DELIBERATELY ───────────────
+    //
+    // `create_bucket`, `delete_bucket`, `{get,put}_bucket_policy` and
+    // `{get,put}_bucket_cors` had arms here from M4 until 2026-08-08. They are gone, not
+    // stubbed, because an arm that answers `AccessDenied` is still an arm: it proves the
+    // op is routable, and the next person to add a `forward` to it has no gate to trip
+    // over. With no arm at all these six fall to `s3s`'s `NotImplemented` default, which
+    // is the layer that holds even if `check` is wrong —
+    // `tests/gate_invariants.rs::denied_ops_have_no_dispatch_arm` measures exactly that.
+    //
+    // Bucket existence, policy, CORS and quota are control-plane: they change through the
+    // console and the operator, so every bucket has an `HFBucket` CR behind it and none is
+    // unmanaged, unquota'd or invisible. See `access::optable::NON_GATEWAY_VERBS`.
 
     // ── object tagging and attributes ───────────────────────────────────────────
 

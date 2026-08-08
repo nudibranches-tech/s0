@@ -8,6 +8,23 @@
   (`screen_riders`, `authorize_riders`, `enforce_object_write`),
   `src/authz/input.rs` (`acl_grants`, `bypass_governance`), `tests/request_riders.rs`
 
+
+> **AMENDED 2026-08-08 — the conferring tier is a refusal, not a decision.** The three
+> tiers below are unchanged in shape, but the third one no longer takes a
+> `write_object_acl` decision: that verb was removed from the vocabulary, so a conferring
+> ACL (`bucket-owner-*`, `aws-exec-read`, an `id=`/`emailAddress=` grantee) is now refused
+> **in code** on all four write paths, exactly as a public one is. The reason is the
+> governing principle of the 2026-08-08 settlement rather than anything about public
+> exposure: an object ACL is a second, backend-side access-control list that hyperfluid
+> does not project, cannot display and cannot revoke, so granting through it is granting
+> outside the managed access model. The two refusals stay distinguishable
+> (`AclDisposition::RefusedPublic` vs `RefusedConferring`) because the operator needs to
+> know which one they hit. Canned `private` is untouched. `CreateBucket` is also no longer
+> one of the write paths — it is `Coverage::Denied`, so its create-time bucket ACL is
+> refused a step earlier, by the gate. Everything this ADR says about tagging and about
+> `x-amz-bypass-governance-retention` still holds unchanged.
+
+
 ## Context
 
 Until this decision, the gateway authorized a write on `(bucket, key)` and nothing else.
@@ -88,7 +105,7 @@ Three sub-decisions worth stating explicitly:
   never heard of is not a public grant; the backend will expand it regardless. Guessing
   permissively is how a closed set silently reopens on the next S3 API addition.
 - **Why `CreateBucket` is refused outright rather than gated on a verb.** A bucket ACL is
-  not an object ACL, `PutBucketAcl` is `Coverage::Denied`, and the frozen 13-verb
+  not an object ACL, `PutBucketAcl` is `Coverage::Denied`, and the grant
   vocabulary has no bucket-ACL verb. Accepting a create-time bucket ACL would enable
   through the back door precisely the operation the table refuses at the front.
 
@@ -100,11 +117,11 @@ decision.
 
 ## Decision 3 — `x-amz-bypass-governance-retention` is refused unconditionally
 
-AWS gates it on its own IAM action, `s3:BypassGovernanceRetention`. The 13-verb
-vocabulary frozen in master plan §1.2 has **no equivalent**, so there is no grant that
-could express "may destroy a retained object" — which means the refusal cannot be a policy
-decision, and inventing a fourteenth verb here would be a cross-repo contract change made
-unilaterally by a PEP.
+AWS gates it on its own IAM action, `s3:BypassGovernanceRetention`. The gateway's grant
+vocabulary has **no equivalent**, so there is no grant that could express "may destroy a
+retained object" — which means the refusal cannot be a policy decision, and inventing an
+extra verb here would be a cross-repo contract change made unilaterally by a PEP. (The
+2026-08-08 settlement made the vocabulary *smaller*, not larger, so this holds a fortiori.)
 
 So: refused in code, on `DeleteObject` and `DeleteObjects`, and on the batch op it refuses
 the *whole* request before any key is decided (a partially-honoured WORM bypass is not

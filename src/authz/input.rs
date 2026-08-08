@@ -30,7 +30,6 @@ pub const OPA_INPUT_FIELDS: &[&str] = &[
     "copy_source",
     "delete_keys",
     "object_tags",
-    "config_kind",
     "requested_tags",
     "acl_grants",
     "bypass_governance",
@@ -76,16 +75,14 @@ pub struct OpaInput {
     /// populated until the on-demand tag fetch is wired.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_tags: Option<BTreeMap<String, String>>,
-    /// Which bucket sub-resource a `{read,write}_bucket_config` decision is about:
-    /// `"policy"` or `"cors"`.
-    ///
-    /// The vocabulary deliberately does **not** split a verb per sub-resource, so
-    /// without this field `GetBucketPolicy` and `GetBucketCors` emit *byte-identical*
-    /// inputs — indistinguishable to a policy author, and (worse) sharing one
-    /// decision-cache entry, since the resource key is a digest of this document. It is
-    /// the discriminator for both.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub config_kind: Option<String>,
+    // `config_kind` was here from M4 until 2026-08-08. It discriminated a
+    // `GetBucketPolicy` decision from a `GetBucketCors` one, which otherwise emitted
+    // byte-identical inputs and shared a decision-cache entry. Both ops — and both
+    // config verbs — are gone: bucket policy and CORS are control-plane, so no producer
+    // could ever set this field again. It is REMOVED rather than left as a permanently
+    // absent `Option`, because a declared input field nothing emits is precisely what a
+    // pushed policy reads and gets `undefined` for: the deny-all shape this type's whole
+    // drift-gate apparatus exists to catch (`tests/fixture_drift.rs`).
     /// The tag set a `write_object_tags` request is asking to **install** — the parsed
     /// body, not the object's current tags (that is `object_tags`, which is on-demand
     /// and still never populated).
@@ -263,7 +260,6 @@ mod tests {
             copy_source: None,
             delete_keys: None,
             object_tags: None,
-            config_kind: None,
             requested_tags: None,
             acl_grants: vec![],
             bypass_governance: false,
@@ -292,7 +288,6 @@ mod tests {
             copy_source,
             delete_keys,
             object_tags,
-            config_kind,
             requested_tags,
             acl_grants,
             bypass_governance,
@@ -310,7 +305,6 @@ mod tests {
             stringify!(copy_source),
             stringify!(delete_keys),
             stringify!(object_tags),
-            stringify!(config_kind),
             stringify!(requested_tags),
             stringify!(acl_grants),
             stringify!(bypass_governance),
@@ -320,7 +314,7 @@ mod tests {
         // reason someone reaches for `..`.
         let _ = (principal, backend, tenant, organization_id, action, bucket);
         let _ = (object, prefix, copy_source, delete_keys, object_tags);
-        let _ = (config_kind, requested_tags, request);
+        let _ = (requested_tags, request);
         let _ = (acl_grants, bypass_governance);
         assert_eq!(names.as_slice(), OPA_INPUT_FIELDS);
 
@@ -387,19 +381,19 @@ mod tests {
         m.request.params = Some("list-type=2".into());
         assert_ne!(base, m.resource_key().unwrap(), "request");
 
-        // Both bucket-config ops map to the same verb on the same bucket, so this field
-        // is the ONLY thing separating a GetBucketPolicy decision from a GetBucketCors
-        // one. If it left the key, one cached verdict would serve both.
-        let mut policy = sample();
-        policy.action = Action::ReadBucketConfig;
-        policy.object = None;
-        policy.config_kind = Some("policy".into());
-        let mut cors = policy.clone();
-        cors.config_kind = Some("cors".into());
+        // The two shapes of the ONE existence verb. `HeadBucket` names a bucket and
+        // `ListBuckets` does not, and they are the same `Action`, so the bucket field is
+        // the only thing keeping one cached verdict from serving both — which would let
+        // an account-scope allow answer a per-bucket question.
+        let mut head = sample();
+        head.action = Action::Read;
+        head.object = None;
+        let mut list = head.clone();
+        list.bucket = String::new();
         assert_ne!(
-            policy.resource_key().unwrap(),
-            cors.resource_key().unwrap(),
-            "a policy read and a cors read must not share a decision-cache entry"
+            head.resource_key().unwrap(),
+            list.resource_key().unwrap(),
+            "a HeadBucket and a ListBuckets must not share a decision-cache entry"
         );
 
         let mut m = sample();

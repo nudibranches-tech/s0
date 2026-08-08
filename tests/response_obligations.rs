@@ -184,13 +184,13 @@ fn names(out: &ListBucketsOutput) -> Vec<String> {
 /// deliberately not in sorted order.
 const TENANT_BUCKETS: [&str; 5] = ["zeta", "reports", "payroll", "logs", "alpha"];
 
-/// `sub` holds `list_buckets` plus a grant on each of `buckets`.
+/// `sub` holds the existence verb `read` plus an object read on each of `buckets`.
 fn bundle_for(sub: &str, buckets: &[&str]) -> serde_json::Value {
     let grants: Vec<serde_json::Value> = buckets
         .iter()
         .map(|b| {
             serde_json::json!({
-                "bucket": b, "actions": ["list_buckets", "read_objects"], "prefixes": []
+                "bucket": b, "actions": ["read", "read_objects"], "prefixes": []
             })
         })
         .collect();
@@ -278,7 +278,7 @@ async fn the_merged_listing_is_gateway_ordered() {
                 "user_attributes": { "alice": { "groups": [], "attributes": [] } },
                 "bucket_attributes": {},
                 "s3_grants": { "alice": [
-                    { "bucket": "*", "actions": ["list_buckets"], "prefixes": [] }
+                    { "bucket": "*", "actions": ["read"], "prefixes": [] }
                 ] },
                 "group_grants": {}
             }}
@@ -407,9 +407,9 @@ async fn no_grants_is_an_empty_listing_not_a_403_and_never_reaches_the_backend()
     // And the two ways of holding nothing —
     //
     //   * `nobody` is a tenant member with no grants at all: the PDP DENIES (there is no
-    //     `list_buckets` verb anywhere), and
-    //   * `alice` here holds `list_buckets` but no bucket grants: the PDP ALLOWS with an
-    //     empty visible set
+    //     `read` grant anywhere), and
+    //   * `alice` here holds `read` but nothing visible: the PDP ALLOWS with an empty
+    //     visible set
     //
     // — must be indistinguishable to the caller. Same status, same body, and the same
     // cost: neither contacts the backend, so the difference is not measurable with a
@@ -430,7 +430,7 @@ async fn no_grants_is_an_empty_listing_not_a_403_and_never_reaches_the_backend()
                 // real revocation rather than a contrived one.
                 "bucket_attributes": { "payroll": { "denylist": { "alice": true } } },
                 "s3_grants": { "alice": [
-                    { "bucket": "payroll", "actions": ["list_buckets"], "prefixes": [] }
+                    { "bucket": "payroll", "actions": ["read"], "prefixes": [] }
                 ] },
                 "group_grants": {}
             }}
@@ -477,7 +477,7 @@ async fn the_denial_and_the_empty_allow_are_still_different_in_the_audit_record(
                 },
                 "bucket_attributes": { "payroll": { "denylist": { "alice": true } } },
                 "s3_grants": { "alice": [
-                    { "bucket": "payroll", "actions": ["list_buckets"], "prefixes": [] }
+                    { "bucket": "payroll", "actions": ["read"], "prefixes": [] }
                 ] },
                 "group_grants": {}
             }}
@@ -521,7 +521,7 @@ async fn the_denial_and_the_empty_allow_are_still_different_in_the_audit_record(
         );
         assert_eq!(
             for_sub(sub).input.expect("input").action,
-            s0::model::Action::ListBuckets
+            s0::model::Action::Read
         );
     }
 }
@@ -581,8 +581,12 @@ async fn a_denied_listing_mints_no_proof() {
 async fn a_wildcard_grant_alone_does_not_reach_the_account_scope_through_bucket_rules() {
     // Plan defect B-2: `bucket_matches(g) if g.bucket == "*"` matches the EMPTY string,
     // so before the fix a wildcard grant carrying *any* verb satisfied the ordinary
-    // bucket rules for an account-scoped decision. `list_buckets` must be the verb that
-    // opens enumeration, and nothing else.
+    // bucket rules for an account-scoped decision. `read` — in the ACCOUNT shape — must
+    // be the only thing that opens enumeration.
+    //
+    // Since 2026-08-08 the grant below is every remaining data-plane verb, on every
+    // bucket, which makes the test stronger than it was: enumeration is not implied by
+    // any amount of access to the objects inside.
     let backend = fake_backend(&TENANT_BUCKETS, 100).await;
     let fx = common::fixture_with_backend(
         "lb-b2",
@@ -592,9 +596,10 @@ async fn a_wildcard_grant_alone_does_not_reach_the_account_scope_through_bucket_
                 "user_attributes": { "alice": { "groups": [], "attributes": [] } },
                 "bucket_attributes": {},
                 "s3_grants": { "alice": [
-                    // Everything on every bucket EXCEPT the enumeration verb.
+                    // Every data-plane verb on every bucket, and NOT `read`.
                     { "bucket": "*",
-                      "actions": ["read_objects", "write_objects", "read_bucket"],
+                      "actions": ["read_objects", "list_objects", "write_objects",
+                                  "delete_objects", "write_object_tags"],
                       "prefixes": [] }
                 ] },
                 "group_grants": {}
@@ -608,7 +613,7 @@ async fn a_wildcard_grant_alone_does_not_reach_the_account_scope_through_bucket_
     assert_eq!(
         names(&out),
         Vec::<String>::new(),
-        "a wildcard grant without list_buckets must not enumerate the tenant"
+        "a wildcard grant without `read` must not enumerate the tenant"
     );
     assert_eq!(backend.requests.load(Ordering::Relaxed), 0);
 }
@@ -629,8 +634,8 @@ async fn a_denylisted_subject_loses_the_unrestricted_view_rather_than_keeping_it
                 "user_attributes": { "alice": { "groups": [], "attributes": [] } },
                 "bucket_attributes": { "payroll": { "denylist": { "alice": true } } },
                 "s3_grants": { "alice": [
-                    { "bucket": "*", "actions": ["list_buckets"], "prefixes": [] },
-                    { "bucket": "reports", "actions": ["list_buckets"], "prefixes": [] }
+                    { "bucket": "*", "actions": ["read"], "prefixes": [] },
+                    { "bucket": "reports", "actions": ["read"], "prefixes": [] }
                 ] },
                 "group_grants": {}
             }}

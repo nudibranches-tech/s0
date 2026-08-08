@@ -973,7 +973,7 @@ async fn a_list_the_gateway_refuses_is_audited_as_denied_not_allowed() {
 
 #[tokio::test]
 async fn a_gate_denial_emits_exactly_one_audit_record() {
-    // Defect 5. Anonymous requests, all 84 gate-denied operations, rejected credentials
+    // Defect 5. Anonymous requests, all 76 gate-denied operations, rejected credentials
     // and unroutable tenants produced a `tracing::warn!` and nothing else — so the
     // decision log held zero evidence of the entire deny-by-default surface and zero
     // evidence of credential-forgery attempts. "Was this gateway probed?" was
@@ -986,10 +986,11 @@ async fn a_gate_denial_emits_exactly_one_audit_record() {
     let host = base.trim_start_matches("http://").to_string();
 
     // A denied operation, signed with a credential the gateway really knows — so the
-    // 403 is the gate's, not a signature failure's. `GetBucketAcl` is outside the 29-op
-    // scope and stays denied; it replaced `DeleteBucket`, which this test used until
-    // M4 enforced it (a policy denial and a gate denial are both 403, and only the
-    // record distinguishes them — which is exactly what is under test).
+    // 403 is the gate's, not a signature failure's. `GetBucketAcl` has been outside the
+    // enforced scope in every milestone: it was chosen over `DeleteBucket` when M4
+    // enforced that one, and it outlived the 2026-08-08 re-scoping that denied
+    // `DeleteBucket` again. A policy denial and a gate denial are both 403, and only the
+    // record distinguishes them — which is exactly what is under test.
     let status = send_signed(
         &base,
         &host,
@@ -1309,242 +1310,276 @@ async fn a_tag_set_with_a_duplicate_key_is_refused() {
     );
 }
 
-#[tokio::test]
-async fn a_bucket_name_outside_the_callers_tenant_is_refused() {
-    // RGW addresses a foreign tenant's bucket as `<tenant>:<bucket>`, and the gateway
-    // forwards re-signed as ITS tenant-owner credential — so a qualified name is a
-    // request to operate on someone else's namespace with our authority. Both the
-    // create and the delete half, because they are separate verbs and each is reached
-    // by its own hook.
-    let fx = common::fixture("sec-bucket-name", common::alice_bundle());
-    let access = GatewayAccess::new(fx.gw.clone());
-    let mut req = fx.request(
-        "CreateBucket",
-        CreateBucketInput {
-            bucket: "globex:secrets".into(),
-            ..Default::default()
-        },
-        Method::PUT,
-    );
-    let err = access
-        .create_bucket(&mut req)
-        .await
-        .expect_err("a tenant-qualified bucket name must never be created");
-    assert_eq!(*err.code(), S3ErrorCode::AccessDenied);
-    assert!(req.extensions.get::<AuthzProof>().is_none());
-    let rec = sole_denial_record(&fx).await;
-    assert!(
-        rec.result.reason.contains("another tenant's namespace"),
-        "{rec:#?}"
-    );
+// ── the gateway is data-plane only (settled 2026-08-08) ─────────────────────────
 
-    let fx = common::fixture("sec-bucket-name-del", common::alice_bundle());
-    let access = GatewayAccess::new(fx.gw.clone());
-    let mut req = fx.request(
-        "DeleteBucket",
-        DeleteBucketInput {
-            bucket: "globex:secrets".into(),
-            ..Default::default()
-        },
-        Method::DELETE,
+/// The six operations M4 enforced and the 2026-08-08 settlement sent back to `Denied`,
+/// each with the S3 request that reaches it, so the refusal is measured over the wire
+/// rather than asserted against the table that decides it.
+///
+/// `(op, method, path, query)`. Query strings are what route a bucket sub-resource:
+/// `PUT /reports?policy` is `PutBucketPolicy` and `PUT /reports` is `CreateBucket`.
+type ReDeniedRequest = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static [(&'static str, &'static str)],
+);
+
+const RE_DENIED_REQUESTS: [ReDeniedRequest; 6] = [
+    ("CreateBucket", "PUT", "/brand-new", &[]),
+    ("DeleteBucket", "DELETE", "/reports", &[]),
+    ("GetBucketPolicy", "GET", "/reports", &[("policy", "")]),
+    ("PutBucketPolicy", "PUT", "/reports", &[("policy", "")]),
+    ("GetBucketCors", "GET", "/reports", &[("cors", "")]),
+    ("PutBucketCors", "PUT", "/reports", &[("cors", "")]),
+];
+
+#[tokio::test]
+async fn the_six_control_plane_ops_are_refused_at_the_gate_and_on_the_record() {
+    // THE regression for the 2026-08-08 settlement, and it is deliberately a black-box
+    // test: every one of these six had a working hook, a dispatch arm and a passing
+    // authorization path in M4, so "we deleted the code" is only half the claim. The
+    // other half is that a real, correctly-signed S3 request for each is refused by the
+    // *gate* — before deserialization, with no policy question asked — and leaves a
+    // record saying so.
+    //
+    // The `input.is_none()` assertion is the one that distinguishes this from a policy
+    // denial. A gate denial must not fabricate an `OpaInput`, because a decision log
+    // that shows a question nobody asked is worse than one that shows nothing.
+    //
+    // Why it matters that these are refused at the GATE rather than by a bundle: the
+    // bundle is pushed by the control plane and can be wrong. `check` cannot.
+    let (base, fx) = spawn_gateway("sec-data-plane-only", common::alice_bundle()).await;
+    let host = base.trim_start_matches("http://").to_string();
+
+    for (op, method, path, query) in RE_DENIED_REQUESTS {
+        let status = send_signed(
+            &base,
+            &host,
+            method,
+            path,
+            query,
+            Some((common::ACCESS_KEY, common::SECRET_KEY)),
+        )
+        .await;
+        assert_eq!(
+            status, 403,
+            "{op} reached the backend or answered something other than a refusal"
+        );
+    }
+
+    let records = fx.await_audit_records(RE_DENIED_REQUESTS.len()).await;
+    assert_eq!(records.len(), RE_DENIED_REQUESTS.len(), "{records:#?}");
+    let mut seen: Vec<&str> = Vec::new();
+    for rec in &records {
+        let gate = rec
+            .gate
+            .as_ref()
+            .unwrap_or_else(|| panic!("a gate denial must carry gate context: {rec:#?}"));
+        assert_eq!(
+            gate.stage,
+            GateStage::OperationNotEnforced,
+            "{} was refused at the wrong stage",
+            gate.operation
+        );
+        assert!(
+            rec.input.is_none(),
+            "{} produced an OpaInput; no policy question is asked for an op the gate \
+             refuses: {rec:#?}",
+            gate.operation
+        );
+        assert!(matches!(rec.gateway.outcome, Outcome::Denied) && !rec.result.allow);
+        seen.push(match gate.operation.as_str() {
+            "CreateBucket" => "CreateBucket",
+            "DeleteBucket" => "DeleteBucket",
+            "GetBucketPolicy" => "GetBucketPolicy",
+            "PutBucketPolicy" => "PutBucketPolicy",
+            "GetBucketCors" => "GetBucketCors",
+            "PutBucketCors" => "PutBucketCors",
+            other => panic!("unexpected gate denial for {other}"),
+        });
+    }
+    seen.sort_unstable();
+    let mut expected: Vec<&str> = RE_DENIED_REQUESTS.iter().map(|(op, ..)| *op).collect();
+    expected.sort_unstable();
+    assert_eq!(
+        seen, expected,
+        "s3s routed these requests to operations other than the six under test — the \
+         paths and query strings above no longer name what this test thinks they name"
     );
-    assert!(access.delete_bucket(&mut req).await.is_err());
-    let _ = sole_denial_record(&fx).await;
 }
 
 #[tokio::test]
-async fn create_bucket_does_not_confer_delete_bucket() {
-    // Lesson 5, restated for the bucket lifecycle: a coarse `manage_bucket` verb was
-    // rejected precisely so that being allowed to make a bucket is not being allowed to
-    // destroy one.
-    let only_create = serde_json::json!({
+async fn the_positive_control_the_six_refusals_need() {
+    // Without this, `the_six_control_plane_ops_are_refused_at_the_gate_and_on_the_record`
+    // is equally true of a gateway that refuses everything — the exact shape of the bug
+    // this repository has already paid for once. `HeadBucket` is the right control: it
+    // is a bucket-shaped request on the same bucket, signed with the same credential,
+    // and it is enforced.
+    let (base, fx) = spawn_gateway("sec-data-plane-control", common::alice_bundle()).await;
+    let host = base.trim_start_matches("http://").to_string();
+    let status = send_signed(
+        &base,
+        &host,
+        "HEAD",
+        "/reports",
+        &[],
+        Some((common::ACCESS_KEY, common::SECRET_KEY)),
+    )
+    .await;
+    assert_ne!(
+        status, 403,
+        "HeadBucket is Enforced and alice holds `read` on reports; a 403 here means the \
+         six refusals above prove nothing"
+    );
+
+    let records = fx.await_audit_records(1).await;
+    let rec = &records[0];
+    assert!(rec.gate.is_none(), "HeadBucket must not be gate-refused");
+    let input = rec.input.as_ref().expect("an enforced op asks a question");
+    assert_eq!(
+        input.action.as_str(),
+        "read",
+        "HeadBucket decides against the existence verb, the same one ListBuckets uses"
+    );
+    assert!(rec.result.allow, "{rec:#?}");
+}
+
+#[tokio::test]
+async fn the_existence_verb_answers_head_bucket_and_list_buckets_identically() {
+    // The defect that started the 2026-08-08 change was two PEPs answering one question
+    // differently. Its gateway-local form: a principal whose `aws s3 ls` came back empty
+    // while its next `head-bucket` on a bucket in that list succeeded — or the reverse.
+    // One verb, so one answer.
+    let one_read_grant = serde_json::json!({
         "org_settings": { "freeze_writes": false },
         "tenants": { "acme": {
             "user_attributes": { "alice": { "groups": [], "attributes": [] } },
             "bucket_attributes": {},
             "s3_grants": { "alice": [
-                { "bucket": "scratch", "actions": ["create_bucket"], "prefixes": [] }
+                { "bucket": "reports", "actions": ["read"], "prefixes": [] }
             ] },
             "group_grants": {}
         }}
     });
-    let fx = common::fixture("sec-create-not-delete", only_create);
+    let fx = common::fixture("sec-existence", one_read_grant);
     let access = GatewayAccess::new(fx.gw.clone());
 
-    let mut req = fx.request(
-        "DeleteBucket",
-        DeleteBucketInput {
-            bucket: "scratch".into(),
-            ..Default::default()
-        },
-        Method::DELETE,
-    );
-    assert!(
-        access.delete_bucket(&mut req).await.is_err(),
-        "a create_bucket grant must not confer delete_bucket"
-    );
-
-    // Positive control, or the assertion above is satisfied by a deny-all bundle.
-    let mut req = fx.request(
-        "CreateBucket",
-        CreateBucketInput {
-            bucket: "scratch".into(),
-            ..Default::default()
-        },
-        Method::PUT,
-    );
-    access
-        .create_bucket(&mut req)
-        .await
-        .expect("create allowed");
-}
-
-#[tokio::test]
-async fn a_bucket_policy_that_locks_the_gateway_out_is_refused() {
-    // The gateway reaches the backend as the tenant-owner credential. A policy denying
-    // every principal denies that one too — and then the PutBucketPolicy that would
-    // undo it fails as well, so recovery is out-of-band backend administration.
-    let fx = common::fixture("sec-policy-lockout", common::alice_bundle());
-    let access = GatewayAccess::new(fx.gw.clone());
-    let mut req = fx.request(
-        "PutBucketPolicy",
-        PutBucketPolicyInput {
-            policy: common::ops::SELF_LOCKOUT_BUCKET_POLICY.into(),
-            ..common::ops::put_bucket_policy_input()
-        },
-        Method::PUT,
-    );
-    let err = access
-        .put_bucket_policy(&mut req)
-        .await
-        .expect_err("a self-lockout policy must not be forwarded");
-    assert_eq!(*err.code(), S3ErrorCode::AccessDenied);
-    assert!(req.extensions.get::<AuthzProof>().is_none());
-    let rec = sole_denial_record(&fx).await;
-    assert!(
-        rec.result.reason.contains("revoke the gateway's own"),
-        "{rec:#?}"
-    );
-    let input = rec.input.as_ref().unwrap();
-    assert_eq!(input.action.as_str(), "write_bucket_config");
-    assert_eq!(input.config_kind.as_deref(), Some("policy"));
-}
-
-#[tokio::test]
-async fn confirm_remove_self_bucket_access_is_refused() {
-    let fx = common::fixture("sec-policy-confirm", common::alice_bundle());
-    let access = GatewayAccess::new(fx.gw.clone());
-    let mut req = fx.request(
-        "PutBucketPolicy",
-        PutBucketPolicyInput {
-            confirm_remove_self_bucket_access: Some(true),
-            ..common::ops::put_bucket_policy_input()
-        },
-        Method::PUT,
-    );
-    assert!(access.put_bucket_policy(&mut req).await.is_err());
-    let rec = sole_denial_record(&fx).await;
-    assert!(
-        rec.result.reason.contains("confirm-remove-self"),
-        "{rec:#?}"
-    );
-}
-
-#[tokio::test]
-async fn an_unparseable_or_oversized_bucket_policy_is_refused() {
-    // `xml_max_body_size` is 20 MiB; AWS caps a bucket policy at 20 KB. A document this
-    // gateway parses needs its own bound, and a document it cannot parse is one whose
-    // lockout check it cannot perform — so it is refused rather than forwarded on trust.
-    let fx = common::fixture("sec-policy-size", common::alice_bundle());
-    let access = GatewayAccess::new(fx.gw.clone());
-    let huge = format!(
-        r#"{{"Version":"2012-10-17","Statement":[{{"Sid":"{}","Effect":"Allow","Principal":"*","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::reports/*"]}}]}}"#,
-        "p".repeat(21 * 1024)
-    );
-    let mut req = fx.request(
-        "PutBucketPolicy",
-        PutBucketPolicyInput {
-            policy: huge,
-            ..common::ops::put_bucket_policy_input()
-        },
-        Method::PUT,
-    );
-    assert!(access.put_bucket_policy(&mut req).await.is_err());
-    let rec = sole_denial_record(&fx).await;
-    assert!(rec.result.reason.contains("over the"), "{rec:#?}");
-
-    let fx = common::fixture("sec-policy-garbage", common::alice_bundle());
-    let access = GatewayAccess::new(fx.gw.clone());
-    let mut req = fx.request(
-        "PutBucketPolicy",
-        PutBucketPolicyInput {
-            policy: "not json at all".into(),
-            ..common::ops::put_bucket_policy_input()
-        },
-        Method::PUT,
-    );
-    assert!(access.put_bucket_policy(&mut req).await.is_err());
-    let rec = sole_denial_record(&fx).await;
-    assert!(rec.result.reason.contains("not valid JSON"), "{rec:#?}");
-}
-
-#[tokio::test]
-async fn a_benign_bucket_policy_is_allowed() {
-    // The control every refusal above depends on: without it, "self-lockout policies
-    // are refused" would be equally true of a build that refuses all of them.
-    let fx = common::fixture("sec-policy-ok", common::alice_bundle());
-    let access = GatewayAccess::new(fx.gw.clone());
-    let mut req = fx.request(
-        "PutBucketPolicy",
-        common::ops::put_bucket_policy_input(),
-        Method::PUT,
-    );
-    access
-        .put_bucket_policy(&mut req)
-        .await
-        .expect("a policy that does not lock the gateway out is an ordinary write");
-    assert!(req.extensions.get::<AuthzProof>().is_some());
-}
-
-#[tokio::test]
-async fn a_bucket_config_read_does_not_confer_the_other_sub_resource() {
-    // Policy and CORS share one verb by the frozen vocabulary, so `config_kind` is the
-    // ONLY thing distinguishing them — in the policy input and, because the resource key
-    // is a digest of that input, in the decision cache. A build that dropped the field
-    // would serve one cached verdict for both documents.
-    let fx = common::fixture("sec-config-kind", common::alice_bundle());
-    let access = GatewayAccess::new(fx.gw.clone());
-    let mut req = fx.request(
-        "GetBucketPolicy",
-        GetBucketPolicyInput {
+    let mut head = fx.request(
+        "HeadBucket",
+        HeadBucketInput {
             bucket: "reports".into(),
+            ..Default::default()
+        },
+        Method::HEAD,
+    );
+    access
+        .head_bucket(&mut head)
+        .await
+        .expect("a `read` grant answers HeadBucket");
+
+    let mut list = fx.request("ListBuckets", ListBucketsInput::default(), Method::GET);
+    access
+        .list_buckets(&mut list)
+        .await
+        .expect("…and the same grant answers ListBuckets");
+    assert!(
+        list.extensions.get::<AuthzProof>().is_some(),
+        "the enumeration was allowed, so it must be proved — an empty listing produced \
+         by a DENIAL mints no proof, and that is the case this test must not accept"
+    );
+
+    // The negative half, on the same bundle: `read` is not a fall-through to the object
+    // verbs. Seeing that a bucket exists is not seeing what is inside it.
+    let mut get = fx.request(
+        "GetObject",
+        GetObjectInput {
+            bucket: "reports".into(),
+            key: "2024/q1.csv".into(),
             ..Default::default()
         },
         Method::GET,
     );
-    access.get_bucket_policy(&mut req).await.expect("allowed");
+    assert!(
+        access.get_object(&mut get).await.is_err(),
+        "`read` says the bucket exists; it must not confer read_objects"
+    );
+
+    // …and a HeadBucket on a bucket the grant does not name is still refused, so `read`
+    // has not become a tenant-wide existence oracle.
+    let mut other = fx.request(
+        "HeadBucket",
+        HeadBucketInput {
+            bucket: "payroll".into(),
+            ..Default::default()
+        },
+        Method::HEAD,
+    );
+    assert!(
+        access.head_bucket(&mut other).await.is_err(),
+        "a `read` grant on `reports` must not answer for `payroll`"
+    );
+}
+
+#[tokio::test]
+async fn a_bucket_shaped_read_carries_no_visible_buckets_obligation() {
+    // The subtlest hazard the merge introduced, and the reason every rego rule reading
+    // `read` carries a shape gate. `read` is in both `bucket_actions` and
+    // `account_actions`; if the account-scope obligations rule loses its
+    // `account_scoped` gate, a permitted HeadBucket comes back carrying an obligation
+    // about a listing it is not.
+    //
+    // Which way that fails depends on the bundle, and both directions are bad:
+    //
+    //   * against the SHIPPED module, which emits no `must_understand`, `enforce_bucket`
+    //     simply ignores the obligation — a restriction the policy declared and the PEP
+    //     silently did not apply, the exact fail-open shape this project exists to avoid;
+    //   * against a pushed module that DOES mark it `must_understand` (the recommended
+    //     way to ship a visibility rule), `unimplemented_obligations` turns it into a
+    //     hard deny and HeadBucket breaks for every principal in every organization.
+    //
+    // So the assertion is on the obligation itself rather than on allow/deny: it is the
+    // only observation that catches both.
+    let wildcard = serde_json::json!({
+        "org_settings": { "freeze_writes": false },
+        "tenants": { "acme": {
+            "user_attributes": { "alice": { "groups": [], "attributes": [] } },
+            "bucket_attributes": {},
+            // A wildcard `read`, so `bucket_obligations` has something to emit and the
+            // ungated rule really would fire.
+            "s3_grants": { "alice": [
+                { "bucket": "*", "actions": ["read"], "prefixes": [] },
+                { "bucket": "reports", "actions": ["read"], "prefixes": [] }
+            ] },
+            "group_grants": {}
+        }}
+    });
+    let fx = common::fixture("sec-headbucket-obligation", wildcard);
+    let access = GatewayAccess::new(fx.gw.clone());
     let mut req = fx.request(
-        "GetBucketCors",
-        GetBucketCorsInput {
+        "HeadBucket",
+        HeadBucketInput {
             bucket: "reports".into(),
             ..Default::default()
         },
-        Method::GET,
+        Method::HEAD,
     );
-    access.get_bucket_cors(&mut req).await.expect("allowed");
+    access
+        .head_bucket(&mut req)
+        .await
+        .expect("a bucket-shaped `read` must not pick up the account scope's obligation");
+    // The record of an ALLOWED request is held for the forward leg. Nothing forwards
+    // here, so dropping the request is what settles it — `PendingAudit`'s `Drop` emits it
+    // unenriched rather than losing it.
+    drop(req);
 
-    let captured = fx.capture.snapshot();
-    let kinds: Vec<_> = captured
-        .iter()
-        .filter_map(|c| c.raw["config_kind"].as_str())
-        .collect();
-    assert_eq!(kinds, vec!["policy", "cors"]);
-    // And the two questions are genuinely different documents. Without `config_kind`
-    // they would be byte-identical, hence one resource key (a digest of the input) and
-    // one cache entry: a `GetBucketCors` answered by a `GetBucketPolicy` verdict.
-    assert_ne!(
-        captured[0].raw, captured[1].raw,
-        "a policy read and a cors read must not emit the same document"
+    let records = fx.await_audit_records(1).await;
+    let rec = &records[0];
+    assert!(rec.result.allow, "{rec:#?}");
+    assert_eq!(
+        serde_json::to_value(&rec.result.obligations).expect("obligations serialize"),
+        serde_json::json!({}),
+        "a HeadBucket decision must carry no obligations at all: {rec:#?}"
     );
 }
 

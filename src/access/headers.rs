@@ -8,8 +8,8 @@
 //! `x-amz-acl: public-read` passed that hook unchanged and the header rode through to
 //! RGW, which made the object **world-readable**. The gateway's decision log recorded an
 //! ordinary allowed write. The same hole existed on `CopyObject`,
-//! `CreateMultipartUpload`, `CreateBucket` and (as of the M4 form-upload arm)
-//! `PostObject`, plus three siblings nobody had looked at either: the five
+//! `CreateMultipartUpload`, `PostObject` and (until 2026-08-08 re-denied it)
+//! `CreateBucket`, plus three siblings nobody had looked at either: the five
 //! `x-amz-grant-*` headers, `x-amz-tagging` on write, and
 //! `x-amz-bypass-governance-retention` on the delete ops.
 //!
@@ -30,8 +30,8 @@
 //!    later as "the shared bucket stopped working", with no error anywhere to correlate
 //!    against — which is the same shape as the bug being fixed, only inverted.
 //! 2. **A deny is discoverable in one round trip.** 403 + a reason naming the header,
-//!    plus a decision record. The operator's next step (grant `write_object_acl`, or stop
-//!    sending the header) is legible from the response.
+//!    plus a decision record. The operator's next step (grant the principal access in the
+//!    console, or stop sending the header) is legible from the response.
 //! 3. **A strip switch is the switch that gets flipped.** Open question 6 makes the
 //!    argument itself: the first thing a frustrated operator does when `--acl private`
 //!    403s is turn stripping on, and it then applies to every principal and every
@@ -51,14 +51,40 @@
 //! |---|---|---|
 //! | no-op | canned `private` | carries no grant; contributes nothing to `acl_grants` |
 //! | public | `public-read`, `public-read-write`, `authenticated-read`, any grantee naming `AllUsers`/`AuthenticatedUsers`, **and any canned name this build does not recognize** | refused **in code**, ahead of and independent of the policy |
-//! | conferring | everything else (`bucket-owner-*`, `aws-exec-read`, `id=`/`emailAddress=` grantees) | a separate `write_object_acl` decision on the same object, which must also allow |
+//! | conferring | everything else (`bucket-owner-*`, `aws-exec-read`, `id=`/`emailAddress=` grantees) | refused **in code** — see below |
 //!
-//! The middle tier is the one that answers the brief. A wildcard grant
-//! (`"actions": ["*"]`) confers `write_object_acl`, and the DEFAULT ACCESS MODEL seeds
-//! exactly that for Owners — so a policy-only guard would leave every org Owner one
-//! `--acl public-read` away from publishing a patient record. Public exposure is not a
-//! capability this gateway brokers, so it is refused in code where no bundle can reach
+//! The middle tier is the one that answered the original brief. A wildcard grant
+//! (`"actions": ["*"]`) used to confer `write_object_acl`, and the DEFAULT ACCESS MODEL
+//! seeds exactly that for Owners — so a policy-only guard would have left every org
+//! Owner one `--acl public-read` away from publishing a patient record. Public exposure
+//! is not a capability this gateway brokers, so it is refused where no bundle can reach
 //! it.
+//!
+//! ## 2026-08-08: the conferring tier is refused in code too
+//!
+//! M4 shipped the conferring tier as a **second decision** on `write_object_acl`: a
+//! request carrying `x-amz-acl: bucket-owner-full-control` was a write *and* an ACL
+//! change, and AWS models it the same way (`s3:PutObject` + `s3:PutObjectAcl`).
+//!
+//! That verb no longer exists. It was removed with the rest of the control-plane
+//! vocabulary because an object ACL is a **second, backend-side access-control list that
+//! hyperfluid does not project, does not display and cannot revoke** — a grant of access
+//! to a principal named in no `grants` row, invisible to the console and to every audit
+//! query that reads the grants model. That is a bypass of managed access whatever verb
+//! guards it, which is the governing principle of the 2026-08-08 settlement.
+//!
+//! So conferring ACLs are now refused in code as well, and the two refusals are kept as
+//! distinct dispositions on purpose: the reasons differ, and an operator reading a 403
+//! needs to know whether they asked to publish to the world or merely to hand the object
+//! to one named principal. Neither is a bare 400 — both go through
+//! `GatewayAccess::refuse`, which writes a real `Deny` audit record against the write's
+//! own verb before answering `AccessDenied` (defect B-1: a refusal with no record is not
+//! a refusal anyone can review).
+//!
+//! **`private` is untouched**, and that matters more than it looks: `s3cmd` and `rclone`
+//! send `x-amz-acl: private` on every upload by default, so folding it into the
+//! conferring tier would 403 the two most common clients on ordinary writes. It confers
+//! nothing on anyone — see [`NO_OP_CANNED_ACLS`].
 
 use std::collections::BTreeMap;
 
@@ -78,7 +104,8 @@ use crate::authz::AclGrant;
 /// gateway the bucket owner is the tenant-owner credential every forward is re-signed as.
 /// That equivalence is a property of the current deployment topology, not of the request,
 /// and an ACL entry that is a no-op only because of how the proxy happens to be wired is
-/// not a no-op. It falls to the conferring tier, where a grant can authorize it.
+/// not a no-op — the day the gateway forwards as anything else, it would start conferring
+/// on a third party. It falls to the conferring tier, which is now a refusal.
 pub const NO_OP_CANNED_ACLS: &[&str] = &["private"];
 
 /// Canned ACLs that publish. Refused in code.
@@ -90,8 +117,15 @@ pub const NO_OP_CANNED_ACLS: &[&str] = &["private"];
 /// apart.
 pub const PUBLIC_CANNED_ACLS: &[&str] = &["public-read", "public-read-write", "authenticated-read"];
 
-/// Canned ACLs that name a specific, non-public grantee. Permitted only with a
-/// `write_object_acl` decision on the object.
+/// Canned ACLs that name a specific, non-public grantee. Refused in code since
+/// 2026-08-08 (they required `write_object_acl` until that verb was removed).
+///
+/// They are still enumerated separately rather than folded into [`PUBLIC_CANNED_ACLS`],
+/// because the *reason* differs and the reason is what reaches the client and the audit
+/// record: `bucket-owner-full-control` does not publish anything, it hands the object to
+/// one named principal outside the grants model. Collapsing the two would tell an
+/// operator their `bucket-owner-full-control` upload was a public-exposure attempt,
+/// which is both false and the kind of false that makes people stop reading 403s.
 ///
 /// The list is CLOSED, and that closure is load-bearing: a canned name outside all three
 /// of these arrays is treated as **public** (see [`classify`]). The gateway does not know
@@ -124,7 +158,12 @@ pub struct AclFields<'a> {
     pub canned: Option<&'a str>,
     pub full_control: Option<&'a str>,
     pub read: Option<&'a str>,
-    /// Only bucket ACLs have a WRITE grant; `None` for every object op.
+    /// Only bucket ACLs have a WRITE grant, so this is `None` at every construction site
+    /// in the gateway today — `CreateBucket` was the last op that could carry one and it
+    /// is `Coverage::Denied` since 2026-08-08. Kept rather than deleted because it is
+    /// what makes this struct a complete model of the S3 ACL headers: an op that CAN
+    /// carry `x-amz-grant-write` is screened the day it is enforced, instead of the day
+    /// someone notices the field was missing.
     pub write: Option<&'a str>,
     pub read_acp: Option<&'a str>,
     pub write_acp: Option<&'a str>,
@@ -158,39 +197,70 @@ impl AclFields<'_> {
 }
 
 /// What the gateway will do about the ACL grants on a request.
+///
+/// Two of the three variants are refusals, and they are kept apart because they are
+/// different facts about the request — the client-facing reason and the audit record
+/// both say which.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AclDisposition {
     /// Nothing was asked for, or only a no-op canned ACL was. Proceed as an ordinary
     /// write.
     NoGrant,
-    /// Refused in code. Carries the client-facing reason.
-    Refused(String),
-    /// A real, non-public grant. Requires a `write_object_acl` decision on the object in
-    /// addition to the write itself.
-    RequiresAclVerb,
+    /// The request would expose the object to every caller of this object store, or
+    /// names a canned ACL this build cannot prove is not that. Refused in code.
+    RefusedPublic(String),
+    /// The request confers access on a named principal outside the grants model.
+    /// Refused in code since 2026-08-08 — there is no verb that authorizes it, and an
+    /// ACL hyperfluid did not project is access it cannot display or revoke.
+    RefusedConferring(String),
+}
+
+impl AclDisposition {
+    /// The client-facing reason, or `None` when the request may proceed.
+    ///
+    /// Callers screen on this rather than matching the variants, so a *third* refusal
+    /// tier added later is refused by every write path the day it is added, instead of
+    /// falling through whichever `match` arm nobody updated.
+    #[must_use]
+    pub fn refusal(&self) -> Option<&str> {
+        match self {
+            AclDisposition::NoGrant => None,
+            AclDisposition::RefusedPublic(why) | AclDisposition::RefusedConferring(why) => {
+                Some(why)
+            }
+        }
+    }
 }
 
 /// Classify the grants a request carries.
 ///
 /// Order matters: **any** public grant refuses the whole request, even alongside
-/// otherwise-fine ones. A request is one unit and the gateway does not part-apply it —
-/// part-applying is stripping under another name.
+/// otherwise-fine ones, and it is reported as the public one — that is the more serious
+/// of the two and the one an operator must see first. A request is one unit and the
+/// gateway does not part-apply it; part-applying is stripping under another name.
 #[must_use]
 pub fn classify(grants: &[AclGrant]) -> AclDisposition {
-    let mut conferring = false;
+    let mut conferring: Option<&AclGrant> = None;
     for g in grants {
         if let Some(reason) = public_grant_reason(g) {
-            return AclDisposition::Refused(reason);
+            return AclDisposition::RefusedPublic(reason);
         }
         if g.source == "acl" && NO_OP_CANNED_ACLS.contains(&g.value.as_str()) {
             continue;
         }
-        conferring = true;
+        conferring = conferring.or(Some(g));
     }
-    if conferring {
-        AclDisposition::RequiresAclVerb
-    } else {
-        AclDisposition::NoGrant
+    match conferring {
+        None => AclDisposition::NoGrant,
+        Some(g) => AclDisposition::RefusedConferring(format!(
+            "the request carries x-amz-{} = {:?}, which confers access on a principal \
+             this gateway did not grant it to. There is no verb that authorizes that: an \
+             object ACL is a second, backend-side access-control list that hyperfluid \
+             does not project, cannot display and cannot revoke, so writing one through \
+             the gateway is a bypass of the managed access model. Refused in code, not \
+             by policy. Grant the principal access in the console instead",
+            g.source, g.value
+        )),
     }
 }
 
@@ -383,14 +453,14 @@ mod tests {
     fn a_public_canned_acl_is_refused_in_code() {
         for acl in PUBLIC_CANNED_ACLS {
             match classify(&canned(acl)) {
-                AclDisposition::Refused(why) => {
+                AclDisposition::RefusedPublic(why) => {
                     assert!(why.contains(acl), "{why}");
                     assert!(
                         why.contains("refused in code, not by policy"),
                         "the reason must say the refusal is unconditional: {why}"
                     );
                 }
-                other => panic!("{acl} must be refused, got {other:?}"),
+                other => panic!("{acl} must be refused as public, got {other:?}"),
             }
         }
     }
@@ -402,9 +472,31 @@ mod tests {
         // reopens.
         assert!(matches!(
             classify(&canned("log-delivery-write")),
-            AclDisposition::Refused(_)
+            AclDisposition::RefusedPublic(_)
         ));
-        assert!(matches!(classify(&canned("")), AclDisposition::Refused(_)));
+        assert!(matches!(
+            classify(&canned("")),
+            AclDisposition::RefusedPublic(_)
+        ));
+    }
+
+    #[test]
+    fn every_disposition_but_no_grant_refuses_and_says_why() {
+        // `refusal()` is what every write path screens on, so "a new tier is refused by
+        // construction" has to be true of the accessor, not of a `match` at each site.
+        assert_eq!(classify(&[]).refusal(), None);
+        for grants in [
+            canned("public-read"),
+            canned("log-delivery-write"),
+            canned("bucket-owner-full-control"),
+            grant("grant-read", "id=\"canonical-user-id\""),
+        ] {
+            let d = classify(&grants);
+            let why = d
+                .refusal()
+                .unwrap_or_else(|| panic!("{grants:?} must be refused, got {d:?}"));
+            assert!(!why.is_empty());
+        }
     }
 
     #[test]
@@ -417,14 +509,42 @@ mod tests {
     }
 
     #[test]
-    fn a_non_public_canned_acl_needs_the_acl_verb() {
+    fn a_non_public_canned_acl_is_refused_for_conferring_rather_than_for_publishing() {
+        // Two claims, and the second is the one worth the test: these are refused, AND
+        // they are refused with the conferring reason. An operator whose
+        // `bucket-owner-full-control` upload is told it was a public-exposure attempt
+        // stops believing the 403s.
         for acl in CONFERRING_CANNED_ACLS {
-            assert_eq!(
-                classify(&canned(acl)),
-                AclDisposition::RequiresAclVerb,
-                "{acl}"
-            );
+            match classify(&canned(acl)) {
+                AclDisposition::RefusedConferring(why) => {
+                    assert!(why.contains(acl), "{why}");
+                    assert!(
+                        why.contains("no verb that authorizes"),
+                        "the reason must say WHY no grant can permit it: {why}"
+                    );
+                    assert!(
+                        !why.contains("every caller of this object store"),
+                        "a conferring ACL is not a public one: {why}"
+                    );
+                }
+                other => panic!("{acl} must be refused as conferring, got {other:?}"),
+            }
         }
+    }
+
+    #[test]
+    fn a_public_grant_outranks_a_conferring_one_in_the_same_request() {
+        // Both refuse, so the request is safe either way — but the reason the client and
+        // the audit record get must name the more serious of the two.
+        let mut grants = canned("bucket-owner-full-control");
+        grants.extend(grant(
+            "grant-read",
+            "uri=\"http://acs.amazonaws.com/groups/global/AllUsers\"",
+        ));
+        assert!(matches!(
+            classify(&grants),
+            AclDisposition::RefusedPublic(_)
+        ));
     }
 
     #[test]
@@ -445,7 +565,10 @@ mod tests {
                 "grant-full-control",
             ] {
                 assert!(
-                    matches!(classify(&grant(source, value)), AclDisposition::Refused(_)),
+                    matches!(
+                        classify(&grant(source, value)),
+                        AclDisposition::RefusedPublic(_)
+                    ),
                     "{source}: {value}"
                 );
             }
@@ -453,20 +576,24 @@ mod tests {
     }
 
     #[test]
-    fn a_named_grantee_needs_the_acl_verb_rather_than_being_refused() {
-        // The positive control for the refusals above: a grant to a specific principal is
-        // an authorization question, not a public exposure, so it goes to the policy.
-        assert_eq!(
-            classify(&grant("grant-read", "id=\"canonical-user-id\"")),
-            AclDisposition::RequiresAclVerb
-        );
-        assert_eq!(
-            classify(&grant(
-                "grant-full-control",
-                "emailAddress=\"a@example.test\""
-            )),
-            AclDisposition::RequiresAclVerb
-        );
+    fn a_named_grantee_is_refused_as_conferring_not_as_public() {
+        // Until 2026-08-08 these went to the policy as a `write_object_acl` question.
+        // The verb is gone: hyperfluid does not project object ACLs, so an ACL written
+        // here is access the console cannot show and cannot take back.
+        for value in [
+            "id=\"canonical-user-id\"",
+            "emailAddress=\"a@example.test\"",
+        ] {
+            for source in ["grant-read", "grant-full-control"] {
+                assert!(
+                    matches!(
+                        classify(&grant(source, value)),
+                        AclDisposition::RefusedConferring(_)
+                    ),
+                    "{source}: {value}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -476,7 +603,10 @@ mod tests {
             "grant-read",
             "uri=\"http://acs.amazonaws.com/groups/global/AllUsers\"",
         ));
-        assert!(matches!(classify(&grants), AclDisposition::Refused(_)));
+        assert!(matches!(
+            classify(&grants),
+            AclDisposition::RefusedPublic(_)
+        ));
     }
 
     #[test]

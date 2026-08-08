@@ -12,6 +12,24 @@
   `src/model.rs`; ADR-001 (direct-path closure, drift control), ADR-002 (audit record shape),
   ADR-004 (list narrowing)
 
+
+> **AMENDED 2026-08-08 — the frozen 13 is now the settled 6.** The projection contract
+> below is otherwise unchanged (same bundle shape, same `{bucket, actions, prefixes}`
+> grant, same prefix semantics); what changed is the closed set `actions` may draw from.
+> It is now `read_objects | list_objects | write_objects | delete_objects |
+> write_object_tags | read`, or `["*"]`. Eight names left the set and one entered it:
+> `create_bucket`,
+> `delete_bucket`, `read_bucket_config`, `write_bucket_config` and `write_object_acl`
+> were removed outright (the gateway is data-plane only — a bucket made, unmade or
+> re-configured through S3 has no `HFBucket` CR, and an object ACL is access hyperfluid
+> cannot revoke), while `read_bucket` + `list_buckets` merged into `read` and
+> `read_object_tags` merged into `read_objects`. Point 4 below now names one verb rather
+> than five, and `read` is the only verb that is both bucket-scoped and account-scoped —
+> which is why the rego gates every rule reading it on the request shape. The
+> authoritative set is `src/model.rs::Action::ALL`, held against hyperfluid's real
+> projection by `tests/cross_repo_contract.rs::the_gateway_vocabulary_is_what_hyperfluid_projects`.
+
+
 ## Context
 
 The gateway's premise is to **consume granular grants** — and today those grants do not yet
@@ -28,7 +46,7 @@ does yet.
   projected into the control-plane RBAC policy (external) for **control-plane API**
   authorization. Data-plane bucket permissions are **bucket-entity CRUD only**
   (`bucket:create | bucket:read | bucket:update | bucket:delete`): there is **no**
-  data-plane verb from the frozen 13 (`read_objects`, `list_objects`, … `write_bucket_config`)
+  data-plane verb from the settled 6 (`read_objects`, `list_objects`, … `read`; the frozen 13 until 2026-08-08)
   as a permission, and **no object-prefix scope** anywhere in the grant model.
 - **The per-organization bundle** (implemented): a gzipped document polled by a
   per-organization OPA running the in-backend defense-in-depth policy (external). The real data
@@ -106,7 +124,7 @@ Grant := {
 | Field | Type | Semantics (as implemented in `authz.rego`) |
 |---|---|---|
 | `bucket` | string | Exact bucket name within the tenant (`bucket_matches`), or the literal `"*"` for all buckets in the tenant. No globbing — `"*"` is a whole-field sentinel, not a pattern. |
-| `actions` | array of string | Values drawn from the closed **13-verb** set (`src/model.rs::Action::as_str`): object-scoped `read_objects \| write_objects \| delete_objects \| read_object_tags \| write_object_tags \| write_object_acl`, listing `list_objects`, bucket-scoped `read_bucket \| create_bucket \| delete_bucket \| read_bucket_config \| write_bucket_config`, account-scoped `list_buckets`; or the single-element `["*"]` (`action_matches`). `manage_lifecycle` was **deleted** — it was the only keyless verb and its rego branch was a whole-bucket allow waiting for an op to reach it. Unknown verbs are a projection bug: they can never match and MUST be rejected at build time, not emitted. |
+| `actions` | array of string | Values drawn from the closed **6-verb** set (`src/model.rs::Action::as_str`, settled 2026-08-08; **13** until then): object-scoped `read_objects \| write_objects \| delete_objects \| write_object_tags`, listing `list_objects`, bucket- **and** account-scoped `read`; or the single-element `["*"]` (`action_matches`). `manage_lifecycle` was **deleted** — it was the only keyless verb and its rego branch was a whole-bucket allow waiting for an op to reach it. Unknown verbs are a projection bug: they can never match and MUST be rejected at build time, not emitted. |
 | `prefixes` | array of string | Raw object-key prefixes matched by `startswith(input.object, p)` (`object_in_scope`). Absent or empty ⇒ the grant scopes the whole bucket (`whole_bucket`). No wildcards, no regex; a `*` inside a prefix is a literal character. |
 
 The full **superset bundle** (target), with today's fields unchanged:
@@ -415,7 +433,7 @@ group-intersection rego tightening decision (R4). **F4** — production config f
 These items are implemented by the control plane against this repository's policy and identity
 contracts.
 
-- **Extend the permission catalog** with the operation family mapping 1:1 to the 13 frozen
+- **Extend the permission catalog** with the operation family mapping 1:1 to the frozen
   gateway verbs (`src/model.rs::Action`) and an object-prefix scope on grants
   (`/<tenant>/<bucket>/<prefix>`).
 - **Build the projection** emitting D1 exactly: roles pre-expanded into `s3_grants[sub]`;

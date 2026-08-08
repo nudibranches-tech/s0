@@ -1,5 +1,35 @@
 # Client compatibility matrix — the 29-op scope (plan task 63, risk 8)
 
+> ## ⚠ AMENDMENT — 2026-08-08: this matrix was measured against the 29-op scope
+>
+> **It has NOT been re-measured against the 23-op scope**, and it is left in place rather
+> than edited because a measurement you did not take is not a measurement. Read every row
+> below as "what the M4 gateway did", and apply these three deltas:
+>
+> 1. **`CreateBucket`, `DeleteBucket`, `GetBucketPolicy`, `PutBucketPolicy`,
+>    `GetBucketCors`, `PutBucketCors` are now `Coverage::Denied`.** Every row that shows
+>    one of them allowed under some grant now shows a **gate** 403 under every grant,
+>    including the wildcard **W**. This does not change any row's *fatality*, only its
+>    reason: BLOCKER-1 (rclone's pre-upload `CreateBucket`) is now unconditional rather
+>    than grant-dependent, so `--s3-no-check-bucket` moves from "needed for principal O"
+>    to **required for every principal**. That is a real, measured-in-principle
+>    regression in client compatibility, accepted deliberately: a bucket made through S3
+>    has no `HFBucket` CR behind it.
+> 2. **`read_bucket` and `list_buckets` are one verb, `read`.** Wherever the grant column
+>    below says either, read `read`. BLOCKER-2 (`mc ls <alias>/<bucket>` without
+>    `read_bucket`) keeps its shape but loses a failure mode it used to have: a principal
+>    could previously hold `list_buckets` and not `read_bucket`, so `mc ls` listed a
+>    bucket that `mc stat` then refused. That is no longer expressible.
+> 3. **A conferring ACL is refused in code.** The
+>    `aws s3 cp --acl bucket-owner-full-control` row said "allowed under a wildcard
+>    grant"; it is now refused under every grant, because `write_object_acl` no longer
+>    exists. `--acl private` is unaffected, which is what keeps `s3cmd` and `rclone`
+>    working on ordinary uploads.
+>
+> `run.sh` has been updated to the new vocabulary so the harness still stands the stack
+> up; the numbers in this file have not.
+
+
 **Measured, not asserted.** Every row below was produced by running the real client
 against a real `s0` binary in front of a real S3 backend, and reading the requests off
 the wire with a transparent recording proxy (`run.sh` rebuilds the whole stack). Where a
@@ -224,7 +254,7 @@ backend would have accepted, so it is measured with a positive control on every 
 | `rclone --s3-acl public-read` | **403** — and note it surfaces on rclone's `CreateBucket` probe, i.e. as a *bucket* ACL refusal |
 | `aws s3api create-bucket --acl private` | **allowed** |
 | `aws s3api create-bucket --acl public-read` | **403** `… does not authorize bucket ACLs at all` |
-| `aws s3api put-object-acl` | **403 at the gate** — `PutObjectAcl` is not in the 29 |
+| `aws s3api put-object-acl` | **403 at the gate** — `PutObjectAcl` is not in the enforced scope |
 | `aws s3 cp --acl public-read-write` | **403** — public tier |
 | `aws s3 cp --acl authenticated-read` | **403** — public tier |
 | `aws s3 cp --acl log-delivery-write` | **403** — a canned name this build does not recognize is treated as public. Stricter than S3, deliberate, one-line reversible. |

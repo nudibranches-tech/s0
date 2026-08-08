@@ -1,13 +1,12 @@
 {
   "acl_grants": [],
-  "action": "write_bucket_config",
+  "action": "read",
   "backend": {
     "id": "bay-1",
     "kind": "ceph"
   },
-  "bucket": "reports",
+  "bucket": "",
   "bypass_governance": false,
-  "config_kind": "cors",
   "organization_id": "org-acme",
   "principal": {
     "attributes": {
@@ -17,8 +16,7 @@
     "type": "user"
   },
   "request": {
-    "method": "PUT",
-    "params": "cors="
+    "method": "GET"
   },
   "tenant": "acme"
 }

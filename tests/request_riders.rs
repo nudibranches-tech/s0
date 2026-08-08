@@ -8,6 +8,13 @@
 //! same hole; `x-amz-grant-*`, `x-amz-tagging` on write and
 //! `x-amz-bypass-governance-retention` were uninspected on top of it.
 //!
+//! **2026-08-08.** M4 answered a *conferring* (non-public) ACL with a second decision on
+//! `write_object_acl`. That verb is gone — an object ACL grants access hyperfluid never
+//! projected and cannot revoke — so those requests are now refused in code too, on all
+//! four write paths, with a real `Deny` record rather than a bare 400. `CreateBucket` is
+//! no longer one of the four: it is `Coverage::Denied`, so its create-time bucket ACL is
+//! refused a step earlier, by the gate, and `security_regressions.rs` covers that.
+//!
 //! Every test here has a positive control, for the reason stated in
 //! `security_regressions.rs`: a deny-all bug would otherwise make the whole file green.
 //!
@@ -138,6 +145,10 @@ async fn every_public_canned_acl_is_refused_on_every_write_shaped_op() {
     // The hole was never PutObject-specific. CopyObject is the worse case of the four:
     // its destination bucket need not be the source's, so a public ACL there publishes
     // a copy of data the caller only held read on.
+    //
+    // `CreateBucket` used to be a fifth case here. It is refused at the gate now, which
+    // is strictly earlier and is pinned by
+    // `security_regressions::the_six_control_plane_ops_are_refused_at_the_gate_and_on_the_record`.
     let fx = common::fixture("riders-acl-ops", wildcard_bundle());
     let access = GatewayAccess::new(fx.gw.clone());
     for acl in ["public-read", "public-read-write", "authenticated-read"] {
@@ -195,23 +206,9 @@ async fn every_public_canned_acl_is_refused_on_every_write_shaped_op() {
             access.copy_object(&mut req).await.is_err(),
             "CopyObject {acl}"
         );
-
-        let mut req = fx.request(
-            "CreateBucket",
-            CreateBucketInput {
-                bucket: "newbucket".into(),
-                acl: Some(BucketCannedACL::from(acl.to_string())),
-                ..Default::default()
-            },
-            Method::PUT,
-        );
-        assert!(
-            access.create_bucket(&mut req).await.is_err(),
-            "CreateBucket {acl}"
-        );
     }
 
-    // Positive control: the identical five requests without an ACL are all allowed under
+    // Positive control: the identical four requests without an ACL are all allowed under
     // this bundle, so the refusals above are about the ACL and not about the fixture.
     let mut req = fx.request(
         "PutObject",
@@ -223,15 +220,6 @@ async fn every_public_canned_acl_is_refused_on_every_write_shaped_op() {
         Method::PUT,
     );
     access.put_object(&mut req).await.expect("plain write");
-    let mut req = fx.request(
-        "CreateBucket",
-        CreateBucketInput {
-            bucket: "newbucket".into(),
-            ..Default::default()
-        },
-        Method::PUT,
-    );
-    access.create_bucket(&mut req).await.expect("plain create");
 }
 
 #[tokio::test]
@@ -275,9 +263,9 @@ async fn each_x_amz_grant_header_is_refused_when_it_names_a_public_group() {
         );
     }
 
-    // Positive control: the same five headers naming a specific principal are an
-    // authorization question, not an unconditional refusal — they reach the PDP and are
-    // allowed where write_object_acl is granted.
+    // Positive control: the SAME headers, absent, on the same bundle. It has to be this
+    // rather than "a named grantee is allowed" — since 2026-08-08 a named grantee is
+    // refused too — and without it every assertion above would hold on a deny-all build.
     let fx = common::fixture("riders-grant-hdr-ok", wildcard_bundle());
     let access = GatewayAccess::new(fx.gw.clone());
     let mut req = fx.request(
@@ -285,46 +273,25 @@ async fn each_x_amz_grant_header_is_refused_when_it_names_a_public_group() {
         PutObjectInput {
             bucket: "reports".into(),
             key: "2024/x".into(),
-            grant_read: Some("id=\"a-colleague\"".into()),
             ..Default::default()
         },
         Method::PUT,
     );
-    access.put_object(&mut req).await.expect("named grantee");
+    access
+        .put_object(&mut req)
+        .await
+        .expect("a write carrying no grant header at all");
 }
 
-#[tokio::test]
-async fn x_amz_grant_write_on_a_bucket_create_is_refused() {
-    // `grant-write` exists only on the bucket ACL, and it is the one grant header that
-    // hands out WRITE. It is refused for a structural reason rather than a public-group
-    // one: this gateway does not authorize bucket ACLs at all (`PutBucketAcl` is denied
-    // at the gate), so a create-time bucket ACL would be a back door into the operation
-    // the table refuses at the front.
-    let fx = common::fixture("riders-bucket-grant", wildcard_bundle());
-    let access = GatewayAccess::new(fx.gw.clone());
-    let mut req = fx.request(
-        "CreateBucket",
-        CreateBucketInput {
-            bucket: "newbucket".into(),
-            grant_write: Some("id=\"someone-else\"".into()),
-            ..Default::default()
-        },
-        Method::PUT,
-    );
-    let err = access
-        .create_bucket(&mut req)
-        .await
-        .expect_err("a create-time bucket ACL must be refused");
-    assert_eq!(*err.code(), S3ErrorCode::AccessDenied);
-    assert!(req.extensions.get::<AuthzProof>().is_none());
-    let rec = sole_refusal(&fx).await;
-    assert!(
-        rec.result.reason.contains("does not authorize bucket ACLs"),
-        "{rec:#?}"
-    );
-    let input = rec.input.expect("an input");
-    assert_eq!(input.acl_grants[0].source, "grant-write");
-}
+// `x_amz_grant_write_on_a_bucket_create_is_refused` lived here from M4 until
+// 2026-08-08. `grant-write` exists only on the bucket ACL, and `CreateBucket` was the
+// only enforced op that could carry one — so with `CreateBucket` back to
+// `Coverage::Denied` the header cannot reach a hook at all, and the test would have been
+// asserting a refusal produced by the gate rather than by the rider screening this file
+// is about. `security_regressions::the_six_control_plane_ops_are_refused_at_the_gate_and_on_the_record`
+// covers it now. `AclFields::write` is kept for exactly one reason: it is what makes the
+// ACL normalizer complete, so a future op that CAN carry the header is screened the day
+// it is added rather than the day someone notices.
 
 #[tokio::test]
 async fn a_canned_acl_this_build_does_not_recognize_is_refused() {
@@ -388,19 +355,39 @@ async fn a_benign_canned_private_acl_is_still_allowed_and_still_recorded() {
 // ── a real, non-public grant is an authorization question ───────────────────────
 
 #[tokio::test]
-async fn a_named_grantee_acl_requires_the_separate_write_object_acl_verb() {
-    // The modelling decision: a `PutObject` carrying an ACL is two requests — write
-    // these bytes, and set who may read them. AWS agrees (`s3:PutObject` +
-    // `s3:PutObjectAcl`); folding the second into the first is what made the header
-    // invisible.
-    let fx = common::fixture("riders-acl-verb", common::alice_bundle());
+async fn a_named_grantee_acl_is_refused_in_code_on_every_write_path() {
+    // The 2026-08-08 change to this file, and the one that needs the most care, because
+    // it makes the gateway STRICTER than M4 on a request an Owner could previously make.
+    //
+    // M4 modelled a `PutObject` carrying an ACL as two requests — write these bytes, and
+    // set who may read them — and asked the PDP about the second under
+    // `write_object_acl`. AWS models it the same way (`s3:PutObject` + `s3:PutObjectAcl`).
+    // What that modelling could not express is the thing that actually matters here: an
+    // object ACL is a SECOND access-control list, held by the backend, that hyperfluid
+    // does not project, cannot display and cannot revoke. Granting through it is granting
+    // outside the managed access model, which is the one thing the settlement forbids —
+    // so the verb was removed and there is nothing left to ask.
+    //
+    // Four write paths, all four asserted, because the refusal now lives in
+    // `screen_riders` and a hook that stopped routing through it would silently reopen
+    // exactly the hole this file exists for. The bundle is the WILDCARD one on purpose:
+    // `"actions": ["*"]` is what every org Owner is seeded, and it must not help.
+    let fx = common::fixture("riders-acl-conferring", wildcard_bundle());
     let access = GatewayAccess::new(fx.gw.clone());
+
+    let named = || Some("id=\"a-colleague\"".to_string());
+    let canned = || {
+        Some(ObjectCannedACL::from(
+            "bucket-owner-full-control".to_string(),
+        ))
+    };
+
     let mut req = fx.request(
         "PutObject",
         PutObjectInput {
             bucket: "reports".into(),
             key: "2024/x".into(),
-            grant_read: Some("id=\"a-colleague\"".into()),
+            grant_read: named(),
             ..Default::default()
         },
         Method::PUT,
@@ -408,47 +395,111 @@ async fn a_named_grantee_acl_requires_the_separate_write_object_acl_verb() {
     let err = access
         .put_object(&mut req)
         .await
-        .expect_err("alice holds write_objects but not write_object_acl");
+        .expect_err("no grant can authorize conferring an ACL");
     assert_eq!(*err.code(), S3ErrorCode::AccessDenied);
     assert!(req.extensions.get::<AuthzProof>().is_none());
+
     let rec = sole_refusal(&fx).await;
-    assert!(rec.result.reason.contains("write_object_acl"), "{rec:#?}");
     assert!(
-        !rec.result.reason.starts_with("deny (gateway):"),
-        "this one IS a policy verdict — the gateway asked and the PDP said no — so it \
-         must not be labelled as a gateway-side refusal: {rec:#?}"
+        rec.result.reason.contains("no verb that authorizes"),
+        "the reason must say the refusal is unconditional, not that a grant was \
+         missing: {rec:#?}"
+    );
+    assert!(
+        rec.result.reason.starts_with("deny (gateway):"),
+        "this is the GATEWAY refusing, not a PDP verdict; mislabelling it would put a \
+         policy decision on the record that no policy made: {rec:#?}"
+    );
+    assert!(
+        !rec.result
+            .reason
+            .contains("every caller of this object store"),
+        "a named grantee is not a public exposure and must not be reported as one: \
+         {rec:#?}"
+    );
+    let input = rec.input.expect("the record must name what was attempted");
+    assert_eq!(input.acl_grants[0].source, "grant-read");
+    assert_eq!(input.acl_grants[0].value, "id=\"a-colleague\"");
+
+    // …and it costs NO policy question. There is no verb to ask about, and asking one
+    // anyway would put a decision on the record for a question with only one answer.
+    assert_eq!(
+        fx.pdp_calls(),
+        0,
+        "a conferring ACL is screened in code, ahead of the PDP"
     );
 
-    // Positive control: the same request under a bundle that grants the verb.
-    let fx = common::fixture("riders-acl-verb-ok", wildcard_bundle());
+    // The other three write paths, each on its own fixture so the pdp-call count above
+    // stays readable. A canned conferring ACL on some, a grant header on others: both
+    // shapes reach `screen_riders`, and both must be refused everywhere.
+    let fx = common::fixture("riders-acl-conferring-post", wildcard_bundle());
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request(
+        "PostObject",
+        PostObjectInput {
+            bucket: "reports".into(),
+            key: "2024/x".into(),
+            acl: canned(),
+            ..Default::default()
+        },
+        Method::POST,
+    );
+    assert!(access.post_object(&mut req).await.is_err(), "PostObject");
+
+    let fx = common::fixture("riders-acl-conferring-cmu", wildcard_bundle());
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request(
+        "CreateMultipartUpload",
+        CreateMultipartUploadInput {
+            bucket: "reports".into(),
+            key: "2024/x".into(),
+            grant_full_control: named(),
+            ..Default::default()
+        },
+        Method::POST,
+    );
+    assert!(
+        access.create_multipart_upload(&mut req).await.is_err(),
+        "CreateMultipartUpload — the ONLY point in the multipart lifecycle where the \
+         completed object's ACL is fixed"
+    );
+
+    let fx = common::fixture("riders-acl-conferring-copy", wildcard_bundle());
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut input = common::ops::copy_object_input();
+    input.acl = canned();
+    let mut req = fx.request("CopyObject", input, Method::PUT);
+    assert!(
+        access.copy_object(&mut req).await.is_err(),
+        "CopyObject — the worst of the four, because the destination bucket need not be \
+         the source's"
+    );
+
+    // Positive control. Without it, everything above is equally true of a build that
+    // refuses every write: the same four ops, same bundle, same objects, no ACL.
+    let fx = common::fixture("riders-acl-conferring-ok", wildcard_bundle());
     let access = GatewayAccess::new(fx.gw.clone());
     let mut req = fx.request(
         "PutObject",
         PutObjectInput {
             bucket: "reports".into(),
             key: "2024/x".into(),
-            grant_read: Some("id=\"a-colleague\"".into()),
             ..Default::default()
         },
         Method::PUT,
     );
-    access
-        .put_object(&mut req)
-        .await
-        .expect("write_object_acl is granted here");
-    assert!(req.extensions.get::<AuthzProof>().is_some());
-    assert_eq!(
-        fx.pdp_calls(),
-        2,
-        "a non-public ACL costs a second decision, on write_object_acl"
-    );
+    access.put_object(&mut req).await.expect("plain write");
+    let mut input = common::ops::copy_object_input();
+    input.acl = None;
+    let mut req = fx.request("CopyObject", input, Method::PUT);
+    access.copy_object(&mut req).await.expect("plain copy");
 }
 
 // ── WORM defeat ────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn a_delete_with_bypass_governance_retention_is_refused_without_the_verb() {
-    // There IS no verb: the frozen 13-verb vocabulary has no equivalent of AWS's
+    // There IS no verb: the gateway's grant vocabulary has no equivalent of AWS's
     // `s3:BypassGovernanceRetention`, so no grant can express "may destroy a retained
     // object" — which means the refusal cannot be a policy decision and has to be a code
     // one. The wildcard bundle is the proof that it is: `actions: ["*"]` still cannot

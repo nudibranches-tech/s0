@@ -131,7 +131,6 @@ mod tests {
                 copy_source: None,
                 delete_keys: None,
                 object_tags: None,
-                config_kind: None,
                 requested_tags: None,
                 acl_grants: vec![],
                 bypass_governance: false,

@@ -13,8 +13,8 @@
 use std::collections::BTreeSet;
 
 use s0::access::optable::{
-    Coverage, DangerTier, FROZEN_VERBS, GateDenial, OP_TABLE, action_for, enforced_ops, gate_op,
-    spec,
+    Coverage, DangerTier, GATEWAY_VERBS, GateDenial, NON_GATEWAY_VERBS, OP_TABLE, action_for,
+    enforced_ops, gate_op, spec,
 };
 use s0::model::Action;
 
@@ -26,11 +26,17 @@ const S3S_OPS: &str = include_str!("data/s3s-0.14.1-ops.txt");
 /// s0's own manifest, so a s3s bump cannot silently leave the reference list behind.
 const CARGO_TOML: &str = include_str!("../Cargo.toml");
 
-/// The 29-op scope M4 exits on. Checked in now so the target is a diff against a
-/// written-down set rather than a number someone remembers — and so that flipping an
-/// op to `Enforced` that is NOT in this list is a visible, deliberate act.
-const TARGET_ENFORCED: [&str; 29] = [
-    // the 15 enforced today
+/// The reviewed enforced scope: 23 operations, after the 2026-08-08 re-scoping.
+///
+/// Checked in so the target is a diff against a written-down set rather than a number
+/// someone remembers — and so that flipping an op to `Enforced` that is NOT in this list
+/// is a visible, deliberate act.
+///
+/// It was 29 from M4 until 2026-08-08. The six that left are named below rather than
+/// silently deleted, because "we removed these on purpose" and "somebody dropped a line"
+/// look identical in a shrinking array.
+const TARGET_ENFORCED: [&str; 23] = [
+    // the 15 enforced at the end of M1
     "AbortMultipartUpload",
     "CompleteMultipartUpload",
     "CopyObject",
@@ -46,29 +52,55 @@ const TARGET_ENFORCED: [&str; 29] = [
     "PutObject",
     "UploadPart",
     "UploadPartCopy",
-    // the 14 M4 adds (S4-tier1/tier2/tagging/getattrs/postobject/listbuckets).
-    //
-    // This list was written before the M4 scope was settled and named
-    // `GetBucketLifecycleConfiguration` / `DeleteBucketLifecycle`, which the settled
-    // scope drops (there is no `manage_lifecycle` verb any more — it was deleted for
-    // being a keyless whole-bucket allow), in favour of the write halves of the two
-    // config pairs: shipping `GetBucketPolicy`/`GetBucketCors` without their `Put`
-    // counterparts leaves an operator able to read a bucket's configuration and unable
-    // to fix it.
-    "CreateBucket",
-    "DeleteBucket",
+    // the 8 M4 added that survived the 2026-08-08 re-scoping: object tagging, object
+    // attributes, the form upload, and the three bucket-EXISTENCE probes every S3
+    // client makes on connect.
     "DeleteObjectTagging",
-    "GetBucketCors",
     "GetBucketLocation",
-    "GetBucketPolicy",
     "GetObjectAttributes",
     "GetObjectTagging",
     "HeadBucket",
     "ListBuckets",
     "PostObject",
-    "PutBucketCors",
-    "PutBucketPolicy",
     "PutObjectTagging",
+];
+
+/// The six M4 enforced and 2026-08-08 sent back to `Denied`, with the reason each is
+/// out of scope **permanently** rather than pending work.
+///
+/// This is the other half of `TARGET_ENFORCED`: that array says what may be enforced,
+/// this one says what may not, and `the_re_denied_ops_are_not_quietly_re_enforced` holds
+/// both. Without it, re-adding `CreateBucket` to `TARGET_ENFORCED` would read as
+/// restoring something that had been dropped by accident.
+const RE_DENIED_2026_08_08: [(&str, &str); 6] = [
+    (
+        "CreateBucket",
+        "a bucket made through S3 has no HFBucket CR: unmanaged, unquota'd, invisible to \
+         the console, and absent from the bucket_attributes the denylist is keyed on",
+    ),
+    (
+        "DeleteBucket",
+        "destroys a bucket the console still believes it manages",
+    ),
+    (
+        "GetBucketPolicy",
+        "the document names the tenant-owner ARN and describes a second, backend-side \
+         PDP; reading it is a control-plane question",
+    ),
+    (
+        "PutBucketPolicy",
+        "a bucket policy IS a second PDP this gateway does not evaluate, so an Allow \
+         written here widens access to a principal no hyperfluid grant named",
+    ),
+    (
+        "GetBucketCors",
+        "CORS is bucket posture, and posture is control-plane",
+    ),
+    (
+        "PutBucketCors",
+        "rule contents were never inspected, so a write-config grant permitted \
+         AllowedOrigin `*`",
+    ),
 ];
 
 fn s3s_op_names() -> Vec<&'static str> {
@@ -127,19 +159,46 @@ fn op_table_covers_every_s3s_operation_and_nothing_else() {
 }
 
 #[test]
-fn exactly_29_enforced_70_denied() {
-    // 15 at the end of M1, +13 for the mechanical half of the M4 op scope, +ListBuckets
-    // — the one op that also filters a *response*. This is M4's exit criterion: the
-    // reviewed 29-op scope, and the other 70 still refused at the gate.
+fn exactly_23_enforced_76_denied() {
+    // 15 at the end of M1, +14 for the M4 op scope (29), −6 for the 2026-08-08
+    // re-scoping that made the gateway data-plane only. The other 76 are refused at the
+    // gate, before deserialization.
     let enforced = enforced_ops();
     let denied = OP_TABLE.len() - enforced.len();
     assert_eq!(
         enforced.len(),
-        29,
+        23,
         "enforced set changed to {enforced:?} — a Denied → Enforced flip needs two \
          reviewers, its hook, its dispatch arm, and this number updated"
     );
-    assert_eq!(denied, 70);
+    assert_eq!(denied, 76);
+}
+
+#[test]
+fn the_re_denied_ops_are_not_quietly_re_enforced() {
+    // The count above is the weak form of this claim: an edit could re-enforce
+    // `PutBucketPolicy` and deny something else to keep 23/76 true. These six are named,
+    // and each is refused at the gate with the ordinary `NotEnforced` refusal — which is
+    // also the assertion that they are refused by the TABLE rather than by a hook that
+    // happens to return an error.
+    let target: BTreeSet<&str> = TARGET_ENFORCED.into_iter().collect();
+    for (op, why) in RE_DENIED_2026_08_08 {
+        assert!(
+            spec(op).is_some(),
+            "RE_DENIED_2026_08_08 names {op}, which is not an s3s operation"
+        );
+        assert_eq!(
+            spec(op).unwrap().coverage,
+            Coverage::Denied,
+            "{op} is Enforced again. It was removed from the gateway's scope on \
+             2026-08-08 and the reason has not expired: {why}"
+        );
+        assert_eq!(gate_op(op), Err(GateDenial::NotEnforced), "{op}");
+        assert!(
+            !target.contains(op),
+            "{op} is back in TARGET_ENFORCED; the two lists now contradict each other"
+        );
+    }
 }
 
 #[test]
@@ -147,11 +206,11 @@ fn every_enforced_op_is_in_the_target_scope() {
     // The target set is the review boundary: an op may only become Enforced if it was
     // already argued for. Adding one to TARGET_ENFORCED is the argument.
     let target: BTreeSet<&str> = TARGET_ENFORCED.into_iter().collect();
-    assert_eq!(target.len(), 29, "TARGET_ENFORCED has duplicates");
+    assert_eq!(target.len(), 23, "TARGET_ENFORCED has duplicates");
     for op in enforced_ops() {
         assert!(
             target.contains(op),
-            "{op} is Enforced but is not in the reviewed 29-op target scope"
+            "{op} is Enforced but is not in the reviewed 23-op target scope"
         );
     }
     for op in TARGET_ENFORCED {
@@ -206,7 +265,11 @@ fn the_two_structural_denials_are_never_implement() {
 }
 
 #[test]
-fn op_table_verbs_are_from_the_frozen_vocabulary() {
+fn op_table_verbs_are_grantable_or_explicitly_control_plane() {
+    // Every row's verb is one of exactly two things, and which one is the whole
+    // classification: a verb a grant can carry, or a label saying the authority is the
+    // console's. There is no third category — "not classified yet" is how an op ends up
+    // Enforced under a verb nobody argued for.
     for s in OP_TABLE {
         match s.verb {
             None => assert_eq!(
@@ -216,11 +279,60 @@ fn op_table_verbs_are_from_the_frozen_vocabulary() {
                 s.name
             ),
             Some(v) => assert!(
-                FROZEN_VERBS.contains(&v),
-                "{} maps to {v}, which is not one of the 13 frozen grant verbs",
+                GATEWAY_VERBS.contains(&v) || NON_GATEWAY_VERBS.contains(&v),
+                "{} maps to {v}, which is neither one of the six projected grant verbs \
+                 nor a recorded control-plane label",
                 s.name
             ),
         }
+    }
+    // The strong half: an ENFORCED row may only name a grantable verb. A control-plane
+    // label on an enforced op would mean the gateway was deciding an authority no grant
+    // can express — which is a decision made by nothing.
+    for s in OP_TABLE.iter().filter(|s| s.coverage == Coverage::Enforced) {
+        let v = s.verb.expect("an enforced op has a verb");
+        assert!(
+            GATEWAY_VERBS.contains(&v),
+            "{} is Enforced under {v}, which is not a projected grant verb",
+            s.name
+        );
+    }
+}
+
+#[test]
+fn the_gateway_vocabulary_is_the_six_verbs_hyperfluid_projects() {
+    // The local half of the cross-repo pin. `tests/cross_repo_contract.rs` holds this
+    // same set against hyperfluid's real projection code; this one runs everywhere and
+    // catches the drift s0's own commits can introduce.
+    let mut verbs = GATEWAY_VERBS.to_vec();
+    verbs.sort_unstable();
+    assert_eq!(
+        verbs,
+        [
+            "delete_objects",
+            "list_objects",
+            "read",
+            "read_objects",
+            "write_object_tags",
+            "write_objects",
+        ],
+        "the projected vocabulary changed; that is a cross-repo contract change, not a \
+         local edit — see hyperfluid s3_gateway_projection::verbs"
+    );
+    let mut removed = NON_GATEWAY_VERBS.to_vec();
+    removed.sort_unstable();
+    assert_eq!(
+        removed,
+        [
+            "create_bucket",
+            "delete_bucket",
+            "read_bucket_config",
+            "write_bucket_config",
+            "write_object_acl",
+        ]
+    );
+    for v in NON_GATEWAY_VERBS {
+        assert!(!GATEWAY_VERBS.contains(v), "{v} is in both sets");
     }
 }
 
@@ -269,7 +381,12 @@ fn the_write_set_matches_the_shipped_rego() {
         "the rego's write_actions and Action::is_write disagree — freeze_writes covers \
          a different set of verbs on each side"
     );
-    assert_eq!(from_rust.len(), 7, "the frozen write set is 7 verbs");
+    assert_eq!(
+        from_rust.len(),
+        3,
+        "the write set is 3 verbs since 2026-08-08: create_bucket, delete_bucket and \
+         write_bucket_config left the vocabulary, and write_object_acl with them"
+    );
 }
 
 #[test]
@@ -304,6 +421,111 @@ fn every_bucket_scoped_verb_is_keyless_in_the_rego_too() {
             "{verb} is keyless in the rego but names objects"
         );
     }
+}
+
+#[test]
+fn the_account_scope_reads_the_same_verb_the_bucket_scope_does() {
+    // The 2026-08-08 merge in one assertion. `read` answers "does this bucket exist, for
+    // me?" in both request shapes, and the two sets sharing it is the *point* — it is
+    // what stops `aws s3 ls` from coming back empty for a principal whose next
+    // `head-bucket` succeeds.
+    //
+    // The sharing is also what makes the rego's shape gates load-bearing, so this test
+    // asserts both halves: the sets agree with `Action`, and they overlap.
+    let rego: &str = include_str!("../policy/gateway/authz.rego");
+    let set = |name: &str| -> Vec<String> {
+        let start = rego
+            .find(&format!("{name} := {{"))
+            .unwrap_or_else(|| panic!("the shipped rego must define {name}"));
+        let body = &rego[start..];
+        let end = body.find('}').expect("set is not closed");
+        let mut v: Vec<String> = body[..end]
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect();
+        v.sort();
+        v
+    };
+    let typed = |f: fn(Action) -> bool| -> Vec<String> {
+        let mut v: Vec<String> = Action::ALL
+            .iter()
+            .copied()
+            .filter(|a| f(*a))
+            .map(|a| a.as_str().to_string())
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(set("account_actions"), typed(Action::is_account_scoped));
+    assert_eq!(set("bucket_actions"), typed(Action::is_bucket_scoped));
+    assert_eq!(
+        set("account_actions"),
+        set("bucket_actions"),
+        "the existence verb must be readable in both request shapes"
+    );
+    assert_eq!(set("account_actions"), vec!["read".to_string()]);
+
+    // …and every rule that reads either set carries its shape gate. Stated as a
+    // whole-file property because the failure it prevents is silent in opposite
+    // directions: an ungated bucket rule lets any wildcard grant answer an account
+    // question, and an ungated account rule hangs a `visible_buckets` obligation on a
+    // HeadBucket — which `must_understand` turns into a hard deny for every principal.
+    let mut checked = 0usize;
+    for body in rule_bodies(rego) {
+        for (set_name, gate) in [
+            ("bucket_actions", "bucket_scoped"),
+            ("account_actions", "account_scoped"),
+        ] {
+            if !body
+                .iter()
+                .any(|l| l.contains(&format!("input.action in {set_name}")))
+            {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                body.iter().any(|l| l.trim() == gate),
+                "a rule body reads `input.action in {set_name}` with no `{gate}` beside \
+                 it:\n{}",
+                body.join("\n")
+            );
+        }
+    }
+    assert!(
+        checked >= 3,
+        "the rule scanner found only {checked} bodies reading an action set — it has \
+         stopped measuring anything (expected the bucket grant rule, the account grant \
+         rule and the account obligations rule)"
+    );
+}
+
+/// Every `{ … }` rule body in a rego module, as its comment-stripped code lines.
+///
+/// Deliberately dumb: this module is hand-written and one-brace-per-line, so a real
+/// parser would be more machinery than the property is worth. If it ever stops finding
+/// bodies, the `checked` floor above says so rather than the test silently passing.
+fn rule_bodies(rego: &str) -> Vec<Vec<&str>> {
+    let mut out = Vec::new();
+    let mut current: Option<Vec<&str>> = None;
+    for line in rego.lines() {
+        let code = line.split('#').next().unwrap_or("");
+        if code.trim_end().ends_with('{') {
+            current = Some(Vec::new());
+            continue;
+        }
+        if code.trim() == "}"
+            && let Some(body) = current.take()
+        {
+            out.push(body);
+            continue;
+        }
+        if let Some(body) = current.as_mut() {
+            body.push(code);
+        }
+    }
+    out
 }
 
 #[test]

@@ -78,7 +78,7 @@ cat > "$STATE/bundle.json" <<'JSON'
       "wildcard-user": [ { "bucket": "*", "actions": ["*"], "prefixes": [] } ],
       "scoped-user": [
         { "bucket": "scoped-b", "actions": ["read_objects","list_objects","write_objects","delete_objects"], "prefixes": ["team-a/"] },
-        { "bucket": "scoped-b", "actions": ["list_buckets","read_bucket"], "prefixes": [] }
+        { "bucket": "scoped-b", "actions": ["read"], "prefixes": [] }
       ],
       "objonly-user": [
         { "bucket": "scoped-b", "actions": ["read_objects","list_objects","write_objects","delete_objects"], "prefixes": [] }

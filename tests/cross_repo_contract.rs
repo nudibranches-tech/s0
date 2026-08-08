@@ -113,7 +113,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use s0::access::optable::{GATEWAY_VERBS, NON_GATEWAY_VERBS};
 use s0::audit::{DATA_DOCK_TYPE_VALUE, DECISION_PATH, LABEL_DATA_DOCK_TYPE, LABEL_ORG_ID};
+use s0::model::Action;
 use s0::pdp::{
     Bundle, BundleStore, CachingPdp, DECISION_RULE, GATEWAY_REGO, Pdp, RegorusPdp, SidecarPdp,
     content_revision, decision_rule_path, parse_bundle,
@@ -225,6 +227,58 @@ mod platform {
         ("duration_seconds", "u32"),
     ];
 
+    /// **The grant vocabulary.** The verbs hyperfluid's projection emits into the
+    /// bundle's `actions` arrays, and therefore the only strings s0's `Action` may
+    /// spell — settled 2026-08-08, when the bucket family went from 17 keys to 9 and
+    /// the projected set from 13 verbs to these 6.
+    ///
+    /// This is the string contract with the widest blast radius in the whole file, and
+    /// the one whose failure is quietest. A verb s0 sends that the projection never
+    /// emits matches no grant and denies; a verb the projection emits that s0 never
+    /// sends is a grant an administrator can create, see in the console, and which
+    /// authorizes nothing. Neither raises an error anywhere — the first is a 403 the
+    /// operator blames on the grant, the second is a grant the operator blames on the
+    /// gateway.
+    ///
+    /// Derived on the platform side from `Permission`'s `bucket:*` keys minus
+    /// `verbs.rs::CONSOLE_ONLY_BUCKET_ACTIONS`; held against s0's
+    /// `optable::GATEWAY_VERBS` by the always-on half below and against the real
+    /// checkout by `the_gateway_vocabulary_is_what_hyperfluid_projects`.
+    pub const PROJECTED_VERBS: &[&str] = &[
+        "delete_objects",
+        "list_objects",
+        "read",
+        "read_objects",
+        "write_object_tags",
+        "write_objects",
+    ];
+
+    /// The bucket-family catalog keys that exist but do **not** project: the
+    /// control-plane three. `bucket:read` is deliberately not among them — it is the
+    /// one dual-plane key, and the whole point of the 2026-08-08 change is that the
+    /// console and the gateway answer "does this bucket exist?" with the same grant.
+    pub const CONSOLE_ONLY_BUCKET_KEYS: &[&str] =
+        &["bucket:create", "bucket:delete", "bucket:update"];
+
+    /// The eight bucket-family keys **removed** from hyperfluid's catalog on
+    /// 2026-08-08.
+    ///
+    /// Pinned as a negative: each must be absent from `Permission`, or a grant naming
+    /// it could exist again. Five of them (`create_bucket`, `delete_bucket`,
+    /// `read_bucket_config`, `write_bucket_config`, `write_object_acl`) survive in s0
+    /// only as `optable::NON_GATEWAY_VERBS` classification labels on denied rows; the
+    /// other three merged into a surviving verb.
+    pub const REMOVED_BUCKET_KEYS: &[&str] = &[
+        "bucket:create_bucket",
+        "bucket:delete_bucket",
+        "bucket:read_bucket",
+        "bucket:list_buckets",
+        "bucket:read_bucket_config",
+        "bucket:write_bucket_config",
+        "bucket:write_object_acl",
+        "bucket:read_object_tags",
+    ];
+
     /// The two wire spellings of `principal_type`, which are **two different bundle
     /// key spaces** (`user:<oidc sub>` vs `sa:<client id>`).
     ///
@@ -258,9 +312,55 @@ mod hf_path {
     /// It must **re-export** `hf_lib_config`'s constant rather than declare a second
     /// one — see `the_console_validates_the_credential_s0_sends_on_the_bundle_poll`.
     pub const CONFIG_FETCHER_RS: &str = "rust/hf_lib_config_fetcher/src/lib.rs";
+    /// The permission catalog: the `#[strum(serialize = "…")]` keys ARE the vocabulary.
+    pub const PERMISSION_RS: &str =
+        "rust/hf_module_console_api/src/hf_console/domain/authz/permission.rs";
+    /// The projection that decides which of those keys reach the gateway at all.
+    pub const PROJECTION_VERBS_RS: &str = "rust/hf_module_console_api/src/hf_console/inbound/\
+                                           http/handlers/vauban/s3_gateway_projection/verbs.rs";
 }
 
 // ── the always-on half: s0's own constants against the pins ─────────────────────
+
+/// s0's grant vocabulary must be exactly what the platform projects.
+///
+/// The always-on half. It needs no sibling checkout, so it runs everywhere and catches
+/// the direction s0's own commits can move: a verb renamed, added or dropped here.
+#[test]
+fn s0_spells_the_verbs_the_platform_projects() {
+    let mut mine: Vec<&str> = GATEWAY_VERBS.to_vec();
+    mine.sort_unstable();
+    assert_eq!(
+        mine,
+        platform::PROJECTED_VERBS,
+        "\ns0's GATEWAY_VERBS and the pinned projection disagree.\n\
+         A verb s0 sends that the projection never emits matches NO grant and denies \
+         every request that uses it. A verb the projection emits that s0 never sends is \
+         a grant an administrator can create and which authorizes nothing. Neither logs \
+         an error on either side.\n"
+    );
+
+    // …and `Action` is the same set again, in typed form. Three spellings of one
+    // vocabulary (the enum, the table's string column, the pin) is two chances to drift.
+    let mut typed: Vec<&str> = Action::ALL.iter().map(|a| a.as_str()).collect();
+    typed.sort_unstable();
+    assert_eq!(typed, platform::PROJECTED_VERBS);
+
+    // The removed verbs must not be expressible as an `Action`, whatever they still
+    // classify in `OP_TABLE`. This is the assertion that keeps a control-plane label
+    // from being promoted back into the grant vocabulary by a one-line edit.
+    for verb in NON_GATEWAY_VERBS {
+        assert!(
+            !platform::PROJECTED_VERBS.contains(verb),
+            "{verb} is a control-plane label AND a projected verb"
+        );
+        assert!(
+            Action::ALL.iter().all(|a| a.as_str() != *verb),
+            "{verb} was removed from the catalog on 2026-08-08 but `Action` still \
+             expresses it — s0 would send a verb no grant can carry"
+        );
+    }
+}
 
 /// s0 must ask the question the platform answers.
 #[test]
@@ -1599,6 +1699,138 @@ fn s0_minted_session_json() -> serde_json::Value {
     serde_json::to_value(MintedCredentials::from(creds)).expect("serialize")
 }
 
+/// **The vocabulary, against the real catalog.** The cross-repo half.
+///
+/// This does not compare s0 to a copy of the platform's vocabulary; it re-derives the
+/// vocabulary from the platform's own two sources of truth and holds s0 equal to the
+/// result:
+///
+/// * `permission.rs` — every `#[strum(serialize = "bucket:…")]` key. The catalog IS the
+///   vocabulary; there is no separate list.
+/// * `verbs.rs::CONSOLE_ONLY_BUCKET_ACTIONS` — the actions that stay control-plane and
+///   are filtered out before anything is projected.
+///
+/// projected = {action of every `bucket:<action>` key} − CONSOLE_ONLY_BUCKET_ACTIONS.
+///
+/// Deriving rather than string-matching is what makes this catch the failure that
+/// matters. A key added to the catalog with no gateway counterpart, a verb dropped from
+/// the projection, or a console-only action list that grows an entry all change the
+/// derived set — and every one of them is a silent, non-erroring divergence in
+/// production: a grant that authorizes nothing, or a request that matches no grant.
+#[test]
+fn the_gateway_vocabulary_is_what_hyperfluid_projects() {
+    let Some(repo) = hyperfluid_repo("the projected grant vocabulary") else {
+        return;
+    };
+
+    let permission_rs = read(&repo, hf_path::PERMISSION_RS);
+    let bucket_keys = strum_keys_with_prefix(&permission_rs, "bucket:");
+    assert!(
+        bucket_keys.len() >= 5,
+        "the catalog scraper found {} bucket keys in {} — it has stopped parsing and \
+         this test would be vacuous: {bucket_keys:?}",
+        bucket_keys.len(),
+        hf_path::PERMISSION_RS,
+    );
+
+    let verbs_rs = read(&repo, hf_path::PROJECTION_VERBS_RS);
+    let console_only =
+        rust_str_array(&verbs_rs, "CONSOLE_ONLY_BUCKET_ACTIONS").unwrap_or_else(|| {
+            panic!(
+                "{} no longer defines CONSOLE_ONLY_BUCKET_ACTIONS — the projection's \
+                 exclusion list has been renamed or removed, and this test can no longer \
+                 tell a projected verb from a console-only one",
+                hf_path::PROJECTION_VERBS_RS
+            )
+        });
+
+    // The console-only list is pinned separately, as `bucket:<action>` keys, because
+    // "which actions do NOT project" is the half a reviewer gets wrong: adding
+    // `bucket:read` to it would silently make every `HeadBucket` and `aws s3 ls` deny.
+    let mut console_only_keys: Vec<String> =
+        console_only.iter().map(|a| format!("bucket:{a}")).collect();
+    console_only_keys.sort();
+    assert_eq!(
+        console_only_keys,
+        platform::CONSOLE_ONLY_BUCKET_KEYS,
+        "{}",
+        drifted(
+            hf_path::PROJECTION_VERBS_RS,
+            "CONSOLE_ONLY_BUCKET_ACTIONS",
+            &platform::CONSOLE_ONLY_BUCKET_KEYS.join(", "),
+            &console_only_keys.join(", "),
+        )
+    );
+
+    let mut projected: Vec<String> = bucket_keys
+        .iter()
+        .filter_map(|k| k.strip_prefix("bucket:"))
+        .filter(|a| !console_only.iter().any(|c| c == a))
+        .map(str::to_string)
+        .collect();
+    projected.sort();
+    projected.dedup();
+
+    let mine: Vec<String> = {
+        let mut v: Vec<String> = GATEWAY_VERBS.iter().map(|v| v.to_string()).collect();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        projected,
+        mine,
+        "{}",
+        drifted(
+            hf_path::PERMISSION_RS,
+            "the projected bucket vocabulary (catalog keys minus CONSOLE_ONLY_BUCKET_ACTIONS)",
+            &mine.join(", "),
+            &projected.join(", "),
+        )
+    );
+
+    // The negative half. A removed key that came BACK would not change the assertion
+    // above if s0 were changed to match it — that is exactly how a control-plane
+    // authority gets quietly restored to the data plane, one "small" catalog edit at a
+    // time. So each removal is pinned as an absence, in the catalog itself.
+    for key in platform::REMOVED_BUCKET_KEYS {
+        assert!(
+            !bucket_keys.iter().any(|k| k == key),
+            "\n{key} is back in {} in {OTHER_REPO}.\n\
+             It was removed on 2026-08-08 because it let a principal act on the bucket \
+             as a MANAGED resource without going through the managed path (or, for the \
+             three merged keys, because one verb already answers the question). \
+             Re-adding it is a settlement change, not a catalog edit: argue it, then \
+             update REMOVED_BUCKET_KEYS and s0's `Action` together.\n",
+            hf_path::PERMISSION_RS,
+        );
+        assert!(
+            Action::ALL
+                .iter()
+                .all(|a| format!("bucket:{}", a.as_str()) != *key),
+            "s0 expresses {key} as an Action"
+        );
+    }
+
+    // …and the five that s0 still names, as classification labels on denied rows, are
+    // exactly the removed keys that have no successor verb. The three merged ones
+    // (`read_bucket`, `list_buckets`, `read_object_tags`) must NOT appear as labels:
+    // their authority still exists, under another name.
+    for verb in NON_GATEWAY_VERBS {
+        assert!(
+            platform::REMOVED_BUCKET_KEYS.contains(&format!("bucket:{verb}").as_str()),
+            "s0 classifies denied ops under {verb}, which hyperfluid never removed — \
+             either it is still a real verb, or the label is fiction"
+        );
+    }
+    for merged in ["read_bucket", "list_buckets", "read_object_tags"] {
+        assert!(
+            !NON_GATEWAY_VERBS.contains(&merged),
+            "{merged} was MERGED into a surviving verb, not made control-plane; \
+             labelling a denied op with it claims the authority went away"
+        );
+    }
+}
+
 #[test]
 fn the_pinned_platform_contract_matches_the_real_hyperfluid_policy_bundle() {
     let Some(repo) = hyperfluid_repo("the rego package and the decision entrypoint") else {
@@ -2202,7 +2434,6 @@ fn platform_input(object: &str) -> s0::authz::OpaInput {
         copy_source: None,
         delete_keys: None,
         object_tags: None,
-        config_kind: None,
         requested_tags: None,
         acl_grants: vec![],
         bypass_governance: false,
@@ -2306,6 +2537,53 @@ fn rust_str_const(src: &str, name: &str) -> Option<String> {
     let needle = format!("const {name}:");
     let at = src.find(&needle)?;
     str_literal_after(&src[at..], "=")
+}
+
+/// Every `#[strum(serialize = "<prefix>…")]` literal in a Rust source file.
+///
+/// hyperfluid's permission catalog declares its keys as strum attributes on the enum
+/// variants, so the attribute values ARE the vocabulary — there is no second list to
+/// read, and scraping them is the closest a test in this repository can get to asking
+/// the catalog itself.
+fn strum_keys_with_prefix(src: &str, prefix: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in src.lines() {
+        let code = line.split("//").next().unwrap_or("");
+        let Some(at) = code.find("strum(serialize") else {
+            continue;
+        };
+        if let Some(v) = str_literal_after(&code[at..], "=")
+            && v.starts_with(prefix)
+        {
+            out.push(v);
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// `const NAME: [&str; N] = ["a", "b"];` → `["a", "b"]`.
+fn rust_str_array(src: &str, name: &str) -> Option<Vec<String>> {
+    let at = src.find(&format!("const {name}:"))?;
+    let rest = &src[at..];
+    let open = rest.find('[')?;
+    // The declared length sits inside the TYPE's brackets, so skip to the initializer.
+    let eq = rest.find('=')?;
+    let open = if open < eq {
+        rest[eq..].find('[')? + eq
+    } else {
+        open
+    };
+    let close = rest[open..].find(']')? + open;
+    Some(
+        rest[open..close]
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect(),
+    )
 }
 
 /// The `impl DecisionLogMetadataExtractor` block for the S3 gateway extractor.
@@ -2576,7 +2854,6 @@ fn sample_decision_record() -> s0::audit::AuditRecord {
         copy_source: None,
         delete_keys: None,
         object_tags: None,
-        config_kind: None,
         requested_tags: None,
         acl_grants: vec![],
         bypass_governance: false,

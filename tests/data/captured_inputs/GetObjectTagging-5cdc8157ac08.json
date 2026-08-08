@@ -1,13 +1,13 @@
 {
   "acl_grants": [],
-  "action": "read_bucket_config",
+  "action": "read_objects",
   "backend": {
     "id": "bay-1",
     "kind": "ceph"
   },
   "bucket": "reports",
   "bypass_governance": false,
-  "config_kind": "policy",
+  "object": "2024/x",
   "organization_id": "org-acme",
   "principal": {
     "attributes": {
@@ -18,7 +18,7 @@
   },
   "request": {
     "method": "GET",
-    "params": "policy="
+    "params": "tagging="
   },
   "tenant": "acme"
 }

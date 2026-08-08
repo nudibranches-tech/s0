@@ -75,27 +75,47 @@ pub enum DangerTier {
     NeverImplement,
 }
 
-/// The 13-verb grant vocabulary frozen in the master plan (§1.2).
+/// The grant vocabulary the gateway can actually decide against — the six verbs
+/// hyperfluid's projection emits (settled 2026-08-08).
 ///
 /// Held as strings rather than [`Action`] because the table classifies *denied* ops
-/// too, and several of those name a verb no hook builds today. [`Action`] now carries
-/// exactly these 13 (the vocabulary widened with the M4 op scope), and
-/// `the_frozen_vocabulary_and_the_action_enum_agree` holds the two sets equal, so the
-/// string form can no longer drift into fiction.
-pub const FROZEN_VERBS: &[&str] = &[
+/// too. [`Action`] carries exactly these six and
+/// `the_gateway_vocabulary_and_the_action_enum_agree` holds the two sets equal, so the
+/// string form cannot drift into fiction.
+pub const GATEWAY_VERBS: &[&str] = &[
     "read_objects",
     "list_objects",
     "write_objects",
     "delete_objects",
-    "read_object_tags",
     "write_object_tags",
-    "write_object_acl",
-    "list_buckets",
-    "read_bucket",
+    "read",
+];
+
+/// Classification labels for denied operations whose authority is **not** the gateway's
+/// to broker. Not grantable, not expressible as an [`Action`], and — this is the point
+/// — not one flip away from being either.
+///
+/// These five were real grant verbs until 2026-08-08. They were removed because each was
+/// a way to act on the bucket as a *managed resource* while bypassing the managed path:
+/// a bucket created or destroyed through S3 has no `HFBucket` CR, and a policy or CORS
+/// document written through S3 changes who can reach the data with no console record of
+/// it. The authority did not disappear, it moved to the control plane (console
+/// `bucket:create` / `bucket:delete` / `bucket:update`), except for `write_object_acl`,
+/// which has no successor at all: conferring an ACL is refused in code
+/// ([`crate::access::headers`]).
+///
+/// They survive here as the table's classification column — the reviewer-facing answer
+/// to "what would this op be about?" — and nowhere else. Three tests hold that line:
+/// this set is disjoint from [`GATEWAY_VERBS`], no `Enforced` entry may name one, and
+/// [`action_for`] returns `None` for every one of them. So flipping such an op to
+/// `Enforced` is not a one-line diff that quietly compiles; it fails the suite and
+/// demands a new verb in the cross-repo vocabulary first.
+pub const NON_GATEWAY_VERBS: &[&str] = &[
     "create_bucket",
     "delete_bucket",
     "read_bucket_config",
     "write_bucket_config",
+    "write_object_acl",
 ];
 
 /// One operation's security classification.
@@ -105,10 +125,16 @@ pub struct OpSpec {
     /// matches on and what rides in the audit record.
     pub name: &'static str,
     pub coverage: Coverage,
-    /// The grant verb the decision is made against, from [`FROZEN_VERBS`]. `None`
-    /// only for [`DangerTier::NeverImplement`]: those have no verb because they are
-    /// never decided. Copy-shaped ops name their *destination* verb; the source read
-    /// is a separate sub-decision.
+    /// The verb the decision is (or would be) made against. `None` only for
+    /// [`DangerTier::NeverImplement`]: those have no verb because they are never
+    /// decided. Copy-shaped ops name their *destination* verb; the source read is a
+    /// separate sub-decision.
+    ///
+    /// For an `Enforced` entry this is always one of [`GATEWAY_VERBS`] — enforced by
+    /// `enforced_verbs_are_expressible_as_actions`, because a hook cannot build an
+    /// `OpaInput` for a verb no [`Action`] expresses. A `Denied` entry may instead name
+    /// one of [`NON_GATEWAY_VERBS`], which says something stronger than "not yet": that
+    /// authority is control-plane and no grant on this gateway will ever carry it.
     pub verb: Option<&'static str>,
     pub shape: ResourceShape,
     pub tier: DangerTier,
@@ -219,18 +245,18 @@ pub const OP_TABLE: &[OpSpec] = &[
              a write grant can make the new object undeletable",
         ],
     ),
-    enforced(
+    // Enforced from M4 until 2026-08-08. A bucket created through the gateway has no
+    // `HFBucket` CR behind it: unmanaged, unquota'd, invisible to the console and absent
+    // from `bucket_attributes` — so the per-bucket denylist the policy reads has nothing
+    // to key on. Bucket existence is control-plane; `bucket:create` lives in the console.
+    // Note the client-compatibility cost, recorded rather than hidden: rclone issues
+    // CreateBucket before every upload and aborts the transfer on a refusal, so it needs
+    // `--s3-no-check-bucket` (tests/compat/matrix.md).
+    denied(
         "CreateBucket",
         "create_bucket",
         ResourceShape::Bucket,
         DangerTier::Mutating,
-        &[
-            "object_ownership is not inspected: `ObjectWriter`/`BucketOwnerPreferred` \
-             re-enable ACLs on the new bucket. That is inert while the gateway refuses \
-             every ACL-bearing request, but it is a posture change nobody authorized",
-            "x-amz-bucket-object-lock-enabled and the LocationConstraint in \
-             CreateBucketConfiguration",
-        ],
     ),
     denied(
         "CreateBucketMetadataTableConfiguration",
@@ -249,15 +275,15 @@ pub const OP_TABLE: &[OpSpec] = &[
         ],
     ),
     unauthorizable("CreateSession", ResourceShape::Bucket),
-    enforced(
+    // Enforced from M4 until 2026-08-08, and the more dangerous half of the pair: it
+    // destroyed a bucket the console still believes it manages. (Runbook P6 named the
+    // inverse — `delete_bucket` returning `Ok(())` while the `HFBucket` CR vanishes and
+    // the bucket persists. That failure mode is no longer reachable through the gateway.)
+    denied(
         "DeleteBucket",
         "delete_bucket",
         ResourceShape::Bucket,
         DangerTier::Mutating,
-        &[
-            "the bucket's emptiness is the backend's business; the gateway does not \
-             re-check it and reports whatever RGW answers",
-        ],
     ),
     denied(
         "DeleteBucketAnalyticsConfiguration",
@@ -386,12 +412,11 @@ pub const OP_TABLE: &[OpSpec] = &[
         ResourceShape::BucketSubresource,
         DangerTier::Routine,
     ),
-    enforced(
+    denied(
         "GetBucketCors",
         "read_bucket_config",
         ResourceShape::Bucket,
         DangerTier::Routine,
-        &["the returned rules are not filtered; the decision is all-or-nothing"],
     ),
     denied(
         "GetBucketEncryption",
@@ -418,11 +443,12 @@ pub const OP_TABLE: &[OpSpec] = &[
         DangerTier::Routine,
     ),
     enforced(
-        // `read_bucket`, not `read_bucket_config`: every S3 client probes this on
-        // connect, so treating it as configuration would make bucket existence
-        // require a config grant.
+        // The existence verb, not a configuration one: every S3 client probes this on
+        // connect, so charging it to anything else would make ordinary use require a
+        // grant nobody would know to give. Same verb as HeadBucket and ListBuckets, and
+        // the same one the console's bucket-detail route checks.
         "GetBucketLocation",
-        "read_bucket",
+        "read",
         ResourceShape::Bucket,
         DangerTier::Routine,
         &["the response names the backend region, which is not tenant-specific"],
@@ -457,15 +483,11 @@ pub const OP_TABLE: &[OpSpec] = &[
         ResourceShape::Bucket,
         DangerTier::Routine,
     ),
-    enforced(
+    denied(
         "GetBucketPolicy",
         "read_bucket_config",
         ResourceShape::Bucket,
         DangerTier::Routine,
-        &[
-            "the returned document names the tenant-owner ARN — information the \
-             ListBuckets owner-stripping decision otherwise withholds (open question 8)",
-        ],
     ),
     denied(
         "GetBucketPolicyStatus",
@@ -547,8 +569,12 @@ pub const OP_TABLE: &[OpSpec] = &[
         DangerTier::Routine,
     ),
     enforced(
+        // `read_objects`, not a tag-specific verb: reading an object's tags is strictly
+        // less than reading the object itself, so a separate read verb bought nothing
+        // and cost a grant an administrator had to know to give. Merged 2026-08-08.
+        // The WRITE direction is deliberately NOT merged — see `Action::WriteObjectTags`.
         "GetObjectTagging",
-        "read_object_tags",
+        "read_objects",
         ResourceShape::Object,
         DangerTier::Routine,
         &["version_id"],
@@ -567,7 +593,7 @@ pub const OP_TABLE: &[OpSpec] = &[
     ),
     enforced(
         "HeadBucket",
-        "read_bucket",
+        "read",
         ResourceShape::Bucket,
         DangerTier::Routine,
         &[
@@ -608,8 +634,13 @@ pub const OP_TABLE: &[OpSpec] = &[
         DangerTier::Routine,
     ),
     enforced(
+        // Same verb as HeadBucket, in the account shape (`input.bucket == ""`). Merged
+        // 2026-08-08: enumerate-vs-exists was two verbs for one question, and a
+        // principal whose `aws s3 ls` came back empty while its next `head-bucket`
+        // succeeded is exactly the two-answers-to-one-question defect the settlement
+        // exists to remove.
         "ListBuckets",
-        "list_buckets",
+        "read",
         ResourceShape::Account,
         DangerTier::Routine,
         &[
@@ -630,7 +661,7 @@ pub const OP_TABLE: &[OpSpec] = &[
     ),
     denied(
         "ListDirectoryBuckets",
-        "list_buckets",
+        "read",
         ResourceShape::Account,
         DangerTier::Routine,
     ),
@@ -714,15 +745,15 @@ pub const OP_TABLE: &[OpSpec] = &[
         ResourceShape::BucketSubresource,
         DangerTier::PostureAltering,
     ),
-    enforced(
+    // Enforced from M4 until 2026-08-08. CORS decides which browser origins may reach a
+    // bucket's data — posture, not data — and the gateway never inspected the rules it
+    // forwarded, so a write-config grant permitted `AllowedOrigin: *`. Bucket
+    // configuration is control-plane; `bucket:update` lives in the console.
+    denied(
         "PutBucketCors",
         "write_bucket_config",
         ResourceShape::Bucket,
         DangerTier::PostureAltering,
-        &[
-            "rule contents are bounded (limits.max_cors_rules) but not inspected: a \
-             write-config grant permits AllowedOrigin `*`",
-        ],
     ),
     denied(
         "PutBucketEncryption",
@@ -772,19 +803,16 @@ pub const OP_TABLE: &[OpSpec] = &[
         ResourceShape::Bucket,
         DangerTier::PostureAltering,
     ),
-    enforced(
+    // Enforced from M4 until 2026-08-08, and the clearest case in the whole re-scoping:
+    // a bucket policy is a SECOND, backend-side PDP that this gateway does not evaluate,
+    // so an Allow statement written through here widened access to a principal no
+    // hyperfluid grant named and no console screen showed. That is a bypass of the
+    // managed access model by definition, whatever verb guarded the write.
+    denied(
         "PutBucketPolicy",
         "write_bucket_config",
         ResourceShape::Bucket,
         DangerTier::PostureAltering,
-        &[
-            "only the self-lockout shapes are rejected (a Deny on Principal `*`, or \
-             confirm_remove_self_bucket_access); a Deny naming the tenant-owner ARN \
-             explicitly is NOT detectable here, because RouteSnapshot deliberately \
-             carries no owner credential to compare against",
-            "an Allow statement widening access to another principal is forwarded — the \
-             bucket policy is a second, backend-side PDP this gateway does not evaluate",
-        ],
     ),
     denied(
         "PutBucketReplication",
@@ -971,8 +999,8 @@ pub fn enforced_ops() -> Vec<&'static str> {
 }
 
 /// The typed verb for a table entry, or `None` when the entry names one [`Action`]
-/// cannot express (which, now that the two vocabularies are equal, means only the
-/// structurally unauthorizable ops).
+/// cannot express: the structurally unauthorizable ops (no verb at all) and the denied
+/// ops classified under a [`NON_GATEWAY_VERBS`] label.
 ///
 /// This is what keeps an `Enforced` flip honest: a hook cannot build an `OpaInput` for
 /// a verb with no `Action`, so `enforced_verbs_are_expressible_as_actions` fails first.
@@ -1008,17 +1036,115 @@ mod tests {
     }
 
     #[test]
-    fn the_frozen_vocabulary_and_the_action_enum_agree() {
+    fn the_gateway_vocabulary_and_the_action_enum_agree() {
         // Two spellings of one vocabulary: the table's string column and the typed verb
         // a hook decides against. While they could differ, an op could be flipped to
         // Enforced naming a verb no `Action` expresses — which is a hook that cannot be
         // written, discovered at the wrong time.
         let mut typed: Vec<&str> = Action::ALL.iter().map(|a| a.as_str()).collect();
-        let mut frozen: Vec<&str> = FROZEN_VERBS.to_vec();
+        let mut gateway: Vec<&str> = GATEWAY_VERBS.to_vec();
         typed.sort_unstable();
-        frozen.sort_unstable();
-        assert_eq!(typed, frozen);
-        assert_eq!(frozen.len(), 13, "the vocabulary is frozen at 13 verbs");
+        gateway.sort_unstable();
+        assert_eq!(typed, gateway);
+        assert_eq!(
+            gateway.len(),
+            6,
+            "the projected vocabulary is six verbs (settled 2026-08-08)"
+        );
+    }
+
+    #[test]
+    fn a_removed_verb_cannot_be_grantable_and_a_classification_label_at_once() {
+        // The two sets are what separates "a grant can carry this" from "this is a label
+        // on a row nothing reaches". An overlap would mean a control-plane authority had
+        // quietly re-entered the grant vocabulary — the exact regression the 2026-08-08
+        // settlement is guarding against — so it is a hard failure, not a lint.
+        for verb in NON_GATEWAY_VERBS {
+            assert!(
+                !GATEWAY_VERBS.contains(verb),
+                "{verb} is both a grantable gateway verb and a control-plane label"
+            );
+            assert!(
+                Action::ALL.iter().all(|a| a.as_str() != *verb),
+                "{verb} was removed from the vocabulary but `Action` still expresses it"
+            );
+        }
+        // …and each label still classifies at least one row. A label nothing uses is a
+        // claim about the table that the table has stopped making.
+        for verb in NON_GATEWAY_VERBS {
+            assert!(
+                OP_TABLE.iter().any(|s| s.verb == Some(verb)),
+                "NON_GATEWAY_VERBS names {verb}, which no OP_TABLE row uses — delete it"
+            );
+        }
+    }
+
+    #[test]
+    fn no_control_plane_operation_is_enforced() {
+        // The load-bearing half of the 2026-08-08 settlement, stated where a reviewer
+        // editing this table will trip over it: the gateway is DATA-PLANE ONLY. Making
+        // or unmaking a bucket, and writing its policy or CORS, go through the console
+        // and the operator so that every bucket has an `HFBucket` CR behind it. Flipping
+        // one of these back to `Enforced` fails here before it fails anywhere subtler.
+        for s in OP_TABLE {
+            if let Some(v) = s.verb
+                && NON_GATEWAY_VERBS.contains(&v)
+            {
+                assert_eq!(
+                    s.coverage,
+                    Coverage::Denied,
+                    "{} is Enforced under the control-plane label {v}; the gateway does \
+                     not broker that authority and there is no grant that carries it",
+                    s.name
+                );
+                assert!(
+                    action_for(s).is_none(),
+                    "{} names {v}, which `Action` must not be able to express",
+                    s.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_six_ops_re_denied_on_2026_08_08_are_refused_at_the_gate() {
+        // Named one by one rather than counted, because the count is the weaker claim:
+        // a future edit could flip one of these back on and rebalance the total by
+        // denying something else, and `exactly_23_enforced_76_denied` would still pass.
+        for op in [
+            "CreateBucket",
+            "DeleteBucket",
+            "GetBucketPolicy",
+            "PutBucketPolicy",
+            "GetBucketCors",
+            "PutBucketCors",
+        ] {
+            assert_eq!(
+                gate_op(op),
+                Err(GateDenial::NotEnforced),
+                "{op} must be refused before deserialization"
+            );
+            assert!(
+                spec(op).unwrap().blind_spots.is_empty(),
+                "{op} is denied but still claims blind spots"
+            );
+        }
+    }
+
+    #[test]
+    fn bucket_existence_is_one_verb_in_both_request_shapes() {
+        // The defect that started the 2026-08-08 change was two PEPs answering one
+        // question differently. Its gateway-local echo is HeadBucket and ListBuckets
+        // asking about existence under two different verbs, so a principal's `aws s3 ls`
+        // came back empty while its next `head-bucket` succeeded.
+        for op in ["HeadBucket", "GetBucketLocation", "ListBuckets"] {
+            assert_eq!(spec(op).unwrap().verb, Some("read"), "{op}");
+            assert_eq!(action_for(spec(op).unwrap()), Some(Action::Read), "{op}");
+        }
+        // …and the two shapes really are different, which is why the rego needs a gate
+        // on each rule that reads the verb.
+        assert_eq!(spec("HeadBucket").unwrap().shape, ResourceShape::Bucket);
+        assert_eq!(spec("ListBuckets").unwrap().shape, ResourceShape::Account);
     }
 
     #[test]

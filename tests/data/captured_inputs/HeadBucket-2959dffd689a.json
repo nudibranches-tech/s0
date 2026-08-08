@@ -1,6 +1,6 @@
 {
   "acl_grants": [],
-  "action": "read_bucket",
+  "action": "read",
   "backend": {
     "id": "bay-1",
     "kind": "ceph"
@@ -16,8 +16,7 @@
     "type": "user"
   },
   "request": {
-    "method": "GET",
-    "params": "location="
+    "method": "HEAD"
   },
   "tenant": "acme"
 }

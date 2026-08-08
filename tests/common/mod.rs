@@ -50,15 +50,21 @@ pub fn scratch(tag: &str) -> PathBuf {
 }
 
 /// The grant fixture most tests run against: `alice` may read/list/write/delete objects
-/// (and their tags) under `reports/2024/`, and operate on the `reports` bucket itself —
-/// including enumerating her buckets, of which `reports` is the only visible one.
-/// Nothing anywhere else.
+/// (and write their tags) under `reports/2024/`, and may see that the `reports` bucket
+/// exists — including enumerating her buckets, of which `reports` is the only visible
+/// one. Nothing anywhere else.
 ///
 /// Two grants, not one, because the two halves of the vocabulary scope differently: the
-/// object verbs are narrowed by `prefixes`, while the bucket verbs have no key to test a
-/// prefix against and are therefore emitted with `"prefixes": []` — the shape the
-/// projection is required to produce (ADR-006), so the fixture models the contract
-/// rather than a convenient approximation of it.
+/// object verbs are narrowed by `prefixes`, while `read` has no key to test a prefix
+/// against and is therefore emitted with `"prefixes": []` — the shape the projection is
+/// required to produce (ADR-006), so the fixture models the contract rather than a
+/// convenient approximation of it.
+///
+/// The second grant carries **one** verb since 2026-08-08. It used to carry six; the
+/// other five (`create_bucket`, `delete_bucket`, `{read,write}_bucket_config`,
+/// `list_buckets`) were removed from the vocabulary, four because they bypassed the
+/// managed path and one because it merged into `read`. `read` is what `HeadBucket`,
+/// `GetBucketLocation` and `ListBuckets` all decide against now.
 ///
 /// `org_settings.reserved_tag_keys` is **published** here, because the shipped default
 /// for an absent list is to refuse every tag write (`access::tagging`). A fixture without
@@ -79,11 +85,10 @@ pub fn alice_bundle() -> serde_json::Value {
             "s3_grants": { "alice": [
                 { "bucket": "reports",
                   "actions": ["read_objects", "list_objects", "write_objects", "delete_objects",
-                              "read_object_tags", "write_object_tags"],
+                              "write_object_tags"],
                   "prefixes": ["2024/"] },
                 { "bucket": "reports",
-                  "actions": ["read_bucket", "create_bucket", "delete_bucket",
-                              "read_bucket_config", "write_bucket_config", "list_buckets"],
+                  "actions": ["read"],
                   "prefixes": [] }
             ] },
             "group_grants": {}

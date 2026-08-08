@@ -270,14 +270,12 @@ pub struct LimitsConfig {
     /// B-1). Set it to 0 and every tag write is refused *and recorded*.
     #[serde(default = "default_max_tag_count")]
     pub max_tag_count: usize,
-    /// Byte ceiling on a `PutBucketPolicy` document. AWS caps bucket policies at 20 KB;
-    /// `xml_max_body_size` (20 MiB) is four orders of magnitude too generous for a
-    /// control-plane body, and the gateway parses this one before forwarding it.
-    #[serde(default = "default_max_bucket_policy_bytes")]
-    pub max_bucket_policy_bytes: usize,
-    /// AWS semantic cap: ≤ 100 CORS rules per bucket (`PutBucketCors`).
-    #[serde(default = "default_max_cors_rules")]
-    pub max_cors_rules: usize,
+    // `max_bucket_policy_bytes` and `max_cors_rules` were removed on 2026-08-08 with the
+    // ops they bounded: `PutBucketPolicy` and `PutBucketCors` are `Coverage::Denied`, so
+    // neither body reaches this process. Both had `#[serde(default)]` and the operator
+    // renders neither (`hf_bin_operator/src/s3_gateway/config.rs::LimitsSection`), so a
+    // deployed `gateway.json` that still carries them keeps loading — they are simply
+    // ignored. A knob that bounds nothing is a claim the binary no longer makes.
     /// Multi-prefix list fan-out bound; above it the list fails closed.
     pub max_list_fanout: usize,
     /// Page size ceiling for a **filtered** `ListBuckets`.
@@ -327,8 +325,6 @@ impl Default for LimitsConfig {
             presigned_url_max_skew_time_secs: 900,
             max_delete_keys: 1000,
             max_tag_count: default_max_tag_count(),
-            max_bucket_policy_bytes: default_max_bucket_policy_bytes(),
-            max_cors_rules: default_max_cors_rules(),
             max_list_fanout: 16,
             max_buckets_per_page: default_max_buckets_per_page(),
             max_bucket_list_pages: default_max_bucket_list_pages(),
@@ -712,11 +708,8 @@ fn default_post_object_max_file_size() -> u64 {
 fn default_max_tag_count() -> usize {
     10
 }
-/// AWS: 20 KB per bucket policy.
-fn default_max_bucket_policy_bytes() -> usize {
-    20 * 1024
-}
-/// AWS: 100 CORS rules per bucket.
+/// One `ListBuckets` page, gateway-owned (the filtering makes the backend's own
+/// pagination meaningless to the client).
 fn default_max_buckets_per_page() -> usize {
     1000
 }
@@ -725,9 +718,6 @@ fn default_max_bucket_list_pages() -> usize {
     64
 }
 
-fn default_max_cors_rules() -> usize {
-    100
-}
 fn default_sub_claim() -> String {
     "sub".into()
 }
@@ -776,8 +766,6 @@ mod tests {
         // The control-plane body caps: AWS's own semantics, four orders of magnitude
         // below `xml_max_body_size`.
         assert_eq!(cfg.max_tag_count, 10);
-        assert_eq!(cfg.max_bucket_policy_bytes, 20 * 1024);
-        assert_eq!(cfg.max_cors_rules, 100);
     }
 
     /// `expand_env` is what makes a single ConfigMap render a per-pod spill path.

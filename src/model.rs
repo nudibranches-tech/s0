@@ -5,23 +5,39 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The grant vocabulary the gateway authorizes against — the **13 frozen verbs**.
+/// The grant vocabulary the gateway authorizes against — the **six projected verbs**.
 ///
 /// Deliberately coarser than the 99 S3 ops: every enforced S3 op maps onto exactly one
-/// of these (a `PutObject` to `write_objects`, a `HeadBucket` to `read_bucket`), and
-/// `CopyObject` maps to two (source read + dest write). The set is frozen: it is the
-/// vocabulary the grant projection emits and the rego matches on, so adding a verb is a
-/// cross-repo contract change, not a local edit.
+/// of these (a `PutObject` to `write_objects`, a `HeadBucket` to `read`), and
+/// `CopyObject` maps to two (source read + dest write). The set is not a local choice:
+/// it is exactly what hyperfluid's grant projection emits
+/// (`s3_gateway_projection::verbs`), so adding a verb is a cross-repo contract change.
+/// `tests/cross_repo_contract.rs::the_gateway_vocabulary_is_what_hyperfluid_projects`
+/// holds the two sides equal against the real checkout.
 ///
-/// `manage_lifecycle` was **deleted** rather than kept as a spare. It was the only
-/// keyless verb, and its rego branch granted the whole bucket ignoring prefixes — a
-/// latent whole-bucket allow that would start matching the moment any lifecycle op
-/// landed. The bucket-scoped verbs below replace it explicitly.
+/// ## THE GATEWAY IS DATA-PLANE ONLY (settled 2026-08-08)
 ///
-/// Policy-vs-CORS is **not** split into separate verbs: both are
-/// `read_bucket_config` / `write_bucket_config`, discriminated by
-/// [`crate::authz::OpaInput::config_kind`]. A verb per sub-resource would multiply the
-/// vocabulary without making any grant more expressive.
+/// Seven verbs were **removed** on 2026-08-08, and the reason is one sentence: each was
+/// a way to act on the bucket as a *managed resource* without going through the managed
+/// path. A bucket made with `create_bucket` has no `HFBucket` CR — unmanaged, unquota'd,
+/// invisible to the console, absent from `bucket_attributes`. So existence, policy,
+/// CORS and quota are control-plane, through the console and the operator, and never
+/// through S3:
+///
+/// | removed | where that authority lives now |
+/// |---|---|
+/// | `create_bucket`, `delete_bucket` | console `bucket:create` / `bucket:delete` |
+/// | `read_bucket_config`, `write_bucket_config` | console `bucket:read` / `bucket:update` |
+/// | `write_object_acl` | nowhere — conferring an ACL is refused in code ([`crate::access::headers`]) |
+/// | `read_bucket`, `list_buckets` | merged into [`Action::Read`] |
+/// | `read_object_tags` | merged into [`Action::ReadObjects`] |
+///
+/// The two merges are widenings of a surviving verb, not deletions of authority:
+/// reading an object's tags is strictly less than reading the object, and
+/// "this bucket exists, for me" is one question however it is asked.
+///
+/// `manage_lifecycle` was deleted earlier, and for the same family of reason: it was a
+/// keyless verb whose rego branch granted the whole bucket ignoring prefixes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Action {
@@ -29,39 +45,42 @@ pub enum Action {
     ReadObjects,
     WriteObjects,
     DeleteObjects,
-    ReadObjectTags,
+    /// Kept **deliberately separate** from [`Action::WriteObjects`].
+    /// `OpaInput::object_tags` exists so a policy can key on tags; the moment it does, a
+    /// principal holding write_objects + tag-write could grant itself whatever the
+    /// policy keys on. Merging the two plants a trap that springs when tag-driven ABAC
+    /// is enabled.
     WriteObjectTags,
-    WriteObjectAcl,
     // listing: bucket + prefix, and the *response* is in scope
     ListObjects,
-    // bucket-scoped: no key, so `prefixes` cannot narrow them
-    ReadBucket,
-    CreateBucket,
-    DeleteBucket,
-    ReadBucketConfig,
-    WriteBucketConfig,
-    // account-scoped
-    ListBuckets,
+    /// The existence verb — hyperfluid's `bucket:read`, and the ONE dual-plane
+    /// permission in the family.
+    ///
+    /// It answers "does this bucket exist, for me?", which the console asks on its
+    /// bucket list and detail routes and which S3 asks as `ListBuckets`, `HeadBucket`
+    /// and `GetBucketLocation`. Those two PEPs must answer identically or a user is told
+    /// yes by one and no by the other — the defect the 2026-08-08 vocabulary exists to
+    /// remove — so it is one verb, and it is the only bucket-shaped verb left.
+    ///
+    /// It is bucket-scoped AND account-scoped: bucket-shaped for `HeadBucket` /
+    /// `GetBucketLocation` (`input.bucket` names one) and account-shaped for
+    /// `ListBuckets` (`input.bucket == ""`). The rego rules that read it are gated on
+    /// which, and those gates are load-bearing — see the module note in
+    /// `policy/gateway/authz.rego`.
+    Read,
 }
 
 impl Action {
     /// Every verb, in declaration order. Exhaustively matched in [`Action::as_str`], so
     /// a new variant is a compile error there, and cross-checked against
-    /// `optable::FROZEN_VERBS` and the rego's own write set by test.
+    /// `optable::GATEWAY_VERBS` and the rego's own action sets by test.
     pub const ALL: &'static [Action] = &[
         Action::ReadObjects,
         Action::WriteObjects,
         Action::DeleteObjects,
-        Action::ReadObjectTags,
         Action::WriteObjectTags,
-        Action::WriteObjectAcl,
         Action::ListObjects,
-        Action::ReadBucket,
-        Action::CreateBucket,
-        Action::DeleteBucket,
-        Action::ReadBucketConfig,
-        Action::WriteBucketConfig,
-        Action::ListBuckets,
+        Action::Read,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -69,16 +88,9 @@ impl Action {
             Action::ReadObjects => "read_objects",
             Action::WriteObjects => "write_objects",
             Action::DeleteObjects => "delete_objects",
-            Action::ReadObjectTags => "read_object_tags",
             Action::WriteObjectTags => "write_object_tags",
-            Action::WriteObjectAcl => "write_object_acl",
             Action::ListObjects => "list_objects",
-            Action::ReadBucket => "read_bucket",
-            Action::CreateBucket => "create_bucket",
-            Action::DeleteBucket => "delete_bucket",
-            Action::ReadBucketConfig => "read_bucket_config",
-            Action::WriteBucketConfig => "write_bucket_config",
-            Action::ListBuckets => "list_buckets",
+            Action::Read => "read",
         }
     }
 
@@ -86,36 +98,39 @@ impl Action {
     ///
     /// This set MUST equal the rego's `write_actions`, or `freeze_writes` — the only
     /// kill switch the live bundle carries — stops covering a verb on one side while
-    /// still claiming to on the other. `write_set_matches_the_shipped_rego` in
+    /// still claiming to on the other. `the_write_set_matches_the_shipped_rego` in
     /// `tests/op_coverage.rs` extracts the rego's set from the shipped module and
     /// compares it here, so a divergence fails the build rather than surfacing as a
     /// freeze that did not freeze.
     pub const fn is_write(self) -> bool {
         matches!(
             self,
-            Action::WriteObjects
-                | Action::DeleteObjects
-                | Action::WriteObjectTags
-                | Action::WriteObjectAcl
-                | Action::CreateBucket
-                | Action::DeleteBucket
-                | Action::WriteBucketConfig
+            Action::WriteObjects | Action::DeleteObjects | Action::WriteObjectTags
         )
     }
 
-    /// True for the verbs decided against a bucket with **no object key**. They ignore
-    /// grant prefixes by construction (there is no key to test a prefix against), which
-    /// is why they are separate verbs rather than a keyless fall-through of the object
-    /// verbs — a `read_objects` grant scoped to `2024/` must never confer `HeadBucket`.
+    /// True for a verb decided against a **named bucket with no object key**. Such a
+    /// verb ignores grant prefixes by construction (there is no key to test a prefix
+    /// against), which is why it must be its own verb rather than a keyless
+    /// fall-through of the object verbs — a `read_objects` grant scoped to `2024/` must
+    /// never confer `HeadBucket`.
+    ///
+    /// Exactly one verb qualifies now, and that is the point: the other four keyless
+    /// verbs were the ones that bypassed the managed path.
     pub const fn is_bucket_scoped(self) -> bool {
-        matches!(
-            self,
-            Action::ReadBucket
-                | Action::CreateBucket
-                | Action::DeleteBucket
-                | Action::ReadBucketConfig
-                | Action::WriteBucketConfig
-        )
+        matches!(self, Action::Read)
+    }
+
+    /// True for a verb decided with **no bucket at all** (`input.bucket == ""`) — the
+    /// account scope, which today is `ListBuckets` alone.
+    ///
+    /// [`Action::Read`] is in this set *and* in [`Action::is_bucket_scoped`], and the
+    /// overlap is deliberate: one verb, two request shapes. Every rego rule that reads
+    /// either set therefore has to carry the matching shape gate, or a permitted
+    /// `HeadBucket` picks up a `visible_buckets` obligation it cannot apply — which
+    /// `must_understand` turns into a hard deny.
+    pub const fn is_account_scoped(self) -> bool {
+        matches!(self, Action::Read)
     }
 }
 
