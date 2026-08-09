@@ -61,7 +61,27 @@ async fn main() -> Result<()> {
     let config = GatewayConfig::load()?;
     let listen = config.listen;
     let instance = s0::config::instance_id();
-    tracing::info!(%instance, "s0 starting");
+    // `version` is on the first line this process ever writes, deliberately.
+    //
+    // The question "which bytes is this pod running?" is the whole of follow-up
+    // F1, and until now the only way to answer it was to read the pod's
+    // `imageID` and resolve that digest against the registry — i.e. to ask the
+    // cluster, from outside, about a process that was right there able to say.
+    // A build identifier in the startup line makes the running binary
+    // self-describing in the one place anyone already looks first, and it costs
+    // a compile-time constant.
+    //
+    // It is deliberately the crate version rather than a digest: a process
+    // cannot know the digest of the image it was unpacked from, and inventing a
+    // build-time stamp would make the number a function of *when* it was built
+    // rather than of *what* was built. The digest remains the authority
+    // (`kubectl get pod -o jsonpath='{…imageID}'`); this is the corroborating
+    // line that turns "the pod is stale" from an inference into a reading.
+    tracing::info!(
+        %instance,
+        version = env!("CARGO_PKG_VERSION"),
+        "s0 starting"
+    );
     let (gateway, audit_handle) = Gateway::build(&config)?;
 
     let source = match &config.bundle_url {
