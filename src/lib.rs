@@ -18,6 +18,9 @@
 //! - [`admin`]    — health / readiness / metrics, on a listener of its own.
 //! - [`internal`] — the **authenticated** console-mediated session mint, on a
 //!   listener of its own (never the admin listener, never the data plane).
+//! - [`mint`]     — the OIDC badge desk, on a listener of its own.
+//! - [`webidentity`] — `AssumeRoleWithWebIdentity` in the AWS STS wire protocol, served
+//!   on the mint's listener: the door every S3 SDK can open with stock configuration.
 //! - [`shutdown`] — the one signal every listener drains on.
 //! - [`secret`]   — `Secret<T>`: a configured credential that cannot be printed.
 
@@ -39,3 +42,4 @@ pub mod proxy;
 pub mod secret;
 pub mod server;
 pub mod shutdown;
+pub mod webidentity;

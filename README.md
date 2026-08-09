@@ -44,8 +44,12 @@ SigV4 verify → region → `S3Access::check` (no body) → body buffer → dese
   - CopyObject **source** (authorizes source read *and* dest write),
   - multi-delete **keys** (authorizes *each* key; strips denied keys from the forward),
   - POST form-upload **key**.
-- **Unbounded list narrowing**: a prefix-scoped `ListObjectsV2` with no prefix is
-  rewritten to the granted prefix instead of enumerating the whole bucket.
+- **List scoping, AWS-shaped**: an **unbounded** `ListObjectsV2` — no prefix at all — is
+  **denied** for a prefix-scoped principal, exactly as `s3:ListBucket` + an `s3:prefix`
+  condition denies it in AWS. A prefix *wider* than the grant but overlapping it is
+  rewritten down to the grant (or fanned out across several) instead of enumerating the
+  whole bucket. Narrowing where the caller named no scope was dropped on 2026-08-09: a
+  filtered listing returned with no signal that it is filtered reads as the whole bucket.
 - **Live policy / live revocation**: OPA holds the policy; a revoked grant denies on the
   next request. No policy is baked into credentials.
 - **`freeze_writes`** org kill-switch and per-bucket denylist, plus the grant superset.
@@ -109,6 +113,7 @@ key, so replacing it invalidates live sessions. Rotate it in a window.
 | [`gateway`](src/gateway.rs) / [`server`](src/server.rs) | assembly + hardened hyper serving |
 | [`admin`](src/admin.rs) / [`shutdown`](src/shutdown.rs) | `/healthz` `/readyz` `/metrics` on their own port; one signal, ordered drain |
 | [`internal`](src/internal.rs) | the **authenticated** control-plane surface: `POST /internal/v1/sts/sessions`, on a port of its own |
+| [`mint`](src/mint.rs) / [`webidentity`](src/webidentity.rs) | the credential door an S3 client uses: `Action=AssumeRoleWithWebIdentity` in the AWS STS wire protocol, on a port of its own |
 
 ## Listeners
 
@@ -121,8 +126,44 @@ answering anonymously.
 |---|---|---|---|
 | `listen` (8014) | the S3 data plane | SigV4, per-request authorization | Ingress-fronted; public |
 | `admin_listen` (8016) | `/healthz` `/readyz` `/metrics` | **none, by construction** — a kubelet probe cannot present a secret | Service (scraping/probes) only. Never the ingress. |
-| `sts_mint.listen` (8015) | OIDC → session (the badge desk) | bearer OIDC token | optional; absent unless configured |
+| `sts_mint.listen` (8015) | **`Action=AssumeRoleWithWebIdentity`** (the AWS STS wire protocol), plus the older bearer-OIDC → session exchange | **none, by design** — a valid web identity token *is* the credential, exactly as at `sts.amazonaws.com` | optional; absent unless configured. Ingress-fronted on its **own hostname** when it is. |
 | `internal.listen` (8017) | `POST /internal/v1/sts/sessions` | `X-Shared-Secret`, constant-time | **the console only.** Never the ingress, never the data plane. |
+
+**Two of these mint credentials, and they are not the same socket on purpose.** 8017 is
+the control plane's door: shared-secret authenticated, never public, and it accepts
+*assertions* about a caller the console has already authenticated. 8015 is the client's
+door: public, unauthenticated because the OIDC token is the credential, and it accepts
+no assertions at all — it derives the principal from the token, the tenant from the
+`RoleArn`, and the organization from s0's own routing table. Collapsing them would put
+the shared-secret boundary behind a routing decision, which is precisely the failure the
+rule above exists to prevent. `GatewayConfig::validate` refuses a config in which any
+two of the four share a port.
+
+### Getting a credential ([`webidentity`](src/webidentity.rs))
+
+Every S3 SDK can obtain one with stock configuration — the same shape an EKS pod uses
+for IRSA, because it is the same call:
+
+```
+AWS_ROLE_ARN=arn:aws:iam::<tenant>:role/<tenant>-sts-role
+AWS_WEB_IDENTITY_TOKEN_FILE=/var/run/secrets/…/token
+AWS_ENDPOINT_URL_STS=https://<org>.s3-gw-sts.<domain>
+AWS_ENDPOINT_URL_S3=https://<org>.s3-gw.<domain>
+```
+
+The SDK mints, reads `Expiration` off the XML and re-mints before it lapses. The
+`RoleArn` is doing the work the token cannot: hyperfluid's Keycloak mints no tenant
+claim and no organization claim, and cannot — the tenant is a property of the *harbor
+being addressed*, not of the *user* — so the tenant travels as a request parameter, the
+token proves who you are, and the organization is resolved from s0's own tenant→org
+binding and never from a claim. The role name confers nothing: s0 has no role objects,
+and authority comes from the bundle at decision time.
+
+Note that STS is on its **own hostname**, not a path on the S3 host. Ceph RGW and MinIO
+do fold the two together; AWS does not, and neither does s0 — a path prefix would
+collide with a bucket named `sts`, and folding the unauthenticated surface into the
+SigV4 data plane would make "is this request authenticated?" a matter of parsing a POST
+body correctly on the public port.
 
 The internal listener is absent unless `internal` is present in the config: no section,
 no bind, no port. A missing or empty `internal.shared_secret` **refuses every request**

@@ -70,6 +70,10 @@
     "org_claim": "org",
     "groups_claim": "groups",
     "jwks_timeout_secs": 5,
-    "jwks_refresh_secs": 300
+    "jwks_refresh_secs": 300,
+    "web_identity_enabled": true,
+    "web_identity_audiences": ["acme-storage", "hf-console", "control-plane-sa"],
+    "role_name_template": "{tenant}-sts-role",
+    "max_duration_secs": 3600
   }
 }

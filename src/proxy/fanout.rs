@@ -1,5 +1,12 @@
 //! Multi-prefix list fan-out (ADR-004). A subject scoped to several object prefixes
-//! issuing an unbounded `ListObjects` cannot be expressed as one S3 `prefix` param.
+//! issuing a list whose own prefix spans more than one of them cannot be served by a
+//! single S3 `prefix` param.
+//!
+//! It used to say "issuing an *unbounded* `ListObjects`", and that was the motivating
+//! case. It no longer is: since 2026-08-09 a list naming no prefix at all is denied
+//! (AWS parity — `policy/gateway/authz.rego` `narrowed`), so the fan-out is reached by
+//! a request that names a prefix WIDER than several grants and overlapping them. The
+//! mechanism below is unchanged; only the request shape that gets here is.
 //!
 //! Key insight: the granted prefixes are **sorted and disjoint**, so every key under
 //! `2024/` sorts before every key under `2025/`. The merged listing is therefore a

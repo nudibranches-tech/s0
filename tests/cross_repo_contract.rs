@@ -318,6 +318,16 @@ mod hf_path {
     /// The projection that decides which of those keys reach the gateway at all.
     pub const PROJECTION_VERBS_RS: &str = "rust/hf_module_console_api/src/hf_console/inbound/\
                                            http/handlers/vauban/s3_gateway_projection/verbs.rs";
+    /// The operator's writer for `gateway.json`, including the `sts_mint` section that
+    /// makes the `AssumeRoleWithWebIdentity` surface exist.
+    pub const GATEWAY_CONFIG_RS: &str = "rust/hf_bin_operator/src/s3_gateway/config.rs";
+    /// Where the per-Harbor RGW role and its accepted client ids are provisioned. The
+    /// role name and the audience list s0 is configured with have to be the same ones.
+    pub const HARBOR_BINDING_RS: &str =
+        "rust/hf_bin_operator/src/controllers/org_storage/harbor_binding_reconciler.rs";
+    /// `to_rgw_role_name` / `to_rgw_tenant`: the two sanitizers whose *disagreement* is
+    /// the reason `webidentity::role_name_key` folds separators.
+    pub const RGW_ADMIN_RS: &str = "rust/hf_bin_operator/src/services/ceph_rgw_admin/mod.rs";
 }
 
 // ── the always-on half: s0's own constants against the pins ─────────────────────
@@ -2873,4 +2883,359 @@ fn sample_decision_record() -> s0::audit::AuditRecord {
             backend_status: None,
         },
     )
+}
+
+// ── the AssumeRoleWithWebIdentity surface (stage 2) ─────────────────────────────
+//
+// s0 is the *reader* of `sts_mint`; hyperfluid's operator is the writer. Four things
+// have to agree across the two repositories, and every one of them fails silently or
+// fails totally rather than partially:
+//
+// * the **port**, or the Ingress fronts a socket nothing listens on;
+// * the **role name**, or the ARN the platform provisions and documents is the one ARN
+//   s0 refuses;
+// * the **accepted client ids**, or a token RGW's STS would honour is refused here;
+// * the **`{tenant}` placeholder**, or the template expands to a literal.
+
+/// The role-name template s0 substitutes into must be the one the operator renders, and
+/// it must carry the placeholder s0 actually looks for.
+#[test]
+fn the_role_name_template_is_the_one_the_operator_renders() {
+    let Some(repo) = hyperfluid_repo("the STS role-name template") else {
+        return;
+    };
+    let src = read(&repo, hf_path::GATEWAY_CONFIG_RS);
+    assert!(
+        src.contains(r#"STS_ROLE_NAME_TEMPLATE: &str = "{tenant}-sts-role""#),
+        "the operator no longer renders `{{tenant}}-sts-role` as the role-name template. \
+         s0 substitutes `{{tenant}}` into whatever it is given and refuses a role name \
+         that does not match, so a change here is AccessDenied on every \
+         AssumeRoleWithWebIdentity."
+    );
+    // …and it is the same name `ensure_harbor_sts` provisions in RGW, which is what
+    // makes a client's `AWS_ROLE_ARN` portable between the RGW STS path and s0.
+    let harbor = read(&repo, hf_path::HARBOR_BINDING_RS);
+    assert!(
+        harbor.contains(r#"to_rgw_role_name(&format!("{}-sts-role", tenant))"#),
+        "the per-Harbor RGW role is no longer named `<tenant>-sts-role`, so the ARN a \
+         client uses against RGW is no longer the ARN it can use against s0"
+    );
+}
+
+/// The two platform client ids s0 accepts must be the two the RGW role's trust policy
+/// accepts. A token that works against `<org>.s3.<domain>` has to work against
+/// `<org>.s3-gw-sts.<domain>`, or migrating a consumer is an identity-provider change
+/// rather than an endpoint change.
+#[test]
+fn the_accepted_client_ids_are_the_ones_the_rgw_role_trusts() {
+    let Some(repo) = hyperfluid_repo("the STS accepted client ids") else {
+        return;
+    };
+    let harbor = read(&repo, hf_path::HARBOR_BINDING_RS);
+    assert!(
+        harbor.contains(r#"&[&storage_client_id, "hf-console", "control-plane-sa"]"#),
+        "the RGW role's accepted client-id list has changed; \
+         `s3_gateway::config::PLATFORM_STS_AUDIENCES` must change with it"
+    );
+    let cfg = read(&repo, hf_path::GATEWAY_CONFIG_RS);
+    assert!(
+        cfg.contains(r#"PLATFORM_STS_AUDIENCES: [&str; 2] = ["hf-console", "control-plane-sa"]"#),
+        "the operator's rendered audience list no longer matches the RGW role's"
+    );
+}
+
+/// **The reason `webidentity::role_name_key` folds separators**, pinned against the two
+/// hyperfluid functions whose disagreement causes it.
+///
+/// `to_rgw_tenant` maps a harbor slug's `-` to `_`; `to_rgw_role_name` refuses `_` in a
+/// role name and maps it back to `-`. So `{tenant}-sts-role` and the role that is
+/// actually provisioned differ for every harbor whose slug contains a hyphen, and a
+/// byte comparison in s0 would 403 the exact ARN the platform documents.
+///
+/// If either sanitizer ever stops doing this, the folding in s0 becomes unnecessary
+/// looseness on a credential endpoint and should be reconsidered — which is what this
+/// test is here to notice.
+#[test]
+fn the_two_sanitizers_still_disagree_which_is_why_s0_folds_separators() {
+    let Some(repo) = hyperfluid_repo("the tenant/role-name sanitizers") else {
+        return;
+    };
+    let src = read(&repo, hf_path::RGW_ADMIN_RS);
+    // `to_rgw_tenant`: everything that is not alphanumeric or `_` becomes `_`.
+    assert!(
+        src.contains("if c.is_ascii_alphanumeric() || c == '_'"),
+        "to_rgw_tenant no longer maps a slug's separators to `_`"
+    );
+    // `to_rgw_role_name`: `_` is NOT in the permitted set, so it becomes `-`.
+    assert!(
+        src.contains(
+            r#"c.is_ascii_alphanumeric() || matches!(c, ':' | '=' | ',' | '.' | '@' | '-')"#
+        ),
+        "to_rgw_role_name's permitted charset has changed; s0's role-name folding was \
+         derived from it"
+    );
+    assert!(
+        !src.contains(r#"matches!(c, '_' | ':'"#),
+        "to_rgw_role_name now permits `_`, so the tenant and the role name may agree \
+         byte for byte and s0's separator folding is no longer required"
+    );
+}
+
+// ── the DATA half of the contract: what the gateway reads, the platform writes ──
+
+/// Bundle paths a policy reads that the platform's document does **not** carry,
+/// each with the reason it is tolerated. Same discipline as
+/// [`PLATFORM_INPUT_PATHS_S0_DOES_NOT_EMIT`], aimed the other way down the wire.
+///
+/// Empty is the goal. `org_settings.reserved_tag_keys` lived here in spirit for
+/// three months (runbook P7): s0's PEP read it, hyperfluid never wrote it, and the
+/// consequence was that `bucket:write_object_tags` — a verb in the settled
+/// vocabulary — could never succeed in production, with nothing red anywhere.
+const BUNDLE_PATHS_THE_PLATFORM_DOES_NOT_WRITE: &[(&str, &str)] = &[];
+
+/// Every `data.<path>` the running policies read, from all three readers at once.
+///
+/// The gateway's `data` document has three consumers and they are easy to think of
+/// as one: the module the PLATFORM pushes (what runs in production), s0's
+/// compiled-in DEFAULT module (what runs in development and what the dual-engine
+/// parity gate replays against), and s0's own **Rust** PEP, which reads
+/// `org_settings.reserved_tag_keys` directly and deliberately — so a pushed policy
+/// cannot forget the reserved-key screen.
+fn bundle_data_readers(hyperfluid: Option<&Path>) -> std::collections::BTreeSet<String> {
+    let mut paths = rego_data_references(GATEWAY_REGO);
+    if let Some(repo) = hyperfluid {
+        paths.extend(rego_data_references(&read(repo, hf_path::RULES_REGO)));
+    }
+    // The one bundle path read by s0's PEP rather than by a policy. Taken from the
+    // constant, not spelled again here, so a move shows up as a failure and not as
+    // a test that quietly stopped covering anything.
+    paths.insert(s0::access::tagging::BUNDLE_PATH.join("."));
+    paths
+}
+
+/// Every `data.<a>.<b>…` reference in a rego module, comments stripped. The `data`
+/// twin of [`rego_input_references`], and deliberately the same shape of extractor:
+/// a bracketed index (`data.tenants[input.tenant]`) truncates the path at the last
+/// dotted segment, so this checks the levels a document can be *missing whole*.
+fn rego_data_references(rego: &str) -> std::collections::BTreeSet<String> {
+    let mut refs = std::collections::BTreeSet::new();
+    for line in rego.lines() {
+        let code = line.split('#').next().unwrap_or("");
+        let bytes = code.as_bytes();
+        let mut i = 0;
+        while let Some(pos) = code[i..].find("data.") {
+            let start = i + pos;
+            let preceded_by_ident =
+                start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_');
+            i = start + "data.".len();
+            if preceded_by_ident {
+                continue;
+            }
+            let mut end = i;
+            while end < bytes.len()
+                && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_' || bytes[end] == b'.')
+            {
+                end += 1;
+            }
+            let path = code[start + "data.".len()..end].trim_end_matches('.');
+            // `data.s3.authz.decision` is the ENTRYPOINT, not a bundle path — it
+            // names the rule being evaluated, which the document never carries.
+            if !path.is_empty() && !DECISION_RULE.ends_with(path) {
+                refs.insert(path.to_string());
+            }
+            i = end;
+        }
+    }
+    refs
+}
+
+/// **The mirror of `the_platform_module_reads_no_input_path_s0_never_sends`, and the
+/// generalisation of runbook P7.**
+///
+/// A bundle field the gateway reads and the platform never writes is a rego lookup of
+/// an absent key, which is `undefined` — neither true nor false — so every rule
+/// depending on it is permanently inert. That is not a hypothetical here: it is
+/// exactly what `org_settings.reserved_tag_keys` was. s0's PEP read it, treated its
+/// absence (correctly) as "deny every tag write", and so `PutObjectTagging`,
+/// `DeleteObjectTagging` and inline `x-amz-tagging` were refused in production for
+/// every principal in every organization, for as long as the field went unpublished.
+/// Nothing was red. Both repositories' suites were green, because each only tested
+/// itself and both agreed the *behaviour* was correct.
+///
+/// This is the gate that would have caught it on the day the reader landed.
+#[test]
+fn s0_reads_no_bundle_path_the_platform_never_writes() {
+    let repo = hyperfluid_repo("the platform's bundle data paths");
+    let referenced = bundle_data_readers(repo.as_deref());
+    assert!(
+        referenced.contains("tenants") && referenced.contains("org_settings.freeze_writes"),
+        "the reference extractor found nothing meaningful — this test would be \
+         vacuous: {referenced:?}",
+    );
+
+    let parsed = parse_bundle(PLATFORM_BUNDLE).expect("the captured platform bundle parses");
+    let tolerated: std::collections::BTreeMap<&str, &str> =
+        BUNDLE_PATHS_THE_PLATFORM_DOES_NOT_WRITE
+            .iter()
+            .copied()
+            .collect();
+
+    let mut unwritten = Vec::new();
+    for path in &referenced {
+        let written = resolve(&parsed.data, path).is_some_and(|v| !v.is_null());
+        if !written && !tolerated.contains_key(path.as_str()) {
+            unwritten.push(path.clone());
+        }
+    }
+    assert!(
+        unwritten.is_empty(),
+        "\nthe gateway reads data.{unwritten:?}, which the platform's own bundle does \
+         NOT carry (tests/data/platform/s3_gateway_bundle.json, produced by hyperfluid's \
+         real serializer).\n\
+         An absent bundle key is UNDEFINED in rego, not false, so every rule reading it \
+         is inert — and where the PEP reads it in Rust (reserved_tag_keys) an absent key \
+         is a silent, permanent DENY of a whole verb. Either publish the field from \
+         `{}` in {OTHER_REPO} and re-capture the fixture, or — if the gap is deliberate \
+         — record it in BUNDLE_PATHS_THE_PLATFORM_DOES_NOT_WRITE with the reason.\n",
+        hf_path::BUNDLE_RS,
+    );
+
+    // The tolerated list must not outlive the gap it documents.
+    for (path, _) in BUNDLE_PATHS_THE_PLATFORM_DOES_NOT_WRITE {
+        assert!(
+            referenced.contains(*path),
+            "BUNDLE_PATHS_THE_PLATFORM_DOES_NOT_WRITE records data.{path}, which nothing \
+             reads any more — delete the entry"
+        );
+        assert!(
+            resolve(&parsed.data, path).is_none_or(|v| v.is_null()),
+            "the platform now writes data.{path}: delete its entry from \
+             BUNDLE_PATHS_THE_PLATFORM_DOES_NOT_WRITE so the path is enforced again"
+        );
+    }
+}
+
+/// The reserved-key screen, end to end across the boundary: hyperfluid publishes the
+/// list, s0's PEP reads it from the captured document, and tag writes come out LIVE.
+///
+/// Asserted through `ReservedTagKeys::from_bundle` — the production reader — rather
+/// than by looking for a key in JSON, because "the field is present" and "tagging
+/// works" are different claims and only the second one is the feature.
+#[test]
+fn the_platforms_bundle_makes_tag_writes_live_and_still_screens_the_platform_namespace() {
+    let parsed = parse_bundle(PLATFORM_BUNDLE).expect("the captured platform bundle parses");
+    let reserved = s0::access::tagging::ReservedTagKeys::from_bundle(&parsed.data);
+
+    assert!(
+        !reserved.denies_all_tag_writes(),
+        "the platform's bundle must make tagging live; an absent or `[\"*\"]` list \
+         leaves `bucket:write_object_tags` a verb that can never succeed (runbook P7)"
+    );
+    assert!(reserved.inert_reason().is_none());
+
+    // An ordinary tag key is writable — the feature works.
+    let ok = std::collections::BTreeMap::from([("owner".to_string(), "team-a".to_string())]);
+    reserved.check(&ok).expect("an unreserved key is writable");
+
+    // The platform's own namespace is not, in every bundle, whatever the grants say.
+    // AWS reserves the `aws:` tag prefix the same way.
+    let platform = std::collections::BTreeMap::from([(
+        "hyperfluid/classification".to_string(),
+        "phi".to_string(),
+    )]);
+    assert!(
+        reserved.check(&platform).is_err(),
+        "the platform tag namespace must be reserved in every bundle"
+    );
+}
+
+/// The captured fixture cannot rot into a *subset* of the real document.
+///
+/// [`s0_reads_no_bundle_path_the_platform_never_writes`] resolves against the capture,
+/// so a capture missing a field the platform actually writes would make that test lie.
+/// This holds the capture's `org_settings` against the real `OrgSettings` struct in the
+/// live checkout — the level where P7's missing field lived, and the level a new
+/// org-global control would land at next.
+#[test]
+fn the_captured_bundles_org_settings_carries_every_field_the_platform_declares() {
+    let Some(repo) = hyperfluid_repo("the platform's OrgSettings fields") else {
+        return;
+    };
+    let src = read(&repo, hf_path::BUNDLE_RS);
+    let declared = required_fields_of_struct(&src, "OrgSettings")
+        .expect("hyperfluid still declares `pub struct OrgSettings`");
+    assert!(
+        declared.contains("freeze_writes") && declared.contains("reserved_tag_keys"),
+        "the struct-field extractor found the wrong thing: {declared:?}"
+    );
+
+    let parsed = parse_bundle(PLATFORM_BUNDLE).expect("the captured platform bundle parses");
+    let captured = parsed.data["org_settings"]
+        .as_object()
+        .expect("the bundle carries an org_settings object");
+    let missing: Vec<&String> = declared
+        .iter()
+        .filter(|f| !captured.contains_key(f.as_str()))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "\ntests/data/platform/s3_gateway_bundle.json is missing org_settings field(s) \
+         {missing:?} that {} in {OTHER_REPO} declares.\n\
+         Re-capture the fixture: the capture is what \
+         `s0_reads_no_bundle_path_the_platform_never_writes` resolves against, so a \
+         stale one turns that gate into a pass-by-omission.\n",
+        hf_path::BUNDLE_RS,
+    );
+}
+
+/// **A platform bundle stripped of its module is a whole-organization outage, and
+/// nothing in either repository said so.** Found while auditing the bundle contract
+/// for fields "declared but never populated" (the `reserved_tag_keys` class); this is
+/// the same failure one level up — not a missing FIELD, a missing MODULE, with s0's
+/// compiled-in default reading a key space the platform never writes.
+///
+/// `gateway::build_pdp` and `bundle_refresh::refresh_once` both fall back to
+/// [`GATEWAY_REGO`] when `policy` is absent. That module keys
+/// `s3_grants` / `user_attributes` on the RAW `input.principal.sub`, because every
+/// bundle s0 writes for itself does. The platform keys them `user:<oidc sub>` /
+/// `sa:<client id>`. So the fallback does not degrade — it denies everything, for
+/// everyone, on a document full of valid grants.
+///
+/// Measured here rather than argued, and paired with the pushed module deciding the
+/// same request the other way, so the test cannot pass because the data went bad.
+/// Fail-closed, therefore a reliability defect rather than a vulnerability — and
+/// `pdp::bundle::parse_bundle` now logs it at ERROR, because every symptom (Ready pod,
+/// advancing revision, 403 everywhere) points away from the cause.
+#[tokio::test]
+async fn a_platform_bundle_without_its_module_denies_the_whole_organization() {
+    let parsed = parse_bundle(PLATFORM_BUNDLE).expect("the fixture parses");
+    let input = platform_input("team-a/report.csv");
+
+    let pushed = RegorusPdp::new(
+        parsed
+            .policy
+            .as_deref()
+            .expect("the fixture ships a module"),
+        &parsed.data,
+    )
+    .expect("the pushed module compiles");
+    let allowed = pushed.decide(&input).await.expect("the PDP answers");
+    assert!(
+        allowed.allow,
+        "control: the PUSHED module must allow this request, or the rest of this test \
+         measures nothing — {allowed:?}"
+    );
+
+    let fallback =
+        RegorusPdp::new(GATEWAY_REGO, &parsed.data).expect("the default module compiles");
+    let denied = fallback.decide(&input).await.expect("the PDP answers");
+    assert!(
+        !denied.allow,
+        "the compiled-in default allowed a platform bundle it does not understand"
+    );
+    assert!(
+        denied.reason.contains("not a tenant member"),
+        "the deny is expected to come from the subject-key mismatch, not from \
+         somewhere else — if this reason changed, re-derive the claim: {denied:?}"
+    );
 }

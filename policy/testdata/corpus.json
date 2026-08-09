@@ -1,5 +1,5 @@
 {
-  "_comment": "Golden decision corpus for policy/gateway/authz.rego. Engine-agnostic: replayed through BOTH regorus (fast path) and OPA (sidecar) by the dual-engine parity gate, and the seed of the conformance corpus. `expect` asserts allow + obligations; obligations.allowed_prefixes is compared order-insensitively. NOTE (2026-08-08): there are no cases for create_bucket / delete_bucket / read_bucket_config / write_bucket_config / write_object_acl and there cannot be \u2014 each case's `input` is deserialized as a real OpaInput, so a verb outside the settled six does not parse. That is deliberate: it means the corpus cannot document a decision for an authority the gateway no longer brokers.",
+  "_comment": "Golden decision corpus for policy/gateway/authz.rego. Engine-agnostic: replayed through BOTH regorus (fast path) and OPA (sidecar) by the dual-engine parity gate, and the seed of the conformance corpus. `expect` asserts allow + obligations; obligations.allowed_prefixes is compared order-insensitively. NOTE (2026-08-08): there are no cases for create_bucket / delete_bucket / read_bucket_config / write_bucket_config / write_object_acl and there cannot be \u2014 each case's `input` is deserialized as a real OpaInput, so a verb outside the settled six does not parse. That is deliberate: it means the corpus cannot document a decision for an authority the gateway no longer brokers. NOTE (2026-08-09): an UNBOUNDED list (no `prefix`, or `\"prefix\": \"\"`) by a principal holding only prefix-scoped grants is a DENY, not a narrowing — AWS parity, and a filtered listing that does not say it is filtered reads as the whole bucket. The four list cases that pin the change are the two `-> DENIED (AWS parity...)` cases, the explicit-empty-prefix case, and `list whole-bucket grant -> no narrowing`, which is the positive control: bob's unbounded list still ALLOWS, so the deny is about the grant shape and not about the absent prefix. Narrowing itself is untouched and is pinned by the two `WIDER-but-overlapping` cases.",
   "bundles": {
     "default": {
       "org_settings": {
@@ -636,7 +636,43 @@
       }
     },
     {
-      "name": "list unbounded with multiple prefix grants -> allowed_prefixes",
+      "name": "list of a WIDER-but-overlapping prefix with multiple prefix grants -> allowed_prefixes",
+      "bundle": "default",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "alice",
+          "type": "user",
+          "attributes": {
+            "groups": [
+              "analysts"
+            ]
+          }
+        },
+        "backend": {
+          "id": "bay-1",
+          "kind": "ceph"
+        },
+        "tenant": "acme",
+        "organization_id": "org-acme",
+        "action": "list_objects",
+        "bucket": "reports",
+        "prefix": "20",
+        "request": {
+          "method": "GET"
+        }
+      },
+      "expect": {
+        "allow": true,
+        "allowed_prefixes": [
+          "2024/",
+          "2025/"
+        ]
+      }
+    },
+    {
+      "name": "list unbounded with multiple prefix grants -> DENIED (AWS parity, 2026-08-09)",
       "bundle": "default",
       "input": {
         "acl_grants": [],
@@ -663,11 +699,41 @@
         }
       },
       "expect": {
-        "allow": true,
-        "allowed_prefixes": [
-          "2024/",
-          "2025/"
-        ]
+        "allow": false,
+        "reason_contains": "unbounded list"
+      }
+    },
+    {
+      "name": "list with an EXPLICIT empty prefix is the same unbounded request -> DENIED",
+      "bundle": "default",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "alice",
+          "type": "user",
+          "attributes": {
+            "groups": [
+              "analysts"
+            ]
+          }
+        },
+        "backend": {
+          "id": "bay-1",
+          "kind": "ceph"
+        },
+        "tenant": "acme",
+        "organization_id": "org-acme",
+        "action": "list_objects",
+        "bucket": "reports",
+        "prefix": "",
+        "request": {
+          "method": "GET"
+        }
+      },
+      "expect": {
+        "allow": false,
+        "reason_contains": "unbounded list"
       }
     },
     {
@@ -736,7 +802,38 @@
       }
     },
     {
-      "name": "list unbounded with single prefix grant -> narrow_prefix",
+      "name": "list of a WIDER-but-overlapping prefix with a single prefix grant -> narrow_prefix",
+      "bundle": "default",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "dave",
+          "type": "user",
+          "attributes": {
+            "groups": []
+          }
+        },
+        "backend": {
+          "id": "bay-1",
+          "kind": "ceph"
+        },
+        "tenant": "acme",
+        "organization_id": "org-acme",
+        "action": "list_objects",
+        "bucket": "reports",
+        "prefix": "lo",
+        "request": {
+          "method": "GET"
+        }
+      },
+      "expect": {
+        "allow": true,
+        "narrow_prefix": "logs/"
+      }
+    },
+    {
+      "name": "list unbounded with a single prefix grant -> DENIED (AWS parity, 2026-08-09)",
       "bundle": "default",
       "input": {
         "acl_grants": [],
@@ -761,8 +858,8 @@
         }
       },
       "expect": {
-        "allow": true,
-        "narrow_prefix": "logs/"
+        "allow": false,
+        "reason_contains": "unbounded list"
       }
     },
     {

@@ -19,20 +19,35 @@
 //! 2. the key space a policy is allowed to *depend* on is reserved: no S3 caller may
 //!    write it, whatever grants it holds.
 //!
-//! ## Absence means deny, and that is the shipped default
+//! ## Absence means deny — and, since 2026-08-09, absence is an anomaly
 //!
 //! The reserved list is supplied by the control plane in the bundle. **An absent list
-//! denies every tag write** (master plan open question 5, resolved to `["*"]`). That
-//! ships tagging *inert* — `PutObjectTagging`, `DeleteObjectTagging` and an inline
-//! `x-amz-tagging` on a write are all refused — until hyperfluid publishes the list.
+//! denies every tag write** (master plan open question 5). Between the day this module
+//! shipped and 2026-08-09 that was the *production* state for every organization,
+//! because nothing published the field: `PutObjectTagging`, `DeleteObjectTagging` and an
+//! inline `x-amz-tagging` were refused for everyone, and `write_object_tags` was a verb
+//! in the settled vocabulary that could never succeed (runbook P7). Nothing was red;
+//! both repositories' suites were green, because each only tested itself and both agreed
+//! the behaviour was correct.
 //!
-//! It has to be this way round. The alternative default (`[]`, nothing reserved) is
-//! indistinguishable from a correctly-configured deployment right up to the moment
-//! someone writes the first ABAC condition, at which point every tag-writing principal
-//! silently gains the ability to satisfy it. A missing security-relevant input must not
-//! read as "no restriction"; that is the same fail-open shape as an obligation this
-//! binary does not implement being dropped, and this project has a `deny_unknown_fields`
-//! and a `must_understand` because of it.
+//! **hyperfluid now publishes it on every bundle**
+//! (`s3_gateway_projection::bundle::derive_reserved_tag_keys`), so this reader's absent
+//! path is a diagnostic rather than the normal case. The published value is the platform
+//! namespace `hyperfluid/*` — AWS reserves the `aws:` tag prefix the same way — unioned
+//! with every tag key a grant in the same document conditions on. Which means the
+//! *coupling* argued below is now enforced by construction on the producing side rather
+//! than promised: a policy cannot come to depend on a tag key without that key being
+//! reserved in the same document. `tests/cross_repo_contract.rs` holds the two ends
+//! together in three places, one of which drives this very reader over the captured
+//! platform bundle.
+//!
+//! Absence still denies, and it has to be this way round. The alternative default (`[]`,
+//! nothing reserved) is indistinguishable from a correctly-configured deployment right up
+//! to the moment someone writes the first ABAC condition, at which point every
+//! tag-writing principal silently gains the ability to satisfy it. A missing
+//! security-relevant input must not read as "no restriction"; that is the same fail-open
+//! shape as an obligation this binary does not implement being dropped, and this project
+//! has a `deny_unknown_fields` and a `must_understand` because of it.
 //!
 //! A malformed list (present but not an array of strings) is treated as absent, i.e. as
 //! deny-all, for the same reason.
@@ -87,8 +102,8 @@ impl ReservedTagKeys {
         ReservedTagKeys(Some(keys))
     }
 
-    /// True when no tag write may proceed at all — the shipped default until hyperfluid
-    /// emits the list, and also what an explicit `["*"]` means.
+    /// True when no tag write may proceed at all — what an absent list means (the
+    /// fail-closed floor), and what an explicit `["*"]` means.
     #[must_use]
     pub fn denies_all_tag_writes(&self) -> bool {
         match &self.0 {
@@ -178,7 +193,9 @@ mod tests {
 
     #[test]
     fn an_absent_list_denies_every_tag_write() {
-        // THE shipped default. Tagging is inert until hyperfluid publishes the list.
+        // The fail-closed floor. This was the PRODUCTION state for every org until
+        // 2026-08-09, when hyperfluid started publishing the list; it is now the
+        // diagnostic for a document that lost the field in transit.
         let r = ReservedTagKeys::from_bundle(&serde_json::json!({
             "org_settings": { "freeze_writes": false }
         }));

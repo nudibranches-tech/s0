@@ -102,6 +102,7 @@ fn bundle() -> serde_json::Value {
                 "reader":  { "groups": [], "attributes": [] },
                 "alice":   { "groups": [], "attributes": [] },
                 "lister":  { "groups": [], "attributes": [] },
+                "wholelister": { "groups": [], "attributes": [] },
                 "spanner": { "groups": [], "attributes": [] },
                 "copyist": { "groups": [], "attributes": [] }
             },
@@ -111,6 +112,10 @@ fn bundle() -> serde_json::Value {
                 "reader":  [ { "bucket": "staging", "actions": ["read_objects"], "prefixes": [] } ],
                 "alice":   [ { "bucket": "staging", "actions": ["read_objects"], "prefixes": [] } ],
                 "lister":  [ { "bucket": "reports", "actions": ["list_objects"], "prefixes": ["2024/"] } ],
+                // The positive control for the unbounded-list deny: same verb, same
+                // bucket, WHOLE-bucket scope. Without it, a rego change that denied
+                // every list would look like a pass.
+                "wholelister": [ { "bucket": "reports", "actions": ["list_objects"], "prefixes": [] } ],
                 "spanner": [ { "bucket": "reports", "actions": ["list_objects"], "prefixes": ["2024/", "2025/"] } ],
                 "copyist": [
                     { "bucket": "secrets", "actions": ["read_objects"], "prefixes": [] },
@@ -337,16 +342,31 @@ async fn a_read_grant_does_not_confer_write() {
 // ── listing must never be unbounded ─────────────────────────────────────────────
 
 #[tokio::test]
-async fn an_unbounded_list_is_never_forwarded_unbounded() {
+async fn an_unbounded_list_is_denied_not_silently_narrowed() {
     // Lesson 4: a client-supplied list prefix is only safe fail-closed. A prefix-scoped
-    // subject asking for the whole bucket must not get the whole bucket — the request
-    // that reaches the backend has to be inside the grant.
+    // subject asking for the whole bucket must not get the whole bucket.
     //
-    // NOTE: the master plan phrases this as "unbounded list denied". The shipped design
-    // *narrows* instead, which is strictly better for clients and equally safe as long
-    // as the narrowing really happens; the property that matters — and that is asserted
-    // here — is that nothing unbounded is forwarded. A subject with no list grant at all
-    // is still denied outright (below).
+    // CHANGED 2026-08-09, and the old comment on this test is the reason it is worth
+    // spelling out. It used to read: "the master plan phrases this as *unbounded list
+    // denied*; the shipped design *narrows* instead, which is strictly better for
+    // clients and equally safe as long as the narrowing really happens." Both halves
+    // of that were wrong.
+    //
+    //   1. It is not AWS behaviour. AWS grants prefix-scoped listing as a BUCKET
+    //      resource plus a `s3:prefix` condition, and a `ListObjectsV2` with no prefix
+    //      fails that condition — `AccessDenied`. AWS does not narrow. Hyperfluid's
+    //      goal is parity with the ecosystem, and a deviation has to be deliberate and
+    //      documented (`s0-plan/AWS-PARITY.md`); this one was neither.
+    //   2. It is not "equally safe". Narrowing leaks nothing, but it returns a
+    //      FILTERED listing with no signal that it was filtered. A user running
+    //      `aws s3 ls s3://reports/` sees `2024/` and concludes that is all the bucket
+    //      holds. In a regulated product, presenting a partial view as a complete one
+    //      is worse than an error: the error gets a support ticket, the short listing
+    //      gets believed.
+    //
+    // This CLOSES a divergence rather than opening one — hyperfluid's pushed `s3.rego`
+    // and the console's object routes (`01d7f7f`) already denied here; this
+    // compiled-in default was the last PEP still narrowing.
     let fx = common::fixture("sec-unbounded-list", bundle());
     let access = GatewayAccess::new(fx.gw.clone());
 
@@ -360,15 +380,41 @@ async fn an_unbounded_list_is_never_forwarded_unbounded() {
         },
         Method::GET,
     );
-    access.list_objects_v2(&mut req).await.expect("narrowed");
-    assert_eq!(
-        req.input.prefix.as_deref(),
-        Some("2024/"),
-        "an unbounded list by a prefix-scoped subject must be rewritten into the grant"
+    let err = access
+        .list_objects_v2(&mut req)
+        .await
+        .expect_err("an unbounded list by a prefix-scoped subject must be DENIED");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("unbounded list"),
+        "the denial must say what to do about it — a caller told only \"no grant \
+         matches\" goes hunting for a permission when the fix is a prefix. got: {msg}"
+    );
+    assert!(
+        req.input.prefix.is_none(),
+        "a denied list must not have been rewritten on the way out"
     );
 
-    // Sibling ops with no fan-out dispatch must reach the same conclusion, or the
-    // narrowing is one API call away from being bypassed.
+    // The same request in its other spelling. A client that sends `prefix=` explicitly
+    // is asking the identical question and must get the identical answer, or the deny
+    // is one query-string away from being bypassed.
+    let mut req = fx.request_as(
+        "lister",
+        "ListObjectsV2",
+        ListObjectsV2Input {
+            bucket: "reports".into(),
+            prefix: Some(String::new()),
+            ..Default::default()
+        },
+        Method::GET,
+    );
+    assert!(
+        access.list_objects_v2(&mut req).await.is_err(),
+        "an explicit empty prefix is an unbounded list and must be denied too"
+    );
+
+    // Sibling ops with no fan-out dispatch must reach the same conclusion, or the rule
+    // is one API call away from being bypassed.
     let mut req = fx.request_as(
         "lister",
         "ListObjects",
@@ -379,8 +425,10 @@ async fn an_unbounded_list_is_never_forwarded_unbounded() {
         },
         Method::GET,
     );
-    access.list_objects(&mut req).await.expect("narrowed");
-    assert_eq!(req.input.prefix.as_deref(), Some("2024/"));
+    assert!(
+        access.list_objects(&mut req).await.is_err(),
+        "the V1 listing op must deny the unbounded request exactly as V2 does"
+    );
 
     // A prefix *outside* the grant is not silently widened into it either.
     let mut req = fx.request_as(
@@ -396,6 +444,53 @@ async fn an_unbounded_list_is_never_forwarded_unbounded() {
     assert!(
         access.list_objects_v2(&mut req).await.is_err(),
         "a list outside every granted prefix must be denied, not narrowed"
+    );
+
+    // NARROWING IS NOT WHAT WAS REMOVED. A request WIDER than the grant but overlapping
+    // it is still allowed and still rewritten into the grant: the caller named a scope
+    // and gets a genuine subset of the scope it named, so nothing is being passed off
+    // as complete. Only the case where the caller named NO scope became a deny.
+    let mut req = fx.request_as(
+        "lister",
+        "ListObjectsV2",
+        ListObjectsV2Input {
+            bucket: "reports".into(),
+            prefix: Some("20".into()),
+            ..Default::default()
+        },
+        Method::GET,
+    );
+    access
+        .list_objects_v2(&mut req)
+        .await
+        .expect("an over-broad but overlapping list is narrowed, not denied");
+    assert_eq!(
+        req.input.prefix.as_deref(),
+        Some("2024/"),
+        "the request that reaches the backend has to be inside the grant"
+    );
+
+    // THE POSITIVE CONTROL. Same op, same bucket, same unbounded request — but a
+    // WHOLE-BUCKET grant. It must still be allowed and still be forwarded unbounded,
+    // or this test is passing because listing broke rather than because the unbounded
+    // case is refused.
+    let mut req = fx.request_as(
+        "wholelister",
+        "ListObjectsV2",
+        ListObjectsV2Input {
+            bucket: "reports".into(),
+            prefix: None,
+            ..Default::default()
+        },
+        Method::GET,
+    );
+    access
+        .list_objects_v2(&mut req)
+        .await
+        .expect("a whole-bucket grant still authorizes an unbounded list");
+    assert!(
+        req.input.prefix.is_none(),
+        "a whole-bucket lister must not be narrowed into anything"
     );
 }
 
@@ -864,6 +959,12 @@ async fn a_list_the_gateway_refuses_is_audited_as_denied_not_allowed() {
     //
     // For a regulated audit trail that is worse than no record at all: a missing record
     // is a gap you can see, a wrong one is evidence that exonerates the wrong thing.
+    //
+    // Every request below asks for `20` — wider than both of `spanner`'s granted
+    // prefixes and overlapping both, which is what produces the multi-prefix verdict.
+    // They used to send no prefix at all; since 2026-08-09 an unbounded list is refused
+    // one layer earlier (in the policy, for being unbounded — AWS parity), which would
+    // make this test measure that deny instead of the fan-out refusal it is about.
     let fx = common::fixture("sec-audit-refused-list", bundle());
     let access = GatewayAccess::new(fx.gw.clone());
 
@@ -874,7 +975,7 @@ async fn a_list_the_gateway_refuses_is_audited_as_denied_not_allowed() {
             "ListObjects",
             ListObjectsInput {
                 bucket: "reports".into(),
-                prefix: None,
+                prefix: Some("20".into()),
                 ..Default::default()
             },
             Method::GET,
@@ -897,7 +998,7 @@ async fn a_list_the_gateway_refuses_is_audited_as_denied_not_allowed() {
             "ListObjectsV2",
             ListObjectsV2Input {
                 bucket: "reports".into(),
-                prefix: None,
+                prefix: Some("20".into()),
                 delimiter: Some("/".into()),
                 ..Default::default()
             },
@@ -946,7 +1047,7 @@ async fn a_list_the_gateway_refuses_is_audited_as_denied_not_allowed() {
         "ListObjectsV2",
         ListObjectsV2Input {
             bucket: "reports".into(),
-            prefix: None,
+            prefix: Some("20".into()),
             ..Default::default()
         },
         Method::GET,

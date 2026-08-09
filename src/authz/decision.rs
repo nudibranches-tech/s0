@@ -38,7 +38,11 @@ pub struct Decision {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Obligations {
-    /// Narrow an unbounded `ListObjects*` to a single granted prefix.
+    /// Narrow an over-broad `ListObjects*` to a single granted prefix — a request whose
+    /// prefix is WIDER than the grant but overlaps it. Not an *unbounded* list: since
+    /// 2026-08-09 a list naming no prefix at all is denied rather than narrowed (AWS
+    /// parity; see `policy/gateway/authz.rego` `narrowed`), so this obligation is never
+    /// emitted for one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub narrow_prefix: Option<String>,
     /// Prefix scopes the subject holds on this bucket. When more than one, a

@@ -4,6 +4,28 @@
 //!
 //! No backend (Ceph/RGW/RustFS/…) is ever involved — this supersedes RGW's STS
 //! and works identically regardless of what object store sits behind the gateway.
+//!
+//! # Two doors, one socket
+//!
+//! This listener serves two protocols, and which one a request gets is decided by the
+//! request itself — not by a path:
+//!
+//! * **`Action=AssumeRoleWithWebIdentity`** (a form-encoded body carrying an `Action`
+//!   parameter) ⇒ the AWS STS query protocol, XML in and out. This is the door every S3
+//!   SDK can use with stock configuration, and it is the only one that can mint a
+//!   *service-account* session. It lives in [`crate::webidentity`], which carries the
+//!   design argument.
+//! * **anything else** ⇒ the original bearer-token JSON exchange below.
+//!
+//! Discriminating on the presence of `Action` rather than on a URL path is what the AWS
+//! query protocol *is* — an SDK POSTs to `/` and puts the action in the body — so there
+//! is no path to get subtly wrong, and a request that carries no `Action` cannot reach
+//! the STS surface at all.
+//!
+//! Both doors are unauthenticated in the sense that no *platform* credential is
+//! presented, and that is correct rather than tolerated: the OIDC token **is** the
+//! credential, exactly as at `sts.amazonaws.com`. It is why this socket is not, and must
+//! never become, the socket [`crate::internal`] serves on.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -11,7 +33,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -27,6 +49,10 @@ use crate::auth::sts::{SessionClaims, StsAuthority};
 use crate::config::StsMintConfig;
 use crate::error::{GatewayError, Result};
 use crate::model::PrincipalType;
+use crate::webidentity::{
+    Params, StsRefusal, WebIdentitySts, WebIdentityVerifier, render_assume_role_response,
+    render_error_response,
+};
 
 /// Identity verified from an OIDC token, to be minted into a gateway session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +98,10 @@ pub struct StandardVerifier {
     issuer: String,
     audience: String,
     claims: ClaimNames,
+    /// Audiences the [`crate::webidentity`] door accepts, matched against `aud` **or**
+    /// `azp`/`client_id`. Empty ⇒ `[audience]`. See
+    /// [`StsMintConfig::web_identity_audiences`] for why the two doors differ.
+    web_identity_audiences: Vec<String>,
 }
 
 impl StandardVerifier {
@@ -112,7 +142,46 @@ impl StandardVerifier {
                 tenant: cfg.tenant_claim.clone(),
                 org: cfg.org_claim.clone(),
             },
+            web_identity_audiences: cfg.web_identity_audiences.clone(),
         })
+    }
+
+    /// The audiences the web-identity door will accept. Never empty: an empty
+    /// configured list falls back to the single `audience`, so there is no configuration
+    /// in which a token's audience binding goes unchecked.
+    fn accepted_audiences(&self) -> Vec<&str> {
+        if self.web_identity_audiences.is_empty() {
+            return vec![self.audience.as_str()];
+        }
+        self.web_identity_audiences
+            .iter()
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// Does this token name one of the audiences this gateway serves?
+    ///
+    /// Accepts a match on `aud` (string **or** array — a JWT `aud` is legally either)
+    /// or on `azp`/`client_id`. The `azp` fallback is what makes a Keycloak
+    /// service-account token usable at all: `grant_type=client_credentials` produces
+    /// `aud: "account"` and names the client only in `azp`. Ceph RGW and MinIO both do
+    /// exactly this, and the operator renders the same client-id list it already gives
+    /// RGW's role, so a token that works against one works against the other.
+    fn audience_is_accepted(&self, claims: &Value) -> bool {
+        let accepted = self.accepted_audiences();
+        let matches = |v: &str| accepted.contains(&v);
+        let aud_ok = match claims.get("aud") {
+            Some(Value::String(s)) => matches(s),
+            Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).any(matches),
+            _ => false,
+        };
+        aud_ok
+            || ["azp", "client_id"].iter().any(|name| {
+                claims
+                    .get(*name)
+                    .and_then(Value::as_str)
+                    .is_some_and(matches)
+            })
     }
 
     /// Keep the JWKS cache warm in the background.
@@ -245,6 +314,59 @@ impl OidcVerifier for StandardVerifier {
     }
 }
 
+/// The web-identity door's verification, which is deliberately **not** `verify()`.
+///
+/// Same signing key, same issuer, same expiry enforcement — three differences, each one
+/// a thing the bearer door gets right for itself and wrong for this one:
+///
+/// 1. it returns the **raw claims**, because the tenant and organization are resolved
+///    from the `RoleArn` and the routing table rather than from claims that hyperfluid's
+///    Keycloak does not mint;
+/// 2. the audience check is the `aud`-or-`azp` rule
+///    ([`StandardVerifier::audience_is_accepted`]) rather than `jsonwebtoken`'s strict
+///    `aud`, so a service-account token is usable;
+/// 3. an **expired** token is reported as `ExpiredTokenException` rather than folded
+///    into a generic invalid-token error, because an SDK treats the two differently: an
+///    expiry means "re-read the projected token file and retry", and any other invalid
+///    token means "stop".
+///
+/// `verify()` is untouched by all of this. Two doors with two threat models sharing one
+/// verification function is how one of them silently acquires the other's leniency.
+#[async_trait::async_trait]
+impl WebIdentityVerifier for StandardVerifier {
+    async fn verify_claims(&self, token: &str) -> std::result::Result<Value, StsRefusal> {
+        let key = self
+            .decoding_key(token)
+            .await
+            .map_err(|e| StsRefusal::InvalidIdentityToken(e.to_string()))?;
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.set_issuer(&[&self.issuer]);
+        // `iss` and `exp` are required outright — a token that omits either is not a
+        // token this gateway can reason about. `aud` is checked below instead of here,
+        // so `validate_aud` is off and `aud` is not in the required set.
+        validation.set_required_spec_claims(&["exp", "iss"]);
+        validation.validate_aud = false;
+        validation.validate_exp = true;
+        validation.validate_nbf = true;
+        let data = decode::<Value>(token, &key, &validation).map_err(|e| match e.kind() {
+            jsonwebtoken::errors::ErrorKind::ExpiredSignature => StsRefusal::ExpiredToken,
+            _ => StsRefusal::InvalidIdentityToken(e.to_string()),
+        })?;
+        if !self.audience_is_accepted(&data.claims) {
+            // The accepted list is NOT echoed back: this endpoint is internet-reachable
+            // and the list is the set of OIDC clients the platform provisions.
+            tracing::warn!(
+                accepted = ?self.accepted_audiences(),
+                "web identity token refused: neither aud nor azp names an accepted audience"
+            );
+            return Err(StsRefusal::InvalidIdentityToken(
+                "neither `aud` nor `azp` names an audience this gateway accepts".into(),
+            ));
+        }
+        Ok(data.claims)
+    }
+}
+
 async fn fetch_jwks(client: &reqwest::Client, uri: &str) -> Result<JwkSet> {
     let resp = client
         .get(uri)
@@ -265,6 +387,11 @@ pub struct Mint {
     verifier: Arc<dyn OidcVerifier>,
     sts: Arc<StsAuthority>,
     ttl: Duration,
+    /// The AWS STS door. `None` ⇒ this listener serves the bearer exchange alone and a
+    /// request carrying an `Action` gets the same answer as any other unrecognised one,
+    /// so turning the surface off really does remove it rather than hiding it behind a
+    /// different error.
+    web_identity: Option<Arc<WebIdentitySts>>,
 }
 
 /// AssumeRoleWithWebIdentity-shaped response.
@@ -302,9 +429,30 @@ impl From<crate::auth::sts::SessionCredentials> for MintedCredentials {
     }
 }
 
+/// Ceiling on a mint request body.
+///
+/// A web identity token is the body's whole bulk, and a Keycloak access token carrying a
+/// realm's worth of role claims is routinely 4–8 KiB, so this is generous where the
+/// internal endpoint's 16 KiB is not. It is still a bound, and it is the *only* one on
+/// this socket: the listener is unauthenticated by design, so what an anonymous caller
+/// can make this process allocate is decided here and nowhere else.
+const MAX_MINT_BODY_BYTES: usize = 64 * 1024;
+
 impl Mint {
     pub fn new(verifier: Arc<dyn OidcVerifier>, sts: Arc<StsAuthority>, ttl: Duration) -> Self {
-        Mint { verifier, sts, ttl }
+        Mint {
+            verifier,
+            sts,
+            ttl,
+            web_identity: None,
+        }
+    }
+
+    /// Attach the [`crate::webidentity`] door. Absent ⇒ bearer exchange only.
+    #[must_use]
+    pub fn with_web_identity(mut self, sts: Arc<WebIdentitySts>) -> Self {
+        self.web_identity = Some(sts);
+        self
     }
 
     /// Verify an OIDC token and mint session credentials. `sid` is caller-supplied
@@ -329,9 +477,54 @@ impl Mint {
 
     async fn route(&self, req: Request<Incoming>) -> Response<Full<Bytes>> {
         if req.method() != Method::POST {
+            // Both doors are POST-only. The AWS query protocol does define a GET form,
+            // but no SDK uses it for a call that carries a bearer token in a parameter,
+            // and putting a web identity token in a URL puts it in every access log
+            // between here and the client. Refused rather than supported.
             return json_error(StatusCode::METHOD_NOT_ALLOWED, "use POST");
         }
-        let Some(token) = bearer(&req) else {
+        // The bearer door ignores the body and the STS door *is* the body, so it is read
+        // once, bounded, before the two are told apart.
+        let query = req.uri().query().unwrap_or_default().to_string();
+        let bearer_token = bearer(&req);
+        let body = match Limited::new(req.into_body(), MAX_MINT_BODY_BYTES)
+            .collect()
+            .await
+        {
+            Ok(b) => b.to_bytes(),
+            Err(_) => {
+                return json_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request body exceeds the mint's limit",
+                );
+            }
+        };
+
+        // The AWS query protocol puts the action in the body of a POST to `/`. A
+        // request that carries one is an STS request and gets STS answers — including
+        // STS-shaped *errors*, which is the half that matters: an SDK that receives a
+        // JSON body where it expects an `ErrorResponse` reports "unknown error" and the
+        // operator never learns what was actually wrong.
+        let mut params = Params::parse(&String::from_utf8_lossy(&body));
+        if params.get("Action").is_none() && !query.is_empty() {
+            // Some clients (and every hand-written `curl` example) put the parameters
+            // in the query string instead. Accepted, but only as a fallback: a body
+            // that names an Action is never overridden by a query string that names
+            // another.
+            params = Params::parse(&query);
+        }
+        if let Some(action) = params.get("Action") {
+            let Some(sts) = &self.web_identity else {
+                tracing::warn!(
+                    %action,
+                    "an AWS STS request arrived but the web-identity surface is disabled"
+                );
+                return sts_error(&StsRefusal::InvalidAction(action.to_string()));
+            };
+            return self.route_sts(sts, &params).await;
+        }
+
+        let Some(token) = bearer_token else {
             return json_error(StatusCode::UNAUTHORIZED, "missing bearer OIDC token");
         };
         let sid = uuid::Uuid::new_v4().to_string();
@@ -346,6 +539,69 @@ impl Mint {
             }
         }
     }
+
+    /// One `AssumeRoleWithWebIdentity` call, rendered as XML either way.
+    async fn route_sts(&self, sts: &WebIdentitySts, params: &Params) -> Response<Full<Bytes>> {
+        // The request id is minted here rather than inside the surface so it can be
+        // logged alongside a refusal and quoted back by a client. It is not the session
+        // id: correlating a support ticket to a log line must not hand out the identifier
+        // the credential is MAC-bound to.
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let sid = uuid::Uuid::new_v4().to_string();
+        match sts.assume_role_from_params(params, &sid).await {
+            Ok(session) => {
+                tracing::info!(
+                    %request_id,
+                    sub = %session.principal.sub,
+                    principal_type = ?session.principal.principal_type,
+                    tenant = %session.role.tenant,
+                    expires_at = session.expires_at,
+                    "AssumeRoleWithWebIdentity minted a gateway session"
+                );
+                xml_ok(render_assume_role_response(&session, &request_id))
+            }
+            Err(refusal) => {
+                tracing::warn!(
+                    %request_id,
+                    code = refusal.code(),
+                    // The internal detail goes here and not into the response body.
+                    detail = ?refusal,
+                    "AssumeRoleWithWebIdentity refused"
+                );
+                xml_error(
+                    refusal.status(),
+                    render_error_response(&refusal, &request_id),
+                )
+            }
+        }
+    }
+}
+
+fn xml_ok(body: String) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/xml")
+        // A credential must never be cached by anything between here and the client.
+        .header("cache-control", "no-store")
+        .body(Full::new(Bytes::from(body)))
+        .expect("response")
+}
+
+fn xml_error(status: u16, body: String) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST))
+        .header("content-type", "text/xml")
+        .header("cache-control", "no-store")
+        .body(Full::new(Bytes::from(body)))
+        .expect("response")
+}
+
+fn sts_error(refusal: &StsRefusal) -> Response<Full<Bytes>> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    xml_error(
+        refusal.status(),
+        render_error_response(refusal, &request_id),
+    )
 }
 
 fn bearer(req: &Request<Incoming>) -> Option<String> {
@@ -361,6 +617,10 @@ fn json_ok(body: Vec<u8>) -> Response<Full<Bytes>> {
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/json")
+        // A credential must not be cached by anything on the way to the client. The
+        // internal endpoint has always said so; this one did not, and the body is the
+        // same kind of thing.
+        .header("cache-control", "no-store")
         .body(Full::new(Bytes::from(body)))
         .expect("response")
 }
@@ -498,14 +758,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn extract_pulls_named_claims() {
-        let v = StandardVerifier {
+    fn verifier_with_web_identity_audiences(audiences: Vec<String>) -> StandardVerifier {
+        StandardVerifier {
             key_source: KeySource::Pem(DecodingKey::from_secret(b"x")),
             issuer: "i".into(),
             audience: "a".into(),
             claims: claim_names(),
-        };
+            web_identity_audiences: audiences,
+        }
+    }
+
+    #[test]
+    fn extract_pulls_named_claims() {
+        let v = verifier_with_web_identity_audiences(Vec::new());
         let claims = serde_json::json!({
             "sub": "alice", "tenant": "acme", "org": "org-acme",
             "groups": ["analysts", "radiology"]
@@ -522,5 +787,64 @@ mod tests {
         // Missing required tenant claim ⇒ error.
         let bad = serde_json::json!({ "sub": "alice", "org": "o" });
         assert!(v.extract(&bad).is_err());
+    }
+
+    /// **The check that decides whether a service account can use this gateway.**
+    ///
+    /// A Keycloak `grant_type=client_credentials` token carries `aud: "account"` and
+    /// names its client only in `azp`. A strict `aud` check — which is exactly what the
+    /// bearer door does, correctly, for itself — refuses every one of them, i.e. the
+    /// primary consumer of the whole product.
+    #[test]
+    fn the_web_identity_door_accepts_a_service_account_token_on_azp() {
+        let v = verifier_with_web_identity_audiences(vec![
+            "acme-storage".into(),
+            "control-plane-sa".into(),
+        ]);
+        // The real shape Keycloak issues for a service account.
+        assert!(v.audience_is_accepted(&serde_json::json!({
+            "aud": "account", "azp": "acme-storage"
+        })));
+        // `client_id` is the same fact under the other spelling some IdPs use.
+        assert!(v.audience_is_accepted(&serde_json::json!({
+            "aud": "account", "client_id": "control-plane-sa"
+        })));
+        // A plain `aud` still works, string or array — a JWT `aud` is legally either.
+        assert!(v.audience_is_accepted(&serde_json::json!({ "aud": "acme-storage" })));
+        assert!(v.audience_is_accepted(&serde_json::json!({ "aud": ["x", "acme-storage"] })));
+    }
+
+    /// …and there is no configuration in which the audience binding is skipped.
+    #[test]
+    fn a_token_naming_no_accepted_audience_is_refused() {
+        let v = verifier_with_web_identity_audiences(vec!["acme-storage".into()]);
+        for claims in [
+            serde_json::json!({}),
+            serde_json::json!({ "aud": "account" }),
+            serde_json::json!({ "aud": "account", "azp": "some-other-client" }),
+            serde_json::json!({ "aud": ["account", "realm-management"] }),
+            // Not a substring match, not a prefix match.
+            serde_json::json!({ "azp": "acme-storage-2" }),
+            serde_json::json!({ "azp": "acme" }),
+            // Not case-insensitive: a client id is an exact identifier.
+            serde_json::json!({ "azp": "ACME-STORAGE" }),
+        ] {
+            assert!(
+                !v.audience_is_accepted(&claims),
+                "{claims} must not pass the audience check"
+            );
+        }
+    }
+
+    /// An empty configured list is not "accept anything" — it falls back to the single
+    /// `audience` the bearer door uses, so the two doors cannot end up with one of them
+    /// unchecked because a field was left out of a config.
+    #[test]
+    fn an_empty_audience_list_falls_back_to_the_configured_audience() {
+        let v = verifier_with_web_identity_audiences(Vec::new());
+        assert_eq!(v.accepted_audiences(), vec!["a"]);
+        assert!(v.audience_is_accepted(&serde_json::json!({ "aud": "a" })));
+        assert!(!v.audience_is_accepted(&serde_json::json!({ "aud": "anything-else" })));
+        assert!(!v.audience_is_accepted(&serde_json::json!({})));
     }
 }

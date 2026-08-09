@@ -256,8 +256,14 @@ grant_matches if {
 	applicable_grant(g)
 }
 
-# list ops: allowed if a whole-bucket grant applies, or the request overlaps a
-# prefix grant (which then drives the narrowing obligation).
+# list ops: allowed if a whole-bucket grant applies, or the request names a prefix
+# that overlaps a prefix grant (which then drives the narrowing obligation).
+#
+# An UNBOUNDED list — no `prefix` on the request — reaches the first clause alone:
+# `narrowed` leaves `scoped_arr` empty for it, so only a whole-bucket grant authorizes
+# it. (The single exception is a grant carrying `prefixes: [""]`, which is a
+# whole-bucket grant spelled oddly — see `narrowed` below, where the deny and that
+# exception are both argued.)
 grant_matches if {
 	input.action == "list_objects"
 	not input.object
@@ -348,7 +354,7 @@ bucket_obligations := {} if {
 	count(visible_bucket_arr) == 0
 }
 
-# ── list-prefix narrowing: rewrite an unbounded/over-broad list to scope ─────────
+# ── list-prefix narrowing: rewrite an OVER-BROAD list down to scope ──────────────
 
 requested_prefix := input.prefix
 
@@ -362,9 +368,57 @@ whole_bucket_list if {
 
 # For each prefix grant overlapping the request, the concrete prefix to enumerate:
 # the more specific of (grant prefix, requested prefix). Undefined ⇒ no overlap.
+#
+# ── AN UNBOUNDED LIST IS A DENY, NEVER A NARROWING (2026-08-09) ─────────────────
+#
+# AWS expresses prefix-scoped list access as a BUCKET-level resource plus a condition:
+#
+#   {"Action": "s3:ListBucket", "Resource": "arn:aws:s3:::bucket",
+#    "Condition": {"StringLike": {"s3:prefix": ["team-a/*"]}}}
+#
+# Calling `ListObjectsV2` with NO prefix against that policy is an `AccessDenied` in
+# AWS: the condition key is simply absent, so the condition fails. AWS does not narrow.
+# (The AWS console only appears to escape this because it always sends a prefix as the
+# user navigates.) Two reasons this module now answers the same way, and the second is
+# the one that decided it:
+#
+#   1. AWS PARITY. This is what people used to S3 expect, and hyperfluid's goal is
+#      parity with the rest of the cloud ecosystem — where we deviate, the deviation
+#      must be deliberate, defensible and written down (`s0-plan/AWS-PARITY.md`).
+#      This one was none of those: it was accidental.
+#   2. SILENT NARROWING PRESENTS A PARTIAL VIEW AS A COMPLETE ONE. The narrowed
+#      listing comes back with no signal that it was filtered, so a user running
+#      `aws s3 ls s3://bucket/` reads it as the bucket's contents and concludes the
+#      bucket holds only `team-a/`. In a regulated product that is worse than an
+#      error: an error is diagnosable and gets a support ticket, a short listing is
+#      believed. A 403 says "ask for a prefix, or ask for more access".
+#
+# This CLOSES the last known divergence rather than opening one. Hyperfluid's pushed
+# `s3.rego` — the module that actually runs in every real deployment — already denies
+# here (`list_scope_covers` requires the requested prefix to lie WITHIN a granted one),
+# and since hyperfluid `01d7f7f` the console's object routes refuse it too. This
+# compiled-in dev default was the last PEP still narrowing, so the three now agree.
+#
+# WHAT DOES NOT CHANGE, which is most of the behaviour:
+#   * a request whose prefix lies INSIDE a grant is allowed and forwarded unrewritten
+#     (clause 1, untouched);
+#   * a request WIDER than the grant but overlapping it is allowed and narrowed to the
+#     grant (clause 2) — narrowing is the correct enforcement there, because the caller
+#     named a scope and gets a genuine subset of the scope it named, not a subset of
+#     "the bucket";
+#   * multi-prefix fan-out is unchanged for every such bounded request;
+#   * a request overlapping no grant is denied, as before.
+#
+# Only `req == ""` moves, and it moves from ALLOW + `narrow_prefix`/`allowed_prefixes`
+# to DENY. It is guarded on clause 2 alone because clause 2 is the only one that can
+# manufacture a scope the caller never asked for. Clause 1 still matches `req == ""`
+# against a grant prefix of `""` — but such a grant already permits every key in the
+# bucket (`startswith(k, "")` holds for all k), so it is a whole-bucket grant spelled
+# oddly, and both hyperfluid's `s3.rego` and this module allow its unbounded list.
 narrowed(p, req) := req if startswith(req, p)
 
 narrowed(p, req) := p if {
+	req != ""
 	startswith(p, req)
 	not startswith(req, p)
 }
@@ -433,6 +487,43 @@ reason := "deny: principal not a tenant member" if {
 	not frozen
 	not denylisted
 	not member
+}
+
+# The principal DOES hold listing here — just prefix-scoped. This is what separates
+# "you asked too broadly" from "you were never granted listing", and the two get
+# different advice below.
+prefix_scoped_list_grant if {
+	input.action == "list_objects"
+	some g in grants
+	applicable_grant(g)
+	not whole_bucket(g)
+}
+
+# The unbounded-list deny gets its own reason, and it is not decoration. This string
+# becomes both the audit reason and the `AccessDenied` message the client reads
+# (`access::classify_list` → `s3_error!(AccessDenied, "{reason}")`), and argument 2 for
+# denying at all — an error beats a silently-filtered listing — only holds if the error
+# says what to do. "no grant matches action/scope" would send a caller hunting for a
+# missing grant when the fix is a `--prefix`.
+#
+# `prefix_scoped_list_grant` keeps it honest in the other direction: a principal with
+# NO list grant at all keeps the generic reason, because telling it to name a prefix
+# would be advice that cannot work.
+#
+# The body is disjoint from every other clause of this complete rule, including
+# `allow`: `count(scoped_arr) == 0` excludes the `prefixes: [""]` case (see `narrowed`),
+# which is the only unbounded list that still allows. Two matching bodies with
+# different values would be an eval error, i.e. no decision at all.
+reason := "deny: an unbounded list needs a whole-bucket grant; name a prefix inside your grant" if {
+	not frozen
+	not denylisted
+	member
+	input.action == "list_objects"
+	not input.object
+	requested_prefix == ""
+	prefix_scoped_list_grant
+	not whole_bucket_list
+	count(scoped_arr) == 0
 }
 
 reason := "allow: grant matched" if allow

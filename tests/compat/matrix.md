@@ -29,6 +29,30 @@
 > `run.sh` has been updated to the new vocabulary so the harness still stands the stack
 > up; the numbers in this file have not.
 
+> ## ⚠ AMENDMENT — 2026-08-09: an unbounded list is now denied
+>
+> Also not re-measured. One further delta, and it touches the most common command in the
+> matrix:
+>
+> 4. **A list with NO prefix is a 403 for a prefix-scoped principal.** `aws s3 ls
+>    s3://<bucket>/` sends `Prefix=` (empty) + `Delimiter=/`; s0 used to answer it by
+>    silently rewriting the request into the granted prefix, and it now answers
+>    `403 AccessDenied … deny: an unbounded list needs a whole-bucket grant; name a
+>    prefix inside your grant`. **Affected rows:** every `ListObjectsV2`-issuing row read
+>    under principal **S** — `aws s3 ls s3://b/`, `aws s3 sync`, `aws s3 rm --recursive`,
+>    `mc ls <bucket>`, `mc mirror`, `rclone` listings — when the command is pointed at
+>    the bucket ROOT. Pointed inside the grant (`aws s3 ls s3://b/team-a/`) they are
+>    unchanged and still rc=0. Principals **W** and **O**… **W** is unaffected (its
+>    `{bucket:"*"}` grant has `prefixes: []`, i.e. whole-bucket, which still authorizes
+>    an unbounded list); **O**'s listing behaviour is governed by BLOCKER-2, not by this.
+>
+>    This is a **deliberate loss of client convenience**, taken for AWS parity and
+>    because a narrowed listing is a filtered view returned with no signal that it is
+>    filtered — see `s0-plan/AWS-PARITY.md` and `policy/gateway/authz.rego::narrowed`.
+>    AWS behaves the same way: `s3:ListBucket` under a `s3:prefix` condition denies a
+>    request that carries no prefix. The AWS console only appears to escape it because it
+>    always sends the prefix it is navigating.
+
 
 **Measured, not asserted.** Every row below was produced by running the real client
 against a real `s0` binary in front of a real S3 backend, and reading the requests off
@@ -261,7 +285,7 @@ backend would have accepted, so it is measured with a positive control on every 
 | `aws s3api delete-object --bypass-governance-retention` | **403** — refused in code, unconditionally; no verb can express a WORM override |
 | `aws s3api put-object --tagging tier=gold` (key not reserved) | **allowed** |
 | `aws s3api put-object-tagging` on `hyperfluid/…` | **403** — reserved key |
-| any tag write with `org_settings.reserved_tag_keys` **absent** | **403** — tagging is inert until the control plane publishes the list. Tag *reads* and plain writes are unaffected (measured). |
+| any tag write with `org_settings.reserved_tag_keys` **absent** | **403** — the fail-closed floor. Tag *reads* and plain writes are unaffected (measured). **Amendment 5 (2026-08-09):** this row no longer describes any deployed org. The control plane publishes the list on every bundle (runbook P7 closed), so the rows above it are the live behaviour and this one is what a bundle that lost the field in transit looks like. |
 
 The rows above were re-measured end to end at the close of M4: 19 of 19 behaved as
 written, each with its own positive control on the same identity.

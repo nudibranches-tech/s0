@@ -88,9 +88,11 @@ pub struct OpaInput {
     /// and still never populated).
     ///
     /// Emitted so a pushed policy can refuse a tag write that would set a key its own
-    /// ABAC conditions read — self-elevation, lesson 6. The shipped default module does
-    /// not read it yet; `reserved_tag_keys` is task S4-tagging's, and until it lands a
-    /// principal holding `write_object_tags` can set any key.
+    /// ABAC conditions read — self-elevation, lesson 6. Neither policy module reads it:
+    /// the reserved-key screen is enforced PEP-side in [`crate::access::tagging`],
+    /// deliberately, so a pushed policy cannot forget it. As of 2026-08-09 hyperfluid
+    /// publishes `org_settings.reserved_tag_keys` on every bundle, so that screen is
+    /// live rather than denying everything by absence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_tags: Option<BTreeMap<String, String>>,
     /// The access-control grants this request asks the backend to install: the canned

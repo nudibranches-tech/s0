@@ -149,6 +149,15 @@ whatever the policy keys on. Two things close that, and the second is new:
 `PutObjectTagging`, `DeleteObjectTagging` and inline `x-amz-tagging` all refused — until
 hyperfluid publishes a list. A malformed list is treated as absent for the same reason.
 
+> **Amended 2026-08-09.** hyperfluid publishes a list, on every bundle, so tagging is no
+> longer inert anywhere (runbook P7 closed). The `["*"]`-versus-`[]` framing turned out to
+> be a false choice: `["*"]` remains the answer *on absence*, and the published value is
+> neither candidate — it is `["hyperfluid/*"]` (the platform namespace, AWS's reserved
+> `aws:` prefix analogue) **unioned with every `tag:<key>` a grant in the same document
+> conditions on**. `[]` was only ever safe under the claim "no policy depends on a tag";
+> deriving the list from the grants being published turns that claim into an invariant
+> the producer cannot violate. See AWS-PARITY D30.
+
 The alternative default is indistinguishable from a correctly-configured deployment right
 up to the moment someone writes the first ABAC condition, at which point every
 tag-writing principal silently gains the ability to satisfy it. A missing
@@ -171,12 +180,17 @@ matter cannot tell which removals do.
 - **The whole captured corpus changed shape** (two new always-present keys) and was
   regenerated. One capture now carries a real `acl_grants` and a header-derived
   `requested_tags`, so the wire form of an ACL grant is on the record for policy authors.
-- **Tagging is inert on every existing deployment** until the control plane publishes
-  `reserved_tag_keys`. This is a deliberate functional regression on two ops that shipped
-  working in the previous stage, and it is the plan's stated intent.
+- ~~**Tagging is inert on every existing deployment** until the control plane publishes
+  `reserved_tag_keys`.~~ **Resolved 2026-08-09** — the control plane publishes it. The
+  deliberate functional regression lasted from this ADR to that date, which is longer
+  than "the plan's stated intent" implied and is why the gap now has a standing gate
+  (`cross_repo_contract::s0_reads_no_bundle_path_the_platform_never_writes`).
 - **A tag key a policy conditions on but which the published list omits is still
   writable.** The failure mode is a list that is present and incomplete, not a missing
-  one; recorded as `PutObjectTagging`'s blind spot.
+  one; recorded as `PutObjectTagging`'s blind spot. **Narrowed 2026-08-09:** a key some
+  projected GRANT conditions on can no longer be omitted, because the list is derived
+  from those grants. The residual is a key read by a policy from outside the grant
+  projection.
 - **Residuals kept, not closed.** Object-lock headers (`mode`, `retain-until-date`,
   `legal-hold`) are still uninspected — a write grant can make an object *undeletable*,
   the opposite direction from the bypass. A `CopyObject` under the default

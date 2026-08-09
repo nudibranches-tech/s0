@@ -4,10 +4,13 @@
 //!
 //! Four listeners, on four ports, with three different auth postures — which is the
 //! point, not an accident: the S3 data plane (SigV4, Ingress-fronted), the admin
-//! listener (**unauthenticated**, probes and metrics), the OIDC mint, and the internal
-//! API (platform shared secret, credential minting). Whether a request is
-//! authenticated is a property of the socket it arrived on, never of the path it
-//! asked for. See `s0::internal` for the full argument.
+//! listener (**unauthenticated**, probes and metrics), the STS mint (**unauthenticated
+//! by design — the OIDC/web-identity token IS the credential**, exactly as at
+//! `sts.amazonaws.com`), and the internal API (platform shared secret, credential
+//! minting for the console). Whether a request is authenticated is a property of the
+//! socket it arrived on, never of the path it asked for. See `s0::internal` for the
+//! full argument and `s0::webidentity` for why the STS door belongs on the mint's
+//! socket and on none of the other three.
 //!
 //! Shutdown ordering is deliberate and is the whole reason this is not three detached
 //! `tokio::spawn`s:
@@ -33,6 +36,7 @@ use s0::config::GatewayConfig;
 use s0::error::Result;
 use s0::internal::{self, InternalApi};
 use s0::mint::{self, Mint, StandardVerifier};
+use s0::webidentity::{WebIdentityConfig, WebIdentitySts};
 use s0::{gateway::Gateway, server, shutdown};
 
 /// Budget for the mint's own drain once the S3 front is down.
@@ -123,18 +127,49 @@ async fn main() -> Result<()> {
         });
     }
 
-    // The badge desk: OIDC token -> gateway session creds, on its own listener.
+    // The badge desk: OIDC token -> gateway session creds, on its own listener. Since
+    // stage 2 it also serves `Action=AssumeRoleWithWebIdentity` in the AWS STS wire
+    // protocol, which is the only door an off-the-shelf S3 client can open — see
+    // `s0::webidentity`. Both are on THIS socket and on no other: the credential is the
+    // IdP token, so there is nothing else to authenticate with, and that posture must
+    // stay a property of the socket rather than of a path.
     let mint_task = match &config.sts_mint {
         Some(sts_cfg) => {
             let verifier = Arc::new(StandardVerifier::from_config(sts_cfg)?);
             // Keep the JWKS cache warm so a key rotation is not a fleet-wide mint
             // failure on the first request after it.
             let jwks_refresh = verifier.spawn_jwks_refresh();
-            let mint = Arc::new(Mint::new(
-                verifier,
+            let mut mint = Mint::new(
+                verifier.clone(),
                 gateway.identity.sts(),
                 config.session_ttl(),
-            ));
+            );
+            if sts_cfg.web_identity_enabled {
+                // The SAME `StsAuthority` the S3 front verifies with, and the same
+                // routing table the request pipeline resolves against. A second of
+                // either would mint credentials this process could not honour, or
+                // accept a tenant it could not route.
+                mint = mint.with_web_identity(Arc::new(WebIdentitySts::new(
+                    verifier,
+                    gateway.identity.sts(),
+                    gateway.registry.clone(),
+                    WebIdentityConfig::from_config(sts_cfg, config.session_ttl()),
+                )));
+                tracing::info!(
+                    listen = %sts_cfg.listen,
+                    issuer = %sts_cfg.issuer,
+                    role_name_template = ?sts_cfg.role_name_template,
+                    max_duration_secs = sts_cfg.max_duration_secs,
+                    "AssumeRoleWithWebIdentity is served on the mint listener \
+                     (unauthenticated by design: the web identity token is the credential)"
+                );
+            } else {
+                tracing::warn!(
+                    "sts_mint.web_identity_enabled is false: no S3 client can obtain a \
+                     credential from this gateway on its own"
+                );
+            }
+            let mint = Arc::new(mint);
             let mint_listen = sts_cfg.listen;
             Some((
                 tokio::spawn(async move {

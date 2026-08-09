@@ -8,6 +8,25 @@
 
 ---
 
+> **AMENDED 2026-08-09 — the motivating case is now a DENY, not a narrowing.** This ADR was
+> written around "a prefix-scoped subject issuing `ListObjectsV2` with no `prefix`", and it
+> chose to rewrite that request into the grant. That choice is reversed for the **unbounded**
+> case only: a list naming no prefix (or `prefix=`) is refused unless the principal holds a
+> whole-bucket grant. Two reasons, both recorded in `policy/gateway/authz.rego::narrowed` and
+> in `s0-plan/AWS-PARITY.md`: (1) AWS denies it — `s3:ListBucket` + a `s3:prefix` condition
+> fails when the request carries no prefix, and AWS does not narrow; (2) a narrowed listing
+> is a filtered view returned with no signal that it is filtered, so `aws s3 ls s3://bucket/`
+> is read as the bucket's contents. "Denying outright … breaks `aws s3 ls`" below was the
+> reasoning; what it actually breaks is `aws s3 ls` *without a prefix*, and breaking it
+> loudly is the point.
+>
+> **Everything else in this ADR stands unchanged.** Narrowing (D2) and bounded fan-out
+> (D3/D4) still apply to a request that names a prefix WIDER than the grant(s) and overlaps
+> them, which is now the shape that reaches them; the obligation types, the cursor, the
+> pagination semantics, the fail-closed floor and every invariant are untouched. Hyperfluid's
+> pushed `s3.rego` — the module production actually evaluates — already denied the unbounded
+> case; this amendment records that s0's compiled-in default was brought into line with it.
+
 ## Context
 
 The problem and the shape of its solution space:
@@ -15,7 +34,8 @@ The problem and the shape of its solution space:
 A prefix-scoped subject issuing `ListObjectsV2` with no `prefix` must not enumerate the whole
 bucket. Denying outright is safe but breaks `aws s3 ls` and every GUI. Because the typed hook
 receives `&mut S3Request<Input>`, the preferred move is to **rewrite `input.prefix`** to the
-granted scope before forwarding.
+granted scope before forwarding. *(Amended 2026-08-09 — see the note above: the unbounded
+case is denied. The rewrite survives for an over-broad but overlapping prefix.)*
 
 Three cases must be decided, not left to the implementer:
 

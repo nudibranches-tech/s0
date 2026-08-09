@@ -70,12 +70,17 @@ async fn capture_enforced_ops() -> (BTreeMap<String, serde_json::Value>, Vec<&'s
         "ListObjectsV2",
         s3s::dto::ListObjectsV2Input {
             bucket: "reports".into(),
-            // No prefix at all: the shape that produces the narrowing obligation.
+            // No prefix at all — the shape a bare `aws s3 ls s3://reports/` sends, and
+            // one a policy author has to be able to see in the corpus. It used to
+            // produce the narrowing obligation; since 2026-08-09 it is a DENY for this
+            // prefix-scoped fixture (AWS parity — see `policy/gateway/authz.rego`
+            // `narrowed`). The *wire shape* recorded here is unchanged either way, which
+            // is what this harness records: the absence of `prefix` on the document.
             prefix: None,
             ..Default::default()
         },
     );
-    assert!(access.list_objects_v2(&mut req).await.is_ok());
+    assert!(access.list_objects_v2(&mut req).await.is_err());
 
     let mut req = fx.request_on_route(
         "DeleteObjects",

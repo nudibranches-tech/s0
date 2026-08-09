@@ -703,6 +703,11 @@ async fn list_multipart_uploads_strips_the_shared_identity_and_re_applies_the_pr
     // gateway can observe — but the keys of in-flight uploads are exactly what a
     // prefix-scoped principal must not see. So the fake answers with a key OUTSIDE the
     // narrowed prefix, which is what RGW would do if it ignored the parameter.
+    //
+    // The request asks for `20` — WIDER than alice's `2024/` grant and overlapping it,
+    // which is the shape narrowing exists for. It used to ask for no prefix at all;
+    // since 2026-08-09 an unbounded list is denied rather than narrowed (AWS parity),
+    // so that shape can no longer reach the response path this test is about.
     let backend = spawn_fake(|_| {
         format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
@@ -723,9 +728,9 @@ async fn list_multipart_uploads_strips_the_shared_identity_and_re_applies_the_pr
         "ListMultipartUploads",
         ListMultipartUploadsInput {
             bucket: "reports".into(),
-            // Unbounded: alice holds a single prefix grant, so the hook narrows it to
-            // `2024/` — which is the prefix the response is then re-checked against.
-            prefix: None,
+            // Over-broad: alice holds a single prefix grant under `20`, so the hook
+            // narrows it to `2024/` — the prefix the response is re-checked against.
+            prefix: Some("20".into()),
             ..Default::default()
         },
         Method::GET,

@@ -65,13 +65,81 @@ pub fn parse_bundle(raw: &str) -> Result<ParsedBundle, String> {
                 .and_then(|p| p.as_str())
                 .map(str::to_string);
             let data = map.get("data").cloned().unwrap_or(serde_json::Value::Null);
-            return Ok(ParsedBundle { policy, data });
+            let parsed = ParsedBundle { policy, data };
+            parsed.warn_if_platform_data_without_policy();
+            return Ok(parsed);
         }
     }
-    Ok(ParsedBundle {
+    let parsed = ParsedBundle {
         policy: None,
         data: value,
-    })
+    };
+    parsed.warn_if_platform_data_without_policy();
+    Ok(parsed)
+}
+
+impl ParsedBundle {
+    /// A platform document that arrives **without its module** is a deny-all, and it
+    /// is silent. Say so.
+    ///
+    /// The fallback in `gateway::build_pdp` / `bundle_refresh::refresh_once` is
+    /// `parsed.policy.unwrap_or(GATEWAY_REGO)`, and [`GATEWAY_REGO`] is a
+    /// *development* module: it reads `data.tenants[t].s3_grants[input.principal.sub]`
+    /// on the RAW subject, while hyperfluid's projection keys those maps
+    /// `user:<oidc sub>` / `sa:<client id>`. Measured against the captured platform
+    /// bundle with `opa eval` 1.13.1: the pushed module answers
+    /// `allow: grant matched`, the compiled-in default answers
+    /// `deny: principal not a tenant member` — for the same request, the same data and
+    /// a subject holding a real grant.
+    ///
+    /// So a data-only platform bundle is not "degraded", it is a total data-plane
+    /// outage for the whole organization, arrived at by a field going absent. It is
+    /// fail-CLOSED, which is why this is a log and not a refusal: refusing to load
+    /// would leave the previous data in force, which is a different and quieter lie.
+    /// But it must be loud, because every symptom (pod Ready, bundle revision moving,
+    /// 403s everywhere) points away from the cause.
+    ///
+    /// `grant_schema_version` is the discriminator: it is hyperfluid's own D-1 gate,
+    /// emitted by `S3GatewayBundle::assemble` and by nothing else. Its presence means
+    /// the document came from the platform's serializer, which *always* ships `policy`
+    /// — so if it is here and the module is not, something stripped it in transit.
+    ///
+    /// **Version 0 is excluded, deliberately.** That is the operator's seed bundle
+    /// (`s3_gateway/config.rs::seed_bundle`): `tenants: {}`, `freeze_writes: true`,
+    /// version `0` so the schema gate hard-denies, and no module because it is *meant*
+    /// to authorize nothing until the first real poll. Every pod reads it at boot, so
+    /// warning on it would put this line in every gateway's startup log and teach
+    /// everyone to ignore it — which is how a real occurrence gets missed.
+    ///
+    /// The condition itself lives in [`Self::is_platform_data_missing_its_module`] so it
+    /// can be asserted without a tracing subscriber: a log line whose condition is
+    /// untested is a log line that fires on every boot, or never at all.
+    fn warn_if_platform_data_without_policy(&self) {
+        if !self.is_platform_data_missing_its_module() {
+            return;
+        }
+        tracing::error!(
+            "bundle carries data.grant_schema_version (a platform-projected document) but \
+             NO `policy` module. Falling back to the compiled-in default, which keys \
+             s3_grants/user_attributes on the RAW principal.sub while the platform keys \
+             them `user:<sub>` / `sa:<client id>` — so EVERY request in this organization \
+             will be denied `principal not a tenant member` despite valid grants. The \
+             control plane always ships its module in this field; something removed it."
+        );
+    }
+
+    /// True when this is a platform-projected document (`grant_schema_version ≥ 1`) that
+    /// arrived without its rego module. See
+    /// [`Self::warn_if_platform_data_without_policy`] for what that costs.
+    #[must_use]
+    pub fn is_platform_data_missing_its_module(&self) -> bool {
+        self.policy.is_none()
+            && self
+                .data
+                .get("grant_schema_version")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|version| version > 0)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,5 +221,45 @@ mod tests {
         let parsed = parse_bundle(raw).unwrap();
         assert!(parsed.policy.is_none());
         assert_eq!(parsed.data["org_settings"]["freeze_writes"], true);
+    }
+
+    /// The condition behind the ERROR log, both ways round. A log line that fires on
+    /// every boot gets ignored, and an ignored log line is not a control.
+    #[test]
+    fn a_platform_document_without_its_module_is_recognized_but_the_seed_is_not() {
+        // A real platform document stripped of `policy`: the compiled-in default keys
+        // grants on the raw sub and would deny the whole organization. Say so.
+        let stripped = parse_bundle(
+            r#"{ "data": { "grant_schema_version": 2,
+                           "org_settings": { "freeze_writes": false },
+                           "tenants": { "acme": {} } } }"#,
+        )
+        .unwrap();
+        assert!(stripped.is_platform_data_missing_its_module());
+
+        // The operator's seed bundle (s3_gateway/config.rs::seed_bundle) is version 0,
+        // module-less ON PURPOSE, and read by every pod at boot. It must stay quiet.
+        let seed = parse_bundle(
+            r#"{ "data": { "grant_schema_version": 0,
+                           "org_settings": { "freeze_writes": true,
+                                             "organization_id": "org",
+                                             "bundle_revision": "seed-inert" },
+                           "tenants": {} } }"#,
+        )
+        .unwrap();
+        assert!(!seed.is_platform_data_missing_its_module());
+
+        // A document that carries its module is the normal case.
+        let complete = parse_bundle(
+            r#"{ "policy": "package s3.authz",
+                 "data": { "grant_schema_version": 2, "tenants": {} } }"#,
+        )
+        .unwrap();
+        assert!(!complete.is_platform_data_missing_its_module());
+
+        // s0's own dev bundles carry no version field at all and legitimately rely on
+        // the compiled-in default.
+        let dev = parse_bundle(r#"{ "org_settings": { "freeze_writes": false } }"#).unwrap();
+        assert!(!dev.is_platform_data_missing_its_module());
     }
 }

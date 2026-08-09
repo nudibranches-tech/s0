@@ -106,14 +106,19 @@ async fn multi_delete_filters_to_authorized_keys() {
 }
 
 #[tokio::test]
-async fn unbounded_list_is_narrowed_to_grant_prefix() {
+async fn an_over_broad_list_is_narrowed_to_grant_prefix() {
+    // `20` is WIDER than alice's `2024/` grant and overlaps it, so narrowing is the
+    // correct enforcement: the caller named a scope and gets a genuine subset of the
+    // scope it named. An UNBOUNDED list (`prefix: None`) is a different question and
+    // since 2026-08-09 it is a deny, not a narrowing — see
+    // `security_regressions::an_unbounded_list_is_denied_not_silently_narrowed`.
     let fx = common::fixture("e2e-list-narrow", bundle());
     let access = GatewayAccess::new(fx.gw.clone());
     let mut req = fx.request(
         "ListObjectsV2",
         ListObjectsV2Input {
             bucket: "reports".into(),
-            prefix: None,
+            prefix: Some("20".into()),
             ..Default::default()
         },
         Method::GET,
@@ -162,7 +167,10 @@ async fn list_multipart_uploads_is_narrowed_to_grant_prefix() {
         "ListMultipartUploads",
         ListMultipartUploadsInput {
             bucket: "reports".into(),
-            prefix: None,
+            // Wider than alice's `2024/` grant, and overlapping it. An unbounded
+            // request (`None`) is denied since 2026-08-09, so it cannot exercise the
+            // narrowing this test is about.
+            prefix: Some("20".into()),
             ..Default::default()
         },
         Method::GET,
@@ -176,14 +184,16 @@ async fn multi_prefix_list_allows_and_stashes_fanout() {
     use s0::proxy::obligations::ResponseObligations;
     let fx = common::fixture("e2e-fanout", bundle());
     let access = GatewayAccess::new(fx.gw.clone());
-    // `multi` holds list grants on two prefixes; an unbounded list is now allowed with
-    // a fan-out obligation (previously it fail-closed).
+    // `multi` holds list grants on two prefixes. A request for `20` is wider than both
+    // and overlaps both, so it fans out to the two granted scopes. (The same fan-out
+    // used to be reachable with no prefix at all; since 2026-08-09 an unbounded list is
+    // denied instead, which changed the request shape here but not the fan-out.)
     let mut req = fx.request_as(
         "multi",
         "ListObjectsV2",
         ListObjectsV2Input {
             bucket: "reports".into(),
-            prefix: None,
+            prefix: Some("20".into()),
             ..Default::default()
         },
         Method::GET,

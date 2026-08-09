@@ -85,8 +85,24 @@ async fn main() {
         .await;
     check("put outside grant (2025/) denied", r.is_err());
 
-    // Unbounded list -> narrowed to the granted prefix (only 2024/ keys returned).
-    let keys: Vec<String> = match alice.list_objects_v2().bucket("data").send().await {
+    // Unbounded list -> DENIED since 2026-08-09. alice holds only `2024/`, and a list
+    // that names no prefix is refused rather than silently rewritten into it (AWS
+    // parity; a filtered listing with no signal that it is filtered reads as the whole
+    // bucket). Asserted through the real sidecar OPA, so this is the shipped module's
+    // answer and not the embedded engine's.
+    let r = alice.list_objects_v2().bucket("data").send().await;
+    check("unbounded list denied", r.is_err());
+
+    // …and the over-broad-but-overlapping list is still narrowed to the grant, which is
+    // the positive control: the deny above is about the ABSENT prefix, not about
+    // listing being broken.
+    let keys: Vec<String> = match alice
+        .list_objects_v2()
+        .bucket("data")
+        .prefix("20")
+        .send()
+        .await
+    {
         Ok(o) => o
             .contents()
             .iter()
@@ -95,7 +111,7 @@ async fn main() {
         Err(_) => Vec::new(),
     };
     check(
-        "unbounded list narrowed to 2024/",
+        "over-broad list narrowed to 2024/",
         keys == vec!["2024/report.txt".to_string()],
     );
 

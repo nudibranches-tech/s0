@@ -112,6 +112,21 @@ pub struct InternalApiConfig {
 
 /// OIDC → gateway-credentials mint. Backend-agnostic: verifies a Keycloak token and
 /// mints the gateway's own session (never a backend STS).
+///
+/// This listener serves **two** doors, and the second one is the one clients use:
+///
+/// * the original bearer-token JSON exchange (`Authorization: Bearer <oidc>` ⇒ a JSON
+///   credential document), which requires `tenant_claim`/`org_claim` to be present in
+///   the token and can only ever mint a *user* session;
+/// * `Action=AssumeRoleWithWebIdentity` — the AWS STS query protocol, form-encoded
+///   request and XML response ([`crate::webidentity`]). This is what every S3 SDK can
+///   speak with stock configuration, it carries the tenant in the `RoleArn` rather than
+///   in a claim, and it can mint a service-account session. Configured by the
+///   `web_identity_*` / `role_name_template` / `max_duration_secs` fields below.
+///
+/// Both are unauthenticated in the sense that no *platform* credential is required —
+/// correctly, because the OIDC token **is** the credential. See
+/// [`crate::webidentity`] for why that posture belongs on this socket and on no other.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StsMintConfig {
     pub listen: SocketAddr,
@@ -142,6 +157,54 @@ pub struct StsMintConfig {
     /// the background refresh, leaving miss-driven fetching only.
     #[serde(default = "default_jwks_refresh_secs")]
     pub jwks_refresh_secs: u64,
+
+    // ── the AssumeRoleWithWebIdentity surface ──────────────────────────────────
+    /// Serve `Action=AssumeRoleWithWebIdentity` on this listener.
+    ///
+    /// Defaults **on**: this door is the whole reason to configure `sts_mint` on this
+    /// platform (the bearer door cannot serve hyperfluid — see [`crate::internal`]), and
+    /// an operator who has gone to the trouble of pointing s0 at an IdP wants clients to
+    /// be able to get a credential. Set it to `false` to run the bearer door alone.
+    #[serde(default = "default_true")]
+    pub web_identity_enabled: bool,
+
+    /// Audiences accepted on the web-identity door. Empty ⇒ `[audience]`.
+    ///
+    /// A separate list from `audience` because the two doors have genuinely different
+    /// requirements, and collapsing them would break one of them:
+    ///
+    /// * the **bearer door** validates `aud` strictly, through `jsonwebtoken`'s own
+    ///   audience check, against this one configured value;
+    /// * a **Keycloak service-account token** obtained with
+    ///   `grant_type=client_credentials` carries `aud: "account"` and identifies the
+    ///   client in **`azp`**. Requiring a matching `aud` would refuse every service
+    ///   account on the platform — i.e. the primary consumer of the gateway.
+    ///
+    /// So the web-identity door accepts a match on `aud` **or** `azp`/`client_id`
+    /// against this list. That is not a local invention: it is exactly what Ceph RGW
+    /// does (`ensure_sts_role` is handed a list of client ids, not audiences) and what
+    /// MinIO documents ("validates `aud` first, then falls back to `azp`"), and the
+    /// operator renders the same list it already gives RGW. There is **no** setting in
+    /// which the check is skipped: an empty list falls back to `[audience]`, so a token
+    /// with no audience binding at all is always refused.
+    #[serde(default)]
+    pub web_identity_audiences: Vec<String>,
+
+    /// Expected role name, with `{tenant}` substituted from the presented `RoleArn`.
+    ///
+    /// Absent ⇒ any non-empty role name is accepted (s0 must stay runnable outside
+    /// hyperfluid). Set, it makes a mistyped ARN a clear refusal instead of a working
+    /// session in a tenant the caller did not mean. It is a **diagnostic**, never an
+    /// authorization input — s0 has no role objects and authority comes from the bundle.
+    #[serde(default)]
+    pub role_name_template: Option<String>,
+
+    /// Ceiling on `DurationSeconds`. Above it, **clamped down** and logged — never
+    /// refused; see [`crate::webidentity::WebIdentitySts::clamp_duration`] for why the
+    /// deviation from AWS (which returns `ValidationError`) is the safer direction for a
+    /// credential-acquisition call.
+    #[serde(default = "default_max_session_ttl_secs")]
+    pub max_duration_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -507,6 +570,56 @@ impl GatewayConfig {
             ));
         }
         self.validate_internal_listener()?;
+        self.validate_mint_listener()?;
+        Ok(())
+    }
+
+    /// The mint listener may not share a port with the data plane or with the probes.
+    ///
+    /// This used to be unchecked, and it used to be *nearly* harmless because nothing
+    /// rendered a `sts_mint` section. That changed when the listener grew the
+    /// [`crate::webidentity`] door: it now mints credentials for anyone holding a valid
+    /// IdP token, it is deliberately unauthenticated, and the operator publishes it
+    /// through an Ingress. Sharing a port with either of the other two would be a
+    /// different failure in each direction:
+    ///
+    /// * with **`listen`**, the S3 data plane would never come up (whichever binds
+    ///   second loses), so a copy-pasted port takes the *storage* down;
+    /// * with **`admin_listen`**, the probe port would answer credential mints — and
+    ///   the probe port is published on the Service for Prometheus, whose network
+    ///   posture is nothing like a mint's.
+    ///
+    /// The `internal` collision is checked from the other side in
+    /// [`Self::validate_internal_listener`]; both are kept so neither section can be
+    /// added without the pair being enforced.
+    fn validate_mint_listener(&self) -> Result<()> {
+        let Some(m) = &self.sts_mint else {
+            return Ok(());
+        };
+        if m.listen.port() == self.listen.port() {
+            return Err(GatewayError::Config(format!(
+                "sts_mint.listen {} shares a port with the S3 data-plane listener {}; \
+                 the mint is a separate, deliberately unauthenticated socket and must \
+                 not be a route inside the SigV4-authenticated data plane",
+                m.listen, self.listen
+            )));
+        }
+        if m.listen.port() == self.admin_listen.port() {
+            return Err(GatewayError::Config(format!(
+                "sts_mint.listen {} shares a port with admin_listen {}; the admin \
+                 listener is published for probes and scraping and must never also \
+                 mint credentials",
+                m.listen, self.admin_listen
+            )));
+        }
+        if m.max_duration_secs == 0 {
+            return Err(GatewayError::Config(
+                "sts_mint.max_duration_secs must be > 0; a zero ceiling clamps every \
+                 minted session to nothing and is not a way to disable the surface \
+                 (set sts_mint.web_identity_enabled=false for that)"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 
@@ -1071,6 +1184,93 @@ mod tests {
         let creds = crate::auth::credentials_from_config(&loaded);
         let rendered = format!("{creds:?}");
         assert!(!rendered.contains(STATIC), "{rendered}");
+    }
+
+    /// The `AssumeRoleWithWebIdentity` knobs load off the shipped example, with the
+    /// values the operator renders.
+    ///
+    /// The example is the schema the operator's own contract test
+    /// (`every_key_the_operator_renders_exists_in_s0s_own_schema`) checks its writer
+    /// against, and s0 **ignores unknown keys** — so a field misspelled on either side
+    /// is silent. Here it is silent in the worst direction: a mistyped
+    /// `web_identity_audiences` leaves the surface accepting only the bearer door's
+    /// single `audience`, which refuses every service account on the platform, with no
+    /// error anywhere.
+    #[test]
+    fn the_web_identity_surface_loads_from_the_shipped_example() {
+        let loaded = GatewayConfig::from_json(&example().to_string()).expect("the example loads");
+        let mint = loaded.sts_mint.expect("the example declares sts_mint");
+        assert_eq!(mint.listen.port(), 8015);
+        assert!(mint.web_identity_enabled);
+        assert_eq!(
+            mint.web_identity_audiences,
+            vec!["acme-storage", "hf-console", "control-plane-sa"]
+        );
+        assert_eq!(
+            mint.role_name_template.as_deref(),
+            Some("{tenant}-sts-role")
+        );
+        assert_eq!(mint.max_duration_secs, 3600);
+
+        // …and a config that predates the surface still loads, with the surface ON by
+        // default. Absence of the section is the only "off" that matters, and it is
+        // still expressible; absence of these *fields* must not be.
+        let mut older = example();
+        let m = older["sts_mint"].as_object_mut().expect("sts_mint");
+        for k in [
+            "web_identity_enabled",
+            "web_identity_audiences",
+            "role_name_template",
+            "max_duration_secs",
+        ] {
+            m.remove(k);
+        }
+        let loaded = GatewayConfig::from_json(&older.to_string()).expect("an older config loads");
+        let mint = loaded.sts_mint.expect("sts_mint");
+        assert!(mint.web_identity_enabled, "the surface defaults ON");
+        assert!(mint.web_identity_audiences.is_empty());
+        assert_eq!(mint.role_name_template, None, "no template ⇒ any role name");
+        assert_eq!(mint.max_duration_secs, 3600);
+    }
+
+    /// The mint listener may not land on the data plane or on the probe port either.
+    ///
+    /// Checked from this side as well as from `internal`'s, because the two sections are
+    /// added independently and a rule enforced from only one of them is a rule that
+    /// disappears when the other section is absent.
+    #[test]
+    fn the_mint_listener_may_not_share_a_port_with_anything_else() {
+        let collide = |port: u16| -> String {
+            let mut cfg = example();
+            cfg["sts_mint"]["listen"] = serde_json::json!(format!("0.0.0.0:{port}"));
+            GatewayConfig::from_json(&cfg.to_string())
+                .expect_err("a port collision must not load")
+                .to_string()
+        };
+        assert!(collide(8014).contains("data-plane"), "{}", collide(8014));
+        assert!(collide(8016).contains("admin_listen"), "{}", collide(8016));
+        // The internal listener's own check catches this one, from the other side.
+        assert!(
+            collide(8017).contains("internal.listen"),
+            "{}",
+            collide(8017)
+        );
+
+        // A zero ceiling would clamp every minted credential to nothing. Turning the
+        // surface off is `web_identity_enabled: false`, not a zero.
+        let mut cfg = example();
+        cfg["sts_mint"]["max_duration_secs"] = serde_json::json!(0);
+        let err = GatewayConfig::from_json(&cfg.to_string())
+            .expect_err("a zero ceiling must not load")
+            .to_string();
+        assert!(err.contains("max_duration_secs"), "{err}");
+        assert!(
+            err.contains("web_identity_enabled"),
+            "the message must say how: {err}"
+        );
+
+        // POSITIVE CONTROL: the example itself still loads on its own port.
+        assert!(GatewayConfig::from_json(&example().to_string()).is_ok());
     }
 
     /// The credential mint may not land on the unauthenticated probe port, on the

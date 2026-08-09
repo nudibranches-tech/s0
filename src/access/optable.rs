@@ -889,7 +889,12 @@ pub const OP_TABLE: &[OpSpec] = &[
              publishes: a key a policy conditions on but which is absent from \
              org_settings.reserved_tag_keys is writable by anyone holding \
              write_object_tags. (An absent list denies every tag write, so the failure \
-             mode is a list that is present and incomplete, not a missing one.)",
+             mode is a list that is present and incomplete, not a missing one.) \
+             NARROWED 2026-08-09: hyperfluid now DERIVES the list from the grants it is \
+             publishing — the union of the platform namespace and every `tag:<key>` a \
+             grant in the same document conditions on — so a key a projected GRANT \
+             conditions on cannot be omitted. What remains is a key some future policy \
+             reads from outside the grant projection.",
             "version_id",
         ],
     ),
