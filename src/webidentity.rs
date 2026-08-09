@@ -93,6 +93,16 @@
 //! oracle for an anonymous caller. After the reordering, probing requires a token the
 //! IdP actually issued, and the refusal is a deliberately unspecific `AccessDenied`
 //! while the detail goes to the log.
+//!
+//! # Two ways a token can be addressed to this gateway
+//!
+//! The configured audience list, **or** the policy bundle — see
+//! [`WebIdentitySts::addressed_to_this_gateway`], which carries the whole argument, and
+//! `s0-plan/AWS-PARITY.md` D31, which registers the deviation. The second route exists
+//! because the first one cannot serve a *tenant's own* service accounts without an
+//! operator re-render per service account, and those are the primary consumer of this
+//! gateway. It is additive: no token the audience list accepts is affected by it, and
+//! acceptance is not authorization in either case.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -576,6 +586,46 @@ pub fn resolve_principal(claims: &Value) -> Result<WebIdentityPrincipal, StsRefu
     })
 }
 
+// ── who this tenant's bundle already knows ─────────────────────────────────────
+
+/// The subjects the **current** policy bundle knows for a tenant.
+///
+/// This is the second, purely **additive** route by which a token can be found to be
+/// addressed to this gateway (see [`WebIdentitySts::addressed_to_this_gateway`], and
+/// `s0-plan/AWS-PARITY.md` D31 for the deviation it registers).
+///
+/// Implemented by [`crate::pdp::BundleStore`] — the same revision-swapped store the PDP
+/// decides against. Every call reads whatever bundle is in force at that instant, so
+/// this can never answer from a snapshot the poller has already replaced. A cache here
+/// would be a *second* answer to "what does the control plane currently say", which is
+/// exactly the failure class the revision swap exists to remove: a revocation would land
+/// in the PDP and not here.
+pub trait TenantSubjects: Send + Sync {
+    /// Is `sa:<client_id>` a **member subject** of `tenant` in the bundle in force?
+    ///
+    /// "Member subject" is the policy's own word rather than a new concept: `s3.rego`'s
+    /// membership rule is
+    /// `member if is_object(data.tenants[input.tenant].user_attributes[subject_key])`,
+    /// and this asks exactly that question, of exactly that map, under exactly that key.
+    fn knows_service_account(&self, tenant: &str, client_id: &str) -> bool;
+}
+
+/// The client id a token names in `azp`, falling back to `client_id`.
+///
+/// **The only claim the bundle route reads.** Never `aud` — that is a list of
+/// *audiences*, not a principal, and a token may carry an audience it does not speak
+/// for. Never `sub` either: a user's `sub` is the other key space (`user:`), and no
+/// claim a human's token carries may be allowed to select an `sa:` key.
+fn azp_or_client_id(claims: &Value) -> Option<&str> {
+    ["azp", "client_id"].into_iter().find_map(|name| {
+        claims
+            .get(name)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    })
+}
+
 // ── the endpoint ───────────────────────────────────────────────────────────────
 
 /// Verifies a web identity token and hands back its **raw** claims.
@@ -586,7 +636,29 @@ pub fn resolve_principal(claims: &Value) -> Result<WebIdentityPrincipal, StsRefu
 /// `RoleArn` and the organization from the routing table.
 #[async_trait::async_trait]
 pub trait WebIdentityVerifier: Send + Sync {
-    async fn verify_claims(&self, token: &str) -> Result<Value, StsRefusal>;
+    /// Verify the token's **signature, issuer and expiry** and return its raw claims.
+    ///
+    /// It deliberately does **not** decide whether the token is addressed to this
+    /// gateway, because that decision now needs the tenant out of the `RoleArn` — which
+    /// this trait never sees. [`WebIdentitySts::addressed_to_this_gateway`] takes it, on
+    /// the one path that can reach a credential, so no implementation of this trait can
+    /// skip it by omission.
+    ///
+    /// **The rename from `verify_claims` is the point of the rename.** The audience
+    /// check used to live inside that method; moving it out while keeping the old name
+    /// would leave any other implementation compiling and silently unchecked.
+    async fn verify_token(&self, token: &str) -> Result<Value, StsRefusal>;
+
+    /// Does the **configured** audience list accept this token? `aud` (string or array)
+    /// or `azp`/`client_id`, exactly as before the bundle route existed. This answer is
+    /// never narrowed by anything below — the bundle route is only ever consulted after
+    /// it says no.
+    fn audience_is_accepted(&self, claims: &Value) -> bool;
+
+    /// The configured list, for a refusal **log line**. Never for a response body: this
+    /// endpoint is internet-reachable and the list is the set of OIDC clients the
+    /// platform provisions.
+    fn configured_audiences(&self) -> Vec<String>;
 }
 
 /// Everything the surface needs that is not a secret.
@@ -628,6 +700,10 @@ pub struct WebIdentitySts {
     sts: Arc<StsAuthority>,
     registry: Arc<BackendRegistry>,
     config: WebIdentityConfig,
+    /// The bundle-driven half of the audience decision. `None` ⇒ the configured
+    /// audience list is the only route, byte-for-byte the behaviour of the build that
+    /// predates it. See [`Self::with_bundle_subjects`].
+    subjects: Option<Arc<dyn TenantSubjects>>,
 }
 
 /// A minted session, plus everything the response document echoes back.
@@ -657,7 +733,22 @@ impl WebIdentitySts {
             sts,
             registry,
             config,
+            subjects: None,
         }
+    }
+
+    /// Attach the policy bundle as a second, **additive** source of audience
+    /// acceptance — see [`Self::addressed_to_this_gateway`] for the rule and the
+    /// argument.
+    ///
+    /// A builder rather than a constructor parameter so that the absence of it is a
+    /// real, reachable state: `main.rs` wires the gateway's own [`crate::pdp::BundleStore`],
+    /// and anything that does not wire it gets precisely the pre-existing behaviour
+    /// rather than a weaker version of the new one.
+    #[must_use]
+    pub fn with_bundle_subjects(mut self, subjects: Arc<dyn TenantSubjects>) -> Self {
+        self.subjects = Some(subjects);
+        self
     }
 
     /// **Clamp, not refuse** — the same choice [`crate::internal::InternalApi::clamp_ttl`]
@@ -686,6 +777,134 @@ impl WebIdentitySts {
             return self.config.max_duration_secs;
         }
         requested
+    }
+
+    /// **Is this token addressed to this gateway?** Two routes, and the second one only
+    /// ever runs after the first has said no.
+    ///
+    /// 1. **The configured audience list** — `aud` or `azp`/`client_id` naming one of
+    ///    `sts_mint.web_identity_audiences` (falling back to the bearer door's single
+    ///    `audience`, so the list is never empty). Unchanged, and still authoritative:
+    ///    every token accepted before this method existed is accepted by this arm alone.
+    /// 2. **The policy bundle** — the token's `azp`/`client_id` `C` names a service
+    ///    account that the *current* bundle already knows as a member subject
+    ///    (`sa:C` ∈ `data.tenants[<tenant from the RoleArn>].user_attributes`).
+    ///
+    /// # Why route 2 exists
+    ///
+    /// Route 1 alone cannot serve a tenant's own service accounts, which are the primary
+    /// consumer of this whole gateway. A Keycloak SA token from
+    /// `grant_type=client_credentials` carries `aud: "account"` and `azp: <its clientId>`,
+    /// and that clientId is in no list the operator rendered: the list is
+    /// `[<org>-storage-sa] + PLATFORM_STS_AUDIENCES + spec.s3Gateway.stsAudiences`
+    /// (`hf_bin_operator/src/s3_gateway/config.rs::audiences`). Naming each SA in
+    /// `stsAudiences` works — it is what `naming_a_service_accounts_client_id_lets_it_present_an_unmapped_token`
+    /// measures — but it costs an operator re-render per service account, so in practice
+    /// every tenant-created SA is refused `InvalidIdentityToken`.
+    ///
+    /// # Why it is safe, in the three properties that make it so
+    ///
+    /// * **Acceptance is not authorization.** This decides only *"is this token
+    ///   addressed to this gateway"*. Nothing here grants anything: the request is still
+    ///   authorized against the bundle on every S3 call, and a subject the bundle knows
+    ///   with no grant is still denied — pinned by
+    ///   `web_identity_e2e::bundle_acceptance_is_not_authorization_a_grantless_subject_is_still_denied`.
+    /// * **It fails closed.** The answer is drawn from the bundle in force. An empty,
+    ///   seed, or stale bundle knows fewer subjects, so it accepts *fewer* tokens. There
+    ///   is no bundle state that widens route 1.
+    /// * **It is tenant-scoped, and the tenant is not the caller's to choose freely.**
+    ///   The tenant comes from the `RoleArn`, and the lookup is against *that* tenant's
+    ///   subject map, so a token cannot be accepted against a tenant whose bundle does
+    ///   not name it. The honest limit: hyperfluid projects `user_attributes` org-wide
+    ///   (`org_s3_gateway_bundle::assemble` clones one map into every tenant of the org),
+    ///   so in practice this is "a service account of this organization, presented
+    ///   against a harbor of this organization". It cannot cross an organization,
+    ///   because a bundle is published per organization and the module hard-denies a
+    ///   request whose `organization_id` is not the bundle's.
+    ///
+    /// # Why `user_attributes` and not `s3_grants`
+    ///
+    /// `user_attributes` is the map the policy's **own membership rule** reads
+    /// (`s3.rego`: `member if is_object(data.tenants[t].user_attributes[subject_key])`),
+    /// and a request from a non-member is denied `principal is not a tenant member`
+    /// before any grant is consulted. So:
+    ///
+    /// * a subject in `user_attributes` with **no grant** is a real, ordinary state — the
+    ///   projection writes an entry for every service account of the organization,
+    ///   grants or not — and it is exactly the state a newly-created SA is in while
+    ///   someone is still assigning its access. Keying on `s3_grants` would refuse it a
+    ///   credential and report an *identity* failure for what is a missing grant;
+    /// * a subject in `s3_grants` but **not** in `user_attributes` is authorized for
+    ///   nothing at all, so accepting it would vend a credential that 403s on every
+    ///   request — the same dud-credential outcome the mint already refuses to create
+    ///   for an unroutable tenant.
+    ///
+    /// So the union buys nothing on the first count and costs a dud credential on the
+    /// second. One map, and it is the one the decision itself is keyed on.
+    ///
+    /// # What it does NOT do
+    ///
+    /// It applies to this door only (the OIDC bearer mint's strict `aud` check in
+    /// [`crate::mint::StandardVerifier::verify`] is untouched), it reads only
+    /// `azp`/`client_id`, never `aud` and never `sub`, and it composes the `sa:` prefix
+    /// itself — so no claim on a human's token can select a service account's key.
+    fn addressed_to_this_gateway(&self, role: &RoleArn, claims: &Value) -> Result<(), StsRefusal> {
+        if self.verifier.audience_is_accepted(claims) {
+            return Ok(());
+        }
+        let client_id = azp_or_client_id(claims);
+        if let (Some(subjects), Some(client_id)) = (&self.subjects, client_id)
+            && subjects.knows_service_account(&role.tenant, client_id)
+        {
+            tracing::info!(
+                tenant = %role.tenant,
+                subject = %format!("sa:{client_id}"),
+                "web identity token accepted by the POLICY BUNDLE rather than by the \
+                 configured audience list: this client id is a service-account subject \
+                 the tenant's current bundle knows. Acceptance is not authorization — \
+                 every request is still authorized against the bundle"
+            );
+            return Ok(());
+        }
+        // Two different operator problems, and the log has to tell them apart: "I made a
+        // new service account and it cannot get a credential" is a *bundle* question
+        // (has the projection published it yet?), while "nothing from this client works"
+        // is an *audience* question. The RESPONSE stays uniform — see below.
+        match (&self.subjects, client_id) {
+            (Some(_), Some(client_id)) => tracing::warn!(
+                tenant = %role.tenant,
+                subject = %format!("sa:{client_id}"),
+                accepted = ?self.verifier.configured_audiences(),
+                "web identity token refused: NO SUCH SUBJECT in this tenant's bundle — \
+                 `sa:<client id>` is not in data.tenants[<tenant>].user_attributes for the \
+                 tenant named by the RoleArn (and neither `aud` nor `azp` names a \
+                 configured audience). If this service account is new, the control plane \
+                 has not published it yet; if it belongs to another organization or \
+                 another harbor, it never will"
+            ),
+            (Some(_), None) => tracing::warn!(
+                tenant = %role.tenant,
+                accepted = ?self.verifier.configured_audiences(),
+                "web identity token refused: AUDIENCE NOT ACCEPTED — neither `aud` nor \
+                 `azp` names a configured audience, and the token carries no \
+                 `azp`/`client_id` at all, so the bundle route cannot apply to it"
+            ),
+            (None, _) => tracing::warn!(
+                accepted = ?self.verifier.configured_audiences(),
+                "web identity token refused: AUDIENCE NOT ACCEPTED — neither `aud` nor \
+                 `azp` names a configured audience, and this instance has no bundle \
+                 wired for the bundle-driven route"
+            ),
+        }
+        // One message for every refusal above. Distinguishing them *here* would make an
+        // internet-reachable, unauthenticated endpoint answer "that tenant's bundle does
+        // not know you" differently from "wrong audience", which is the same
+        // tenant-oracle D22 refuses to be. The accepted list is not echoed either.
+        Err(StsRefusal::InvalidIdentityToken(
+            "neither `aud` nor `azp` names an audience this gateway accepts, and `azp` \
+             does not name a service account known to the requested tenant"
+                .into(),
+        ))
     }
 
     /// Is this the role name this gateway serves for that tenant?
@@ -768,8 +987,14 @@ impl WebIdentitySts {
         // ── identity, before anything that could disclose a tenant ─────────────
         let claims = self
             .verifier
-            .verify_claims(&request.web_identity_token)
+            .verify_token(&request.web_identity_token)
             .await?;
+        // The audience decision sits exactly where it always did — immediately after
+        // signature/issuer/expiry and before the principal is resolved — so no refusal
+        // that was an `InvalidIdentityToken` becomes an `IDPRejectedClaim`, or the other
+        // way round. What changed is only that it can now also be satisfied by the
+        // bundle, which needs the tenant the RoleArn named.
+        self.addressed_to_this_gateway(&role, &claims)?;
         let principal = resolve_principal(&claims)?;
 
         // ── now, and only now, the tenant ─────────────────────────────────────
@@ -1319,6 +1544,390 @@ mod tests {
                 "RoleSessionName {good:?} must be accepted"
             );
         }
+    }
+
+    // ── addressing: the configured list, and the bundle route ───────────────────
+    //
+    // These drive the REAL `assume_role` — the same method the HTTP handler calls —
+    // over a real `BackendRegistry` with TWO routable tenants and a real `StsAuthority`.
+    // Two routable tenants is the load-bearing part of the setup: it is what makes
+    // `the_same_service_account_is_refused_against_another_tenants_role_arn` a statement
+    // about the bundle lookup rather than about the routing table, which would have
+    // refused an unroutable tenant whatever this code did.
+
+    /// A verifier that hands back fixed claims and holds a configured audience list.
+    /// The signature/issuer/expiry half is `tests/web_identity_e2e.rs`'s job, with a
+    /// real RS256 key; what these tests need to vary is the claims and the list.
+    struct FixedVerifier {
+        claims: Value,
+        audiences: Vec<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl WebIdentityVerifier for FixedVerifier {
+        async fn verify_token(&self, _token: &str) -> Result<Value, StsRefusal> {
+            Ok(self.claims.clone())
+        }
+        fn audience_is_accepted(&self, claims: &Value) -> bool {
+            // The same rule `StandardVerifier` applies: `aud` (string or array) or
+            // `azp`/`client_id`, against the configured list.
+            let matches = |v: &str| self.audiences.iter().any(|a| a == v);
+            let aud = match claims.get("aud") {
+                Some(Value::String(s)) => matches(s),
+                Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).any(matches),
+                _ => false,
+            };
+            aud || ["azp", "client_id"]
+                .iter()
+                .any(|n| claims.get(*n).and_then(Value::as_str).is_some_and(matches))
+        }
+        fn configured_audiences(&self) -> Vec<String> {
+            self.audiences.clone()
+        }
+    }
+
+    /// The bundle, reduced to the one question the door asks it.
+    struct KnownSubjects(Vec<(&'static str, &'static str)>);
+
+    impl TenantSubjects for KnownSubjects {
+        fn knows_service_account(&self, tenant: &str, client_id: &str) -> bool {
+            self.0.iter().any(|(t, c)| *t == tenant && *c == client_id)
+        }
+    }
+
+    /// `acme` and `warehouse`, both routable, both in the same organization.
+    fn two_tenant_registry() -> Arc<BackendRegistry> {
+        let cfg = crate::config::GatewayConfig::from_json(
+            &serde_json::json!({
+                "listen": "127.0.0.1:0",
+                "sts": { "master_key_hex": "00".repeat(32), "signing_key_hex": "11".repeat(32) },
+                "pdp": { "mode": "embedded" },
+                "audit": { "sink_url": "http://127.0.0.1:59999/none",
+                           "spill_path": "/dev/null" },
+                "backends": [
+                    { "id": "bay-1", "kind": "ceph", "endpoint_url": "http://127.0.0.1:1" }
+                ],
+                "tenants": [
+                    { "tenant": "acme", "organization_id": "org-acme", "backend_id": "bay-1",
+                      "owner_access_key": "OWNER", "owner_secret_key": "SECRET" },
+                    { "tenant": "warehouse", "organization_id": "org-acme",
+                      "backend_id": "bay-1",
+                      "owner_access_key": "OWNER", "owner_secret_key": "SECRET" }
+                ],
+                "bundle_path": "/dev/null"
+            })
+            .to_string(),
+        )
+        .expect("config");
+        Arc::new(BackendRegistry::from_config(&cfg).expect("registry"))
+    }
+
+    fn door(claims: Value, audiences: &[&str], known: Option<KnownSubjects>) -> WebIdentitySts {
+        let sts = WebIdentitySts::new(
+            Arc::new(FixedVerifier {
+                claims,
+                audiences: audiences.iter().map(|s| (*s).to_string()).collect(),
+            }),
+            Arc::new(StsAuthority::new(vec![4u8; 32], vec![8u8; 32]).expect("authority")),
+            two_tenant_registry(),
+            WebIdentityConfig {
+                max_duration_secs: 3600,
+                default_duration_secs: 900,
+                role_name_template: Some("{tenant}-sts-role".into()),
+            },
+        );
+        match known {
+            Some(k) => sts.with_bundle_subjects(Arc::new(k)),
+            None => sts,
+        }
+    }
+
+    /// The refusal, or a panic naming what was minted instead.
+    ///
+    /// Written out rather than reached with `expect_err` because
+    /// [`AssumedRoleSession`] deliberately does not implement `Debug` — three of its
+    /// fields are a live credential, and the strongest guarantee that they never reach a
+    /// panic message or a log line is that `{:?}` on it does not compile. That guarantee
+    /// is worth more than the convenience, so the tests bend around it.
+    fn refusal(outcome: Result<AssumedRoleSession, StsRefusal>, expectation: &str) -> StsRefusal {
+        match outcome {
+            Ok(_) => panic!("{expectation}: a credential was minted instead"),
+            Err(e) => e,
+        }
+    }
+
+    fn request_for(tenant: &str) -> AssumeRoleWithWebIdentityRequest {
+        AssumeRoleWithWebIdentityRequest {
+            role_arn: format!("arn:aws:iam::{tenant}:role/{tenant}-sts-role"),
+            role_session_name: "unit-session".into(),
+            web_identity_token: "verified-by-the-mock".into(),
+            duration_seconds: None,
+        }
+    }
+
+    /// A tenant's own service account, exactly as Keycloak issues it: `aud: "account"`,
+    /// `azp: <clientId>`, and nothing in it that any configured audience names.
+    fn tenant_sa_claims(client_id: &str) -> Value {
+        serde_json::json!({
+            "iss": "https://kc.example/realms/default",
+            "aud": "account",
+            "azp": client_id,
+            "sub": "48794dea-0000-0000-0000-000000000000",
+            "preferred_username": format!("service-account-{client_id}")
+        })
+    }
+
+    /// **The case the whole change exists for.** `test-s0-before` is the real clientId
+    /// measured against dev1: it is in no rendered audience list, its `aud` is
+    /// Keycloak's `account`, and before the bundle route every token like it was refused
+    /// `InvalidIdentityToken`.
+    #[tokio::test]
+    async fn a_tenant_service_account_the_bundle_knows_is_accepted_though_no_audience_names_it() {
+        let sts = door(
+            tenant_sa_claims("test-s0-before"),
+            // The list the operator really renders: the org storage client and the two
+            // platform clients. The SA is in none of them.
+            &["acme-storage-sa", "hf-console", "control-plane-sa"],
+            Some(KnownSubjects(vec![("acme", "test-s0-before")])),
+        );
+        let session = sts
+            .assume_role(&request_for("acme"), "sid-1")
+            .await
+            .expect("the bundle knows this subject for this tenant");
+        assert_eq!(session.principal.sub, "test-s0-before");
+        assert_eq!(
+            session.principal.principal_type,
+            PrincipalType::ServiceAccount
+        );
+        assert_eq!(session.role.tenant, "acme");
+
+        // NEGATIVE CONTROL, on the identical claims and the identical list: with no
+        // bundle wired at all the token is refused, so the acceptance above came from
+        // the bundle and from nothing else.
+        let unwired = door(
+            tenant_sa_claims("test-s0-before"),
+            &["acme-storage-sa", "hf-console", "control-plane-sa"],
+            None,
+        );
+        assert_eq!(
+            unwired
+                .assume_role(&request_for("acme"), "sid-1")
+                .await
+                .err(),
+            Some(StsRefusal::InvalidIdentityToken(
+                "neither `aud` nor `azp` names an audience this gateway accepts, and `azp` \
+                 does not name a service account known to the requested tenant"
+                    .into()
+            ))
+        );
+    }
+
+    /// **The tenant scoping, measured where it could actually fail.** `warehouse` is
+    /// routable and its role name is right, so the ONLY thing standing between this
+    /// token and a `warehouse` credential is that `warehouse`'s subject map does not
+    /// name it.
+    #[tokio::test]
+    async fn the_same_service_account_is_refused_against_another_tenants_role_arn() {
+        let known = || KnownSubjects(vec![("acme", "test-s0-before")]);
+        let audiences = ["acme-storage-sa"];
+
+        // POSITIVE CONTROL first: the tenant that does know it.
+        assert!(
+            door(
+                tenant_sa_claims("test-s0-before"),
+                &audiences,
+                Some(known())
+            )
+            .assume_role(&request_for("acme"), "sid-1")
+            .await
+            .is_ok()
+        );
+
+        let err = refusal(
+            door(
+                tenant_sa_claims("test-s0-before"),
+                &audiences,
+                Some(known()),
+            )
+            .assume_role(&request_for("warehouse"), "sid-2")
+            .await,
+            "warehouse's bundle does not name this subject",
+        );
+        assert_eq!(err.code(), "InvalidIdentityToken");
+        // The refusal names neither the tenant nor the subject: this endpoint is
+        // internet-reachable (D22).
+        assert!(!err.message().contains("warehouse"), "{}", err.message());
+        assert!(
+            !err.message().contains("test-s0-before"),
+            "{}",
+            err.message()
+        );
+    }
+
+    /// A client id nothing knows is refused by both routes — the ordinary case, and the
+    /// one that proves the bundle route is a *lookup* rather than a way in.
+    #[tokio::test]
+    async fn an_unknown_client_id_is_refused_by_both_routes() {
+        let sts = door(
+            tenant_sa_claims("attacker-client"),
+            &["acme-storage-sa"],
+            Some(KnownSubjects(vec![("acme", "test-s0-before")])),
+        );
+        let err = refusal(
+            sts.assume_role(&request_for("acme"), "sid-1").await,
+            "nothing names this client",
+        );
+        assert_eq!(err.code(), "InvalidIdentityToken");
+        assert_eq!(err.status(), 400);
+    }
+
+    /// **Additivity, which is the constraint this change had to meet: nothing that is
+    /// accepted today may become refused.**
+    ///
+    /// Every shape the configured list accepts — `aud` as a string, `aud` as an array,
+    /// `azp`, `client_id`, and a human's console token — is driven through the door
+    /// twice: once with **no bundle** (the build that predates this change) and once
+    /// with a bundle that knows **nothing at all**. Both must mint. A bundle route that
+    /// could ever narrow route 1 fails here.
+    #[tokio::test]
+    async fn every_token_the_configured_list_accepts_today_is_still_accepted() {
+        let accepted_today = [
+            serde_json::json!({ "aud": "acme-storage-sa", "sub": "u-1" }),
+            serde_json::json!({ "aud": ["account", "acme-storage-sa"], "sub": "u-2" }),
+            serde_json::json!({ "aud": "account", "azp": "hf-console", "sub": "u-3",
+                                "preferred_username": "alice" }),
+            serde_json::json!({ "aud": "account", "client_id": "control-plane-sa",
+                                "sub": "u-4" }),
+            // A service account whose clientId the operator DID name in stsAudiences:
+            // route 1, and it must not start depending on the bundle.
+            serde_json::json!({ "aud": "account", "azp": "control-plane-sa",
+                                "sub": "u-5",
+                                "preferred_username": "service-account-control-plane-sa" }),
+        ];
+        for claims in accepted_today {
+            for (label, known) in [
+                ("no bundle wired at all", None),
+                (
+                    "a bundle that knows nothing",
+                    Some(KnownSubjects(Vec::new())),
+                ),
+            ] {
+                let sts = door(
+                    claims.clone(),
+                    &["acme-storage-sa", "hf-console", "control-plane-sa"],
+                    known,
+                );
+                assert!(
+                    sts.assume_role(&request_for("acme"), "sid-1").await.is_ok(),
+                    "{claims} was accepted before the bundle route and must still be \
+                     accepted with {label}"
+                );
+            }
+        }
+    }
+
+    /// An empty bundle is the seed bundle every pod boots on, and a stale one is what a
+    /// broken poll leaves behind. Neither may widen anything, and neither may take route
+    /// 1 away — the configured list is not sourced from the bundle at all.
+    #[tokio::test]
+    async fn an_empty_bundle_refuses_the_bundle_route_and_still_honours_the_configured_list() {
+        // Route 2, against an empty bundle: refused.
+        let empty = door(
+            tenant_sa_claims("test-s0-before"),
+            &["acme-storage-sa"],
+            Some(KnownSubjects(Vec::new())),
+        );
+        assert_eq!(
+            refusal(
+                empty.assume_role(&request_for("acme"), "sid-1").await,
+                "an empty bundle knows nobody",
+            )
+            .code(),
+            "InvalidIdentityToken"
+        );
+        // Route 1, against the same empty bundle: unaffected.
+        let configured = door(
+            serde_json::json!({ "aud": "account", "azp": "acme-storage-sa", "sub": "u" }),
+            &["acme-storage-sa"],
+            Some(KnownSubjects(Vec::new())),
+        );
+        assert!(
+            configured
+                .assume_role(&request_for("acme"), "sid-1")
+                .await
+                .is_ok(),
+            "an empty bundle must not be able to refuse a token the configured list accepts"
+        );
+    }
+
+    /// The bundle route reads `azp`/`client_id` and composes the `sa:` prefix itself, so
+    /// there is no claim a human's token can carry that reaches a service account's key
+    /// space — and no `aud` value that reaches the bundle route at all.
+    #[tokio::test]
+    async fn the_bundle_route_reads_only_azp_and_never_aud_or_sub() {
+        let known = || KnownSubjects(vec![("acme", "test-s0-before")]);
+        for claims in [
+            // `sub` naming the service account: the OTHER key space, ignored here.
+            serde_json::json!({ "aud": "account", "sub": "test-s0-before" }),
+            // `aud` naming it: an audience is not a principal.
+            serde_json::json!({ "aud": "test-s0-before", "sub": "u" }),
+            serde_json::json!({ "aud": ["account", "test-s0-before"], "sub": "u" }),
+            // `preferred_username` naming it, with an azp that does not.
+            serde_json::json!({ "aud": "account", "azp": "hf-console", "sub": "u",
+                                "preferred_username": "service-account-test-s0-before" }),
+            // No client id at all.
+            serde_json::json!({ "aud": "account", "sub": "u" }),
+        ] {
+            let sts = door(claims.clone(), &["acme-storage-sa"], Some(known()));
+            assert_eq!(
+                refusal(
+                    sts.assume_role(&request_for("acme"), "sid-1").await,
+                    &format!("{claims} must not reach the bundle route"),
+                )
+                .code(),
+                "InvalidIdentityToken",
+                "{claims}"
+            );
+        }
+    }
+
+    /// Acceptance is decided **before** the role name and the routing table, exactly
+    /// where it was before, so a token the bundle route accepts still gets the uniform
+    /// `AccessDenied` for a wrong role name — and a token neither route accepts still
+    /// answers the token error rather than the tenant one.
+    #[tokio::test]
+    async fn bundle_acceptance_does_not_reorder_the_role_and_tenant_checks() {
+        let wrong_role = AssumeRoleWithWebIdentityRequest {
+            role_arn: "arn:aws:iam::acme:role/not-the-role".into(),
+            ..request_for("acme")
+        };
+        let sts = door(
+            tenant_sa_claims("test-s0-before"),
+            &["acme-storage-sa"],
+            Some(KnownSubjects(vec![("acme", "test-s0-before")])),
+        );
+        assert_eq!(
+            sts.assume_role(&wrong_role, "sid-1").await.err(),
+            Some(StsRefusal::AccessDenied)
+        );
+
+        // …and a token the bundle does not know, against a tenant that does not exist,
+        // still answers the *token* error: the tenant is not disclosed by ordering.
+        let unknown = door(
+            tenant_sa_claims("test-s0-before"),
+            &["acme-storage-sa"],
+            Some(KnownSubjects(vec![("acme", "test-s0-before")])),
+        );
+        assert_eq!(
+            refusal(
+                unknown
+                    .assume_role(&request_for("no-such-tenant"), "sid-1")
+                    .await,
+                "a subject no tenant knows is refused",
+            )
+            .code(),
+            "InvalidIdentityToken"
+        );
     }
 
     // ── the wire documents ──────────────────────────────────────────────────────

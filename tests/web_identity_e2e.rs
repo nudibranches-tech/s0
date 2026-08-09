@@ -203,7 +203,11 @@ async fn harness(tag: &str) -> Harness {
 }
 
 async fn harness_with(tag: &str, cfg: StsMintConfig) -> Harness {
-    let fx = common::fixture(tag, bundle());
+    harness_over(tag, cfg, bundle()).await
+}
+
+async fn harness_over(tag: &str, cfg: StsMintConfig, bundle: serde_json::Value) -> Harness {
+    let fx = common::fixture(tag, bundle);
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind s3");
     let s3_addr: SocketAddr = listener.local_addr().expect("addr");
@@ -214,12 +218,18 @@ async fn harness_with(tag: &str, cfg: StsMintConfig) -> Harness {
     });
 
     let verifier = Arc::new(StandardVerifier::from_config(&cfg).expect("verifier"));
-    let web_identity = Arc::new(WebIdentitySts::new(
-        verifier.clone(),
-        fx.gw.identity.sts(),
-        fx.gw.registry.clone(),
-        WebIdentityConfig::from_config(&cfg, Duration::from_secs(900)),
-    ));
+    let web_identity = Arc::new(
+        WebIdentitySts::new(
+            verifier.clone(),
+            fx.gw.identity.sts(),
+            fx.gw.registry.clone(),
+            WebIdentityConfig::from_config(&cfg, Duration::from_secs(900)),
+        )
+        // The gateway's OWN BundleStore — the one the PDP decides against and the
+        // poller swaps — exactly as `main.rs` wires it. A separate store here would
+        // make every bundle-route test measure a document the data plane does not use.
+        .with_bundle_subjects(fx.gw.bundles.clone()),
+    );
     let mint = Arc::new(
         Mint::new(verifier, fx.gw.identity.sts(), Duration::from_secs(900))
             .with_web_identity(web_identity),
@@ -827,6 +837,142 @@ async fn naming_a_service_accounts_client_id_lets_it_present_an_unmapped_token()
     .await;
     assert_eq!(status, 400, "{xml}");
     assert!(xml.contains("<Code>InvalidIdentityToken</Code>"), "{xml}");
+}
+
+// ── the bundle-driven route (stage 4) ──────────────────────────────────────────
+
+/// A service account created by a **tenant**, not by the operator: its clientId is in no
+/// rendered audience list and never will be. This is the real one measured against dev1.
+const TENANT_SA: &str = "test-s0-before";
+
+/// [`bundle`] plus the PLATFORM-KEYED membership entry the STS door's bundle route
+/// reads: `sa:<clientId>` in `data.tenants[<tenant>].user_attributes`, which is what
+/// `org_s3_gateway_bundle::service_account_subject` writes for every service account of
+/// the organization.
+///
+/// **It carries no grant, deliberately** — that is the ordinary state of a
+/// freshly-created SA, it is the case `s3_grants` alone would have missed, and it is
+/// what makes the 403 in
+/// `bundle_acceptance_is_not_authorization_a_grantless_subject_is_still_denied` mean
+/// something. The rest of the map keeps the raw keys the *compiled-in* module reads
+/// (this fixture runs `GATEWAY_REGO`, which keys on the unprefixed sub), so the two key
+/// spaces sit side by side here exactly as they do in a mixed deployment.
+fn bundle_with_a_tenant_service_account() -> serde_json::Value {
+    let mut bundle = bundle();
+    bundle["tenants"][TENANT]["user_attributes"]
+        .as_object_mut()
+        .expect("user_attributes")
+        .insert(
+            format!("sa:{TENANT_SA}"),
+            serde_json::json!({ "groups": [], "attributes": [] }),
+        );
+    bundle
+}
+
+/// The token such an SA really presents: Keycloak's `client_credentials` default, with
+/// no audience mapper and no entry in `stsAudiences`.
+fn unmapped_service_account_token(client_id: &str) -> String {
+    sign(serde_json::json!({
+        "iss": ISSUER,
+        "aud": "account",
+        "azp": client_id,
+        "sub": SA_TOKEN_SUB,
+        "preferred_username": format!("service-account-{client_id}"),
+        "exp": now() + 3600,
+    }))
+}
+
+/// **The case this stage exists for, end to end.** A tenant's own service account —
+/// unmapped token, `aud: "account"`, clientId in none of the configured audiences —
+/// obtains a credential because the **policy bundle already knows it**, with no operator
+/// re-render and no Keycloak change.
+///
+/// The negative control is the same token, the same configured list and the same code
+/// path against a bundle that does *not* name it: refused. So this measures the bundle
+/// lookup and not a hole in the audience check.
+#[tokio::test]
+async fn a_tenant_service_account_the_bundle_knows_mints_a_credential_with_no_operator_re_render() {
+    let h = harness_over(
+        "webid-e2e-bundle-route",
+        mint_config(),
+        bundle_with_a_tenant_service_account(),
+    )
+    .await;
+    let token = unmapped_service_account_token(TENANT_SA);
+
+    let session = assume_role_ok(&h, &token).await;
+    assert!(
+        session.access_key_id.starts_with("HFST"),
+        "not an STS access key: {}",
+        session.access_key_id
+    );
+    assert!(!session.session_token.is_empty());
+
+    // NEGATIVE CONTROL: the default fixture bundle knows no `sa:` subject at all, so the
+    // identical token is refused there. Nothing about the configured list differs.
+    let plain = harness("webid-e2e-bundle-route-neg").await;
+    let (status, xml) = assume_role(
+        &plain,
+        &[
+            ("Action", "AssumeRoleWithWebIdentity"),
+            ("RoleArn", &role_arn()),
+            ("RoleSessionName", "unknown-to-the-bundle"),
+            ("WebIdentityToken", &token),
+        ],
+    )
+    .await;
+    assert_eq!(status, 400, "{xml}");
+    assert!(xml.contains("<Code>InvalidIdentityToken</Code>"), "{xml}");
+    assert!(!xml.contains("<AccessKeyId>"), "{xml}");
+    // The refusal still enumerates nothing: not the accepted clients, not the subject,
+    // not the tenant.
+    assert!(!xml.contains(STORAGE_CLIENT), "{xml}");
+    assert!(!xml.contains(TENANT_SA), "{xml}");
+    assert!(!xml.contains(TENANT), "{xml}");
+}
+
+/// **Acceptance is not authorization**, measured on a real S3 request rather than
+/// argued.
+///
+/// The subject above is in the bundle and holds no grant. Its credential is perfectly
+/// valid — it signs, the session token verifies, the identity resolves as
+/// `sa:<clientId>` in the tenant the RoleArn named — and every S3 request it makes is
+/// still refused, by the same policy as everyone else. If the bundle route had conferred
+/// anything, this is where it would show.
+#[tokio::test]
+async fn bundle_acceptance_is_not_authorization_a_grantless_subject_is_still_denied() {
+    let h = harness_over(
+        "webid-e2e-bundle-route-authz",
+        mint_config(),
+        bundle_with_a_tenant_service_account(),
+    )
+    .await;
+    let session = assume_role_ok(&h, &unmapped_service_account_token(TENANT_SA)).await;
+
+    for key in ["sa/q1.csv", "human/private.csv", "anything.txt"] {
+        let (status, _) = get_object(&h, &session, key).await;
+        assert_eq!(
+            status, 403,
+            "a subject the bundle merely KNOWS reached {key}: acceptance conferred access"
+        );
+    }
+    // …and it was refused as itself, at the policy, not as a broken credential: the
+    // decision document names the SA in the tenant the RoleArn selected.
+    let input = last_opa_input(&h);
+    assert_eq!(input["principal"]["sub"], serde_json::json!(TENANT_SA));
+    assert_eq!(
+        input["principal"]["type"],
+        serde_json::json!("service_account")
+    );
+    assert_eq!(input["tenant"], serde_json::json!(TENANT));
+    assert_eq!(input["organization_id"], serde_json::json!(ORG));
+
+    // POSITIVE CONTROL, same gateway and same bundle: the SA that DOES hold a grant
+    // still reaches its own prefix, so the 403s above are the absence of a grant rather
+    // than a data plane that refuses every web-identity session.
+    let granted = assume_role_ok(&h, &service_account_token(SA_CLIENT_ID)).await;
+    let (status, body) = get_object(&h, &granted, "sa/q1.csv").await;
+    assert_ne!(status, 403, "{body}");
 }
 
 /// A refusal must not tell an anonymous caller whether a tenant exists.

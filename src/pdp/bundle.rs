@@ -175,10 +175,68 @@ pub fn content_revision(raw: &str) -> String {
     hex::encode(h.finalize())
 }
 
+/// The subject key hyperfluid's projection writes for a service account:
+/// `sa:<iam_sa_client_id>`.
+///
+/// **Confirmed against the code that writes it and the document it produces**, not
+/// assumed: `org_s3_gateway_bundle::service_account_subject` emits
+/// `format!("sa:{iam_sa_client_id}")` keyed on the Keycloak **clientId** (not
+/// `iam_sa_id`), and the captured platform bundle in
+/// `tests/data/platform/s3_gateway_bundle.json` carries `sa:pipeline` alongside
+/// `user:sub-a` in both `user_attributes` and `s3_grants`. The module composes the same
+/// string with `sprintf("sa:%s", [input.principal.sub])`, so this is one key space
+/// spelled in three places — pinned by
+/// `tests::the_service_account_key_shape_is_the_one_the_platform_really_writes`.
+pub fn service_account_subject_key(client_id: &str) -> String {
+    format!("sa:{client_id}")
+}
+
+/// Does this bundle's policy data know `sa:<client_id>` as a **member subject** of
+/// `tenant`?
+///
+/// The predicate is `s3.rego`'s own membership rule, evaluated in Rust:
+/// `is_object(data.tenants[<tenant>].user_attributes["sa:<client id>"])`. Nothing looser
+/// — a key whose value is not an object is not a member to the policy either, and
+/// accepting one would vend a credential denied `principal is not a tenant member` on
+/// every request.
+///
+/// Fails closed on every degenerate input there is: no `tenants`, no such tenant, no
+/// `user_attributes`, an empty tenant or client id, or a document that is not an object
+/// at all all answer `false`. An empty bundle therefore accepts nothing, which is the
+/// direction a bundle-driven check has to fail in.
+pub fn bundle_knows_service_account(
+    data: &serde_json::Value,
+    tenant: &str,
+    client_id: &str,
+) -> bool {
+    if tenant.is_empty() || client_id.is_empty() {
+        return false;
+    }
+    data.get("tenants")
+        .and_then(|tenants| tenants.get(tenant))
+        .and_then(|tenant| tenant.get("user_attributes"))
+        .and_then(|subjects| subjects.get(service_account_subject_key(client_id)))
+        .is_some_and(serde_json::Value::is_object)
+}
+
 /// Hot-swappable current bundle, shared by every engine instance and the decision
 /// cache. Swapping is lock-free; readers never block a decision.
 pub struct BundleStore {
     current: ArcSwap<Bundle>,
+}
+
+/// The STS door's bundle-driven audience acceptance, answered from **this** store — the
+/// same one the PDP decides against and the poller swaps.
+///
+/// `current()` is loaded per call and dropped before returning, so the answer is always
+/// the revision in force at that instant: a subject removed by a poll stops being
+/// accepted on the next request, with no cache to invalidate and no snapshot to go
+/// stale. See [`crate::webidentity::TenantSubjects`] for why there must not be a second
+/// one.
+impl crate::webidentity::TenantSubjects for BundleStore {
+    fn knows_service_account(&self, tenant: &str, client_id: &str) -> bool {
+        bundle_knows_service_account(&self.current().data, tenant, client_id)
+    }
 }
 
 impl BundleStore {
@@ -206,6 +264,150 @@ impl BundleStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::webidentity::TenantSubjects;
+
+    /// The captured platform document — the same bytes `tests/cross_repo_contract.rs`
+    /// reads. Compiled into the test binary only.
+    const PLATFORM_BUNDLE: &str = include_str!("../../tests/data/platform/s3_gateway_bundle.json");
+
+    /// **The key shape, read off the platform's own document rather than assumed.**
+    ///
+    /// If hyperfluid ever changed `service_account_subject` — to `iam_sa_id`, to an
+    /// unprefixed client id, to `service-account:` — the STS door's bundle route would
+    /// look up a key nobody writes and refuse every tenant service account, while every
+    /// test that made up its own bundle stayed green. So the assertion is made against
+    /// the captured document.
+    #[test]
+    fn the_service_account_key_shape_is_the_one_the_platform_really_writes() {
+        let parsed = parse_bundle(PLATFORM_BUNDLE).expect("the captured bundle parses");
+        let subjects = parsed.data["tenants"]["acme-prod"]["user_attributes"]
+            .as_object()
+            .expect("acme-prod has user_attributes");
+        assert!(
+            subjects.contains_key("sa:pipeline"),
+            "the captured platform bundle no longer keys a service account \
+             `sa:<client id>`; keys are {:?}",
+            subjects.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(service_account_subject_key("pipeline"), "sa:pipeline");
+        // …and the predicate agrees with the document it was written against.
+        assert!(bundle_knows_service_account(
+            &parsed.data,
+            "acme-prod",
+            "pipeline"
+        ));
+        // The OTHER key space is not reachable through this door: `user:sub-a` is in the
+        // very same map, and no client id may select it.
+        assert!(!bundle_knows_service_account(
+            &parsed.data,
+            "acme-prod",
+            "user:sub-a"
+        ));
+        assert!(!bundle_knows_service_account(
+            &parsed.data,
+            "acme-prod",
+            "sub-a"
+        ));
+    }
+
+    /// Membership is per tenant, and everything degenerate answers `false`.
+    #[test]
+    fn a_subject_is_known_only_where_the_bundle_says_so_and_absence_fails_closed() {
+        let data = serde_json::json!({
+            "tenants": {
+                "acme": { "user_attributes": {
+                    // A subject with NO grant at all: the ordinary state of a
+                    // freshly-created service account, and the case `s3_grants` would
+                    // have missed.
+                    "sa:pipeline-runner": { "groups": [], "attributes": [] },
+                    "user:oidc-sub-alice": { "groups": [], "attributes": [] }
+                }, "s3_grants": {} },
+                "other": { "user_attributes": {} }
+            }
+        });
+        assert!(bundle_knows_service_account(
+            &data,
+            "acme",
+            "pipeline-runner"
+        ));
+        // Another tenant of the same document does not know it.
+        assert!(!bundle_knows_service_account(
+            &data,
+            "other",
+            "pipeline-runner"
+        ));
+        // Nor does a tenant that is not in the bundle at all.
+        assert!(!bundle_knows_service_account(
+            &data,
+            "absent",
+            "pipeline-runner"
+        ));
+        for (tenant, client) in [
+            ("acme", "pipeline-runner-2"),  // not a prefix match
+            ("acme", "pipeline"),           // nor the other way round
+            ("acme", "PIPELINE-RUNNER"),    // a client id is an exact identifier
+            ("acme", "oidc-sub-alice"),     // never the user key space
+            ("acme", "sa:pipeline-runner"), // the prefix is ours to compose, not theirs
+            ("acme", ""),
+            ("", "pipeline-runner"),
+        ] {
+            assert!(
+                !bundle_knows_service_account(&data, tenant, client),
+                "{tenant}/{client} must not be known"
+            );
+        }
+        // Every shape of an absent or broken document, all closed.
+        for empty in [
+            serde_json::json!({}),
+            serde_json::json!(null),
+            serde_json::json!("not a document"),
+            serde_json::json!({ "tenants": {} }),
+            serde_json::json!({ "tenants": { "acme": {} } }),
+            serde_json::json!({ "tenants": { "acme": { "user_attributes": {} } } }),
+            // Present but not an object ⇒ not a member to `s3.rego` either.
+            serde_json::json!({ "tenants": { "acme": {
+                "user_attributes": { "sa:pipeline-runner": true } } } }),
+            serde_json::json!({ "tenants": { "acme": {
+                "user_attributes": { "sa:pipeline-runner": null } } } }),
+        ] {
+            assert!(
+                !bundle_knows_service_account(&empty, "acme", "pipeline-runner"),
+                "{empty} must know nothing"
+            );
+        }
+    }
+
+    /// **The lookup reads the bundle in force, not the one that was in force.**
+    ///
+    /// The store is hot-swapped on every poll, and the handle the STS door holds is the
+    /// store itself rather than a snapshot of it. A subject added by a poll is accepted
+    /// immediately; a subject *removed* by one stops being accepted immediately — which
+    /// is the half that matters, because that is a revocation.
+    #[test]
+    fn the_lookup_follows_the_store_across_a_swap_in_both_directions() {
+        let with = |subjects: serde_json::Value| serde_json::json!({ "tenants": { "acme": { "user_attributes": subjects } } });
+        let store = BundleStore::new(Bundle::new("rev-1", with(serde_json::json!({}))));
+        // The handle is taken ONCE, before either swap, exactly as `main.rs` takes it at
+        // boot and holds it for the process's life.
+        let subjects: &dyn TenantSubjects = &store;
+        assert!(!subjects.knows_service_account("acme", "pipeline-runner"));
+
+        store.store(Bundle::new(
+            "rev-2",
+            with(serde_json::json!({ "sa:pipeline-runner": { "groups": [] } })),
+        ));
+        assert!(
+            subjects.knows_service_account("acme", "pipeline-runner"),
+            "a subject the poller published is not visible to the STS door"
+        );
+
+        store.store(Bundle::new("rev-3", with(serde_json::json!({}))));
+        assert!(
+            !subjects.knows_service_account("acme", "pipeline-runner"),
+            "a subject the poller REMOVED is still accepted: the door is holding a stale \
+             snapshot"
+        );
+    }
 
     #[test]
     fn wrapped_bundle_splits_policy_and_data() {

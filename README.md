@@ -165,6 +165,63 @@ collide with a bucket named `sts`, and folding the unauthenticated surface into 
 SigV4 data plane would make "is this request authenticated?" a matter of parsing a POST
 body correctly on the public port.
 
+#### Is this token addressed to this gateway?
+
+Two routes, and the second is purely **additive** — it can only ever be consulted after
+the first has said no, so no token that is accepted today can become refused:
+
+1. **The configured audience list.** `aud` **or** `azp`/`client_id` names one of
+   `sts_mint.web_identity_audiences` (empty ⇒ `[sts_mint.audience]`, so the check is
+   never skipped). This is the AWS-shaped route and the only one an operator configures.
+2. **A service account the tenant's policy bundle already knows.** When `azp`/`client_id`
+   is `C` and `sa:C` is a member subject of the tenant named in the `RoleArn` —
+   `data.tenants[<tenant>].user_attributes["sa:C"]`, read live from the same
+   revision-swapped bundle the PDP decides against.
+
+Route 2 exists because Keycloak's `client_credentials` tokens carry `aud: "account"` and
+name the client only in `azp`, so before it existed **no tenant-created service account
+could obtain a credential at all** without an operator naming each clientId in the
+gateway's audience list — one control-plane re-render per service account.
+
+**Acceptance is not authorization.** This decides only "is this token addressed to this
+gateway". The grant check runs afterwards, unchanged: a subject the bundle knows but has
+granted nothing still gets `403` on every request. Route 2 also **fails closed** (an
+empty or stale bundle knows *fewer* subjects, so it accepts *fewer* tokens, and it can
+never narrow route 1) and is **tenant-scoped** (the tenant comes from the `RoleArn`, never
+from a claim). Deviation register: `AWS-PARITY.md` **D31**.
+
+#### Follow-up: the Keycloak audience mapper (the intended end state)
+
+Route 2 is a deliberate, documented deviation, not the destination. **The destination is
+route 1 for everyone**, reached by making Keycloak stamp a fixed audience on the tokens it
+issues — which is exactly what AWS does. EKS IRSA projects a service-account token whose
+`aud` is `sts.amazonaws.com`, and STS accepts it on the audience alone; it never consults
+the authorization data to decide whether a token is addressed to it.
+
+What an operator would configure, once, at the realm level:
+
+1. Create a **client scope** (e.g. `s3-gateway-audience`), protocol `openid-connect`.
+2. Add a mapper to it of type **`oidc-audience-mapper`** ("Audience"), with
+   *Included Custom Audience* set to the value the gateway accepts (the org's
+   `status.storageClientId`, i.e. `<org>-storage-sa`) and **Add to access token: on**.
+3. Assign that client scope as a **default** (not optional) scope, so every token carries
+   the audience without the client having to request it.
+
+Then every realm token names an audience `web_identity_audiences` already lists, route 1
+accepts it, and route 2 becomes dead code that can be deleted.
+
+**Why it was deferred.** Assigning a default client scope at the realm level **changes
+token issuance for every existing client and user in the realm**, not just for storage
+clients — every token grows an `aud` entry, and any relying party in the realm that
+validates `aud` strictly sees a different token than it did yesterday. That is a
+realm-configuration change with its own blast radius and its own review, not a config
+tweak that ships alongside a gateway feature. So the bundle route landed first.
+
+**Removing route 2 later is not a deletion, it is a migration.** The moment it is
+removed, every service account that has not been migrated to the mapper is refused
+`InvalidIdentityToken`. Land the mapper, confirm real tokens carry the audience, *then*
+remove the route.
+
 The internal listener is absent unless `internal` is present in the config: no section,
 no bind, no port. A missing or empty `internal.shared_secret` **refuses every request**
 — there is no unauthenticated mode — and says so at `error` level once at startup.

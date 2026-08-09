@@ -149,12 +149,22 @@ async fn main() -> Result<()> {
                 // routing table the request pipeline resolves against. A second of
                 // either would mint credentials this process could not honour, or
                 // accept a tenant it could not route.
-                mint = mint.with_web_identity(Arc::new(WebIdentitySts::new(
-                    verifier,
-                    gateway.identity.sts(),
-                    gateway.registry.clone(),
-                    WebIdentityConfig::from_config(sts_cfg, config.session_ttl()),
-                )));
+                mint = mint.with_web_identity(Arc::new(
+                    WebIdentitySts::new(
+                        verifier,
+                        gateway.identity.sts(),
+                        gateway.registry.clone(),
+                        WebIdentityConfig::from_config(sts_cfg, config.session_ttl()),
+                    )
+                    // …and the SAME BundleStore the PDP decides against, so a tenant's
+                    // own service account is addressed to this gateway when the bundle
+                    // already knows it — without an operator re-render per SA. Additive
+                    // to the configured audience list, never instead of it, and read
+                    // live so a revocation lands within one poll. See
+                    // `webidentity::WebIdentitySts::addressed_to_this_gateway` and
+                    // `s0-plan/AWS-PARITY.md` D31.
+                    .with_bundle_subjects(gateway.bundles.clone()),
+                ));
                 tracing::info!(
                     listen = %sts_cfg.listen,
                     issuer = %sts_cfg.issuer,

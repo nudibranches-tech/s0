@@ -159,31 +159,6 @@ impl StandardVerifier {
             .collect()
     }
 
-    /// Does this token name one of the audiences this gateway serves?
-    ///
-    /// Accepts a match on `aud` (string **or** array — a JWT `aud` is legally either)
-    /// or on `azp`/`client_id`. The `azp` fallback is what makes a Keycloak
-    /// service-account token usable at all: `grant_type=client_credentials` produces
-    /// `aud: "account"` and names the client only in `azp`. Ceph RGW and MinIO both do
-    /// exactly this, and the operator renders the same client-id list it already gives
-    /// RGW's role, so a token that works against one works against the other.
-    fn audience_is_accepted(&self, claims: &Value) -> bool {
-        let accepted = self.accepted_audiences();
-        let matches = |v: &str| accepted.contains(&v);
-        let aud_ok = match claims.get("aud") {
-            Some(Value::String(s)) => matches(s),
-            Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).any(matches),
-            _ => false,
-        };
-        aud_ok
-            || ["azp", "client_id"].iter().any(|name| {
-                claims
-                    .get(*name)
-                    .and_then(Value::as_str)
-                    .is_some_and(matches)
-            })
-    }
-
     /// Keep the JWKS cache warm in the background.
     ///
     /// Refresh-on-`kid`-miss alone is a cold cache: the first request after a key
@@ -322,9 +297,11 @@ impl OidcVerifier for StandardVerifier {
 /// 1. it returns the **raw claims**, because the tenant and organization are resolved
 ///    from the `RoleArn` and the routing table rather than from claims that hyperfluid's
 ///    Keycloak does not mint;
-/// 2. the audience check is the `aud`-or-`azp` rule
-///    ([`StandardVerifier::audience_is_accepted`]) rather than `jsonwebtoken`'s strict
-///    `aud`, so a service-account token is usable;
+/// 2. the audience check is the `aud`-or-`azp` rule ([`Self::audience_is_accepted`])
+///    rather than `jsonwebtoken`'s strict `aud`, so a service-account token is usable —
+///    and it is applied by [`crate::webidentity::WebIdentitySts::addressed_to_this_gateway`]
+///    rather than here, because since the bundle route it also needs the tenant out of
+///    the `RoleArn`, which this trait never sees;
 /// 3. an **expired** token is reported as `ExpiredTokenException` rather than folded
 ///    into a generic invalid-token error, because an SDK treats the two differently: an
 ///    expiry means "re-read the projected token file and retry", and any other invalid
@@ -334,7 +311,7 @@ impl OidcVerifier for StandardVerifier {
 /// verification function is how one of them silently acquires the other's leniency.
 #[async_trait::async_trait]
 impl WebIdentityVerifier for StandardVerifier {
-    async fn verify_claims(&self, token: &str) -> std::result::Result<Value, StsRefusal> {
+    async fn verify_token(&self, token: &str) -> std::result::Result<Value, StsRefusal> {
         let key = self
             .decoding_key(token)
             .await
@@ -352,18 +329,43 @@ impl WebIdentityVerifier for StandardVerifier {
             jsonwebtoken::errors::ErrorKind::ExpiredSignature => StsRefusal::ExpiredToken,
             _ => StsRefusal::InvalidIdentityToken(e.to_string()),
         })?;
-        if !self.audience_is_accepted(&data.claims) {
-            // The accepted list is NOT echoed back: this endpoint is internet-reachable
-            // and the list is the set of OIDC clients the platform provisions.
-            tracing::warn!(
-                accepted = ?self.accepted_audiences(),
-                "web identity token refused: neither aud nor azp names an accepted audience"
-            );
-            return Err(StsRefusal::InvalidIdentityToken(
-                "neither `aud` nor `azp` names an audience this gateway accepts".into(),
-            ));
-        }
         Ok(data.claims)
+    }
+
+    /// Does this token name one of the audiences this gateway serves?
+    ///
+    /// Accepts a match on `aud` (string **or** array — a JWT `aud` is legally either)
+    /// or on `azp`/`client_id`. The `azp` fallback is what makes a Keycloak
+    /// service-account token usable at all: `grant_type=client_credentials` produces
+    /// `aud: "account"` and names the client only in `azp`. Ceph RGW and MinIO both do
+    /// exactly this, and the operator renders the same client-id list it already gives
+    /// RGW's role, so a token that works against one works against the other.
+    ///
+    /// **Unchanged by the bundle route.** This is still the whole of the configured
+    /// answer; the bundle is consulted only where this returns `false`, and only for the
+    /// tenant the `RoleArn` named.
+    fn audience_is_accepted(&self, claims: &Value) -> bool {
+        let accepted = self.accepted_audiences();
+        let matches = |v: &str| accepted.contains(&v);
+        let aud_ok = match claims.get("aud") {
+            Some(Value::String(s)) => matches(s),
+            Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).any(matches),
+            _ => false,
+        };
+        aud_ok
+            || ["azp", "client_id"].iter().any(|name| {
+                claims
+                    .get(*name)
+                    .and_then(Value::as_str)
+                    .is_some_and(matches)
+            })
+    }
+
+    fn configured_audiences(&self) -> Vec<String> {
+        self.accepted_audiences()
+            .into_iter()
+            .map(str::to_string)
+            .collect()
     }
 }
 
