@@ -4,6 +4,12 @@ on:
   push:
     branches: ["main", "master", "feat/**", "fix/**"]
   pull_request:
+  # Callable, so `release.yml` can gate a tag on THIS definition of "s0 passes"
+  # rather than on a copy of it. A tag can be pointed at any commit, and the
+  # triggers above only fire for branches and pull requests — without this, a
+  # release could publish a commit the suite never ran on. One definition, two
+  # callers, no way for the release gate to drift from the merge gate.
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always
