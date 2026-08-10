@@ -89,6 +89,22 @@ pub struct BackendRegistry {
     timeouts: TimeoutConfig,
 }
 
+/// The gateway's own tenant→organization table, exposed to the credential layer.
+///
+/// **This is the only place a derived long-lived key's organization may come from.** The
+/// credential itself carries no organization field (see [`crate::auth::derived`]), so
+/// there is nothing to prefer over this — and because the table is behind the same
+/// `ArcSwap` the routing table is, an operator re-binding a tenant to another organization
+/// re-attributes its keys on the next request rather than at the next pod roll.
+impl crate::auth::TenantDirectory for BackendRegistry {
+    fn organization_of(&self, tenant: &str) -> Option<String> {
+        self.routes
+            .load()
+            .get(tenant)
+            .map(|r| r.organization_id.clone())
+    }
+}
+
 impl BackendRegistry {
     pub fn from_config(cfg: &GatewayConfig) -> Result<Self> {
         Ok(BackendRegistry {

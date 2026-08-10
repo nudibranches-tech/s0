@@ -321,16 +321,28 @@ fn validate_kid(kid: &str) -> Result<()> {
     if kid.is_empty() {
         return Err(GatewayError::Sts("sts key id must be non-empty".into()));
     }
-    if !kid
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    {
+    if !kid_is_well_formed(kid) {
         return Err(GatewayError::Sts(format!(
             "sts key id {kid:?} must be ASCII alphanumeric, '-' or '_' \
              (it becomes part of the access-key id {STS_PREFIX}<kid>{KID_SEP}<sid>)"
         )));
     }
     Ok(())
+}
+
+/// The character rule a `kid` must satisfy, in **both** credential namespaces.
+///
+/// Shared with [`crate::auth::derived`] rather than restated there, because the two
+/// namespaces spell their access-key ids the same way (`<PREFIX><kid>.…`) and a rule that
+/// drifted apart would mean a `kid` that is decomposable in one and not the other — i.e.
+/// a credential class that silently stops verifying after a rotation. The load-bearing
+/// half is rejecting the separator: a `kid` containing one splits the id at the wrong
+/// place and selects a different key.
+pub(crate) fn kid_is_well_formed(kid: &str) -> bool {
+    !kid.is_empty()
+        && kid
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 #[cfg(test)]

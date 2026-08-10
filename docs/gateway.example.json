@@ -9,6 +9,7 @@
     "signing_key_hex": "REPLACE_ME_openssl_rand_hex_32_1111111111111111111111111111",
     "session_ttl_secs": 3600
   },
+  "_derived_keys_note": "OPTIONAL and OFF here on purpose. Add a `derived_keys` section (same two forms as `sts`: `master_key_hex`, or `master_keys` + `current_kid`) to accept long-lived per-principal S3 keys (`HFSA<kid>.<payload>.<mac>` — see src/auth/derived.rs). It must NOT share key material with `sts`, and the gateway refuses to load if it does. Switching it on is only half the opt-in: the policy bundle must also publish `tenants.<tenant>.s3_key_epoch`, because the ABSENCE of that number denies every derived key for that tenant. Whether the section is present or not, the `HFSA*` namespace is reserved and a static_credentials entry inside it is refused at load.",
   "pdp": {
     "mode": "embedded",
     "cache_capacity": 100000

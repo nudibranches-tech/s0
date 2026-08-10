@@ -7,8 +7,9 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 
 use crate::audit::{self, AuditConfig, AuditHandle, AuditSink};
+use crate::auth::derived::DerivedKeyAuthority;
 use crate::auth::sts::StsAuthority;
-use crate::auth::{Identity, StaticCredentialStore};
+use crate::auth::{DerivedKeys, Identity, StaticCredentialStore};
 use crate::authz::CaptureSink;
 use crate::config::{GatewayConfig, LimitsConfig, PdpConfig};
 use crate::error::{GatewayError, Result};
@@ -52,10 +53,20 @@ impl Gateway {
     pub fn build(cfg: &GatewayConfig) -> Result<(Arc<Gateway>, AuditHandle)> {
         let sts = Arc::new(build_sts(cfg)?);
         let credentials = Arc::new(StaticCredentialStore::from_config(cfg));
-        let identity = Arc::new(Identity::new(sts, credentials.clone()));
 
+        // Built BEFORE the identity, because derived long-lived keys need both: the
+        // bundle store is where their revocation is read from and the registry is the
+        // tenant→org table their attribution comes from.
         let (bundles, pdp) = build_pdp(cfg)?;
         let registry = Arc::new(BackendRegistry::from_config(cfg)?);
+
+        let identity = Arc::new(build_identity(
+            cfg,
+            sts,
+            credentials.clone(),
+            registry.clone(),
+            bundles.clone(),
+        )?);
 
         let (audit, audit_handle) = audit::spawn(AuditConfig {
             sink_url: cfg.audit.sink_url.clone(),
@@ -104,8 +115,14 @@ impl Gateway {
     /// **Not** applied, because they are consumed once at assembly and re-reading them
     /// would report a change that did not happen: the listen addresses, the s3s
     /// protocol limits and connection cap (baked into the `S3Service` and the accept
-    /// loop by `crate::server`), the STS key ring, the PDP mode, and the audit backend.
-    /// Changing any of those still needs a restart, which is what a pod roll does.
+    /// loop by `crate::server`), the STS key ring, the **derived-key ring**, the PDP
+    /// mode, and the audit backend. Changing any of those still needs a restart, which is
+    /// what a pod roll does.
+    ///
+    /// Note the derived-key *ring* is baked while its two inputs are not: revocation
+    /// follows the bundle store and attribution follows the routing table, both of which
+    /// this method (and the bundle poller) do swap. So the half that has to be live is
+    /// live, and the half that is key material is not.
     ///
     /// ## Ordering
     ///
@@ -128,6 +145,49 @@ impl Gateway {
         );
         Ok(())
     }
+}
+
+/// Assemble the credential authority: STS, the static store, and — when the deployment
+/// configured a ring — derived long-lived per-principal keys.
+///
+/// The derived half is wired to the **live** bundle store and the **live** routing table,
+/// not to snapshots of them: revocation has to follow the bundle the PDP is deciding
+/// against, and a tenant re-bound to another organization has to re-attribute on the next
+/// request. Handing either a clone of the current contents would produce a credential
+/// class that could not be revoked without a pod roll, which is the failure this design
+/// exists to avoid.
+fn build_identity(
+    cfg: &GatewayConfig,
+    sts: Arc<StsAuthority>,
+    credentials: Arc<StaticCredentialStore>,
+    registry: Arc<BackendRegistry>,
+    bundles: Arc<BundleStore>,
+) -> Result<Identity> {
+    let identity = Identity::new(sts, credentials);
+    let Some(derived_cfg) = &cfg.derived_keys else {
+        // Not an error and not a warning: the feature is off, and `HFSA*` stays reserved
+        // and unanswered either way (`Identity::secret_key`).
+        return Ok(identity);
+    };
+    // The ring's shape is settled by `GatewayConfig::validate`; what is left here is hex.
+    let (ring, current_kid) = derived_cfg.key_ring();
+    let mut master_keys = std::collections::BTreeMap::new();
+    for (kid, hex_key) in &ring {
+        let key = hex::decode(hex_key.expose())
+            .map_err(|e| GatewayError::Config(format!("derived_keys master key {kid}: {e}")))?;
+        master_keys.insert(kid.clone(), key);
+    }
+    let authority = Arc::new(DerivedKeyAuthority::with_key_ring(
+        master_keys,
+        &current_kid,
+    )?);
+    tracing::info!(
+        current_kid = %authority.current_kid(),
+        key_ids = ?authority.key_ids(),
+        "derived long-lived key ring loaded; revocation reads \
+         tenants.<tenant>.s3_key_epoch from the bundle and its ABSENCE denies"
+    );
+    Ok(identity.with_derived_keys(Arc::new(DerivedKeys::new(authority, registry, bundles))))
 }
 
 fn build_sts(cfg: &GatewayConfig) -> Result<StsAuthority> {
@@ -243,20 +303,30 @@ mod tests {
             spill_path: cfg.audit.spill_path.clone(),
             ..AuditConfig::default()
         });
+        let registry = Arc::new(BackendRegistry::from_config(cfg).expect("registry"));
+        let bundles = Arc::new(BundleStore::new(Bundle::new(
+            "rev-1",
+            serde_json::json!({}),
+        )));
         let gw = Gateway {
-            identity: Arc::new(Identity::new(
-                Arc::new(build_sts(cfg).expect("sts")),
-                credentials.clone(),
-            )),
+            // Through the real assembly function, so a test that configures
+            // `derived_keys` exercises the same wiring `build` does.
+            identity: Arc::new(
+                build_identity(
+                    cfg,
+                    Arc::new(build_sts(cfg).expect("sts")),
+                    credentials.clone(),
+                    registry.clone(),
+                    bundles.clone(),
+                )
+                .expect("identity"),
+            ),
             pdp: Arc::new(RegorusPdp::new(GATEWAY_REGO, &serde_json::json!({})).expect("regorus")),
             audit,
-            registry: Arc::new(BackendRegistry::from_config(cfg).expect("registry")),
+            registry,
             credentials,
             limits: Arc::new(ArcSwap::from_pointee(cfg.limits.clone())),
-            bundles: Arc::new(BundleStore::new(Bundle::new(
-                "rev-1",
-                serde_json::json!({}),
-            ))),
+            bundles,
             capture: None,
         };
         (gw, handle)

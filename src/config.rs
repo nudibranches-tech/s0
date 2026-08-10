@@ -30,6 +30,16 @@ pub struct GatewayConfig {
     #[serde(default = "default_admin_listen")]
     pub admin_listen: SocketAddr,
     pub sts: StsConfig,
+    /// Optional: the key ring for **derived long-lived per-principal keys**
+    /// (`FOLLOW-UPS.md` F17). Absent ⇒ the gateway mints and honours none, and behaves
+    /// byte-identically to a build made before they existed.
+    ///
+    /// **Absent does not mean the namespace is free.** `HFSA*` is refused for static
+    /// credentials either way (see [`GatewayConfig::validate`]) and answered by nothing
+    /// at runtime, so enabling this later cannot silently activate a credential someone
+    /// parked in the namespace in the meantime.
+    #[serde(default)]
+    pub derived_keys: Option<DerivedKeysConfig>,
     pub pdp: PdpConfig,
     #[serde(default)]
     pub audit: AuditFileConfig,
@@ -262,6 +272,52 @@ impl StsConfig {
     }
 }
 
+/// The master-key ring for derived long-lived per-principal keys.
+///
+/// Mirrors [`StsConfig`]'s ring exactly — the same two forms, the same `current_kid`
+/// rule — because an operator should not have to learn a second convention for the second
+/// derivation. There is **no signing key**: a derived key has no session token to sign;
+/// the MAC inside the access-key id is what proves it, and it is derived from this ring.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DerivedKeysConfig {
+    /// Hex-encoded master key (≥32 bytes). Sugar for a one-entry `master_keys` ring
+    /// under `auth::derived::DEFAULT_KID`; mutually exclusive with it.
+    #[serde(default)]
+    pub master_key_hex: Option<Secret<String>>,
+    /// The master-key **ring**: `kid -> hex key`. The `kid` lands in every access-key id
+    /// minted from it (`HFSA<kid>.<payload>.<mac>`), which is what lets a key be rotated
+    /// without invalidating every outstanding one.
+    ///
+    /// Unlike the STS ring there is **no TTL after which stragglers are gone**: retiring
+    /// an entry here revokes every long-lived key minted under it, permanently, so it
+    /// must be paired with reissuing them.
+    #[serde(default)]
+    pub master_keys: std::collections::BTreeMap<String, Secret<String>>,
+    /// Which ring entry mints new keys. Required with `master_keys`, never inferred.
+    #[serde(default)]
+    pub current_kid: Option<String>,
+}
+
+impl DerivedKeysConfig {
+    /// The configured ring as `(kid -> hex key, current kid)`, normalizing the single-key
+    /// form. Shape errors are raised at load by [`GatewayConfig::validate`].
+    pub fn key_ring(&self) -> (std::collections::BTreeMap<String, Secret<String>>, String) {
+        match &self.master_key_hex {
+            Some(hex) if self.master_keys.is_empty() => (
+                std::collections::BTreeMap::from([(
+                    crate::auth::derived::DEFAULT_KID.to_string(),
+                    hex.clone(),
+                )]),
+                crate::auth::derived::DEFAULT_KID.to_string(),
+            ),
+            _ => (
+                self.master_keys.clone(),
+                self.current_kid.clone().unwrap_or_default(),
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum PdpConfig {
@@ -483,6 +539,7 @@ impl GatewayConfig {
 
     fn validate(&self) -> Result<()> {
         self.validate_sts_key_ring()?;
+        self.validate_derived_key_ring()?;
         let ids: HashMap<&str, &BackendConfig> =
             self.backends.iter().map(|b| (b.id.as_str(), b)).collect();
         for t in &self.tenants {
@@ -518,6 +575,28 @@ impl GatewayConfig {
                     crate::auth::sts::STS_PREFIX,
                     crate::auth::sts::STS_PREFIX,
                     crate::auth::sts::KID_SEP,
+                )));
+            }
+            // The SAME rule for the derived long-lived namespace, and it is not a copy
+            // for symmetry's sake. `HFSA` differs from `HFST` in the fourth character
+            // only, so a hand-written credential list is one keystroke away from landing
+            // in it — and `Identity::secret_key` answers every key carrying this prefix
+            // from the derived-key half alone, INCLUDING when derived keys are switched
+            // off, where the answer is "no". Without this check an operator provisions a
+            // static credential that silently never resolves; worse, it would start
+            // resolving differently the day the feature is enabled.
+            if crate::auth::derived::DerivedKeyAuthority::is_derived_access_key(&c.access_key_id) {
+                return Err(GatewayError::Config(format!(
+                    "static credential {} is inside the DERIVED long-lived access-key \
+                     namespace {:?}*; derived keys are minted as {}<kid>{}<payload>{}<mac> \
+                     and every key carrying the prefix is answered by the derived-key \
+                     authority (or by nothing at all, when `derived_keys` is unset), so \
+                     this credential would never resolve",
+                    c.access_key_id,
+                    crate::auth::derived::DERIVED_PREFIX,
+                    crate::auth::derived::DERIVED_PREFIX,
+                    crate::auth::derived::FIELD_SEP,
+                    crate::auth::derived::FIELD_SEP,
                 )));
             }
             match tenant_org.get(c.tenant.as_str()) {
@@ -721,6 +800,85 @@ impl GatewayConfig {
                         s.master_keys.keys().collect::<Vec<_>>()
                     )));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// The derived-key ring's shape, plus the one rule that is not a copy of the STS
+    /// ring's: **no key may be shared between the two credential classes.**
+    ///
+    /// The classes have different lifetimes (one hour against indefinite) and different
+    /// revocation stories, and sharing material would collapse them into one blast
+    /// radius: retiring a `kid` to revoke a long-lived key would silently 403 every live
+    /// session, and material recovered from either would forge both. The check covers the
+    /// STS signing key too — it is a second, differently-handled secret in the same
+    /// section, and "the operator pasted the wrong hex" is the failure being caught.
+    fn validate_derived_key_ring(&self) -> Result<()> {
+        let Some(d) = &self.derived_keys else {
+            return Ok(());
+        };
+        match (&d.master_key_hex, d.master_keys.is_empty()) {
+            (None, true) => {
+                return Err(GatewayError::Config(
+                    "derived_keys needs either master_key_hex or a non-empty master_keys ring; \
+                     omit the whole `derived_keys` section to switch the feature off"
+                        .into(),
+                ));
+            }
+            (Some(_), false) => {
+                return Err(GatewayError::Config(
+                    "derived_keys.master_key_hex and derived_keys.master_keys are mutually \
+                     exclusive; master_key_hex is shorthand for a one-entry ring"
+                        .into(),
+                ));
+            }
+            (Some(_), true) => {
+                if d.current_kid.is_some() {
+                    return Err(GatewayError::Config(
+                        "derived_keys.current_kid is meaningless without \
+                         derived_keys.master_keys"
+                            .into(),
+                    ));
+                }
+            }
+            (None, false) => {
+                let Some(kid) = &d.current_kid else {
+                    return Err(GatewayError::Config(
+                        "derived_keys.current_kid is required with derived_keys.master_keys: \
+                         which key mints new credentials is an operator decision, never \
+                         inferred"
+                            .into(),
+                    ));
+                };
+                if !d.master_keys.contains_key(kid) {
+                    return Err(GatewayError::Config(format!(
+                        "derived_keys.current_kid {kid:?} is not one of \
+                         derived_keys.master_keys {:?}",
+                        d.master_keys.keys().collect::<Vec<_>>()
+                    )));
+                }
+            }
+        }
+        let (derived_ring, _) = d.key_ring();
+        let (sts_ring, _) = self.sts.key_ring();
+        for (kid, key) in &derived_ring {
+            if key.expose() == self.sts.signing_key_hex.expose() {
+                return Err(GatewayError::Config(format!(
+                    "derived_keys master key {kid} is the same material as sts.signing_key_hex; \
+                     the two credential classes must not share a key"
+                )));
+            }
+            if let Some(sts_kid) = sts_ring
+                .iter()
+                .find(|(_, k)| k.expose() == key.expose())
+                .map(|(k, _)| k)
+            {
+                return Err(GatewayError::Config(format!(
+                    "derived_keys master key {kid} is the same material as sts master key \
+                     {sts_kid}; the two credential classes must not share a key — retiring a \
+                     kid to revoke long-lived credentials would then 403 every live session"
+                )));
             }
         }
         Ok(())
@@ -1092,6 +1250,148 @@ mod tests {
             "organization_id": "org-acme",
         }]);
         assert!(GatewayConfig::from_json(&cfg.to_string()).is_ok());
+    }
+
+    /// **The prefix-collision guard for the DERIVED namespace.**
+    ///
+    /// `HFSA` differs from `HFST` in one character, so this is the near-miss the existing
+    /// STS guard's own comment warns about, one keystroke away. It must fire whether or
+    /// not `derived_keys` is configured: with the feature off the credential silently
+    /// never resolves, and with it on it resolves to a *different* principal than the
+    /// operator wrote down.
+    #[test]
+    fn a_static_credential_inside_the_derived_namespace_is_refused_switched_on_or_off() {
+        let derived_section = serde_json::json!({ "master_key_hex": "cc".repeat(32) });
+        for key in [
+            "HFSAk0.AQEAAAABBGFjbWU.AAAAAAAAAAAAAAAAAAAAAA", // a well-formed one
+            "HFSAk0.payload",                                // half-formed
+            "HFSAsomething",                                 // prefix only
+            "HFSA",
+            crate::auth::derived::DERIVED_PREFIX,
+        ] {
+            for with_feature in [false, true] {
+                let mut cfg = example();
+                if with_feature {
+                    cfg["derived_keys"] = derived_section.clone();
+                }
+                cfg["static_credentials"] = serde_json::json!([{
+                    "access_key_id": key,
+                    "secret_access_key": "s",
+                    "principal_sub": "alice",
+                    "tenant": "acme",
+                    "organization_id": "org-acme",
+                }]);
+                let err = GatewayConfig::from_json(&cfg.to_string())
+                    .expect_err(&format!("{key} must be refused (feature={with_feature})"))
+                    .to_string();
+                assert!(
+                    err.contains("DERIVED long-lived access-key namespace"),
+                    "{key} (feature={with_feature}): {err}"
+                );
+            }
+        }
+
+        // Positive controls, both directions: an ordinary key still loads with the
+        // feature on, and a key that merely *starts* like the prefix but is not it is
+        // not caught by an over-eager check.
+        let mut cfg = example();
+        cfg["derived_keys"] = derived_section;
+        cfg["static_credentials"] = serde_json::json!([
+            { "access_key_id": "AKIAEXAMPLE", "secret_access_key": "s",
+              "principal_sub": "alice", "tenant": "acme", "organization_id": "org-acme" },
+            { "access_key_id": "HFS", "secret_access_key": "s",
+              "principal_sub": "bob", "tenant": "acme", "organization_id": "org-acme" },
+            { "access_key_id": "HFSB-not-ours", "secret_access_key": "s",
+              "principal_sub": "carol", "tenant": "acme", "organization_id": "org-acme" },
+        ]);
+        assert!(GatewayConfig::from_json(&cfg.to_string()).is_ok());
+    }
+
+    #[test]
+    fn the_derived_key_ring_shape_is_settled_at_load_and_shares_no_key_with_sts() {
+        // Absent is the default and is not an error: the feature is simply off.
+        assert!(
+            GatewayConfig::from_json(&example().to_string())
+                .unwrap()
+                .derived_keys
+                .is_none()
+        );
+
+        let with = |section: serde_json::Value| -> Result<GatewayConfig> {
+            let mut cfg = example();
+            cfg["derived_keys"] = section;
+            GatewayConfig::from_json(&cfg.to_string())
+        };
+        let reject = |section: serde_json::Value| -> String {
+            with(section).expect_err("must not load").to_string()
+        };
+
+        // The single-key form normalizes onto the default kid.
+        let loaded = with(serde_json::json!({ "master_key_hex": "cc".repeat(32) })).unwrap();
+        let (ring, current) = loaded.derived_keys.as_ref().unwrap().key_ring();
+        assert_eq!(current, crate::auth::derived::DEFAULT_KID);
+        assert_eq!(
+            ring[crate::auth::derived::DEFAULT_KID].expose(),
+            &"cc".repeat(32)
+        );
+
+        // The ring form.
+        assert!(
+            with(serde_json::json!({
+                "master_keys": { "k0": "cc".repeat(32), "k1": "dd".repeat(32) },
+                "current_kid": "k1"
+            }))
+            .is_ok()
+        );
+
+        assert!(
+            reject(serde_json::json!({})).contains("master_key_hex or a non-empty master_keys")
+        );
+        assert!(
+            reject(serde_json::json!({
+                "master_key_hex": "cc".repeat(32),
+                "master_keys": { "k0": "cc".repeat(32) }
+            }))
+            .contains("mutually exclusive")
+        );
+        assert!(
+            reject(serde_json::json!({ "master_keys": { "k0": "cc".repeat(32) } }))
+                .contains("current_kid is required")
+        );
+        assert!(
+            reject(serde_json::json!({
+                "master_keys": { "k0": "cc".repeat(32) }, "current_kid": "k9"
+            }))
+            .contains("k9")
+        );
+        assert!(
+            reject(serde_json::json!({ "master_key_hex": "cc".repeat(32), "current_kid": "k0" }))
+                .contains("meaningless")
+        );
+
+        // **The rule that is not a copy of the STS ring's.** The example's STS section
+        // holds master key `k0` and a signing key; reusing either here is refused,
+        // because retiring a derived kid would then 403 every live session and material
+        // recovered from one class would forge the other.
+        let sts = &example()["sts"];
+        let sts_master = sts["master_keys"]["k0"].as_str().unwrap().to_string();
+        let sts_signing = sts["signing_key_hex"].as_str().unwrap().to_string();
+        assert!(
+            reject(serde_json::json!({ "master_key_hex": sts_master.clone() }))
+                .contains("same material as sts master key")
+        );
+        assert!(
+            reject(serde_json::json!({
+                "master_keys": { "d0": "cc".repeat(32), "d1": sts_master },
+                "current_kid": "d0"
+            }))
+            .contains("same material as sts master key"),
+            "the check must cover every ring entry, not just the first"
+        );
+        assert!(
+            reject(serde_json::json!({ "master_key_hex": sts_signing }))
+                .contains("same material as sts.signing_key_hex")
+        );
     }
 
     /// M0 issue 3: "plaintext secrets reachable via `{:?}`".

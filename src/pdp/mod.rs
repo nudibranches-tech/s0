@@ -10,8 +10,9 @@ mod embedded;
 mod sidecar;
 
 pub use bundle::{
-    Bundle, BundleStore, DECISION_RULE, GATEWAY_REGO, ParsedBundle, bundle_knows_service_account,
-    content_revision, decision_rule_path, parse_bundle, service_account_subject_key,
+    Bundle, BundleStore, DECISION_RULE, GATEWAY_REGO, KEY_EPOCH_FIELD, KEY_EPOCHS_FIELD,
+    ParsedBundle, bundle_key_epoch_floor, bundle_knows_service_account, content_revision,
+    decision_rule_path, parse_bundle, principal_subject_key, service_account_subject_key,
 };
 pub use cache::CachingPdp;
 pub use embedded::RegorusPdp;

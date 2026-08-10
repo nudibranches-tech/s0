@@ -191,6 +191,65 @@ pub fn service_account_subject_key(client_id: &str) -> String {
     format!("sa:{client_id}")
 }
 
+/// The bundle's subject key for either principal class: `sa:<client id>` for a service
+/// account, `user:<oidc sub>` for a human.
+///
+/// Both spellings are the platform projection's, read off the captured document rather
+/// than assumed — `user_attributes` in `tests/data/platform/s3_gateway_bundle.json`
+/// carries `sa:pipeline` and `user:sub-a` side by side, and the module composes the same
+/// two strings. This is the key a per-subject lookup in the bundle must use, and it exists
+/// as one function so the two key spaces cannot drift apart at a new call site.
+pub fn principal_subject_key(principal_type: crate::model::PrincipalType, sub: &str) -> String {
+    match principal_type {
+        crate::model::PrincipalType::ServiceAccount => service_account_subject_key(sub),
+        crate::model::PrincipalType::User => format!("user:{sub}"),
+    }
+}
+
+/// The bundle field publishing a tenant's **key epoch floor** — the lowest epoch a
+/// derived long-lived key ([`crate::auth::derived`]) may carry and still be honoured.
+///
+/// A cross-repo contract: hyperfluid's projection writes it, s0 reads it, and nothing
+/// negotiates. Named here once so both the reader and any future writer point at the same
+/// string.
+pub const KEY_EPOCH_FIELD: &str = "s3_key_epoch";
+
+/// The optional per-subject override map, keyed by [`principal_subject_key`]. See
+/// [`KEY_EPOCH_FIELD`].
+pub const KEY_EPOCHS_FIELD: &str = "s3_key_epochs";
+
+/// The effective key-epoch floor for `(tenant, subject_key)`: the greater of the tenant's
+/// published epoch and the subject's override, or `None` when the tenant publishes none.
+///
+/// **`None` denies** — see [`crate::auth::KeyEpochFloor`] for the full argument. Every
+/// degenerate input lands there: a document that is not an object, no `tenants`, no such
+/// tenant, no `s3_key_epoch`, a value that is not a number, a negative number, or one
+/// above `u32::MAX`. So the operator's seed bundle, an empty bundle and a bundle from a
+/// platform that has not learned about this field all mean "no derived key works here",
+/// which is the only direction a revocation channel may fail in.
+///
+/// A malformed **per-subject** entry is likewise ignored rather than defaulted, which
+/// leaves the tenant floor in force: a subject override can only ever raise the floor, so
+/// discarding a broken one can never admit a key the tenant epoch already refuses.
+pub fn bundle_key_epoch_floor(
+    data: &serde_json::Value,
+    tenant: &str,
+    subject_key: &str,
+) -> Option<u32> {
+    if tenant.is_empty() {
+        return None;
+    }
+    let tenant_data = data.get("tenants")?.get(tenant)?;
+    let as_epoch = |v: &serde_json::Value| u32::try_from(v.as_u64()?).ok();
+    let floor = as_epoch(tenant_data.get(KEY_EPOCH_FIELD)?)?;
+    let per_subject = tenant_data
+        .get(KEY_EPOCHS_FIELD)
+        .and_then(|m| m.get(subject_key))
+        .and_then(as_epoch)
+        .unwrap_or(0);
+    Some(floor.max(per_subject))
+}
+
 /// Does this bundle's policy data know `sa:<client_id>` as a **member subject** of
 /// `tenant`?
 ///
@@ -236,6 +295,19 @@ pub struct BundleStore {
 impl crate::webidentity::TenantSubjects for BundleStore {
     fn knows_service_account(&self, tenant: &str, client_id: &str) -> bool {
         bundle_knows_service_account(&self.current().data, tenant, client_id)
+    }
+}
+
+/// Derived-key revocation, answered from **this** store — the same one the PDP decides
+/// against and the poller swaps, for the same reason the audience check is: the answer
+/// must be the revision in force at this instant, not a snapshot taken at boot.
+///
+/// `current()` is loaded per call and dropped before returning, so a key epoch raised by
+/// a poll revokes on the very next request, with no cache to invalidate. That is what
+/// makes "revocation lands at normal bundle latency" true rather than aspirational.
+impl crate::auth::KeyEpochFloor for BundleStore {
+    fn key_epoch_floor(&self, tenant: &str, subject_key: &str) -> Option<u32> {
+        bundle_key_epoch_floor(&self.current().data, tenant, subject_key)
     }
 }
 
@@ -407,6 +479,159 @@ mod tests {
             "a subject the poller REMOVED is still accepted: the door is holding a stale \
              snapshot"
         );
+    }
+
+    /// **The revocation channel for derived long-lived keys, and the direction absence
+    /// fails in.** This is the half of F17 that makes the credential class safe, so the
+    /// degenerate cases are the point rather than an afterthought.
+    #[test]
+    fn the_key_epoch_floor_is_published_per_tenant_and_its_absence_denies() {
+        let data = serde_json::json!({
+            "tenants": {
+                "acme": {
+                    "s3_key_epoch": 3,
+                    // The surgical lever: one consumer cut off without touching the
+                    // other four.
+                    "s3_key_epochs": { "sa:leaked-registry": 9, "user:alice": 4 }
+                },
+                // A tenant that publishes no epoch at all — the state every tenant is in
+                // before the platform learns about this field.
+                "quiet": { "user_attributes": {} }
+            }
+        });
+        assert_eq!(
+            bundle_key_epoch_floor(&data, "acme", "sa:trino-background"),
+            Some(3),
+            "the tenant floor applies to a subject with no override"
+        );
+        assert_eq!(
+            bundle_key_epoch_floor(&data, "acme", "sa:leaked-registry"),
+            Some(9),
+            "a subject override must raise the floor for that subject alone"
+        );
+        // An override BELOW the tenant floor cannot loosen it — the floor is the max.
+        assert_eq!(bundle_key_epoch_floor(&data, "acme", "user:alice"), Some(4));
+        let lowered = serde_json::json!({ "tenants": { "acme": {
+            "s3_key_epoch": 7, "s3_key_epochs": { "user:alice": 1 } } } });
+        assert_eq!(
+            bundle_key_epoch_floor(&lowered, "acme", "user:alice"),
+            Some(7)
+        );
+
+        // Every shape of absent, unknown or broken denies.
+        for (label, doc, tenant) in [
+            ("tenant publishes nothing", data.clone(), "quiet"),
+            ("tenant not in the bundle", data.clone(), "absent"),
+            ("empty tenant name", data.clone(), ""),
+            ("no document", serde_json::json!(null), "acme"),
+            ("not an object", serde_json::json!("nope"), "acme"),
+            ("no tenants map", serde_json::json!({}), "acme"),
+            (
+                "the operator's seed bundle",
+                serde_json::json!({ "tenants": {}, "org_settings": { "freeze_writes": true } }),
+                "acme",
+            ),
+            (
+                "epoch is not a number",
+                serde_json::json!({ "tenants": { "acme": { "s3_key_epoch": "3" } } }),
+                "acme",
+            ),
+            (
+                "epoch is negative",
+                serde_json::json!({ "tenants": { "acme": { "s3_key_epoch": -1 } } }),
+                "acme",
+            ),
+            (
+                "epoch overflows u32",
+                serde_json::json!({ "tenants": { "acme": { "s3_key_epoch": 4294967296u64 } } }),
+                "acme",
+            ),
+            (
+                "epoch is null",
+                serde_json::json!({ "tenants": { "acme": { "s3_key_epoch": null } } }),
+                "acme",
+            ),
+        ] {
+            assert_eq!(
+                bundle_key_epoch_floor(&doc, tenant, "sa:x"),
+                None,
+                "{label} must deny"
+            );
+        }
+
+        // A malformed per-subject entry is discarded, leaving the tenant floor — which
+        // can only ever be the stricter of the two, so this cannot admit anything.
+        let broken_override = serde_json::json!({ "tenants": { "acme": {
+            "s3_key_epoch": 5, "s3_key_epochs": { "sa:x": "nine", "sa:y": null } } } });
+        assert_eq!(
+            bundle_key_epoch_floor(&broken_override, "acme", "sa:x"),
+            Some(5)
+        );
+        assert_eq!(
+            bundle_key_epoch_floor(&broken_override, "acme", "sa:y"),
+            Some(5)
+        );
+
+        // The field names are a cross-repo contract; assert them rather than trust the
+        // literals above.
+        assert_eq!(KEY_EPOCH_FIELD, "s3_key_epoch");
+        assert_eq!(KEY_EPOCHS_FIELD, "s3_key_epochs");
+    }
+
+    /// The floor is read from the bundle **in force**, through the same store the PDP
+    /// decides against — which is what makes "revocation lands at normal bundle latency"
+    /// a fact rather than a hope.
+    #[test]
+    fn the_key_epoch_floor_follows_the_store_across_a_swap() {
+        use crate::auth::KeyEpochFloor;
+        let with = |epoch: serde_json::Value| serde_json::json!({ "tenants": { "acme": { "s3_key_epoch": epoch } } });
+        let store = BundleStore::new(Bundle::new("rev-1", with(serde_json::json!(1))));
+        // The handle is taken ONCE, as `Gateway::build` takes it at boot.
+        let floors: &dyn KeyEpochFloor = &store;
+        assert_eq!(floors.key_epoch_floor("acme", "sa:x"), Some(1));
+
+        store.store(Bundle::new("rev-2", with(serde_json::json!(2))));
+        assert_eq!(
+            floors.key_epoch_floor("acme", "sa:x"),
+            Some(2),
+            "a revocation the poller published is not visible to the credential layer"
+        );
+
+        // And the tenant disappearing from the bundle denies, rather than freezing the
+        // last floor it published.
+        store.store(Bundle::new("rev-3", serde_json::json!({ "tenants": {} })));
+        assert_eq!(floors.key_epoch_floor("acme", "sa:x"), None);
+    }
+
+    /// Both subject key spaces, composed in one place so a new call site cannot invent a
+    /// third spelling. Asserted against the captured platform document, like the service
+    /// account key shape above.
+    #[test]
+    fn the_subject_key_is_the_platforms_own_for_both_principal_classes() {
+        use crate::model::PrincipalType;
+        assert_eq!(
+            principal_subject_key(PrincipalType::ServiceAccount, "pipeline"),
+            "sa:pipeline"
+        );
+        assert_eq!(
+            principal_subject_key(PrincipalType::User, "sub-a"),
+            "user:sub-a"
+        );
+
+        let parsed = parse_bundle(PLATFORM_BUNDLE).expect("the captured bundle parses");
+        let subjects = parsed.data["tenants"]["acme-prod"]["user_attributes"]
+            .as_object()
+            .expect("acme-prod has user_attributes");
+        for key in [
+            principal_subject_key(PrincipalType::ServiceAccount, "pipeline"),
+            principal_subject_key(PrincipalType::User, "sub-a"),
+        ] {
+            assert!(
+                subjects.contains_key(&key),
+                "the captured platform bundle does not key {key}; keys are {:?}",
+                subjects.keys().collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]
