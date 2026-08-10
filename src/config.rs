@@ -215,6 +215,59 @@ pub struct StsMintConfig {
     /// credential-acquisition call.
     #[serde(default = "default_max_session_ttl_secs")]
     pub max_duration_secs: u64,
+
+    // ── the listener's own hardening bounds (F13) ──────────────────────────────
+    /// Max concurrent connections on the mint listener.
+    ///
+    /// The same treatment `LimitsConfig::max_connections` gives the S3 data plane,
+    /// with its own number, because this listener's exposure is different in both
+    /// directions:
+    ///
+    /// * it is the **one socket that is both internet-facing and unauthenticated by
+    ///   design** — the web identity token *is* the credential, exactly as at
+    ///   `sts.amazonaws.com`, so there is nothing to present before being served, and
+    ///   the Ingress in front of it applies no rate limiting (Cilium has no
+    ///   rate-limit annotation, and an nginx-shaped key would be silently ignored).
+    ///   Whatever bound exists has to exist here;
+    /// * its natural concurrency is far *below* the data plane's. A client mints once
+    ///   and then uses the credential for an hour, so the mint sees roughly one
+    ///   request per client per session lifetime, against the data plane's one per
+    ///   object operation.
+    ///
+    /// **It is a queue, not a refusal.** The accept loop takes a permit *before* it
+    /// accepts, exactly as `server::serve_with_shutdown` does, so a connection beyond
+    /// the bound waits in the kernel's accept backlog rather than being answered with
+    /// an error. That is the point: a legitimate mint refused is worse than no bound
+    /// at all, and every mint is a few hundred microseconds of RS256, so a queue
+    /// drains as fast as it forms. Saturation is counted and logged rather than
+    /// returned to the caller (`s0_mint_connection_limit_saturated_total`).
+    ///
+    /// `0` is refused at load: a zero-permit semaphore is not "unbounded", it is a
+    /// listener that accepts nothing.
+    #[serde(default = "default_mint_max_connections")]
+    pub max_connections: usize,
+
+    /// Hard ceiling on the lifetime of one accepted mint connection, in seconds.
+    ///
+    /// Without it the connection bound above makes slowloris *easier*, not harder: an
+    /// attacker who dribbles bytes on `max_connections` sockets holds every permit
+    /// forever and locks out the whole fleet's credential path with a few hundred
+    /// connections. With it, a permit is always returned within this many seconds.
+    ///
+    /// **Deliberately not `hyper`'s `header_read_timeout`.** That knob needs a timer
+    /// installed on the h1 builder that does not survive `into_owned()`, so it panics
+    /// once per connection — this project already added it once and removed it (see
+    /// the NOTE in `server::serve_with_shutdown`). This is a plain
+    /// `tokio::time::timeout` around the already-`GracefulShutdown`-watched connection
+    /// future: no timer in the builder, no shape to get subtly wrong, and it bounds
+    /// the *whole* connection rather than only its header read.
+    ///
+    /// The default is far longer than any legitimate mint — a token verification plus,
+    /// worst case on a `kid` miss, one JWKS fetch bounded by `jwks_timeout_secs` — and
+    /// far shorter than "forever", which is what an unbounded socket grants. `0` is
+    /// refused at load rather than read as "no bound".
+    #[serde(default = "default_mint_connection_timeout_secs")]
+    pub connection_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -699,6 +752,28 @@ impl GatewayConfig {
                     .into(),
             ));
         }
+        // Both of these read like "no limit" and mean the opposite. A zero-permit
+        // semaphore never hands out a permit, so the accept loop would park forever and
+        // the listener would answer nothing while still being bound and still passing a
+        // TCP probe; a zero timeout closes every connection before its first byte. Both
+        // are silent, total outages of the credential path, so they are refused at load
+        // — the same reasoning as `max_duration_secs` above.
+        if m.max_connections == 0 {
+            return Err(GatewayError::Config(
+                "sts_mint.max_connections must be > 0; zero is not 'unbounded', it is a \
+                 listener that accepts no connection at all while still binding the port \
+                 and still passing a TCP probe"
+                    .into(),
+            ));
+        }
+        if m.connection_timeout_secs == 0 {
+            return Err(GatewayError::Config(
+                "sts_mint.connection_timeout_secs must be > 0; zero is not 'no timeout', \
+                 it closes every connection before it can be answered. Raise it if the \
+                 default of 30 s is too short for your IdP"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 
@@ -966,6 +1041,35 @@ fn default_jwks_timeout_secs() -> u64 {
 }
 fn default_jwks_refresh_secs() -> u64 {
     300
+}
+/// 256 concurrent connections on the mint.
+///
+/// Sized against the largest legitimate burst anyone could point at it, not against a
+/// guess. The worst realistic case is a deployment rolling many pods at once, each
+/// minting a credential on startup: a 200-pod Deployment at the kubernetes default
+/// `maxSurge: 25%` brings up ~50 pods at a time, and even a whole-fleet restart is
+/// serialised by image pulls and readiness gates long before it is serialised here.
+/// 256 leaves that burst several times over, and one mint is a signature verification
+/// against a *cached* JWKS plus an HMAC — a few hundred microseconds — so 256 in flight
+/// is throughput this listener will never reach.
+///
+/// It is a quarter of the data plane's 1024, deliberately (F13: "the mint's natural
+/// concurrency is far below the data plane's"), and it is two orders of magnitude
+/// below what the unbounded loop allowed, which was the process file-descriptor limit.
+fn default_mint_max_connections() -> usize {
+    256
+}
+/// 30 s of connection lifetime.
+///
+/// An order of magnitude above the worst legitimate request — a `kid`-miss mint pays
+/// one JWKS fetch, bounded by `jwks_timeout_secs` (5 s), on top of a verification
+/// measured in microseconds — and it is a *lifetime* rather than an idle timeout, so
+/// the only client it can inconvenience is one reusing a pooled connection more than
+/// 30 s after opening it. That client minted twice inside 30 s, which no SDK does
+/// (a session lasts an hour), and every HTTP client already retries a connection the
+/// server closed underneath it, because every HTTP server closes idle keep-alives.
+fn default_mint_connection_timeout_secs() -> u64 {
+    30
 }
 fn default_backend_connect_timeout_secs() -> u64 {
     5
@@ -1571,6 +1675,70 @@ mod tests {
 
         // POSITIVE CONTROL: the example itself still loads on its own port.
         assert!(GatewayConfig::from_json(&example().to_string()).is_ok());
+    }
+
+    /// The mint listener's own hardening bounds (F13): present in the shipped schema,
+    /// defaulted for every config that predates them, and never settable to a value
+    /// that reads as "no limit" and means "no service".
+    ///
+    /// The defaulting half is the part that matters most. This socket is the one that
+    /// is both internet-facing and unauthenticated by design, so a deployed
+    /// `gateway.json` written before these fields existed — which is every one of them
+    /// — must come up **bounded**. If absence meant "unbounded", the fix would land
+    /// only on operators who edited their config, i.e. on nobody.
+    #[test]
+    fn the_mint_listeners_bounds_are_defaulted_and_cannot_be_set_to_zero() {
+        let loaded = GatewayConfig::from_json(&example().to_string()).expect("the example loads");
+        let mint = loaded.sts_mint.expect("sts_mint");
+        assert_eq!(mint.max_connections, 256);
+        assert_eq!(mint.connection_timeout_secs, 30);
+
+        // A config written before F13 gets exactly the same numbers.
+        let mut older = example();
+        let m = older["sts_mint"].as_object_mut().expect("sts_mint");
+        m.remove("max_connections");
+        m.remove("connection_timeout_secs");
+        let mint = GatewayConfig::from_json(&older.to_string())
+            .expect("a config that predates the bounds still loads")
+            .sts_mint
+            .expect("sts_mint");
+        assert_eq!(
+            mint.max_connections, 256,
+            "an unbounded mint must not be reachable by omission"
+        );
+        assert_eq!(mint.connection_timeout_secs, 30);
+
+        // Zero reads like "no limit" and does the opposite in both cases: a
+        // zero-permit semaphore accepts nothing, and a zero timeout closes every
+        // connection before it can be answered. Both are silent total outages of the
+        // credential path, so both are refused at load.
+        let reject = |key: &str| -> String {
+            let mut cfg = example();
+            cfg["sts_mint"][key] = serde_json::json!(0);
+            GatewayConfig::from_json(&cfg.to_string())
+                .expect_err("zero must not load")
+                .to_string()
+        };
+        let err = reject("max_connections");
+        assert!(err.contains("max_connections"), "{err}");
+        assert!(
+            err.contains("unbounded"),
+            "the message must say why zero is not what the operator meant: {err}"
+        );
+        let err = reject("connection_timeout_secs");
+        assert!(err.contains("connection_timeout_secs"), "{err}");
+        assert!(err.contains("no timeout"), "{err}");
+
+        // POSITIVE CONTROL: a deliberately raised bound loads unchanged.
+        let mut cfg = example();
+        cfg["sts_mint"]["max_connections"] = serde_json::json!(2048);
+        cfg["sts_mint"]["connection_timeout_secs"] = serde_json::json!(120);
+        let mint = GatewayConfig::from_json(&cfg.to_string())
+            .expect("a raised bound loads")
+            .sts_mint
+            .expect("sts_mint");
+        assert_eq!(mint.max_connections, 2048);
+        assert_eq!(mint.connection_timeout_secs, 120);
     }
 
     /// The credential mint may not land on the unauthenticated probe port, on the

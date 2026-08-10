@@ -309,49 +309,98 @@ async fn a_service_account_session_carries_its_principal_type_to_the_opa_input()
 /// outage for that organization, with no fallback (`decide_issuance_path` never
 /// returns to the legacy path once the flag is on). Clamping can only ever *shorten* a
 /// credential's life, and `Expiration` reports the truth.
+/// # Why this reads as a bracket rather than a subtraction (F12)
+///
+/// It used to sample one `before` and compare *two* later responses against it, with a
+/// ±10 s slack to absorb the drift. That made it depend on where the second boundaries
+/// happened to fall: the handler computes `Expiration = SystemTime::now() + ttl`, so a
+/// request that crosses one tick returns `before + ttl + 1` — one over the top of the
+/// `..=900` window — and the test reddened for a gateway that had done exactly the
+/// right thing.
+///
+/// The fix is not a wider window (that only moves the boundary). Each request is
+/// bracketed between two readings of the **same clock the handler uses**, and the
+/// answer must land in `[before + ttl, after + ttl]`. That interval is where a correct
+/// answer provably is, whatever the clock did in between — so the assertion is exact
+/// rather than approximate, and it holds for every possible interleaving instead of
+/// most of them. It is strictly *stronger* than the ±10 s window it replaces: 899 and
+/// 891 used to pass, and now only the true value does.
 #[tokio::test]
 async fn a_ttl_over_the_cap_is_clamped_down_not_honoured() {
     let (base, _stop) = serve(api_with(Some(SECRET), 900, sts())).await;
-    let before = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock")
-        .as_secs();
 
-    let minted: serde_json::Value = client()
-        .post(format!("{base}{SESSION_PATH}"))
-        .header(SHARED_SECRET_HEADER, SECRET)
-        .json(&body("service_account", "acme-prod", ORG, 86_400))
-        .send()
-        .await
-        .expect("send")
-        .json()
-        .await
-        .expect("json");
-
-    let expiration = minted["Expiration"].as_u64().expect("Expiration");
-    let ttl = expiration - before;
-    assert!(
-        (890..=900).contains(&ttl),
-        "a 86400 s request produced a {ttl} s session; the 900 s cap was not applied"
+    // 86 400 requested against a 900 s cap: clamped DOWN to exactly the cap.
+    let over = mint_bracketed(&base, 86_400).await;
+    over.assert_lifetime_is_exactly(
+        900,
+        "a 86400 s request must come back clamped to the 900 s cap",
     );
 
     // Under the cap, the request is honoured exactly — the clamp is a ceiling, not a
     // fixed lifetime.
-    let short: serde_json::Value = client()
+    let under = mint_bracketed(&base, 300).await;
+    under.assert_lifetime_is_exactly(
+        300,
+        "an under-cap request must be honoured exactly, not rounded up to the cap",
+    );
+}
+
+/// One minted session, with the wall-clock interval its `Expiration` was computed
+/// inside. See [`a_ttl_over_the_cap_is_clamped_down_not_honoured`].
+struct BracketedMint {
+    requested: u64,
+    expiration: u64,
+    before: u64,
+    after: u64,
+}
+
+impl BracketedMint {
+    /// The session's lifetime is exactly `expected` seconds — proved without reading a
+    /// clock a third time, by checking `Expiration` against the interval in which the
+    /// handler must have taken its own reading.
+    fn assert_lifetime_is_exactly(&self, expected: u64, why: &str) {
+        let window = self.before + expected..=self.after + expected;
+        assert!(
+            window.contains(&self.expiration),
+            "{why}: DurationSeconds={} came back with Expiration={}, which is not in \
+             [{}, {}] — the only values a {expected} s session minted between unix {} \
+             and unix {} can have",
+            self.requested,
+            self.expiration,
+            self.before + expected,
+            self.after + expected,
+            self.before,
+            self.after,
+        );
+    }
+}
+
+async fn mint_bracketed(base: &str, requested: u64) -> BracketedMint {
+    let before = unix_now();
+    let minted: serde_json::Value = client()
         .post(format!("{base}{SESSION_PATH}"))
         .header(SHARED_SECRET_HEADER, SECRET)
-        .json(&body("service_account", "acme-prod", ORG, 300))
+        .json(&body("service_account", "acme-prod", ORG, requested))
         .send()
         .await
         .expect("send")
         .json()
         .await
         .expect("json");
-    let short_ttl = short["Expiration"].as_u64().expect("Expiration") - before;
-    assert!(
-        (290..=300).contains(&short_ttl),
-        "an under-cap request was not honoured: {short_ttl}"
-    );
+    let after = unix_now();
+    BracketedMint {
+        requested,
+        expiration: minted["Expiration"].as_u64().expect("Expiration"),
+        before,
+        after,
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs()
 }
 
 /// Everything the console can get wrong about the facts it asserts, refused rather

@@ -29,7 +29,8 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -44,6 +45,7 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 
 use crate::auth::sts::{SessionClaims, StsAuthority};
 use crate::config::StsMintConfig;
@@ -384,6 +386,114 @@ fn empty_jwks() -> JwkSet {
     serde_json::from_str(r#"{"keys":[]}"#).expect("empty jwks")
 }
 
+/// What an anonymous caller may make this listener do (F13).
+///
+/// Every field here bounds something an **unauthenticated** caller controls, because
+/// this is the one socket on which nothing else does. See [`StsMintConfig`] for the
+/// per-field argument and the chosen defaults.
+#[derive(Debug, Clone, Copy)]
+pub struct MintLimits {
+    /// Concurrent connections. A permit is taken *before* `accept`, so this is a queue
+    /// depth, not a refusal threshold — see [`StsMintConfig::max_connections`].
+    pub max_connections: usize,
+    /// Hard ceiling on one connection's lifetime, so a slow client cannot hold a
+    /// permit indefinitely.
+    pub connection_timeout: Duration,
+}
+
+impl Default for MintLimits {
+    fn default() -> Self {
+        MintLimits {
+            max_connections: 256,
+            connection_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+impl MintLimits {
+    pub fn from_config(cfg: &StsMintConfig) -> Self {
+        MintLimits {
+            max_connections: cfg.max_connections,
+            connection_timeout: Duration::from_secs(cfg.connection_timeout_secs),
+        }
+    }
+}
+
+/// Counters for the mint listener, scraped through the admin listener.
+///
+/// These exist because **a silently refused mint looks to an operator exactly like a
+/// broken IdP**. Both produce "clients cannot get credentials" with a healthy-looking
+/// gateway, and the two have opposite remedies — raise a bound here, or go and fix
+/// Keycloak. Without a counter at the point where the bound bites, the only way to
+/// tell them apart is to guess.
+///
+/// Held behind an `Arc` shared by the mint and `admin::AdminState`, so the numbers on
+/// `/metrics` are the ones the accept loop is actually keeping and not a second copy.
+#[derive(Debug, Default)]
+pub struct MintMetrics {
+    /// The configured `max_connections`, published so the saturation counter below is
+    /// interpretable without reading the pod's config.
+    pub connection_limit: AtomicU64,
+    /// Connections accepted since start.
+    pub connections_accepted: AtomicU64,
+    /// Connections currently being served. Compare against `connection_limit`.
+    pub connections_active: AtomicU64,
+    /// Times the accept loop found the connection bound **already full**, i.e. the
+    /// next connection had to wait in the accept backlog. Sustained non-zero is the
+    /// signal to raise `sts_mint.max_connections` — or to look at who is calling.
+    pub connection_limit_saturated: AtomicU64,
+    /// Connections closed because they outlived `connection_timeout`. This is the
+    /// slowloris counter: a legitimate client never reaches it.
+    pub connection_timeouts: AtomicU64,
+    /// Requests refused with `413` because the body exceeded
+    /// [`MAX_MINT_BODY_BYTES`].
+    pub bodies_too_large: AtomicU64,
+}
+
+impl MintMetrics {
+    fn incr(counter: &AtomicU64) -> u64 {
+        counter.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+/// A once-per-interval gate on a log line an anonymous caller can trigger at will.
+///
+/// The counters above are always exact; only the *line* is throttled. Without this,
+/// the two lines that report a bound biting are themselves an amplification: an
+/// attacker holding the cap open would emit one `warn` per accepted connection, and
+/// this deployment ships logs off the node — so the observability added to make an
+/// attack visible would be the second half of the attack.
+#[derive(Debug)]
+struct LogThrottle {
+    interval: Duration,
+    /// Last emission, and how many occurrences have been swallowed since it.
+    state: std::sync::Mutex<(Instant, u64)>,
+}
+
+impl LogThrottle {
+    fn new(interval: Duration) -> Self {
+        LogThrottle {
+            // Far enough in the past that the first occurrence always speaks.
+            state: std::sync::Mutex::new((Instant::now() - interval - interval, 0)),
+            interval,
+        }
+    }
+
+    /// `Some(n)` ⇒ emit, where `n` is how many occurrences were suppressed since the
+    /// last emitted line (so the line can say so). `None` ⇒ stay quiet.
+    fn allow(&self) -> Option<u64> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        if now.duration_since(state.0) < self.interval {
+            state.1 += 1;
+            return None;
+        }
+        let suppressed = state.1;
+        *state = (now, 0);
+        Some(suppressed)
+    }
+}
+
 /// The mint: verify an OIDC token, issue a gateway session.
 pub struct Mint {
     verifier: Arc<dyn OidcVerifier>,
@@ -394,6 +504,10 @@ pub struct Mint {
     /// so turning the surface off really does remove it rather than hiding it behind a
     /// different error.
     web_identity: Option<Arc<WebIdentitySts>>,
+    /// What an anonymous caller may make this listener do. Read by
+    /// [`serve_on`], which is the only place the connection bound can be applied.
+    limits: MintLimits,
+    metrics: Arc<MintMetrics>,
 }
 
 /// AssumeRoleWithWebIdentity-shaped response.
@@ -447,6 +561,11 @@ impl Mint {
             sts,
             ttl,
             web_identity: None,
+            // Defaulted rather than required, so a caller that predates F13 — every
+            // test harness, and anyone embedding this crate — is bounded rather than
+            // unbounded. "No limits configured" must never mean "no limits".
+            limits: MintLimits::default(),
+            metrics: Arc::new(MintMetrics::default()),
         }
     }
 
@@ -455,6 +574,30 @@ impl Mint {
     pub fn with_web_identity(mut self, sts: Arc<WebIdentitySts>) -> Self {
         self.web_identity = Some(sts);
         self
+    }
+
+    /// Override the listener's hardening bounds (F13). Omitted ⇒
+    /// [`MintLimits::default`], never "unbounded".
+    #[must_use]
+    pub fn with_limits(mut self, limits: MintLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// Share this mint's counters with the admin listener, so the bounds above are
+    /// observable rather than merely applied.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<MintMetrics>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    pub fn metrics(&self) -> Arc<MintMetrics> {
+        self.metrics.clone()
+    }
+
+    pub fn limits(&self) -> MintLimits {
+        self.limits
     }
 
     /// Verify an OIDC token and mint session credentials. `sid` is caller-supplied
@@ -495,6 +638,11 @@ impl Mint {
         {
             Ok(b) => b.to_bytes(),
             Err(_) => {
+                // `Limited` stops polling the body the moment the ceiling is crossed,
+                // so the bytes beyond it are never read off the socket, never
+                // allocated, and never parsed. Counted because an anonymous caller
+                // decides how often this happens.
+                MintMetrics::incr(&self.metrics.bodies_too_large);
                 return json_error(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     "request body exceeds the mint's limit",
@@ -640,6 +788,39 @@ fn json_error(status: StatusCode, msg: &str) -> Response<Full<Bytes>> {
 /// is a token verification plus an HMAC — anything still running past this is stuck.
 const MINT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Ceiling on one HTTP/1 message head, and on an HTTP/2 header list.
+///
+/// **hyper does bound this already**, and the bound is real but sized for a general
+/// server: h1 refuses a head larger than `DEFAULT_MAX_BUFFER_SIZE` (8 KiB + 100 × 4 KiB
+/// ≈ **408 KiB**) or carrying more than `DEFAULT_MAX_HEADERS` (**100**) fields, with a
+/// `431 Request Header Fields Too Large`; h2 advertises
+/// `DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE` = **16 KiB**. So the failure mode is bounded
+/// either way and nothing here is load-bearing for correctness.
+///
+/// It is tightened to 64 KiB because on *this* socket the multiplier is
+/// `max_connections` × an anonymous caller's discretion: 408 KiB × 256 is ~100 MiB of
+/// header buffer an unauthenticated client can ask this process to hold, to serve a
+/// request whose real headers are a `Host`, a `Content-Type` and a `Content-Length`.
+/// 64 KiB is the same number as [`MAX_MINT_BODY_BYTES`] and eight times the largest
+/// thing that legitimately appears in a mint header — a Keycloak access token on the
+/// bearer door's `Authorization` line, routinely 4–8 KiB.
+///
+/// The header-count default (100) is left alone: it is already far below anything a
+/// mint request carries, and re-stating it here would be a second place to keep in
+/// sync with hyper for no gain.
+const MINT_MAX_HEADER_BYTES: usize = 64 * 1024;
+
+/// Concurrent HTTP/2 streams per mint connection.
+///
+/// Without a bound of the right order the connection cap means nothing over h2: hyper
+/// defaults to 200 streams per connection, so `max_connections` × 200 = 51 200
+/// concurrent in-flight mints behind a bound that says 256. A mint client opens a
+/// connection, POSTs once, and reads one XML document; 32 is already 32× that.
+const MINT_MAX_CONCURRENT_STREAMS: u32 = 32;
+
+/// How often the two "a bound is biting" lines may speak. See [`LogThrottle`].
+const MINT_PRESSURE_LOG_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Serve the mint on its own listener (control plane, separate from the S3 data
 /// plane) until SIGTERM/Ctrl-C, then drain.
 pub async fn serve(mint: Arc<Mint>, listen: SocketAddr) -> Result<()> {
@@ -658,30 +839,141 @@ pub async fn serve_with_shutdown(
     listen: SocketAddr,
     shutdown: impl std::future::Future<Output = ()> + Send,
 ) -> Result<()> {
-    let listener = TcpListener::bind(listen).await?;
-    tracing::info!(%listen, "sts mint listening");
-    let http = ConnBuilder::new(TokioExecutor::new());
+    serve_on(mint, TcpListener::bind(listen).await?, shutdown).await
+}
+
+/// As [`serve_with_shutdown`], on an already-bound listener.
+///
+/// Split out for the same reason `internal::serve_on` is: a test that must know the
+/// port has to bind `127.0.0.1:0` itself, and the alternative — bind, read the port,
+/// drop, hand the address to `serve_with_shutdown` — is a race that another test in
+/// the same run can win. Everything below is what production runs.
+///
+/// # What bounds this listener (F13)
+///
+/// The mint is the one socket that is **both internet-facing and unauthenticated by
+/// design**: the web identity token *is* the credential, exactly as at
+/// `sts.amazonaws.com`, so there is nothing to check before serving a request, and the
+/// Ingress in front of it applies no rate limiting (Cilium's Ingress has no rate-limit
+/// annotation, and an nginx-shaped key would be silently ignored — protection that
+/// confers nothing). Every bound therefore lives here:
+///
+/// | bound | where | default |
+/// |---|---|---|
+/// | concurrent connections | `Semaphore`, permit taken **before** `accept` | 256 |
+/// | connection lifetime | `tokio::time::timeout` around the watched connection | 30 s |
+/// | request body | [`MAX_MINT_BODY_BYTES`] via `Limited`, in [`Mint::route`] | 64 KiB |
+/// | header block / h2 header list | [`MINT_MAX_HEADER_BYTES`] | 64 KiB |
+/// | h2 streams per connection | [`MINT_MAX_CONCURRENT_STREAMS`] | 32 |
+///
+/// The connection bound is deliberately the **same mechanism** the S3 data plane
+/// already uses (`server::serve_with_shutdown`), down to taking the permit before the
+/// accept and putting both inside the shutdown `select!`, so there is one idiom in this
+/// repository rather than two. Taking the permit first is what makes the bound a
+/// *queue*: excess connections wait in the kernel's accept backlog instead of being
+/// answered with an error, so no legitimate mint is ever refused by it. What an
+/// operator sees instead is [`MintMetrics::connection_limit_saturated`] and a throttled
+/// `warn`.
+///
+/// The lifetime bound is **not** hyper's `header_read_timeout`, and that is not an
+/// oversight: that knob needs a timer on the h1 builder that does not survive
+/// `into_owned()`, so it panics once per connection. This project added it once and
+/// removed it (see the NOTE in `server::serve_with_shutdown`); reintroducing that shape
+/// on the credential path would turn a hardening change into an outage. A plain
+/// `timeout` around the connection future has no such coupling and bounds strictly
+/// more: the whole connection, not only its header read.
+///
+/// Graceful draining is unchanged and still wraps the connection *inside* the timeout,
+/// so a bound that fires during a drain releases the `GracefulShutdown` guard rather
+/// than holding the drain open — a bound that broke clean draining would trade F13 for
+/// the problem `serve_with_shutdown` was written to fix.
+pub async fn serve_on(
+    mint: Arc<Mint>,
+    listener: TcpListener,
+    shutdown: impl std::future::Future<Output = ()> + Send,
+) -> Result<()> {
+    // Read once, before the mint is shared with the connection tasks: this listener's
+    // bounds are a property of the listener and cannot change under it.
+    let limits = mint.limits;
+    let metrics = mint.metrics.clone();
+    metrics
+        .connection_limit
+        .store(limits.max_connections as u64, Ordering::Relaxed);
+
+    let listen = listener.local_addr()?;
+    tracing::info!(
+        %listen,
+        max_connections = limits.max_connections,
+        connection_timeout_secs = limits.connection_timeout.as_secs(),
+        max_body_bytes = MAX_MINT_BODY_BYTES,
+        max_header_bytes = MINT_MAX_HEADER_BYTES,
+        "sts mint listening (unauthenticated by design; these are the only bounds on it)"
+    );
+
+    let mut http = ConnBuilder::new(TokioExecutor::new());
+    http.http1().max_buf_size(MINT_MAX_HEADER_BYTES);
+    http.http2()
+        .max_concurrent_streams(MINT_MAX_CONCURRENT_STREAMS)
+        .max_header_list_size(MINT_MAX_HEADER_BYTES as u32);
+    let conn_limit = Arc::new(Semaphore::new(limits.max_connections));
     let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+    let saturation_log = Arc::new(LogThrottle::new(MINT_PRESSURE_LOG_INTERVAL));
+    let timeout_log = Arc::new(LogThrottle::new(MINT_PRESSURE_LOG_INTERVAL));
     tokio::pin!(shutdown);
 
     loop {
-        // Accept inside the select, or an idle mint never observes the signal.
+        // The permit comes before the accept, exactly as on the data plane. Trying
+        // first rather than awaiting straight away is not an optimisation: the failed
+        // try IS the moment the bound bites, and it is the only moment at which an
+        // operator can be told. A silently queued mint is indistinguishable from a
+        // broken IdP.
+        let permit = match conn_limit.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                MintMetrics::incr(&metrics.connection_limit_saturated);
+                if let Some(suppressed) = saturation_log.allow() {
+                    tracing::warn!(
+                        max_connections = limits.max_connections,
+                        active = metrics.connections_active.load(Ordering::Relaxed),
+                        suppressed_since_last_line = suppressed,
+                        "the mint's connection bound is saturated; further connections \
+                         are waiting in the accept backlog. They are NOT refused — but \
+                         if this persists, raise sts_mint.max_connections or find out \
+                         who is calling"
+                    );
+                }
+                tokio::select! {
+                    p = conn_limit.clone().acquire_owned() => p.expect("semaphore never closed"),
+                    _ = &mut shutdown => {
+                        tracing::info!("shutdown signal; draining mint connections");
+                        break;
+                    }
+                }
+            }
+        };
+        // Accept inside the select, or an idle mint never observes the signal. Both
+        // branches are cancel-safe.
         let accepted = tokio::select! {
             r = listener.accept() => r,
             _ = &mut shutdown => {
                 tracing::info!("shutdown signal; draining mint connections");
+                drop(permit);
                 break;
             }
         };
-        let (stream, _) = match accepted {
+        let (stream, peer) = match accepted {
             Ok(v) => v,
             Err(e) => {
                 // Back off rather than busy-spin on a persistent accept error.
                 tracing::warn!(%e, "mint accept failed; backing off");
+                drop(permit);
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
         };
+        MintMetrics::incr(&metrics.connections_accepted);
+        metrics.connections_active.fetch_add(1, Ordering::Relaxed);
+
         let mint = mint.clone();
         let svc = service_fn(move |req: Request<Incoming>| {
             let mint = mint.clone();
@@ -691,8 +983,28 @@ pub async fn serve_with_shutdown(
             .serve_connection(TokioIo::new(stream), svc)
             .into_owned();
         let conn = graceful.watch(conn);
+        let metrics = metrics.clone();
+        let timeout_log = timeout_log.clone();
+        let lifetime = limits.connection_timeout;
         tokio::spawn(async move {
-            let _ = conn.await;
+            match tokio::time::timeout(lifetime, conn).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::debug!(%peer, %e, "mint connection ended"),
+                Err(_) => {
+                    MintMetrics::incr(&metrics.connection_timeouts);
+                    if let Some(suppressed) = timeout_log.allow() {
+                        tracing::warn!(
+                            %peer,
+                            timeout_secs = lifetime.as_secs(),
+                            suppressed_since_last_line = suppressed,
+                            "mint connection exceeded its lifetime bound and was closed; \
+                             a slow or idle client does not get to hold a connection slot"
+                        );
+                    }
+                }
+            }
+            metrics.connections_active.fetch_sub(1, Ordering::Relaxed);
+            drop(permit);
         });
     }
 
@@ -836,6 +1148,65 @@ mod tests {
                 "{claims} must not pass the audience check"
             );
         }
+    }
+
+    /// The saturation and timeout lines are triggerable by an anonymous caller at will,
+    /// so the throttle in front of them is load-bearing: without it, the observability
+    /// added to make a flood visible would itself be the second half of the flood
+    /// (these logs are shipped off the node).
+    ///
+    /// What must NOT be throttled is the counting — `MintMetrics` stays exact — and the
+    /// suppressed tally has to reach the line that does get emitted, or an operator
+    /// reads "this happened once" for something that happened ten thousand times.
+    #[test]
+    fn the_pressure_log_speaks_once_per_interval_and_reports_what_it_swallowed() {
+        let throttle = LogThrottle::new(Duration::from_secs(3600));
+        // The first occurrence always speaks, with nothing yet suppressed.
+        assert_eq!(throttle.allow(), Some(0));
+        // Everything inside the interval is counted and silent.
+        for _ in 0..5_000 {
+            assert_eq!(throttle.allow(), None);
+        }
+
+        // When the interval passes, the next line speaks AND carries the tally.
+        let throttle = LogThrottle::new(Duration::from_millis(1));
+        assert_eq!(throttle.allow(), Some(0));
+        for _ in 0..3 {
+            let _ = throttle.allow();
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        let spoken = throttle.allow().expect("the interval elapsed");
+        assert!(
+            spoken >= 1,
+            "the emitted line must say how many occurrences it stands for, got {spoken}"
+        );
+        // …and the tally resets, rather than accumulating for the life of the process.
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(throttle.allow(), Some(0));
+    }
+
+    /// The listener's bounds default to the documented numbers whatever the caller
+    /// does. `Mint::new` takes no limits, and every existing call site uses it — so
+    /// "not configured" has to mean *bounded*, on the one socket where it matters most.
+    #[test]
+    fn a_mint_built_without_limits_is_bounded_rather_than_unbounded() {
+        let mint = Mint::new(
+            Arc::new(MockVerifier(VerifiedIdentity {
+                sub: "alice".into(),
+                groups: Vec::new(),
+                tenant: "acme".into(),
+                org: "org-acme".into(),
+            })),
+            sts(),
+            Duration::from_secs(900),
+        );
+        assert_eq!(mint.limits().max_connections, 256);
+        assert_eq!(mint.limits().connection_timeout, Duration::from_secs(30));
+        // And it is the same number the S3 data plane's own bound is a multiple of:
+        // the mint's natural concurrency is a quarter of the data plane's 1024.
+        assert!(
+            mint.limits().max_connections < crate::config::LimitsConfig::default().max_connections
+        );
     }
 
     /// An empty configured list is not "accept anything" — it falls back to the single

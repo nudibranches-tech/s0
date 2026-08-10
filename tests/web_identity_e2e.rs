@@ -182,6 +182,12 @@ fn mint_config() -> StsMintConfig {
         ],
         role_name_template: Some(ROLE_TEMPLATE.into()),
         max_duration_secs: MAX_DURATION,
+        // The listener's own hardening bounds (F13). Left at the production
+        // defaults on purpose: every test in this file drives one request at a
+        // time, so if any of them ever starts tripping a bound, the bound is wrong
+        // for real traffic too. `tests/mint_hardening.rs` is where they are pushed.
+        max_connections: 256,
+        connection_timeout_secs: 30,
     }
 }
 

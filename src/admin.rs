@@ -40,6 +40,7 @@ use tokio::net::TcpListener;
 use crate::audit::{AuditMetrics, AuditSink};
 use crate::bundle_refresh::BundleHealth;
 use crate::error::Result;
+use crate::mint::MintMetrics;
 use crate::pdp::BundleStore;
 
 /// In-flight probe/scrape budget on shutdown. Probes are sub-millisecond; anything
@@ -51,6 +52,13 @@ pub struct AdminState {
     audit: Arc<AuditMetrics>,
     health: Arc<BundleHealth>,
     bundles: Arc<BundleStore>,
+    /// The mint listener's counters, when this process runs a mint.
+    ///
+    /// `Option` rather than a zeroed struct, deliberately: a gateway with no
+    /// `sts_mint` section binds no mint port, and publishing `s0_mint_*` series that
+    /// are structurally 0 would put a flat line on a dashboard where the honest answer
+    /// is "this pod has no mint". A missing series is the correct absence.
+    mint: Option<Arc<MintMetrics>>,
     instance: String,
     shutting_down: AtomicBool,
 }
@@ -61,9 +69,18 @@ impl AdminState {
             audit: audit.metrics(),
             health,
             bundles,
+            mint: None,
             instance: crate::config::instance_id(),
             shutting_down: AtomicBool::new(false),
         }
+    }
+
+    /// Publish the mint listener's bounds and counters (F13). Call it only when a mint
+    /// is actually served; see the field docs.
+    #[must_use]
+    pub fn with_mint_metrics(mut self, metrics: Arc<MintMetrics>) -> Self {
+        self.mint = Some(metrics);
+        self
     }
 
     /// Start failing readiness. Call on the shutdown signal, *before* the data plane
@@ -289,6 +306,64 @@ fn prometheus(state: &AdminState) -> Response<Full<Bytes>> {
         state.ready().is_ok() as u64,
     );
 
+    // The mint listener (F13). Present only on a pod that serves one — see
+    // `AdminState::mint`. These are the only numbers that distinguish "the credential
+    // path is bounded and the bound is biting" from "the IdP is broken", which look
+    // identical from every other angle.
+    if let Some(m) = &state.mint {
+        metric(
+            &mut out,
+            "s0_mint_connection_limit",
+            "gauge",
+            "Configured sts_mint.max_connections. The saturation counter below is \
+             meaningless without it.",
+            m.connection_limit.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut out,
+            "s0_mint_connections_active",
+            "gauge",
+            "Mint connections currently being served. Approaching \
+             s0_mint_connection_limit means the next connection waits.",
+            m.connections_active.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut out,
+            "s0_mint_connections_accepted_total",
+            "counter",
+            "Mint connections accepted since start.",
+            m.connections_accepted.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut out,
+            "s0_mint_connection_limit_saturated_total",
+            "counter",
+            "Times the mint's connection bound was already full when the accept loop \
+             asked for a slot, so the next connection waited in the kernel backlog. \
+             NOT a refusal — no mint is answered with an error because of this — but \
+             sustained increase means either raise sts_mint.max_connections or find \
+             out who is calling. This socket is unauthenticated by design.",
+            m.connection_limit_saturated.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut out,
+            "s0_mint_connection_timeouts_total",
+            "counter",
+            "Mint connections closed for outliving sts_mint.connection_timeout_secs. \
+             A legitimate client never reaches this; sustained increase is a slow-client \
+             (slowloris) attempt to hold every connection slot.",
+            m.connection_timeouts.load(Ordering::Relaxed),
+        );
+        metric(
+            &mut out,
+            "s0_mint_bodies_too_large_total",
+            "counter",
+            "Mint requests refused 413 for exceeding the body ceiling. The oversized \
+             bytes were never read off the socket.",
+            m.bodies_too_large.load(Ordering::Relaxed),
+        );
+    }
+
     out.push_str("# HELP s0_build_info Build and instance identity.\n");
     out.push_str("# TYPE s0_build_info gauge\n");
     out.push_str(&format!(
@@ -391,6 +466,61 @@ mod tests {
         assert!(text.contains("s0_bundle_source_remote 0"));
         assert!(text.contains("s0_ready 0"));
         assert!(text.contains("s0_bundle_revision_info{revision=\"rev-1\"} 1"));
+        // No `sts_mint` on this state ⇒ no mint series at all. See `AdminState::mint`:
+        // a flat 0 would claim a bounded mint on a pod that serves none.
+        assert!(!text.contains("s0_mint_"), "{text}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The mint's bounds are only useful if an operator can see them bite.
+    ///
+    /// A refused or queued mint and a broken IdP produce the same symptom — "clients
+    /// cannot get credentials" on a gateway that looks healthy — and the two have
+    /// opposite remedies. These counters are the only thing that tells them apart, so
+    /// the scrape carrying them is pinned rather than assumed.
+    #[tokio::test]
+    async fn metrics_expose_the_mint_bounds_and_the_counters_that_show_them_biting() {
+        let dir = tmpdir();
+        let (st, _h) = state(false, &dir);
+        let mint = Arc::new(crate::mint::MintMetrics::default());
+        mint.connection_limit.store(256, Ordering::Relaxed);
+        mint.connections_active.store(3, Ordering::Relaxed);
+        mint.connection_limit_saturated.store(11, Ordering::Relaxed);
+        mint.connection_timeouts.store(4, Ordering::Relaxed);
+        mint.bodies_too_large.store(2, Ordering::Relaxed);
+
+        let st = Arc::new(
+            Arc::try_unwrap(st)
+                .unwrap_or_else(|_| panic!("sole owner"))
+                .with_mint_metrics(mint),
+        );
+        let body = prometheus(&st).into_body();
+        let text = String::from_utf8(
+            http_body_util::BodyExt::collect(body)
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+
+        // The bound itself, without which the saturation count below means nothing.
+        assert!(text.contains("\ns0_mint_connection_limit 256\n"), "{text}");
+        assert!(text.contains("\ns0_mint_connections_active 3\n"), "{text}");
+        assert!(
+            text.contains("\ns0_mint_connection_limit_saturated_total 11\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\ns0_mint_connection_timeouts_total 4\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\ns0_mint_bodies_too_large_total 2\n"),
+            "{text}"
+        );
+        assert!(text.contains("# TYPE s0_mint_connection_limit_saturated_total counter"));
+        assert!(text.contains("# TYPE s0_mint_connections_active gauge"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

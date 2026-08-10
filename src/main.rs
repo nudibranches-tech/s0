@@ -35,7 +35,7 @@ use s0::bundle_refresh::{self, BundleHealth, BundleSource};
 use s0::config::GatewayConfig;
 use s0::error::Result;
 use s0::internal::{self, InternalApi};
-use s0::mint::{self, Mint, StandardVerifier};
+use s0::mint::{self, Mint, MintLimits, MintMetrics, StandardVerifier};
 use s0::webidentity::{WebIdentityConfig, WebIdentitySts};
 use s0::{gateway::Gateway, server, shutdown};
 
@@ -111,13 +111,23 @@ async fn main() -> Result<()> {
         health.clone(),
     );
 
+    // Built here, before the admin listener, because the same `Arc` has to reach two
+    // places: the mint's accept loop, which keeps the numbers, and `/metrics`, which
+    // publishes them. A second copy would report zeros forever.
+    let mint_metrics = Arc::new(MintMetrics::default());
+
     // Probes and metrics come up first: a pod that is starting must be able to report
     // "not ready" rather than refuse the connection.
-    let admin_state = Arc::new(AdminState::new(
-        &gateway.audit,
-        health,
-        gateway.bundles.clone(),
-    ));
+    let admin_state = {
+        let state = AdminState::new(&gateway.audit, health, gateway.bundles.clone());
+        // Only when a mint is actually served — see `AdminState::mint`.
+        let state = if config.sts_mint.is_some() {
+            state.with_mint_metrics(mint_metrics.clone())
+        } else {
+            state
+        };
+        Arc::new(state)
+    };
     let (admin_stop, admin_stopped) = tokio::sync::oneshot::channel::<()>();
     let admin_task = {
         let state = admin_state.clone();
@@ -163,7 +173,12 @@ async fn main() -> Result<()> {
                 verifier.clone(),
                 gateway.identity.sts(),
                 config.session_ttl(),
-            );
+            )
+            // F13: this socket is internet-facing AND unauthenticated by design, and
+            // the Ingress in front of it deliberately rate-limits nothing, so its
+            // bounds exist here or nowhere. See `mint::serve_on`.
+            .with_limits(MintLimits::from_config(sts_cfg))
+            .with_metrics(mint_metrics.clone());
             if sts_cfg.web_identity_enabled {
                 // The SAME `StsAuthority` the S3 front verifies with, and the same
                 // routing table the request pipeline resolves against. A second of

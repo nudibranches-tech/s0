@@ -38,6 +38,11 @@ fn verifier() -> StandardVerifier {
         web_identity_audiences: Vec::new(),
         role_name_template: None,
         max_duration_secs: 3600,
+        // The listener's own bounds (F13). Irrelevant to every assertion in this
+        // file — nothing here binds a socket — and spelled out for the same reason
+        // as the web-identity fields above.
+        max_connections: 256,
+        connection_timeout_secs: 30,
     };
     StandardVerifier::from_config(&cfg).expect("verifier")
 }
@@ -185,6 +190,11 @@ async fn jwks_is_refreshed_in_the_background_not_only_on_a_kid_miss() {
         web_identity_audiences: Vec::new(),
         role_name_template: None,
         max_duration_secs: 3600,
+        // The listener's own bounds (F13). Irrelevant to every assertion in this
+        // file — nothing here binds a socket — and spelled out for the same reason
+        // as the web-identity fields above.
+        max_connections: 256,
+        connection_timeout_secs: 30,
     };
     // A zero interval leaves the miss-driven path alone and spawns nothing.
     let off = Arc::new(StandardVerifier::from_config(&cfg).unwrap());

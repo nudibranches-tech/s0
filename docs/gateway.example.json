@@ -75,6 +75,8 @@
     "web_identity_enabled": true,
     "web_identity_audiences": ["acme-storage", "hf-console", "control-plane-sa"],
     "role_name_template": "{tenant}-sts-role",
-    "max_duration_secs": 3600
+    "max_duration_secs": 3600,
+    "max_connections": 256,
+    "connection_timeout_secs": 30
   }
 }
