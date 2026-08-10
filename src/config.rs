@@ -31,7 +31,7 @@ pub struct GatewayConfig {
     pub admin_listen: SocketAddr,
     pub sts: StsConfig,
     /// Optional: the key ring for **derived long-lived per-principal keys**
-    /// (`FOLLOW-UPS.md` F17). Absent ⇒ the gateway mints and honours none, and behaves
+    ///. Absent ⇒ the gateway mints and honours none, and behaves
     /// byte-identically to a build made before they existed.
     ///
     /// **Absent does not mean the namespace is free.** `HFSA*` is refused for static

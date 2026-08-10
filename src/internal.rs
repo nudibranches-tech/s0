@@ -102,6 +102,7 @@ use sha2::Sha256;
 use tokio::net::TcpListener;
 
 use crate::auth::sts::{SessionClaims, StsAuthority};
+use crate::auth::{DerivedKeys, DerivedMintRefusal};
 use crate::config::InternalApiConfig;
 use crate::error::Result;
 use crate::mint::MintedCredentials;
@@ -123,6 +124,21 @@ pub const SHARED_SECRET_HEADER: &str = "X-Shared-Secret";
 /// The session endpoint's path. Held equal to hyperfluid's
 /// `s3_gateway_sts::GATEWAY_SESSION_PATH` by `tests/cross_repo_contract.rs`.
 pub const SESSION_PATH: &str = "/internal/v1/sts/sessions";
+
+/// The long-lived key endpoint's path. Held equal to hyperfluid's
+/// `s3_gateway_sts::GATEWAY_DERIVED_KEY_PATH` by `tests/cross_repo_contract.rs`.
+///
+/// **Why minting lives here and not in the platform.** The wire format of a derived key
+/// is an HMAC over a byte layout with no version handshake: a byte of disagreement
+/// between minter and verifier is a credential that simply does not authenticate, with
+/// nothing in either log saying why. A second implementation in another repository, in
+/// another language, kept in step by a golden vector, is that failure waiting for a
+/// refactor — it is the same shape as the OPA-entrypoint defect this project already
+/// paid for once. So there is one implementation, in the process that verifies, and the
+/// platform asks it. Two properties fall out that a platform-side minter could not have
+/// had: the master ring never leaves s0, and the epoch stamped into a key is read from
+/// the very bundle that will revoke it (see [`crate::auth::DerivedKeys::mint`]).
+pub const DERIVED_KEY_PATH: &str = "/internal/v1/derived-keys";
 
 /// Ceiling on a session request body. The document is six small fields; anything
 /// larger is a mistake or an attempt to make this process allocate. Applied *after*
@@ -269,6 +285,55 @@ pub struct SessionRequest {
     pub duration_seconds: u64,
 }
 
+/// The body of `POST /internal/v1/derived-keys`.
+///
+/// The first four fields are [`SessionRequest`]'s, with the same meanings and the same
+/// `deny_unknown_fields` reasoning. What is **absent** is the contract:
+///
+/// * no `duration_seconds` — the credential does not expire, which is the entire point
+///   of the class; it ends when the epoch floor rises past it;
+/// * no `groups` — not even advisory. A session carries them so an audit record shows
+///   what the console believed at mint time, which is meaningful for something that
+///   lives an hour. A key that outlives every group it was minted under would make that
+///   record misleading, and group membership is read live from the bundle regardless;
+/// * no scope, prefix or permission field, and there is deliberately nowhere to put one.
+///   Baking scope into a long-lived credential breaks live revocation, which is this
+///   project's first invariant, and was settled against once already.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DerivedKeyRequest {
+    /// The **raw** OIDC subject — the Keycloak `clientId` for a service account, the
+    /// user id for a user. See [`SessionRequest::sub`]; the prefix is composed here.
+    pub sub: String,
+    /// `user` | `service_account`.
+    pub principal_type: PrincipalType,
+    /// Ceph tenant == harbor slug. Must be routable on this gateway.
+    pub tenant: String,
+    /// Control-plane organization id. Must agree with this gateway's tenant→org binding.
+    pub organization_id: String,
+    /// Which epoch to stamp. Absent ⇒ the revocation floor in force, which is what a
+    /// first issue wants. A rotation passes `floor + 1` so the new key and the one it
+    /// replaces can both work until the old one is revoked — see
+    /// [`crate::auth::DerivedKeys::mint`]. Below the floor is refused, not clamped.
+    #[serde(default)]
+    pub key_epoch: Option<u32>,
+}
+
+/// The response. **Both halves, once** — nothing is stored on this side, so a caller
+/// that loses `secret_access_key` has to mint a new key rather than re-read this one.
+///
+/// `key_epoch` and `kid` are returned because the platform's issuance ledger cannot
+/// recompute them: the epoch is read from the bundle at mint time and is what a later
+/// revocation must raise the floor past, and the kid says which ring signed it, which is
+/// what makes a rotation's blast radius answerable.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MintedDerivedKeyResponse {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub key_epoch: u32,
+    pub kid: String,
+}
+
 /// Why a session was not minted. Every variant is a **refusal**, never a downgrade.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionRefusal {
@@ -345,6 +410,12 @@ pub struct InternalApi {
     /// console names is one this gateway can actually route.
     registry: Arc<BackendRegistry>,
     max_ttl_secs: u64,
+    /// The **same** [`DerivedKeys`] the S3 front admits keys with, for the reason the
+    /// same `StsAuthority` is shared: one ring, one epoch source, one encoding.
+    /// `None` when the deployment configured no ring, which makes
+    /// [`DERIVED_KEY_PATH`] answer 409 rather than 404 — the path exists, the feature
+    /// is off, and those are different problems for whoever is reading the response.
+    derived: Option<Arc<DerivedKeys>>,
 }
 
 impl InternalApi {
@@ -358,7 +429,15 @@ impl InternalApi {
             sts,
             registry,
             max_ttl_secs: cfg.max_session_ttl_secs,
+            derived: None,
         }
+    }
+
+    /// Switch on `POST /internal/v1/derived-keys`. Additive: a caller that does not
+    /// supply this gets a binary whose derived-key path is off, exactly as before.
+    pub fn with_derived_keys(mut self, derived: Option<Arc<DerivedKeys>>) -> Self {
+        self.derived = derived;
+        self
     }
 
     /// True when a usable shared secret is configured. Callers log this at startup;
@@ -469,7 +548,8 @@ impl InternalApi {
         if req.method() != Method::POST {
             return json_error(StatusCode::METHOD_NOT_ALLOWED, "use POST");
         }
-        if req.uri().path() != SESSION_PATH {
+        let path = req.uri().path().to_string();
+        if path != SESSION_PATH && path != DERIVED_KEY_PATH {
             return json_error(StatusCode::NOT_FOUND, "not found");
         }
 
@@ -484,6 +564,9 @@ impl InternalApi {
                 )));
             }
         };
+        if path == DERIVED_KEY_PATH {
+            return self.route_derived_key(&body);
+        }
         let parsed: SessionRequest = match serde_json::from_slice(&body) {
             Ok(v) => v,
             Err(e) => return refuse(&SessionRefusal::Malformed(e.to_string())),
@@ -508,6 +591,84 @@ impl InternalApi {
                 refuse(&refusal)
             }
         }
+    }
+
+    /// `POST /internal/v1/derived-keys`, past authentication and the body read.
+    ///
+    /// **Nothing about the response is logged.** A refusal names the tenant and subject,
+    /// as the session path does, because a refusal with neither is undiagnosable. A
+    /// success logs the same two identifiers and the epoch — never the access-key id,
+    /// which is half of a credential that does not expire and would otherwise sit in a
+    /// log aggregator for as long as the key lives. That is a stricter rule than the STS
+    /// path needs, and it is the lifetime that makes it necessary.
+    fn route_derived_key(&self, body: &[u8]) -> Response<Full<Bytes>> {
+        let Some(derived) = self.derived.as_ref() else {
+            return json_error(
+                StatusCode::CONFLICT,
+                "long-lived keys are not configured on this gateway (no `derived_keys` \
+                 section); the path exists but the feature is off",
+            );
+        };
+        let parsed: DerivedKeyRequest = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(e) => {
+                return refuse(&SessionRefusal::Malformed(format!(
+                    "malformed derived key request: {e}"
+                )));
+            }
+        };
+        match derived.mint(
+            &parsed.tenant,
+            &parsed.organization_id,
+            parsed.principal_type,
+            &parsed.sub,
+            parsed.key_epoch,
+        ) {
+            Ok(minted) => {
+                tracing::info!(
+                    sub = %parsed.sub,
+                    tenant = %parsed.tenant,
+                    key_epoch = minted.key_epoch,
+                    kid = %minted.kid,
+                    "minted a long-lived key"
+                );
+                let response = MintedDerivedKeyResponse {
+                    access_key_id: minted.credential.access_key_id,
+                    secret_access_key: minted.credential.secret_access_key,
+                    key_epoch: minted.key_epoch,
+                    kid: minted.kid,
+                };
+                match serde_json::to_vec(&response) {
+                    Ok(body) => json_ok(body),
+                    Err(_) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "encode failed"),
+                }
+            }
+            Err(refusal) => {
+                tracing::warn!(
+                    sub = %parsed.sub,
+                    tenant = %parsed.tenant,
+                    reason = %refusal.message(),
+                    "long-lived key mint refused"
+                );
+                json_error(derived_mint_status(&refusal), &refusal.message())
+            }
+        }
+    }
+}
+
+/// A tenant that has not opted in, and a tenant that does not exist here, are different
+/// answers on purpose: the first is a platform action away from working (publish the
+/// epoch), the second is a routing mistake, and a caller that cannot tell them apart
+/// will chase the wrong one.
+fn derived_mint_status(refusal: &DerivedMintRefusal) -> StatusCode {
+    match refusal {
+        // Both are "the state moved under you", not "your request is malformed": a
+        // caller that retries after re-reading the floor succeeds.
+        DerivedMintRefusal::NotEnabledForTenant(_) | DerivedMintRefusal::EpochBelowFloor { .. } => {
+            StatusCode::CONFLICT
+        }
+        DerivedMintRefusal::MintFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        _ => StatusCode::BAD_REQUEST,
     }
 }
 

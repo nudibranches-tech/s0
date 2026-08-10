@@ -163,6 +163,34 @@ mod platform {
     /// every mint for an opted-in organization, with no fallback.
     pub const GATEWAY_SESSION_PATH: &str = "/internal/v1/sts/sessions";
 
+    /// `GATEWAY_DERIVED_KEY_PATH` — `s3_gateway_sts/mod.rs`. Where the console asks
+    /// for a **long-lived** key (F17b). A 404 here is not a degraded mint: the
+    /// console has no local fallback, because deriving the credential itself is
+    /// exactly what this design refuses to do.
+    pub const GATEWAY_DERIVED_KEY_PATH: &str = "/internal/v1/derived-keys";
+
+    /// The body `GatewayDerivedKeyRequest` serializes to on a **first issue** —
+    /// `key_epoch` is `skip_serializing_if = "Option::is_none"`, so it is genuinely
+    /// absent rather than `null`. Replayed through s0's real deserializer below.
+    pub const DERIVED_KEY_REQUEST_BODY: &str = r#"{
+        "sub": "trino-background",
+        "principal_type": "service_account",
+        "tenant": "acme-prod",
+        "organization_id": "11111111-1111-1111-1111-111111111111"
+    }"#;
+
+    /// The same body on a **rotation**, which is the only shape that carries the
+    /// epoch. Both are pinned because `deny_unknown_fields` makes the presence of
+    /// the field a hard contract in one direction and its absence a defaulted
+    /// `None` in the other — two different parses of one struct.
+    pub const DERIVED_KEY_ROTATION_BODY: &str = r#"{
+        "sub": "trino-background",
+        "principal_type": "service_account",
+        "tenant": "acme-prod",
+        "organization_id": "11111111-1111-1111-1111-111111111111",
+        "key_epoch": 2
+    }"#;
+
     /// The exact JSON body hyperfluid's own contract test
     /// (`the_session_request_is_the_agreed_wire_contract`) asserts
     /// `GatewaySessionRequest` serializes to. Replayed through s0's real deserializer
@@ -635,6 +663,69 @@ fn s0_serves_the_session_endpoint_at_the_path_the_console_calls() {
         platform::GATEWAY_SESSION_PATH,
         hf_path::STS_CLIENT_RS,
     );
+}
+
+/// The path the console POSTs a long-lived key request to (F17b).
+#[test]
+fn s0_serves_the_derived_key_endpoint_at_the_path_the_console_calls() {
+    assert_eq!(
+        s0::internal::DERIVED_KEY_PATH,
+        platform::GATEWAY_DERIVED_KEY_PATH,
+        "\ns0 serves {:?}; {OTHER_REPO} posts to GATEWAY_DERIVED_KEY_PATH = {:?} ({}).\n",
+        s0::internal::DERIVED_KEY_PATH,
+        platform::GATEWAY_DERIVED_KEY_PATH,
+        hf_path::STS_CLIENT_RS,
+    );
+}
+
+/// The console's long-lived key request, through s0's real deserializer.
+///
+/// **The absence of a field is the assertion**, on both shapes. A first issue must
+/// parse with `key_epoch: None` — s0 then stamps the revocation floor, which is the
+/// only epoch that both works immediately and stays revocable. A rotation must parse
+/// with the epoch it names. And nothing scope-shaped may parse at all: this request
+/// has nowhere to put a prefix, a bucket or a duration, and `deny_unknown_fields`
+/// makes an attempt a 400 rather than a silently dropped restriction on a credential
+/// that never expires.
+#[test]
+fn the_consoles_derived_key_request_deserializes_through_s0s_real_type() {
+    use s0::internal::DerivedKeyRequest;
+    use s0::model::PrincipalType;
+
+    let first: DerivedKeyRequest = serde_json::from_str(platform::DERIVED_KEY_REQUEST_BODY)
+        .unwrap_or_else(|e| {
+            panic!(
+                "\nthe first-issue body {OTHER_REPO} sends ({}) does not deserialize into s0's \
+                 `DerivedKeyRequest`: {e}\nEvery long-lived key issue would be a 400.\n",
+                hf_path::STS_CLIENT_RS
+            )
+        });
+    assert_eq!(first.sub, "trino-background");
+    // The RAW subject. `sa:trino-background` would authenticate and then be denied
+    // everything, because the bundle lookups would go looking for `sa:sa:…`.
+    assert!(!first.sub.starts_with("sa:") && !first.sub.starts_with("user:"));
+    assert_eq!(first.principal_type, PrincipalType::ServiceAccount);
+    assert_eq!(first.tenant, "acme-prod");
+    assert_eq!(
+        first.key_epoch, None,
+        "an absent key_epoch must default to None, not to 0 — a key stamped 0 would be \
+         below every floor and refused on first use"
+    );
+
+    let rotation: DerivedKeyRequest = serde_json::from_str(platform::DERIVED_KEY_ROTATION_BODY)
+        .expect("the rotation body must deserialize");
+    assert_eq!(rotation.key_epoch, Some(2));
+
+    for forbidden in ["duration_seconds", "groups", "prefixes", "scope", "bucket"] {
+        let mut body: serde_json::Value =
+            serde_json::from_str(platform::DERIVED_KEY_REQUEST_BODY).expect("pinned body");
+        body[forbidden] = serde_json::json!(1);
+        assert!(
+            serde_json::from_value::<DerivedKeyRequest>(body).is_err(),
+            "`{forbidden}` must be refused, not dropped: on a credential with no expiry, a \
+             silently ignored restriction is permanent"
+        );
+    }
 }
 
 /// **The fact half, not the text half.** The console's own pinned request body is
@@ -1246,6 +1337,27 @@ fn the_pinned_platform_contract_matches_the_real_hyperfluid_internal_surfaces() 
     );
 
     let sts_rs = read(&repo, hf_path::STS_CLIENT_RS);
+    let derived_path =
+        rust_str_const(&sts_rs, "GATEWAY_DERIVED_KEY_PATH").unwrap_or_else(|| {
+            panic!(
+                "{} no longer defines GATEWAY_DERIVED_KEY_PATH — the console would have no \
+                 way to issue a long-lived key, and no local fallback, because deriving one \
+                 itself is what this design refuses to do",
+                hf_path::STS_CLIENT_RS
+            );
+        });
+    assert_eq!(
+        derived_path,
+        platform::GATEWAY_DERIVED_KEY_PATH,
+        "{}",
+        drifted(
+            hf_path::STS_CLIENT_RS,
+            "GATEWAY_DERIVED_KEY_PATH",
+            platform::GATEWAY_DERIVED_KEY_PATH,
+            &derived_path
+        )
+    );
+
     let path = rust_str_const(&sts_rs, "GATEWAY_SESSION_PATH").unwrap_or_else(|| {
         panic!(
             "{} no longer defines GATEWAY_SESSION_PATH",

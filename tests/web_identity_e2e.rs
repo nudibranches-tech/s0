@@ -3,7 +3,7 @@
 //!
 //! Before this surface existed, nothing outside the console could obtain an `HFST*`
 //! credential at all — `aws-cli`, `rclone`, Trino, Spark and every backup tool were
-//! simply unable to use the gateway (`s0-plan/REHEARSAL.md` §6b records this as the
+//! simply unable to use the gateway (recorded as the
 //! finding that blocked the whole client matrix). So the claim this file has to
 //! establish is not "the handler returns 200". It is the full loop:
 //!
@@ -119,7 +119,7 @@ fn now() -> u64 {
 ///   is what makes the token say "issued for this gateway's STS". That mapper is a
 ///   deployment prerequisite for this flow and is called out as one — see
 ///   `the_audience_binding_is_required_and_account_alone_is_not_one` for what happens
-///   without it, and `s0-plan/DEPLOYMENT-RUNBOOK.md` §5.2 for how to add it.
+///   without it, and the deployment runbook for how to add it.
 /// * **`azp` is the SA's own clientId, not the audience.** It is the *subject* half, and
 ///   it is what the bundle keys `sa:<clientId>` on. A token whose subject and audience
 ///   were the same value would not distinguish the two roles the claims play here.
@@ -511,7 +511,7 @@ async fn the_expiration_on_the_wire_is_iso8601_and_within_the_configured_ceiling
 /// credential with a shorter life, because an SDK reads `Expiration` and schedules its
 /// own refresh from it — whereas AWS's `ValidationError` would be a hard failure at
 /// credential acquisition, i.e. the workload never starts. Registered as a deliberate
-/// deviation in `s0-plan/AWS-PARITY.md` D20.
+/// deviation in the AWS-parity register (D20).
 #[tokio::test]
 async fn a_duration_above_the_ceiling_is_clamped_rather_than_refused() {
     let h = harness("webid-e2e-clamp").await;

@@ -13,7 +13,7 @@
 > chose to rewrite that request into the grant. That choice is reversed for the **unbounded**
 > case only: a list naming no prefix (or `prefix=`) is refused unless the principal holds a
 > whole-bucket grant. Two reasons, both recorded in `policy/gateway/authz.rego::narrowed` and
-> in `s0-plan/AWS-PARITY.md`: (1) AWS denies it — `s3:ListBucket` + a `s3:prefix` condition
+> in the AWS-parity register: (1) AWS denies it — `s3:ListBucket` + a `s3:prefix` condition
 > fails when the request carries no prefix, and AWS does not narrow; (2) a narrowed listing
 > is a filtered view returned with no signal that it is filtered, so `aws s3 ls s3://bucket/`
 > is read as the bucket's contents. "Denying outright … breaks `aws s3 ls`" below was the

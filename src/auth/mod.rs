@@ -5,7 +5,7 @@
 //! - **STS sessions** — derived secrets, no store, claims in a signed token ([`sts`]).
 //! - **Derived long-lived per-principal keys** — derived secrets, no store, identity in
 //!   the access-key id itself ([`derived`]). The migration path for consumers that hold
-//!   a static key and cannot refresh (`FOLLOW-UPS.md` F17).
+//!   a static key and cannot refresh.
 //! - **Long-lived static keys** — issued to external apps / service accounts, each
 //!   its own principal ([`CredentialStore`]).
 //!
@@ -25,7 +25,7 @@ use s3s::{S3Result, s3_error};
 use crate::error::{GatewayError, Result};
 use crate::identity::ResolvedPrincipal;
 use crate::model::PrincipalType;
-use derived::{DerivedKeyAuthority, DerivedPrincipal};
+use derived::{DerivedKeyAuthority, DerivedKeyCredential, DerivedPrincipal};
 use sts::StsAuthority;
 
 /// SigV4 verification recomputes an HMAC, so the plaintext secret must be
@@ -199,7 +199,7 @@ pub trait TenantDirectory: Send + Sync {
 /// subject entry can only ever tighten, never loosen, what the tenant published.
 ///
 /// The epoch carries **no scope and no permissions**. It is a revocation counter, and
-/// that distinction is what keeps `FOLLOW-UPS.md` **F21** / **ADR-0016** closed: the
+/// that distinction is what keeps session-scoped credentials closed out: the
 /// credential stays an identity, and everything about what it may do is still read live
 /// from the bundle at decision time.
 pub trait KeyEpochFloor: Send + Sync {
@@ -308,6 +308,155 @@ impl DerivedKeys {
             organization_id,
         })
     }
+
+    /// **Mint a key this same object will admit.**
+    ///
+    /// Every input [`Self::admit`] reads on the hot path is checked here first, against
+    /// the same sources, so a key this returns is one the data plane accepts on its next
+    /// request rather than one whose usability is discovered by a consumer:
+    ///
+    /// 1. the tenant must be routable, and the organization the caller asserts must be
+    ///    the one this gateway binds it to — the same cross-check
+    ///    [`crate::internal::InternalApi::mint_session`] applies to a session, for the
+    ///    same reason (attribution comes from the route, so a disagreement would produce
+    ///    a credential evaluated against an organization nobody named);
+    /// 2. the tenant must have a **published key-epoch floor**, and the key is stamped
+    ///    with exactly that floor. Minting below it would produce a credential that is
+    ///    revoked on arrival; minting above it would produce one the floor could no
+    ///    longer revoke. Reading the number here rather than accepting it from the caller
+    ///    is what makes those two states unreachable.
+    ///
+    /// Refusing when the floor is absent is the same fail-closed rule as admission: a
+    /// tenant the platform has not opted in gets no keys, rather than keys that do not
+    /// work.
+    ///
+    /// ## `requested_epoch`, and why gapless rotation needs it
+    ///
+    /// A derived key is a **pure function** of `(ring, tenant, sub, principal_type,
+    /// epoch)` — there is no nonce — so two mints with the same inputs return the same
+    /// two strings. The epoch is therefore the only thing that distinguishes one key for
+    /// a principal from the next, which makes it the serial number as well as the
+    /// revocation counter.
+    ///
+    /// With `None` the key is stamped at the floor, which is what a first issue wants.
+    /// Rotation wants one above the key it is replacing: mint at `floor + 1`, roll the
+    /// consumer, *then* revoke — at which point the floor rises past the old key and the
+    /// new one survives. Without this the two keys would be the same key, and rotation
+    /// would mean an outage bounded by the bundle poll rather than by nothing at all.
+    /// That is AWS's two-access-key rotation, reached with a counter instead of a table.
+    ///
+    /// **Below the floor is refused, never clamped up.** A caller asking for an epoch the
+    /// bundle has already revoked past has stale state, and quietly handing back a
+    /// working credential at a different epoch than the one it recorded would put the
+    /// platform's ledger out of step with what it can actually revoke.
+    pub fn mint(
+        &self,
+        tenant: &str,
+        organization_id: &str,
+        principal_type: PrincipalType,
+        sub: &str,
+        requested_epoch: Option<u32>,
+    ) -> std::result::Result<MintedDerivedKey, DerivedMintRefusal> {
+        if sub.trim().is_empty() {
+            return Err(DerivedMintRefusal::EmptySubject);
+        }
+        let bound = self
+            .tenants
+            .organization_of(tenant)
+            .ok_or_else(|| DerivedMintRefusal::UnroutableTenant(tenant.to_string()))?;
+        if bound != organization_id {
+            tracing::warn!(
+                %tenant,
+                asserted = %organization_id,
+                bound = %bound,
+                "refusing a derived key whose organization disagrees with the tenant binding"
+            );
+            return Err(DerivedMintRefusal::OrganizationMismatch);
+        }
+
+        let subject_key = crate::pdp::principal_subject_key(principal_type, sub);
+        let floor = self
+            .epochs
+            .key_epoch_floor(tenant, &subject_key)
+            .ok_or_else(|| DerivedMintRefusal::NotEnabledForTenant(tenant.to_string()))?;
+        let key_epoch = match requested_epoch {
+            None => floor,
+            Some(requested) if requested >= floor => requested,
+            Some(requested) => return Err(DerivedMintRefusal::EpochBelowFloor { requested, floor }),
+        };
+
+        let credential = self
+            .authority
+            .mint(&DerivedPrincipal {
+                tenant: tenant.to_string(),
+                sub: sub.to_string(),
+                principal_type,
+                key_epoch,
+            })
+            .map_err(|e| DerivedMintRefusal::MintFailed(e.to_string()))?;
+        Ok(MintedDerivedKey {
+            credential,
+            key_epoch,
+            kid: self.authority.current_kid().to_string(),
+        })
+    }
+}
+
+/// A freshly minted derived key, plus the two facts the platform's issuance ledger needs
+/// and cannot recompute: the epoch it was stamped at and the key id that minted it.
+///
+/// Nothing is stored on this side, so that ledger is the only inventory of which keys
+/// exist — and `key_epoch` is what tells a later revocation how high the floor must go.
+#[derive(Debug, Clone)]
+pub struct MintedDerivedKey {
+    pub credential: DerivedKeyCredential,
+    pub key_epoch: u32,
+    pub kid: String,
+}
+
+/// Why a derived key was not minted. As with [`crate::internal::SessionRefusal`], every
+/// variant is a refusal — nothing here degrades to a weaker credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DerivedMintRefusal {
+    /// `sub` is empty, which would compose the bare key `sa:` / `user:`.
+    EmptySubject,
+    /// The tenant is not in this gateway's routing table.
+    UnroutableTenant(String),
+    /// The asserted organization disagrees with this gateway's tenant→org binding.
+    OrganizationMismatch,
+    /// The bundle in force publishes no `s3_key_epoch` for this tenant, so the key would
+    /// be refused the moment it was used. Publishing the number is the platform's opt-in
+    /// to the credential class; see [`KeyEpochFloor`].
+    NotEnabledForTenant(String),
+    /// The caller asked for an epoch the bundle has already revoked past. Refused rather
+    /// than clamped: see [`DerivedKeys::mint`].
+    EpochBelowFloor { requested: u32, floor: u32 },
+    /// The ring refused — an over-long `sub`, or a `current_kid` that is not in it.
+    MintFailed(String),
+}
+
+impl DerivedMintRefusal {
+    pub fn message(&self) -> String {
+        match self {
+            DerivedMintRefusal::EmptySubject => "sub must be non-empty".into(),
+            DerivedMintRefusal::UnroutableTenant(t) => {
+                format!("tenant {t:?} is not routable on this gateway")
+            }
+            DerivedMintRefusal::OrganizationMismatch => {
+                "organization_id disagrees with this gateway's tenant binding".into()
+            }
+            DerivedMintRefusal::NotEnabledForTenant(t) => format!(
+                "long-lived keys are not enabled for tenant {t:?}: the policy bundle in force \
+                 publishes no `s3_key_epoch` for it, so a key minted now would be refused on \
+                 first use"
+            ),
+            DerivedMintRefusal::EpochBelowFloor { requested, floor } => format!(
+                "requested key_epoch {requested} is below the revocation floor {floor} in force \
+                 for this principal; a key minted there would be refused on first use"
+            ),
+            DerivedMintRefusal::MintFailed(why) => format!("mint failed: {why}"),
+        }
+    }
 }
 
 /// Ties the STS authority, the derived-key authority and the static store together.
@@ -348,6 +497,15 @@ impl Identity {
     /// inbound verification use the same keys.
     pub fn sts(&self) -> Arc<StsAuthority> {
         self.sts.clone()
+    }
+
+    /// The derived-key half, or `None` when this deployment has not configured a ring.
+    ///
+    /// Shared with the internal API for the same reason [`Identity::sts`] is: the
+    /// endpoint that mints a derived key and the data plane that admits one must be the
+    /// same object, or a key one side produces is a key the other cannot verify.
+    pub fn derived(&self) -> Option<Arc<DerivedKeys>> {
+        self.derived.clone()
     }
 
     /// The three credential namespaces are disjoint **by construction**, not by

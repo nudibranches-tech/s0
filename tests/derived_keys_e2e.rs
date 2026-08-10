@@ -1,4 +1,4 @@
-//! Derived long-lived per-principal keys (`FOLLOW-UPS.md` **F17**), end to end.
+//! Derived long-lived per-principal keys, end to end.
 //!
 //! The unit tests in `src/auth/derived.rs` and `src/auth/mod.rs` prove the derivation and
 //! the admission rules. This file proves the thing that actually matters to the five
@@ -15,7 +15,7 @@
 //! The backend endpoint is a **closed port**, deliberately. An *allowed* request therefore
 //! fails at the forward with a `500`-class error, which is the unambiguous signal that the
 //! decision was allow and the request really left the policy engine — exactly the role the
-//! `404 NoSuchKey` plays in the cluster measurements in `FOLLOW-UPS.md`. A denial never
+//! `404 NoSuchKey` plays in the cluster measurements in the migration notes. A denial never
 //! gets that far and answers `403`, and an unknown or forged credential is refused by s3s
 //! before the gate with `InvalidAccessKeyId`.
 

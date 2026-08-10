@@ -197,7 +197,7 @@ async fn main() -> Result<()> {
                     // to the configured audience list, never instead of it, and read
                     // live so a revocation lands within one poll. See
                     // `webidentity::WebIdentitySts::addressed_to_this_gateway` and
-                    // `s0-plan/AWS-PARITY.md` D31.
+                    // the AWS-parity register (D31).
                     .with_bundle_subjects(gateway.bundles.clone()),
                 ));
                 tracing::info!(
@@ -234,11 +234,17 @@ async fn main() -> Result<()> {
     // listener.
     let internal_task = match &config.internal {
         Some(internal_cfg) => {
-            let api = Arc::new(InternalApi::new(
-                internal_cfg,
-                gateway.identity.sts(),
-                gateway.registry.clone(),
-            ));
+            let api = Arc::new(
+                InternalApi::new(
+                    internal_cfg,
+                    gateway.identity.sts(),
+                    gateway.registry.clone(),
+                )
+                // The same derived-key half the S3 front admits with, so the endpoint
+                // cannot mint a key the data plane would refuse. `None` here when no
+                // ring is configured, which leaves the route answering 409.
+                .with_derived_keys(gateway.identity.derived()),
+            );
             let internal_listen = internal_cfg.listen;
             Some(tokio::spawn(async move {
                 if let Err(e) =

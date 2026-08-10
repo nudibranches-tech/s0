@@ -356,7 +356,7 @@ async fn an_unbounded_list_is_denied_not_silently_narrowed() {
     //      resource plus a `s3:prefix` condition, and a `ListObjectsV2` with no prefix
     //      fails that condition — `AccessDenied`. AWS does not narrow. Hyperfluid's
     //      goal is parity with the ecosystem, and a deviation has to be deliberate and
-    //      documented (`s0-plan/AWS-PARITY.md`); this one was neither.
+    //      documented; this one was neither.
     //   2. It is not "equally safe". Narrowing leaks nothing, but it returns a
     //      FILTERED listing with no signal that it was filtered. A user running
     //      `aws s3 ls s3://reports/` sees `2024/` and concludes that is all the bucket

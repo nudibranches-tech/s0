@@ -48,7 +48,7 @@
 >
 >    This is a **deliberate loss of client convenience**, taken for AWS parity and
 >    because a narrowed listing is a filtered view returned with no signal that it is
->    filtered — see `s0-plan/AWS-PARITY.md` and `policy/gateway/authz.rego::narrowed`.
+>    filtered — see the AWS-parity register and `policy/gateway/authz.rego::narrowed`.
 >    AWS behaves the same way: `s3:ListBucket` under a `s3:prefix` condition denies a
 >    request that carries no prefix. The AWS console only appears to escape it because it
 >    always sends the prefix it is navigating.

@@ -1,4 +1,4 @@
-//! Long-lived **per-principal** S3 keys (`FOLLOW-UPS.md` F17) — the migration path for
+//! Long-lived **per-principal** S3 keys — the migration path for
 //! the five consumers that hold the per-harbor tenant-owner credential today.
 //!
 //! This is **not a new credential type**. It is the shape the platform already runs on —
@@ -12,8 +12,8 @@
 //! **The key carries identity, never scope.** Groups and grants stay in the policy
 //! bundle, so a grant change lands at normal bundle latency without reissuing anything,
 //! and live revocation — invariant #1 of this project — is preserved. Baking permissions
-//! into the credential was rejected once already: ADR-0016 killed RGW session policies
-//! for exactly this reason, and `FOLLOW-UPS.md` **F21** records the decision.
+//! into the credential was rejected once already: RGW session policies were killed
+//! for exactly this reason, and F21 records the decision.
 //!
 //! ## The property that makes it multi-replica-correct
 //!

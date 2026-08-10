@@ -98,7 +98,7 @@
 //!
 //! The configured audience list, **or** the policy bundle — see
 //! [`WebIdentitySts::addressed_to_this_gateway`], which carries the whole argument, and
-//! `s0-plan/AWS-PARITY.md` D31, which registers the deviation. The second route exists
+//! the AWS-parity register (D31), which registers the deviation. The second route exists
 //! because the first one cannot serve a *tenant's own* service accounts without an
 //! operator re-render per service account, and those are the primary consumer of this
 //! gateway. It is additive: no token the audience list accepts is affected by it, and
@@ -592,7 +592,7 @@ pub fn resolve_principal(claims: &Value) -> Result<WebIdentityPrincipal, StsRefu
 ///
 /// This is the second, purely **additive** route by which a token can be found to be
 /// addressed to this gateway (see [`WebIdentitySts::addressed_to_this_gateway`], and
-/// `s0-plan/AWS-PARITY.md` D31 for the deviation it registers).
+/// the AWS-parity register (D31) for the deviation it registers).
 ///
 /// Implemented by [`crate::pdp::BundleStore`] — the same revision-swapped store the PDP
 /// decides against. Every call reads whatever bundle is in force at that instant, so
@@ -756,7 +756,7 @@ impl WebIdentitySts {
     ///
     /// AWS refuses: `DurationSeconds` above the role's `MaxSessionDuration` is a
     /// `ValidationError`. That is a deviation this file takes deliberately and registers
-    /// (`s0-plan/AWS-PARITY.md` D20), because of who the caller is. The AWS SDK web
+    ///, because of who the caller is. The AWS SDK web
     /// identity providers read `Expiration` off this response and schedule their own
     /// refresh from it, so a clamped credential simply works — the client re-mints
     /// sooner. A refusal, by contrast, is a hard failure at *credential acquisition*,
