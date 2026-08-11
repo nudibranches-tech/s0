@@ -20,14 +20,30 @@ FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 
 COPY --from=builder /usr/local/bin/s0 /usr/local/bin/s0
 
-# S3 data-plane listener (and the STS mint listener, when configured).
+# Four listeners with three different authentication postures. Which posture applies is a
+# property of the socket, never of the path, so they are four ports on purpose and
+# `GatewayConfig::validate` refuses a config where any two collide. EXPOSE is
+# documentation only — it neither publishes nor firewalls anything.
+
+# S3 data plane: SigV4, per-request authorization. Ingress-fronted.
 EXPOSE 8014
+
+# STS mint: AssumeRoleWithWebIdentity. Unauthenticated by design — a valid web identity
+# token IS the credential, as at sts.amazonaws.com. Absent unless configured; give it its
+# own hostname when it is.
 EXPOSE 8015
-# Admin: /healthz, /readyz, /metrics. This image is distroless — there is no shell, so
-# an `exec` probe is impossible and these endpoints are the only way to health-check a
-# pod. Keep the port off the ingress: it is unauthenticated by design (a probe cannot
-# sign SigV4).
+
+# Admin: /healthz, /readyz, /metrics. Unauthenticated by construction — a kubelet probe
+# cannot present a secret. This image is distroless, so there is no shell and an `exec`
+# probe is impossible: these endpoints are the only way to health-check a pod. Keep the
+# port off the ingress.
 EXPOSE 8016
+
+# Internal control-plane surface: POST /internal/v1/sts/sessions and
+# /internal/v1/derived-keys, guarded by a constant-time X-Shared-Secret. Absent unless
+# `internal` is configured, and an empty secret refuses every request. Never the ingress,
+# never the data plane — fence it with a NetworkPolicy; the secret is the second line.
+EXPOSE 8017
 
 # The gateway reads its JSON config from $GATEWAY_CONFIG; mount it at runtime,
 # e.g. `-v /etc/s0-gas:/etc/s0-gas -e GATEWAY_CONFIG=/etc/s0-gas/gateway.json`.

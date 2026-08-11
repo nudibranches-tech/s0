@@ -1,17 +1,28 @@
-# s3s 0.14.1 / s3s-aws / regorus — Substrate API Reference (verified from vendored source)
+# Substrate API reference — `s3s` 0.14.1, `s3s-aws` 0.14.1, `regorus` 0.10.1
 
-Consolidated from five recon passes over the vendored trees at
-`/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/{s3s-0.14.1, s3s-aws-0.14.1, regorus-0.10.1}` (aws-sdk-s3 signatures quoted from installed `aws-sdk-s3-1.138.0`, API-identical to the pinned `1.135.0`). All `file:line` references point into those trees. Two recon ambiguities (`S3Operation` accessor, the Proxy's missing op) were re-verified directly against source during consolidation and are marked as such.
+s0 sits on three crates whose APIs are load-bearing for its safety argument, and two of
+them are experimental. This is a reference for those APIs, verified against the vendored
+source of each pinned version rather than against their published docs.
+
+> **Every `file:line` reference below points into a *dependency's* source tree, not into
+> this repository.** A path like `src/dto/mod.rs` means
+> `<cargo registry>/s3s-0.14.1/src/dto/mod.rs`. Sections 0–5 are `s3s`, section 6 is
+> `s3s-aws`, sections 7 and 9 are `regorus`. Nothing here resolves under s0's own `src/`.
+
+`aws-sdk-s3` signatures are quoted from 1.138.0, which is API-identical to the 1.135.0
+that `s3s-aws` pins.
 
 ---
 
-## ⚠ Discrepancies vs the design
+## ⚠ Verified claims, and the traps around them
 
-**Bottom line: all four the design requirements assertions are CONFIRMED against vendored source. There are no discrepancies.** However, four adjacent facts the the design requirements does *not* state are load-bearing traps — read "Traps" below before coding.
+Four assumptions s0's design rests on are **confirmed** against the vendored source, and
+are set out below with their evidence. Four *adjacent* facts that no design document
+states are load-bearing traps — read "Traps" before writing against these APIs.
 
 ### (a) Pipeline order — CONFIRMED
 
-Claimed: `sigv4 header-only verify -> region -> S3Access::check with NO body -> body buffer -> deserialize -> typed hook with full input -> S3::op`.
+Assumed: `sigv4 header-only verify -> region -> S3Access::check with NO body -> body buffer -> deserialize -> typed hook with full input -> S3::op`.
 
 Evidence — `S3Service::call` (`service.rs:614`) builds `ops::CallContext` (`ops/mod.rs:64-72`: `&Arc<dyn S3>`, `&Arc<dyn S3ConfigProvider>`, `Option<&dyn _>` for host/auth/access/route/validation) and calls `ops::call` (`ops/mod.rs:260`). `prepare()` (`ops/mod.rs:315-632`) then `call()` execute, in order:
 
