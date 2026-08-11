@@ -1,36 +1,93 @@
-# Hyperfluid S3 Authorization Gateway — data-plane object authorization.
+# s0 — data-plane object authorization policy.
 #
-# This is NET-NEW policy (PROMPT §3.4: nothing in the in-RGW `ceph.rego` does
-# object/prefix/op matching — it is membership + per-bucket denylist only). It
-# consumes the *target* data-plane grant projection (§3.3, [NOT-YET-BUILT] on the
-# console side) while reusing the bundle data that already exists today
-# (`user_attributes`, `bucket_attributes`, `org_settings.freeze_writes`).
+# This policy does object/prefix/op-level authorization: finer-grained than a plain
+# membership + per-bucket denylist check. It consumes a data-plane grant projection
+# delivered in the bundle, alongside the membership, denylist, and `freeze_writes`
+# data (`user_attributes`, `bucket_attributes`, `org_settings.freeze_writes`).
+#
+# This module is the gateway's compiled-in DEFAULT policy: what runs for local
+# development, and the oracle the dual-engine parity check replays against. In
+# production the control plane pushes the authoritative policy module and data as a
+# bundle; a data-only bundle leaves this default in force.
 #
 # It is evaluated once per parsed request (or per sub-decision: one multi-delete
 # key, or the source-read / dest-write halves of a copy — the PEP decomposes those
-# blind-spot ops into separate questions, §5). The engine reads the single rule
-# `data.hyperfluid.gateway.decision`.
+# blind-spot ops into separate questions). The engine reads the single rule
+# `data.s3.authz.decision`.
 #
-# ── input (PROMPT §5) ──────────────────────────────────────────────────────────
+# ── input ──────────────────────────────────────────────────────────────────────
 #   input.principal.{sub,type,attributes.groups,attributes.<extra>}
 #   input.backend.{id,kind}   input.tenant   input.organization_id
-#   input.action  ∈ {read_objects,list_objects,write_objects,delete_objects,manage_lifecycle}
-#   input.bucket  input.object?  input.prefix?  input.copy_source?  input.delete_keys?
+#   input.action  ∈ the 6 settled verbs (2026-08-08; was 13):
+#       object-scoped : read_objects write_objects delete_objects write_object_tags
+#       listing       : list_objects
+#       bucket/account: read
 #
-# ── data / grant contract (target projection) ──────────────────────────────────
-#   data.org_settings.freeze_writes : bool                       # EXISTS today
-#   data.tenants[t].user_attributes[sub] : {groups, attributes}  # EXISTS today
-#   data.tenants[t].bucket_attributes[b].denylist[sub] : true    # EXISTS today
-#   data.tenants[t].s3_grants[sub]     : [ Grant ]               # NOT-YET-BUILT
-#   data.tenants[t].group_grants[group]: [ Grant ]               # NOT-YET-BUILT
+#     THE GATEWAY IS DATA-PLANE ONLY. `create_bucket`, `delete_bucket`,
+#     `read_bucket_config` and `write_bucket_config` are gone: each was a way to make,
+#     unmake or re-configure a bucket with no record in the control plane that owns it —
+#     unmanaged, unquota'd, invisible. That authority belongs to the control plane, and
+#     the six S3 ops that carried it are refused at the gate before deserialization.
+#     `write_object_acl` is gone with no successor: an object ACL grants access no
+#     projection emitted and none can revoke, so conferring one is refused in code
+#     (`s0::access::headers`).
+#     `read_bucket` + `list_buckets` merged into `read`, and `read_object_tags` into
+#     `read_objects`. Both merges widen a surviving verb rather than dropping authority.
+#
+#   input.bucket  — "" for the ACCOUNT scope. `read` is the ONLY verb that appears in
+#                   both shapes: `HeadBucket`/`GetBucketLocation` name a bucket,
+#                   `ListBuckets` does not. EVERY rule below that reads `read` therefore
+#                   carries a shape gate (`bucket_scoped` / `account_scoped`), and those
+#                   gates are load-bearing in both directions:
+#                     * without `input.bucket != ""` a `"bucket": "*"` grant matches the
+#                       empty string, so every account decision is covered by any
+#                       wildcard grant and the per-bucket denylist is keyed on a bucket
+#                       nobody named;
+#                     * without `input.bucket == ""` a permitted HeadBucket picks up the
+#                       `visible_buckets` obligation, which it cannot apply — and an
+#                       unapplicable obligation is a hard deny, so HeadBucket would
+#                       break for everyone.
+#   input.object?  input.prefix?  input.copy_source?  input.delete_keys?
+#   input.requested_tags? the tag set a write_object_tags request wants to INSTALL
+#                         (not the object's current tags, which are input.object_tags
+#                         and are never populated). A policy that conditions on tags
+#                         should refuse a write that sets the keys it reads. This is why
+#                         `write_object_tags` was NOT merged into `write_objects` when
+#                         the vocabulary shrank: a principal holding both could grant
+#                         itself whatever a tag-driven policy keys on.
+#   input.acl_grants      ALWAYS present, `[]` when the request asks for no ACL. The
+#                         canned x-amz-acl and the five x-amz-grant-* headers,
+#                         normalized to [{source, value}]. NOTE: as of 2026-08-08 a
+#                         request carrying any CONFERRING grant (public or named) is
+#                         refused in code before any decision is asked for, so this
+#                         field is carried for the audit record and for a policy that
+#                         wants to see what was attempted — never as the thing that
+#                         stops it. A policy cannot re-permit an ACL; there is no verb.
+#   input.bypass_governance  ALWAYS present. x-amz-bypass-governance-retention. The PEP
+#                         refuses it unconditionally (no verb in the vocabulary
+#                         expresses "may override object-lock retention"); it is on the
+#                         wire so the attempt is on the audit record.
+#
+# ── data / grant contract ──────────────────────────────────────────────────────
+#   data.org_settings.freeze_writes : bool
+#   data.org_settings.reserved_tag_keys : ["<platform-namespace>/*", ...]
+#     Read by the PEP (`s0::access::tagging`), NOT by this module — deliberately, so a
+#     pushed policy cannot forget it. Tag keys no S3 caller may write, because a policy
+#     may condition grants on them. ABSENT ⇒ every tag write is refused (tagging ships
+#     inert). `["*"]` means the same thing explicitly; `[]` means nothing is reserved and
+#     is a claim the control plane makes, not a default the gateway assumes.
+#   data.tenants[t].user_attributes[sub] : {groups, attributes}
+#   data.tenants[t].bucket_attributes[b].denylist[sub] : true
+#   data.tenants[t].s3_grants[sub]     : [ Grant ]
+#   data.tenants[t].group_grants[group]: [ Grant ]
 #     Grant := { "bucket": "<name>" | "*",
 #                "actions": ["read_objects", ...] | ["*"],
 #                "prefixes": ["reports/", ...] }   # absent/[] ⇒ whole bucket
 #
-# Deny-by-default. Membership is necessary but NOT sufficient (unlike ceph.authz):
-# an explicit data-plane grant must match the (action, bucket, object|prefix).
+# Deny-by-default. Membership is necessary but NOT sufficient: an explicit
+# data-plane grant must match the (action, bucket, object|prefix).
 
-package hyperfluid.gateway
+package s3.authz
 
 import future.keywords.contains
 import future.keywords.if
@@ -55,14 +112,56 @@ allow if {
 
 # ── org-global and per-bucket denies (evaluated ahead of grants) ────────────────
 
+# The verbs `freeze_writes` covers. This set MUST equal `Action::is_write` on the PEP
+# side: a verb one side calls a write and the other does not is a hole in the only kill
+# switch the live bundle carries. `tests/op_coverage.rs::the_write_set_matches_the_shipped_rego`
+# extracts this literal and compares it, so a divergence fails the build.
+write_actions := {
+	"write_objects",
+	"delete_objects",
+	"write_object_tags",
+}
+
+# The verbs decided against a NAMED bucket with no object key. They carry no key, so
+# grant `prefixes` cannot narrow them — see `grant_matches` below for why that is safe
+# here and was not for the deleted `manage_lifecycle`.
+#
+# Exactly one verb, and that is the settlement rather than a coincidence: the other four
+# keyless verbs (`create_bucket`, `delete_bucket`, `{read,write}_bucket_config`) were the
+# ones that acted on the bucket as a managed resource, and they are control-plane now.
+bucket_actions := {"read"}
+
+# The verbs decided with NO bucket at all (`input.bucket == ""`) — the account scope,
+# which today is `ListBuckets` alone.
+#
+# This set and `bucket_actions` deliberately SHARE the verb `read`: "does this bucket
+# exist, for me?" is one question whether it is asked about one bucket or about all of
+# them, and answering it under two verbs is what let `aws s3 ls` come back empty for a
+# principal whose next `head-bucket` succeeded. The sharing is exactly why every rule
+# reading either set carries its shape gate.
+account_actions := {"read"}
+
+# A decision that names a bucket. Written once so the gate cannot be spelled two ways.
+bucket_scoped if input.bucket != ""
+
+# A decision that names none.
+account_scoped if input.bucket == ""
+
 # Truthy (not `== true`) so a malformed projected value ("true", 1, …) fails toward
 # the SAFE direction — frozen/denied — instead of silently faulting open.
 frozen if {
-	input.action in {"write_objects", "delete_objects", "manage_lifecycle"}
+	input.action in write_actions
 	data.org_settings.freeze_writes
 }
 
-denylisted if data.tenants[input.tenant].bucket_attributes[input.bucket].denylist[input.principal.sub]
+# Gated on a non-empty bucket. `input.bucket` is "" for the
+# account-scoped ops, and a rule keyed on it would then be asking about a bucket nobody
+# named — silently false, which is the wrong direction for a *deny* rule to fail in.
+# `subject_denylisted_anywhere` below is the account-scope replacement.
+denylisted if {
+	bucket_scoped
+	data.tenants[input.tenant].bucket_attributes[input.bucket].denylist[input.principal.sub]
+}
 
 member if data.tenants[input.tenant].user_attributes[input.principal.sub]
 
@@ -72,8 +171,8 @@ grants contains g if some g in data.tenants[input.tenant].s3_grants[input.princi
 
 # Group membership is read LIVE from the bundle (user_attributes[sub].groups), NOT
 # from the caller's token. A token's groups are frozen at mint; sourcing group grants
-# from them would make group removal non-revocable until token expiry (violates §6.1).
-# The bundle is re-projected on every revision, so a group removal lands immediately.
+# from them would make group removal non-revocable until token expiry. The bundle is
+# re-projected on every revision, so a group removal lands immediately.
 grants contains g if {
 	some group in data.tenants[input.tenant].user_attributes[input.principal.sub].groups
 	some g in data.tenants[input.tenant].group_grants[group]
@@ -84,9 +183,19 @@ applicable_grant(g) if {
 	action_matches(g)
 }
 
-bucket_matches(g) if g.bucket == input.bucket
+bucket_matches(g) if {
+	bucket_scoped
+	g.bucket == input.bucket
+}
 
-bucket_matches(g) if g.bucket == "*"
+# Without the guard, `"bucket": "*"` matches the EMPTY string, so every
+# account-scoped decision (input.bucket == "") would be covered by any wildcard grant
+# through the ordinary bucket rules. The account scope has its own rules below, and they
+# are the only way to reach it.
+bucket_matches(g) if {
+	bucket_scoped
+	g.bucket == "*"
+}
 
 action_matches(g) if input.action in g.actions
 
@@ -112,7 +221,7 @@ object_in_scope(g) if whole_bucket(g)
 # Prefixes are LITERAL S3 key prefixes, matched exactly as S3 ListObjects/IAM do:
 # a grant on "team" also matches "team-private/x". This is intentional and consistent
 # with the backend's own prefix semantics (the key the PDP sees is the canonical key
-# that is forwarded, §6.3, so there is no parser-differential). To isolate a folder,
+# that is forwarded, so there is no parser-differential). To isolate a folder,
 # author the grant with a trailing slash ("team/"). The projection SHOULD normalize
 # folder-scoped grants to end in "/" (ADR-006).
 object_in_scope(g) if {
@@ -120,20 +229,40 @@ object_in_scope(g) if {
 	startswith(input.object, p)
 }
 
-# Genuinely bucket-level actions (manage_lifecycle) — no key, no list semantics.
-# Restricted to manage_lifecycle ON PURPOSE: a read/write/delete arriving with a
+# Genuinely bucket-level actions — no key, no list semantics.
+#
+# Restricted to `bucket_actions` ON PURPOSE: a read/write/delete arriving with a
 # MISSING object key must NOT fall through to a keyless whole-bucket allow (that
 # would bypass the grant's prefix scope). Missing key on an object op ⇒ no rule
-# matches ⇒ deny (§6.2).
+# matches ⇒ deny.
+#
+# `read` ignores `prefixes`, and that is sound only because it is its OWN verb: nothing
+# here is reachable from a `read_objects`/`write_objects` grant, so a principal scoped to
+# `2024/` gets `HeadBucket` if and only if someone granted it `read` on the bucket. This
+# is exactly what made the deleted `manage_lifecycle` variant dangerous — it was a
+# keyless whole-bucket allow waiting for an op to reach it.
+# The projection SHOULD emit bucket-verb grants with `"prefixes": []` so the data never
+# implies a scoping that is not applied (ADR-006).
+#
+# `bucket_scoped` is not redundant with `applicable_grant`, which already demands it:
+# stating it here is what keeps the rule readable as "the BUCKET shape of `read`" next to
+# the account shape below, so the two cannot be confused when only one is being edited.
 grant_matches if {
 	not input.object
-	input.action == "manage_lifecycle"
+	bucket_scoped
+	input.action in bucket_actions
 	some g in grants
 	applicable_grant(g)
 }
 
-# list ops: allowed if a whole-bucket grant applies, or the request overlaps a
-# prefix grant (which then drives the narrowing obligation, §5.1).
+# list ops: allowed if a whole-bucket grant applies, or the request names a prefix
+# that overlaps a prefix grant (which then drives the narrowing obligation).
+#
+# An UNBOUNDED list — no `prefix` on the request — reaches the first clause alone:
+# `narrowed` leaves `scoped_arr` empty for it, so only a whole-bucket grant authorizes
+# it. (The single exception is a grant carrying `prefixes: [""]`, which is a
+# whole-bucket grant spelled oddly — see `narrowed` below, where the deny and that
+# exception are both argued.)
 grant_matches if {
 	input.action == "list_objects"
 	not input.object
@@ -146,7 +275,85 @@ grant_matches if {
 	count(scoped_arr) > 0
 }
 
-# ── list-prefix narrowing (§5.1): rewrite an unbounded/over-broad list to scope ──
+# ── ListBuckets: the account scope (input.bucket == "") ─────────────────────────
+#
+# Two separate questions, and conflating them is what makes bucket listings either
+# useless or leaky:
+#
+#   1. MAY this principal enumerate at all?  It holds `read` somewhere in this tenant.
+#   2. WHICH buckets may it see?             The ones it holds any grant on.
+#
+# (2) is deliberately not "the buckets it holds `read` on". A bucket a principal can
+# already read or write is not hidden by being absent from its own bucket list — it is
+# only made undiscoverable, which breaks `aws s3 ls` without withholding anything the
+# caller could not already reach. Enumeration is the capability; visibility follows
+# access.
+#
+# `account_scoped` is the whole difference between this rule and the bucket-shaped one
+# above: they read the SAME verb, and without the two gates a HeadBucket would take this
+# branch (skipping `applicable_grant`, so any `read` grant anywhere in the tenant would
+# permit a HeadBucket on any bucket) and a ListBuckets would take that one.
+#
+# A denial here is NOT a 403 — the PEP answers an empty listing either way, so that "may
+# not enumerate" and "has nothing" are indistinguishable to the client. The distinction
+# is kept in the audit record. See `GatewayAccess::list_buckets`.
+grant_matches if {
+	account_scoped
+	input.action in account_actions
+	some g in grants
+	action_matches(g)
+}
+
+# The account-scope reading of the per-bucket denylist. It is keyed on a bucket, and this
+# decision names none, so the conservative substitution is: a subject denylisted on ANY
+# bucket in the tenant loses the unrestricted view and falls back to the enumerated one.
+subject_denylisted_anywhere if {
+	some b
+	data.tenants[input.tenant].bucket_attributes[b].denylist[input.principal.sub]
+}
+
+wildcard_bucket_grant if {
+	some g in grants
+	g.bucket == "*"
+}
+
+# Every bucket the subject holds a grant on, minus the ones it is denylisted from.
+visible_bucket_set contains g.bucket if {
+	some g in grants
+	g.bucket != "*"
+	not data.tenants[input.tenant].bucket_attributes[g.bucket].denylist[input.principal.sub]
+}
+
+visible_bucket_arr := [b | some b in visible_bucket_set]
+
+# The ONLY unfiltered path, and it is not reachable by accident: it needs a wildcard
+# grant AND no denylist entry anywhere. With a denylist entry the wildcard is dropped
+# rather than trusted — the bundle cannot enumerate the tenant's buckets, so there is no
+# way to emit "all except these". The cost is that a wildcard-granted subject with one
+# denylisted bucket sees only its explicitly-named grants, which is conservative in the
+# safe direction and is recorded as such.
+unrestricted_bucket_view if {
+	wildcard_bucket_grant
+	not subject_denylisted_anywhere
+}
+
+bucket_obligations := {"all_buckets_visible": true} if unrestricted_bucket_view
+
+bucket_obligations := {"visible_buckets": visible_bucket_arr} if {
+	not unrestricted_bucket_view
+	count(visible_bucket_arr) > 0
+}
+
+# Allowed to enumerate, nothing to enumerate. `{}` — and the PEP reads an ABSENT
+# visible_buckets as NOTHING VISIBLE, the opposite of how it reads an absent
+# allowed_prefixes. That asymmetry is the whole reason this branch is safe to leave
+# empty.
+bucket_obligations := {} if {
+	not unrestricted_bucket_view
+	count(visible_bucket_arr) == 0
+}
+
+# ── list-prefix narrowing: rewrite an OVER-BROAD list down to scope ──────────────
 
 requested_prefix := input.prefix
 
@@ -160,9 +367,52 @@ whole_bucket_list if {
 
 # For each prefix grant overlapping the request, the concrete prefix to enumerate:
 # the more specific of (grant prefix, requested prefix). Undefined ⇒ no overlap.
+#
+# ── AN UNBOUNDED LIST IS A DENY, NEVER A NARROWING (2026-08-09) ─────────────────
+#
+# AWS expresses prefix-scoped list access as a BUCKET-level resource plus a condition:
+#
+#   {"Action": "s3:ListBucket", "Resource": "arn:aws:s3:::bucket",
+#    "Condition": {"StringLike": {"s3:prefix": ["team-a/*"]}}}
+#
+# Calling `ListObjectsV2` with NO prefix against that policy is an `AccessDenied` in
+# AWS: the condition key is simply absent, so the condition fails. AWS does not narrow.
+# (The AWS console only appears to escape this because it always sends a prefix as the
+# user navigates.) Two reasons this module answers the same way, and the second is the
+# one that decided it:
+#
+#   1. AWS PARITY. This is what people used to S3 expect. Where the gateway deviates,
+#      the deviation should be deliberate and written down; this one was neither.
+#   2. SILENT NARROWING PRESENTS A PARTIAL VIEW AS A COMPLETE ONE. The narrowed
+#      listing comes back with no signal that it was filtered, so a user running
+#      `aws s3 ls s3://bucket/` reads it as the bucket's contents and concludes the
+#      bucket holds only `team-a/`. In a regulated product that is worse than an
+#      error: an error is diagnosable and gets a support ticket, a short listing is
+#      believed. A 403 says "ask for a prefix, or ask for more access".
+#
+# A pushed module is expected to deny here too (requiring the requested prefix to lie
+# WITHIN a granted one); this compiled-in default was the last PEP still narrowing.
+#
+# WHAT DOES NOT CHANGE, which is most of the behaviour:
+#   * a request whose prefix lies INSIDE a grant is allowed and forwarded unrewritten
+#     (clause 1, untouched);
+#   * a request WIDER than the grant but overlapping it is allowed and narrowed to the
+#     grant (clause 2) — narrowing is the correct enforcement there, because the caller
+#     named a scope and gets a genuine subset of the scope it named, not a subset of
+#     "the bucket";
+#   * multi-prefix fan-out is unchanged for every such bounded request;
+#   * a request overlapping no grant is denied, as before.
+#
+# Only `req == ""` moves, and it moves from ALLOW + `narrow_prefix`/`allowed_prefixes`
+# to DENY. It is guarded on clause 2 alone because clause 2 is the only one that can
+# manufacture a scope the caller never asked for. Clause 1 still matches `req == ""`
+# against a grant prefix of `""` — but such a grant already permits every key in the
+# bucket (`startswith(k, "")` holds for all k), so it is a whole-bucket grant spelled
+# oddly, and its unbounded list is allowed.
 narrowed(p, req) := req if startswith(req, p)
 
 narrowed(p, req) := p if {
+	req != ""
 	startswith(p, req)
 	not startswith(req, p)
 }
@@ -187,6 +437,16 @@ obligations := ob if {
 	ob := list_obligations
 }
 
+# `account_scoped` is load-bearing, not decoration. `read` is in both `bucket_actions`
+# and `account_actions`, so without it a permitted HeadBucket would carry a
+# `visible_buckets` obligation — and `must_understand` makes an obligation the op cannot
+# apply a hard deny, so HeadBucket would break for every principal in every org.
+obligations := ob if {
+	account_scoped
+	input.action in account_actions
+	ob := bucket_obligations
+}
+
 list_obligations := {} if whole_bucket_list
 
 list_obligations := {"allowed_prefixes": scoped_arr} if {
@@ -206,7 +466,7 @@ list_obligations := {} if {
 	scoped_arr[0] == requested_prefix
 }
 
-# ── audit-facing reason (deny reasons matter as much as allow, §6.6) ─────────────
+# ── audit-facing reason (deny reasons matter as much as allow) ───────────────────
 
 default reason := "deny: no grant matches action/scope"
 
@@ -221,6 +481,43 @@ reason := "deny: principal not a tenant member" if {
 	not frozen
 	not denylisted
 	not member
+}
+
+# The principal DOES hold listing here — just prefix-scoped. This is what separates
+# "you asked too broadly" from "you were never granted listing", and the two get
+# different advice below.
+prefix_scoped_list_grant if {
+	input.action == "list_objects"
+	some g in grants
+	applicable_grant(g)
+	not whole_bucket(g)
+}
+
+# The unbounded-list deny gets its own reason, and it is not decoration. This string
+# becomes both the audit reason and the `AccessDenied` message the client reads
+# (`access::classify_list` → `s3_error!(AccessDenied, "{reason}")`), and argument 2 for
+# denying at all — an error beats a silently-filtered listing — only holds if the error
+# says what to do. "no grant matches action/scope" would send a caller hunting for a
+# missing grant when the fix is a `--prefix`.
+#
+# `prefix_scoped_list_grant` keeps it honest in the other direction: a principal with
+# NO list grant at all keeps the generic reason, because telling it to name a prefix
+# would be advice that cannot work.
+#
+# The body is disjoint from every other clause of this complete rule, including
+# `allow`: `count(scoped_arr) == 0` excludes the `prefixes: [""]` case (see `narrowed`),
+# which is the only unbounded list that still allows. Two matching bodies with
+# different values would be an eval error, i.e. no decision at all.
+reason := "deny: an unbounded list needs a whole-bucket grant; name a prefix inside your grant" if {
+	not frozen
+	not denylisted
+	member
+	input.action == "list_objects"
+	not input.object
+	requested_prefix == ""
+	prefix_scoped_list_grant
+	not whole_bucket_list
+	count(scoped_arr) == 0
 }
 
 reason := "allow: grant matched" if allow

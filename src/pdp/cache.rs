@@ -1,10 +1,10 @@
-//! Decision cache — correct by construction (§4.3.2).
+//! Decision cache.
 //!
-//! The key embeds the bundle revision, the full principal (so a differing group set
-//! never reuses another principal's verdict), and the resource tuple (backend, tenant,
-//! bucket, action, object/prefix). A revocation bumps the revision, so stale entries
-//! are simply never looked up again — no TTL, no invalidation. Decisions whose input
-//! carries on-demand data (object tags, §5.2) are never cached: their freshness is not
+//! The key embeds the bundle revision, the full principal, and a digest of *every other
+//! field* of the input ([`OpaInput::resource_key`] — derived, not enumerated, so a field
+//! the policy can read is never outside the key). A revocation bumps the revision, so
+//! stale entries are never looked up again: no TTL, no invalidation. Decisions whose
+//! input carries on-demand data (object tags) are never cached — their freshness is not
 //! bounded by the revision.
 
 use std::sync::Arc;
@@ -36,10 +36,8 @@ impl CachingPdp {
         // Full principal in the key: two tokens for the same `sub` but different
         // groups must not share a verdict.
         let principal = serde_json::to_string(&input.principal)?;
-        Ok(format!(
-            "{revision}\u{1f}{principal}\u{1f}{}",
-            input.resource_key()
-        ))
+        let resource = input.resource_key()?;
+        Ok(format!("{revision}\u{1f}{principal}\u{1f}{resource}"))
     }
 }
 
@@ -58,7 +56,7 @@ impl Pdp for CachingPdp {
         Ok(decision)
     }
 
-    async fn reload(&self, bundle: &serde_json::Value) -> Result<()> {
-        self.inner.reload(bundle).await
+    async fn reload(&self, policy: Option<&str>, data: &serde_json::Value) -> Result<()> {
+        self.inner.reload(policy, data).await
     }
 }

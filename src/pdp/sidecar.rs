@@ -1,4 +1,4 @@
-//! Sidecar OPA PDP (the shipping default, §4.3.1): the same engine every other PEP
+//! Sidecar OPA PDP (the shipping default): the same engine every other PEP
 //! in the platform runs, on loopback, fed by the bundle. ~0.5–2ms per decision.
 //!
 //! The embedded regorus engine is a config-swap behind the same [`Pdp`] trait, gated
@@ -34,11 +34,24 @@ impl SidecarPdp {
             .map_err(|e| GatewayError::Pdp(format!("build opa client: {e}")))?;
         Ok(SidecarPdp {
             client,
+            // Derived from `DECISION_RULE`, never spelled out again: the sidecar and the
+            // embedded engine must ask the *same* question, and a second hand-typed copy
+            // of the entrypoint is exactly how they stop doing so — silently, since an
+            // entrypoint that does not resolve returns undefined and this PDP fails
+            // closed to a deny.
             decision_url: format!(
-                "{}/v1/data/hyperfluid/gateway/decision",
-                base_url.trim_end_matches('/')
+                "{}/v1/data/{}",
+                base_url.trim_end_matches('/'),
+                super::decision_rule_path()
             ),
         })
+    }
+
+    /// The URL this PDP posts decisions to. Exposed so a test can hold it equal to the
+    /// entrypoint the pushed module declares — a mismatch evaluates to `undefined`, which
+    /// denies every request while the pod stays healthy.
+    pub fn decision_url(&self) -> &str {
+        &self.decision_url
     }
 }
 
@@ -60,7 +73,7 @@ impl Pdp for SidecarPdp {
             .json()
             .await
             .map_err(|e| GatewayError::Pdp(format!("opa decode: {e}")))?;
-        // Undefined result ⇒ deny (fail closed, §6.2).
+        // Undefined result ⇒ deny (fail closed).
         Ok(parsed
             .result
             .unwrap_or_else(|| Decision::deny("opa: undefined decision")))

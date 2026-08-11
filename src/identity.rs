@@ -2,7 +2,7 @@
 //! (from a verified STS session token or a static credential), stashed in the s3s
 //! request extensions by `S3Access::check`, and read by the typed hooks (for the OPA
 //! input) and the S3 dispatcher (for backend routing). Always the **end-user**
-//! identity — never a shared/service principal (§6.5, §6.6).
+//! identity — never a shared/service principal.
 
 use crate::authz::{Principal, PrincipalAttributes};
 use crate::model::{PrincipalType, Tenant};
@@ -21,7 +21,7 @@ impl ResolvedPrincipal {
         Tenant(self.tenant.clone())
     }
 
-    /// The principal half of the OPA input (§5).
+    /// The principal half of the OPA input.
     pub fn to_opa_principal(&self) -> Principal {
         Principal {
             sub: self.sub.clone(),

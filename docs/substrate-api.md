@@ -1,17 +1,28 @@
-# s3s 0.14.1 / s3s-aws / regorus — Substrate API Reference (verified from vendored source)
+# Substrate API reference — `s3s` 0.14.1, `s3s-aws` 0.14.1, `regorus` 0.10.1
 
-Consolidated from five recon passes over the vendored trees at
-`/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/{s3s-0.14.1, s3s-aws-0.14.1, regorus-0.10.1}` (aws-sdk-s3 signatures quoted from installed `aws-sdk-s3-1.138.0`, API-identical to the pinned `1.135.0`). All `file:line` references point into those trees. Two recon ambiguities (`S3Operation` accessor, the Proxy's missing op) were re-verified directly against source during consolidation and are marked as such.
+s0 sits on three crates whose APIs are load-bearing for its safety argument, and two of
+them are experimental. This is a reference for those APIs, verified against the vendored
+source of each pinned version rather than against their published docs.
+
+> **Every `file:line` reference below points into a *dependency's* source tree, not into
+> this repository.** A path like `src/dto/mod.rs` means
+> `<cargo registry>/s3s-0.14.1/src/dto/mod.rs`. Sections 0–5 are `s3s`, section 6 is
+> `s3s-aws`, sections 7 and 9 are `regorus`. Nothing here resolves under s0's own `src/`.
+
+`aws-sdk-s3` signatures are quoted from 1.138.0, which is API-identical to the 1.135.0
+that `s3s-aws` pins.
 
 ---
 
-## ⚠ Discrepancies vs PROMPT (v4)
+## ⚠ Verified claims, and the traps around them
 
-**Bottom line: all four PROMPT assertions are CONFIRMED against vendored source. There are no discrepancies.** However, four adjacent facts the PROMPT does *not* state are load-bearing traps — read "Traps" below before coding.
+Four assumptions s0's design rests on are **confirmed** against the vendored source, and
+are set out below with their evidence. Four *adjacent* facts that no design document
+states are load-bearing traps — read "Traps" before writing against these APIs.
 
 ### (a) Pipeline order — CONFIRMED
 
-Claimed: `sigv4 header-only verify -> region -> S3Access::check with NO body -> body buffer -> deserialize -> typed hook with full input -> S3::op`.
+Assumed: `sigv4 header-only verify -> region -> S3Access::check with NO body -> body buffer -> deserialize -> typed hook with full input -> S3::op`.
 
 Evidence — `S3Service::call` (`service.rs:614`) builds `ops::CallContext` (`ops/mod.rs:64-72`: `&Arc<dyn S3>`, `&Arc<dyn S3ConfigProvider>`, `Option<&dyn _>` for host/auth/access/route/validation) and calls `ops::call` (`ops/mod.rs:260`). `prepare()` (`ops/mod.rs:315-632`) then `call()` execute, in order:
 
@@ -76,7 +87,7 @@ impl From<aws_sdk_s3::Client> for Proxy {
 
 Single private tuple field; the **only** constructor is `From<aws_sdk_s3::Client>` (no `new`); the inner client cannot be extracted. One `Proxy` == one client == correct unit per (backend, tenant).
 
-### Traps — true facts the PROMPT omits
+### Traps — true facts the the design requirements omits
 
 1. **The general `check` runs ONLY when an auth provider is set** (`ops/mod.rs:608`, module docs `access/mod.rs:19-29`). `set_access` without `set_auth` ⇒ `check`/`default_check` are **silently skipped**. The gateway MUST call both `set_auth` and `set_access`.
 2. **Typed per-op hooks are NOT gated on auth** — they run whenever access is configured (`ops/generated.rs:539`). So with access-only wiring you get hooks but no general gate; with both, you get both.
@@ -957,7 +968,7 @@ use aws_sdk_s3::{Client, Config};
 let creds = Credentials::new(access_key, secret_key, None, None, "static");
 let conf: Config = Config::builder()
     .behavior_version(BehaviorVersion::latest())   // REQUIRED: behavior-version-latest feature off; omit => panic at build()
-    .endpoint_url("https://rgw.internal:7480")     // Ceph RGW
+    .endpoint_url("https://s3-backend.example.com:7480")     // Ceph RGW
     .region(Region::new("us-east-1"))              // RGW ignores it but SigV4 needs a value
     .credentials_provider(creds)
     .force_path_style(true)                        // RGW: path-style, not vhost

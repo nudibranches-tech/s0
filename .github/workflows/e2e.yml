@@ -1,0 +1,42 @@
+name: e2e
+
+# Real-stack end-to-end: aws-cli -> s0-gas gateway -> MinIO backend, embedded
+# OPA (regorus). Proves the security properties (including the copy-source
+# authorization that closes the Ceph RGW-OPA gap, per-key multi-delete
+# filtering, list narrowing, and live revocation) against an off-the-shelf S3
+# client and a real S3-compatible backend, not mocks.
+
+on:
+  # See ci.yml: `main` plus pull requests, so a PR from a topic branch runs once.
+  push:
+    branches: ["main"]
+  pull_request:
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      # The same scenarios against both engines. The sidecar is the shipping default;
+      # the embedded engine is the gated fast path. A divergence shows up here as well
+      # as in the parity gate.
+      matrix:
+        pdp: [embedded, sidecar]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build gateway
+        run: cargo build --bin s0
+
+      - name: Run end-to-end suite (PDP=${{ matrix.pdp }})
+        run: bash tests/e2e/run.sh
+        env:
+          GW_BIN: ${{ github.workspace }}/target/debug/s0
+          PDP_MODE: ${{ matrix.pdp }}

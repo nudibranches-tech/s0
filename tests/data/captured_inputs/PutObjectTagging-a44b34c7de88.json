@@ -1,0 +1,27 @@
+{
+  "acl_grants": [],
+  "action": "write_object_tags",
+  "backend": {
+    "id": "bay-1",
+    "kind": "ceph"
+  },
+  "bucket": "reports",
+  "bypass_governance": false,
+  "object": "2024/x",
+  "organization_id": "org-acme",
+  "principal": {
+    "attributes": {
+      "groups": []
+    },
+    "sub": "alice",
+    "type": "user"
+  },
+  "request": {
+    "method": "PUT",
+    "params": "tagging="
+  },
+  "requested_tags": {
+    "tier": "internal"
+  },
+  "tenant": "acme"
+}

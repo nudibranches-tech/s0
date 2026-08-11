@@ -1,14 +1,14 @@
-//! Golden decision corpus replayed through the embedded regorus engine (§4.3.1).
+//! Golden decision corpus replayed through the embedded regorus engine.
 //! This is the executable specification of `policy/gateway/authz.rego`: every branch
 //! of the grant/prefix/deny logic has a case in `policy/testdata/corpus.json`.
 //!
-//! The same corpus is the seed of the dual-engine parity gate — once the sidecar
-//! test harness exists, OPA replays these and must produce identical decisions.
+//! `tests/parity.rs` replays the same corpus through a real OPA and requires identical
+//! decisions.
 
 use std::collections::HashMap;
 
-use hyperfluid_s3_gateway::authz::{Decision, OpaInput};
-use hyperfluid_s3_gateway::pdp::{GATEWAY_REGO, Pdp, RegorusPdp};
+use s0::authz::{Decision, OpaInput};
+use s0::pdp::{GATEWAY_REGO, Pdp, RegorusPdp};
 use serde::Deserialize;
 
 const CORPUS: &str = include_str!(concat!(
@@ -39,6 +39,13 @@ struct Expect {
     narrow_prefix: Option<String>,
     #[serde(default)]
     allowed_prefixes: Option<Vec<String>>,
+    /// `ListBuckets`. Asserted as a **set**, and `Some(vec![])` is a real assertion —
+    /// "allowed to enumerate, nothing visible" is a distinct outcome from "denied", and
+    /// the corpus has to be able to say so.
+    #[serde(default)]
+    visible_buckets: Option<Vec<String>>,
+    #[serde(default)]
+    all_buckets_visible: Option<bool>,
     #[serde(default)]
     no_obligations: bool,
 }
@@ -113,8 +120,30 @@ fn check_case(case: &Case, d: &Decision) -> Vec<String> {
             ));
         }
     }
+    if let Some(vb) = &case.expect.visible_buckets {
+        let mut got = d.obligations.visible_buckets.clone();
+        got.sort();
+        let mut want = vb.clone();
+        want.sort();
+        if got != want {
+            out.push(format!(
+                "[{tag}] visible_buckets = {got:?} expected {want:?}"
+            ));
+        }
+    }
+    if let Some(all) = case.expect.all_buckets_visible
+        && d.obligations.all_buckets_visible != all
+    {
+        out.push(format!(
+            "[{tag}] all_buckets_visible = {} expected {all}",
+            d.obligations.all_buckets_visible
+        ));
+    }
     if case.expect.no_obligations
-        && (d.obligations.narrow_prefix.is_some() || !d.obligations.allowed_prefixes.is_empty())
+        && (d.obligations.narrow_prefix.is_some()
+            || !d.obligations.allowed_prefixes.is_empty()
+            || !d.obligations.visible_buckets.is_empty()
+            || d.obligations.all_buckets_visible)
     {
         out.push(format!(
             "[{tag}] expected no obligations, got {:?}",

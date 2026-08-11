@@ -1,12 +1,20 @@
 [package]
-name = "hyperfluid-s3-gateway"
-version = "0.1.0"
+name = "s0"
+version = "0.3.0-local"
 edition = "2024"
+rust-version = "1.85"
+license = "BUSL-1.1"
+description = "An OPA/ABAC-enforcing, S3-compatible authorization gateway."
+repository = "https://github.com/nudibranches-tech/s0-gas"
+authors = ["Nudibranches <roch@nudibranches.tech>"]
+keywords = ["s3", "abac", "opa", "gateway", "authorization"]
+categories = ["web-programming", "authentication"]
 
 [dependencies]
 anyhow = "1.0.103"
 arc-swap = "1.9.2"
 async-trait = "0.1.89"
+base64 = "0.22.1"
 aws-config = { version = "1.9.0", features = ["behavior-version-latest"] }
 aws-credential-types = { version = "1.3.0", features = ["hardcoded-credentials"] }
 aws-sdk-s3 = "1.138.0"
@@ -24,7 +32,11 @@ moka = { version = "0.12.15", features = ["future"] }
 regorus = "0.10.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "gzip", "http2", "charset"] }
 s3s = "=0.14.1"
-s3s-aws = "0.14"
+# Pinned as hard as `s3s` itself: the gate's safety argument ("an operation with no hook
+# falls through to NotImplemented") is a claim about which methods s3s-aws's generated
+# `Proxy` impl overrides, so a patch bump overriding one more silently opens a forwarding
+# path. Guarded by `op_coverage::the_reference_op_list_matches_the_pinned_s3s_version`.
+s3s-aws = "=0.14.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = "0.11.0"

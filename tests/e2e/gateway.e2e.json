@@ -1,0 +1,52 @@
+{
+  "_note": "e2e gateway config. One tenant (acme) fronts a MinIO backend as a remote_s3 bay; the owner_* keys are the MinIO root creds the gateway re-signs with (never the caller's). Two long-lived virtual credentials stand in for platform-issued identities. Embedded regorus PDP; the policy bundle is pushed via bundle_path and re-read every 2s so the live-revocation scenario works. State (bundle + audit spill) lives under /tmp/s0-gas-e2e, seeded by run.sh.",
+  "listen": "0.0.0.0:8014",
+  "sts": {
+    "master_key_hex": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+    "signing_key_hex": "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100",
+    "session_ttl_secs": 3600
+  },
+  "pdp": { "mode": "embedded", "cache_capacity": 10000 },
+  "audit": {
+    "sink_url": "http://127.0.0.1:9099/api/v1/decision-logs",
+    "spill_path": "/tmp/s0-gas-e2e/audit-spill.ndjson"
+  },
+  "backends": [
+    {
+      "id": "minio",
+      "kind": "remote_s3",
+      "endpoint_url": "http://127.0.0.1:9000",
+      "region": "us-east-1",
+      "force_path_style": true
+    }
+  ],
+  "tenants": [
+    {
+      "tenant": "acme",
+      "organization_id": "org-acme",
+      "backend_id": "minio",
+      "owner_access_key": "minioadmin",
+      "owner_secret_key": "minioadmin"
+    }
+  ],
+  "static_credentials": [
+    {
+      "access_key_id": "AKIAOPEN",
+      "secret_access_key": "open-virtual-secret",
+      "principal_sub": "open-user",
+      "tenant": "acme",
+      "organization_id": "org-acme",
+      "groups": []
+    },
+    {
+      "access_key_id": "AKIAADMIN",
+      "secret_access_key": "admin-virtual-secret",
+      "principal_sub": "admin-user",
+      "tenant": "acme",
+      "organization_id": "org-acme",
+      "groups": []
+    }
+  ],
+  "bundle_path": "/tmp/s0-gas-e2e/bundle.json",
+  "bundle_poll_secs": 2
+}

@@ -1,8 +1,11 @@
 {
-  "_note": "Projected per-Org policy data (§3.4). Reuses today's user_attributes / bucket_attributes / org_settings.freeze_writes; the s3_grants / group_grants superset is the companion projection (§3.3, ADR-006). The gateway rego reads these by name.",
+  "_note": "Projected per-tenant policy data: user_attributes / bucket_attributes / org_settings.freeze_writes, plus the s3_grants / group_grants grant superset the control plane projects. The gateway's rego reads these by name. This object is the 'data'. To push the policy module alongside it, wrap it as { \"policy\": \"<rego source>\", \"data\": { ... } }; a bare object (this file) uses the gateway's compiled-in default policy.",
   "org_settings": { "freeze_writes": false },
   "tenants": {
     "acme": {
+      "_s3_key_epoch_note": "Revocation for long-lived derived per-principal keys (src/auth/derived.rs). `s3_key_epoch` is the lowest epoch such a key may carry and still be honoured; raising it revokes every outstanding key for the tenant at the next bundle poll. `s3_key_epochs` optionally raises the floor for ONE subject (keyed `sa:<client id>` / `user:<sub>`), so one compromised consumer can be cut off without touching the others; it can only ever tighten. ABSENCE OF `s3_key_epoch` DENIES every derived key for this tenant — so publishing it is the opt-in, and losing it fails closed.",
+      "s3_key_epoch": 1,
+      "s3_key_epochs": {},
       "user_attributes": {
         "5f3a...oidc-sub-alice": { "groups": ["analysts"], "attributes": [] },
         "9c21...oidc-sub-bob": { "groups": [], "attributes": [] }

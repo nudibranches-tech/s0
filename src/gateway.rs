@@ -4,13 +4,18 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
+
 use crate::audit::{self, AuditConfig, AuditHandle, AuditSink};
+use crate::auth::derived::DerivedKeyAuthority;
 use crate::auth::sts::StsAuthority;
-use crate::auth::{Identity, StaticCredential, StaticCredentialStore};
+use crate::auth::{DerivedKeys, Identity, StaticCredentialStore};
+use crate::authz::CaptureSink;
 use crate::config::{GatewayConfig, LimitsConfig, PdpConfig};
 use crate::error::{GatewayError, Result};
 use crate::pdp::{
     Bundle, BundleStore, CachingPdp, GATEWAY_REGO, Pdp, RegorusPdp, SidecarPdp, content_revision,
+    parse_bundle,
 };
 use crate::proxy::BackendRegistry;
 
@@ -21,26 +26,53 @@ pub struct Gateway {
     pub pdp: Arc<dyn Pdp>,
     pub audit: AuditSink,
     pub registry: Arc<BackendRegistry>,
-    pub limits: LimitsConfig,
-    /// Kept so a bundle-refresh loop can swap revisions (cache stays coherent, §4.3.2).
+    /// The concrete static credential store, kept alongside the `Arc<dyn
+    /// CredentialStore>` inside `identity` so a config apply can reach it — `Identity::new`
+    /// erases the handle immediately.
+    pub credentials: Arc<StaticCredentialStore>,
+    /// Behind an [`ArcSwap`] so the semantic caps can be re-applied without a restart, and
+    /// `Arc<ArcSwap<_>>` so the *handle* can be shared with layers that must not hold the
+    /// whole `Gateway`. Load it at the point of use: a reader that clones the
+    /// `LimitsConfig` into a long-lived field has silently opted out of the reload.
+    pub limits: Arc<ArcSwap<LimitsConfig>>,
+    /// Kept so a bundle-refresh loop can swap revisions (cache stays coherent).
     pub bundles: Arc<BundleStore>,
+    /// Golden-capture tap. `None` in every deployed binary: [`Gateway::build`] is the only
+    /// production construction path and hard-codes `None`, with no setter and no config
+    /// knob, so only a test that builds a `Gateway` literally can enable it.
+    pub capture: Option<Arc<CaptureSink>>,
 }
 
 impl Gateway {
     /// Build the full gateway from config. Must run inside a tokio runtime (spawns
     /// the audit worker). Returns the shared gateway plus the audit drain handle, which
-    /// the caller must `drain()` on shutdown so buffered records are not lost (§9.2).
+    /// the caller must `drain()` on shutdown so buffered records are not lost.
     pub fn build(cfg: &GatewayConfig) -> Result<(Arc<Gateway>, AuditHandle)> {
         let sts = Arc::new(build_sts(cfg)?);
-        let creds = Arc::new(build_static_store(cfg));
-        let identity = Arc::new(Identity::new(sts, creds));
+        let credentials = Arc::new(StaticCredentialStore::from_config(cfg));
 
+        // Built BEFORE the identity, because derived long-lived keys need both: the
+        // bundle store is where their revocation is read from and the registry is the
+        // tenant→org table their attribution comes from.
         let (bundles, pdp) = build_pdp(cfg)?;
         let registry = Arc::new(BackendRegistry::from_config(cfg)?);
+
+        let identity = Arc::new(build_identity(
+            cfg,
+            sts,
+            credentials.clone(),
+            registry.clone(),
+            bundles.clone(),
+        )?);
 
         let (audit, audit_handle) = audit::spawn(AuditConfig {
             sink_url: cfg.audit.sink_url.clone(),
             spill_path: cfg.audit.spill_path.clone(),
+            backend: cfg.audit.backend,
+            labels: crate::audit::LabelPolicy::new(
+                cfg.audit.organization_label_key.clone(),
+                cfg.audit.extra_labels.clone(),
+            ),
             ..AuditConfig::default()
         });
 
@@ -49,52 +81,127 @@ impl Gateway {
             pdp,
             audit,
             registry,
-            limits: cfg.limits.clone(),
+            credentials,
+            limits: Arc::new(ArcSwap::from_pointee(cfg.limits.clone())),
             bundles,
+            // Never enabled from config: a capture sink retains principal identifiers
+            // and object keys in memory, and nothing an operator can set should be able
+            // to turn that on.
+            capture: None,
         });
         Ok((gateway, audit_handle))
     }
+
+    /// The hardening limits in force right now.
+    pub fn limits(&self) -> arc_swap::Guard<Arc<LimitsConfig>> {
+        self.limits.load()
+    }
+
+    /// Re-apply a rendered config to the running gateway. There is deliberately no producer
+    /// for this in-tree; it exists so the swap *is possible* and so the state it swaps is
+    /// provably reachable rather than erased into a trait object at construction.
+    ///
+    /// Reloaded: the backend routing table (and with it every tenant→org binding and owner
+    /// credential), the static credential list, and the semantic caps. Everything consumed
+    /// once at assembly needs a restart instead — listen addresses, s3s protocol limits,
+    /// the STS and derived-key rings, the PDP mode, the audit backend.
+    ///
+    /// Ordering: each half is built before anything is stored, so an unusable config leaves
+    /// the running one intact. The stores are then swapped in sequence, so a request can
+    /// observe new routes with old limits — harmless, since limits are resource bounds and
+    /// no decision reads both. A single request's view of its own route must not tear, and
+    /// that is guaranteed one level up by the `RouteSnapshot` in `req.extensions`.
+    pub fn apply_config(&self, cfg: &GatewayConfig) -> Result<()> {
+        let credentials = crate::auth::credentials_from_config(cfg);
+        self.registry.apply_config(cfg)?;
+        self.credentials.replace(credentials);
+        self.limits.store(Arc::new(cfg.limits.clone()));
+        tracing::info!(
+            tenants = cfg.tenants.len(),
+            static_credentials = cfg.static_credentials.len(),
+            "gateway configuration re-applied"
+        );
+        Ok(())
+    }
+}
+
+/// Assemble the credential authority: STS, the static store, and — when the deployment
+/// configured a ring — derived long-lived per-principal keys.
+///
+/// The derived half is wired to the **live** bundle store and routing table, not to
+/// snapshots: revocation has to follow the bundle the PDP is deciding against, and a
+/// tenant re-bound to another organization has to re-attribute on the next request.
+/// Snapshots would produce a credential class that could not be revoked without a restart.
+fn build_identity(
+    cfg: &GatewayConfig,
+    sts: Arc<StsAuthority>,
+    credentials: Arc<StaticCredentialStore>,
+    registry: Arc<BackendRegistry>,
+    bundles: Arc<BundleStore>,
+) -> Result<Identity> {
+    let identity = Identity::new(sts, credentials);
+    let Some(derived_cfg) = &cfg.derived_keys else {
+        // Not an error and not a warning: the feature is off, and `HFSA*` stays reserved
+        // and unanswered either way (`Identity::secret_key`).
+        return Ok(identity);
+    };
+    // The ring's shape is settled by `GatewayConfig::validate`; what is left here is hex.
+    let (ring, current_kid) = derived_cfg.key_ring();
+    let mut master_keys = std::collections::BTreeMap::new();
+    for (kid, hex_key) in &ring {
+        let key = hex::decode(hex_key.expose())
+            .map_err(|e| GatewayError::Config(format!("derived_keys master key {kid}: {e}")))?;
+        master_keys.insert(kid.clone(), key);
+    }
+    let authority = Arc::new(DerivedKeyAuthority::with_key_ring(
+        master_keys,
+        &current_kid,
+    )?);
+    tracing::info!(
+        current_kid = %authority.current_kid(),
+        key_ids = ?authority.key_ids(),
+        "derived long-lived key ring loaded; revocation reads \
+         tenants.<tenant>.s3_key_epoch from the bundle and its ABSENCE denies"
+    );
+    Ok(identity.with_derived_keys(Arc::new(DerivedKeys::new(authority, registry, bundles))))
 }
 
 fn build_sts(cfg: &GatewayConfig) -> Result<StsAuthority> {
-    let master = hex::decode(&cfg.sts.master_key_hex)
-        .map_err(|e| GatewayError::Config(format!("sts master_key_hex: {e}")))?;
-    let signing = hex::decode(&cfg.sts.signing_key_hex)
-        .map_err(|e| GatewayError::Config(format!("sts signing_key_hex: {e}")))?;
-    StsAuthority::new(master, signing)
-}
-
-fn build_static_store(cfg: &GatewayConfig) -> StaticCredentialStore {
-    let mut store = StaticCredentialStore::new();
-    for c in &cfg.static_credentials {
-        store.insert(
-            c.access_key_id.clone(),
-            StaticCredential {
-                secret_access_key: c.secret_access_key.clone(),
-                principal_sub: c.principal_sub.clone(),
-                tenant: c.tenant.clone(),
-                organization_id: c.organization_id.clone(),
-                groups: c.groups.clone(),
-            },
-        );
+    // The ring's shape (exactly one of the two forms, `current_kid` present and
+    // resolvable) is settled by `GatewayConfig::validate`; what is left here is hex.
+    let (ring, current_kid) = cfg.sts.key_ring();
+    let mut master_keys = std::collections::BTreeMap::new();
+    for (kid, hex_key) in &ring {
+        let key = hex::decode(hex_key.expose())
+            .map_err(|e| GatewayError::Config(format!("sts master key {kid}: {e}")))?;
+        master_keys.insert(kid.clone(), key);
     }
-    store
+    let signing = hex::decode(cfg.sts.signing_key_hex.expose())
+        .map_err(|e| GatewayError::Config(format!("sts signing_key_hex: {e}")))?;
+    let authority = StsAuthority::with_key_ring(master_keys, &current_kid, signing)?;
+    tracing::info!(
+        current_kid = %authority.current_kid(),
+        key_ids = ?authority.key_ids(),
+        "sts key ring loaded"
+    );
+    Ok(authority)
 }
 
 fn build_pdp(cfg: &GatewayConfig) -> Result<(Arc<BundleStore>, Arc<dyn Pdp>)> {
     let raw = std::fs::read_to_string(&cfg.bundle_path)
         .map_err(|e| GatewayError::Bundle(format!("read {:?}: {e}", cfg.bundle_path)))?;
-    let data: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| GatewayError::Bundle(format!("parse bundle: {e}")))?;
+    let parsed = parse_bundle(&raw).map_err(GatewayError::Bundle)?;
     let revision = content_revision(&raw);
-    let bundles = Arc::new(BundleStore::new(Bundle::new(revision, data.clone())));
+    let bundles = Arc::new(BundleStore::new(Bundle::new(revision, parsed.data.clone())));
 
     let pdp: Arc<dyn Pdp> = match &cfg.pdp {
         PdpConfig::Embedded { cache_capacity } => {
-            // Cache is sound for the embedded engine: the gateway reloads the engine
-            // and bumps the revision atomically, so a stale entry misses by
-            // construction (§4.3.2).
-            let engine: Arc<dyn Pdp> = Arc::new(RegorusPdp::new(GATEWAY_REGO, &data)?);
+            // Cache is sound for the embedded engine: the gateway reloads the engine and
+            // bumps the revision atomically, so a stale entry misses by construction.
+            // The pushed module is authoritative; the compiled-in default is the fallback
+            // when the bundle carries data only.
+            let policy = parsed.policy.as_deref().unwrap_or(GATEWAY_REGO);
+            let engine: Arc<dyn Pdp> = Arc::new(RegorusPdp::new(policy, &parsed.data)?);
             Arc::new(CachingPdp::new(engine, bundles.clone(), *cache_capacity))
         }
         PdpConfig::Sidecar {
@@ -102,12 +209,10 @@ fn build_pdp(cfg: &GatewayConfig) -> Result<(Arc<BundleStore>, Arc<dyn Pdp>)> {
             timeout_ms,
             ..
         } => {
-            // NO decision cache for the sidecar: OPA polls its own bundle
-            // independently, so the gateway's BundleStore revision is not bound to the
-            // data OPA actually evaluates. A revision-keyed cache would serve stale
-            // allows across the skew window (a live-revocation bypass, §6.1). Every
-            // request hits OPA, which holds the current bundle. Caching returns once
-            // the gateway is authoritative for OPA's revision (ADR-005 follow-up).
+            // NO decision cache for the sidecar: OPA polls its own bundle independently,
+            // so the gateway's BundleStore revision is not bound to the data OPA
+            // evaluates. A revision-keyed cache would serve stale allows across the skew
+            // window — a live-revocation bypass (ADR-005).
             Arc::new(SidecarPdp::new(
                 base_url,
                 Duration::from_millis(*timeout_ms),
@@ -115,4 +220,201 @@ fn build_pdp(cfg: &GatewayConfig) -> Result<(Arc<BundleStore>, Arc<dyn Pdp>)> {
         }
     };
     Ok((bundles, pdp))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::{CredentialStore, StaticCredential, StaticCredentials};
+
+    fn cfg_with(static_credentials: serde_json::Value, max_delete_keys: u64) -> GatewayConfig {
+        GatewayConfig::from_json(
+            &serde_json::json!({
+                "listen": "127.0.0.1:0",
+                "sts": { "master_key_hex": "00".repeat(32), "signing_key_hex": "11".repeat(32) },
+                "pdp": { "mode": "embedded" },
+                "audit": { "sink_url": "http://127.0.0.1:59999/none",
+                           "spill_path": std::env::temp_dir()
+                               .join(format!("s0-gwcfg-{}.ndjson", uuid::Uuid::new_v4())) },
+                "limits": {
+                    "xml_max_body_size": 20971520,
+                    "presigned_url_max_skew_time_secs": 900,
+                    "max_delete_keys": max_delete_keys,
+                    "max_list_fanout": 16,
+                    "max_connections": 1024,
+                    "header_read_timeout_secs": 15
+                },
+                "backends": [
+                    { "id": "bay-1", "kind": "ceph", "endpoint_url": "http://127.0.0.1:7480" },
+                    { "id": "bay-2", "kind": "remote_s3", "endpoint_url": "http://127.0.0.1:7481" }
+                ],
+                "tenants": [
+                    { "tenant": "acme", "organization_id": "org-acme", "backend_id": "bay-1",
+                      "owner_access_key": "OWNER", "owner_secret_key": "OWNERSECRET" }
+                ],
+                "static_credentials": static_credentials,
+                "bundle_path": "/dev/null"
+            })
+            .to_string(),
+        )
+        .expect("config")
+    }
+
+    fn cred(key: &str, sub: &str, secret: &str) -> serde_json::Value {
+        serde_json::json!({
+            "access_key_id": key, "secret_access_key": secret,
+            "principal_sub": sub, "tenant": "acme", "organization_id": "org-acme"
+        })
+    }
+
+    /// A gateway assembled the way `build` does. Returns the audit handle so the
+    /// worker outlives the test rather than every `emit` logging an error.
+    fn gateway(cfg: &GatewayConfig) -> (Gateway, AuditHandle) {
+        let credentials = Arc::new(StaticCredentialStore::from_config(cfg));
+        let (audit, handle) = audit::spawn(AuditConfig {
+            sink_url: cfg.audit.sink_url.clone(),
+            spill_path: cfg.audit.spill_path.clone(),
+            ..AuditConfig::default()
+        });
+        let registry = Arc::new(BackendRegistry::from_config(cfg).expect("registry"));
+        let bundles = Arc::new(BundleStore::new(Bundle::new(
+            "rev-1",
+            serde_json::json!({}),
+        )));
+        let gw = Gateway {
+            // Through the real assembly function, so a test that configures
+            // `derived_keys` exercises the same wiring `build` does.
+            identity: Arc::new(
+                build_identity(
+                    cfg,
+                    Arc::new(build_sts(cfg).expect("sts")),
+                    credentials.clone(),
+                    registry.clone(),
+                    bundles.clone(),
+                )
+                .expect("identity"),
+            ),
+            pdp: Arc::new(RegorusPdp::new(GATEWAY_REGO, &serde_json::json!({})).expect("regorus")),
+            audit,
+            registry,
+            credentials,
+            limits: Arc::new(ArcSwap::from_pointee(cfg.limits.clone())),
+            bundles,
+            capture: None,
+        };
+        (gw, handle)
+    }
+
+    /// `Identity::new` erases the store into `Arc<dyn CredentialStore>` at construction.
+    /// If the swap lived *around* the store, replacing it would leave `Identity` reading
+    /// the original forever while a test checking the concrete handle still passed. So
+    /// this asserts through `Identity::resolve`, the path a real request takes.
+    #[tokio::test]
+    async fn a_credential_swap_reaches_the_handle_identity_erased_at_construction() {
+        let (gw, _audit) = gateway(&cfg_with(
+            serde_json::json!([cred("AKIAOLD", "alice", "old-secret")]),
+            1000,
+        ));
+        assert_eq!(gw.identity.resolve("AKIAOLD", None).unwrap().sub, "alice");
+
+        gw.apply_config(&cfg_with(
+            serde_json::json!([cred("AKIANEW", "bob", "new-secret")]),
+            1000,
+        ))
+        .expect("apply");
+
+        // The revocation direction: a credential removed from the config stops
+        // resolving, through the same erased handle.
+        assert!(
+            gw.identity.resolve("AKIAOLD", None).is_err(),
+            "a credential removed from the config still resolves"
+        );
+        assert_eq!(gw.identity.resolve("AKIANEW", None).unwrap().sub, "bob");
+    }
+
+    #[tokio::test]
+    async fn a_secret_rotation_reaches_the_sigv4_path() {
+        // `secret_key` is what s3s asks for to verify a signature, and it is a
+        // different method from `resolve` — a swap that reached one and not the other
+        // would authenticate with the old secret and attribute with the new principal.
+        let (gw, _audit) = gateway(&cfg_with(
+            serde_json::json!([cred("AKIASAME", "alice", "old-secret")]),
+            1000,
+        ));
+        let store: &dyn CredentialStore = gw.credentials.as_ref();
+        assert_eq!(store.secret("AKIASAME").as_deref(), Some("old-secret"));
+
+        gw.apply_config(&cfg_with(
+            serde_json::json!([cred("AKIASAME", "alice", "rotated")]),
+            1000,
+        ))
+        .expect("apply");
+        assert_eq!(store.secret("AKIASAME").as_deref(), Some("rotated"));
+    }
+
+    #[tokio::test]
+    async fn applying_a_config_moves_the_semantic_caps() {
+        let (gw, _audit) = gateway(&cfg_with(serde_json::json!([]), 1000));
+        assert_eq!(gw.limits().max_delete_keys, 1000);
+        gw.apply_config(&cfg_with(serde_json::json!([]), 50))
+            .expect("apply");
+        assert_eq!(gw.limits().max_delete_keys, 50);
+    }
+
+    #[tokio::test]
+    async fn the_sts_key_ring_is_deliberately_not_hot_reloaded() {
+        // A decision, not an oversight: the mint holds a SECOND `Arc<StsAuthority>` clone
+        // (`Identity::sts()`, captured into a detached task), so swapping the authority
+        // behind `Identity` would leave the mint issuing under the old ring. Rotation is
+        // a config edit plus a restart, which the key ring's `kid` makes survivable.
+        // Making it live requires the swap to live INSIDE `StsAuthority`.
+        let (gw, _audit) = gateway(&cfg_with(serde_json::json!([]), 1000));
+        let held_by_the_mint = gw.identity.sts();
+        gw.apply_config(&cfg_with(serde_json::json!([]), 1000))
+            .expect("apply");
+        assert!(
+            Arc::ptr_eq(&held_by_the_mint, &gw.identity.sts()),
+            "the STS authority was swapped; the mint's detached clone would not see it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_config_that_does_not_apply_changes_nothing() {
+        let (gw, _audit) = gateway(&cfg_with(
+            serde_json::json!([cred("AKIAOLD", "alice", "old-secret")]),
+            1000,
+        ));
+        let mut broken = cfg_with(serde_json::json!([cred("AKIANEW", "bob", "s")]), 7);
+        broken.tenants[0].backend_id = "nope".into();
+
+        assert!(gw.apply_config(&broken).is_err());
+        // Every half stays as it was — including the two that are swapped *after* the
+        // routing table, which is what makes "build before store" load-bearing rather
+        // than incidental.
+        assert_eq!(gw.limits().max_delete_keys, 1000);
+        assert!(gw.identity.resolve("AKIANEW", None).is_err());
+        assert_eq!(gw.identity.resolve("AKIAOLD", None).unwrap().sub, "alice");
+        assert!(gw.registry.route_snapshot("acme").is_some());
+    }
+
+    #[test]
+    fn the_credential_store_swaps_wholesale_not_by_merge() {
+        // `replace` is not `extend`: an operator who deletes a credential from the
+        // ConfigMap has revoked it, and a merge would keep it alive forever.
+        let store = StaticCredentialStore::new();
+        store.insert(
+            "AKIA1",
+            StaticCredential {
+                secret_access_key: "s1".into(),
+                principal_sub: "alice".into(),
+                tenant: "acme".into(),
+                organization_id: "org-acme".into(),
+                groups: vec![],
+            },
+        );
+        assert_eq!(store.len(), 1);
+        store.replace(StaticCredentials::new());
+        assert!(store.is_empty());
+        assert_eq!(store.secret("AKIA1"), None);
+    }
 }

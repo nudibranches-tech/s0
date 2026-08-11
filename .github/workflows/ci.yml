@@ -1,9 +1,18 @@
 name: ci
 
 on:
+  # `main` only on push: a topic branch is covered by its pull request, and listing both
+  # would run this suite twice on every PR.
   push:
-    branches: ["main", "master", "feat/**", "fix/**"]
+    branches: ["main"]
   pull_request:
+  # Callable, so `release.yml` gates a tag on THIS definition of "s0 passes" rather than a
+  # copy of it — a tag can point at any commit, which the triggers above do not cover.
+  workflow_call:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -30,19 +39,26 @@ jobs:
       - name: build
         run: cargo build --all-targets
 
-      # Dual-engine parity gate (§4.3.1): the embedded regorus fast path may only
-      # serve traffic if it agrees with OPA over the golden decision corpus. The
-      # tests/parity.rs harness skips when `opa` is absent, so installing it here is
-      # what makes the gate enforce.
+      # Dual-engine parity gate: the embedded regorus fast path may only serve traffic
+      # if it agrees with OPA over the golden decision corpus.
+      #
+      # The version must equal `EXPECTED_OPA_VERSION` in tests/parity.rs — the OPA major
+      # version selects the rego dialect (>=1.0 parses v1, 0.x parses v0), so an oracle on
+      # the wrong side of that line answers different questions than the deployed engine.
+      #
+      # `S0_ALLOW_NO_OPA` is deliberately NOT set anywhere in this workflow: if the install
+      # below fails, the parity test panics instead of reporting a gate it never ran.
       - name: install OPA (parity gate)
         uses: open-policy-agent/setup-opa@v2
         with:
-          version: "0.70.0"
+          version: "1.13.1"
 
-      - name: test (unit + e2e + corpus + parity)
+      # Fail here, with an obvious message, rather than 200 lines later inside cargo.
+      - name: verify the parity oracle
+        run: opa version
+
+      - name: test (unit + typed-hook e2e + golden corpus + dual-engine parity)
         run: cargo test --all-targets
 
-  # S3 protocol conformance (Ceph s3-tests / MinIO Mint) per supported backend
-  # vendor (§9.4). Scaffolded in .github/workflows/conformance.yml (manual trigger)
-  # because it needs a live backend service; wire into CI once a Ceph/MinIO service
-  # container is standardized.
+  # S3 protocol conformance against a live backend is scaffolded in conformance.yml
+  # (manual trigger, harness not yet wired). Fold it in here once it is.

@@ -1,10 +1,10 @@
-//! Embedded regorus PDP — the in-process fast path (§4.3.1): µs-scale, no hop, no
-//! serialization to a sidecar. Permitted in production only behind the dual-engine
-//! parity gate (§4.3.1); until then it is the engine the tests run against.
+//! Embedded regorus PDP — the in-process fast path: no hop, no serialization to a
+//! sidecar.
 //!
-//! Hot path uses [`regorus::CompiledPolicy`]: compiled once per (policy, bundle
-//! revision) and evaluated with `&self` — no lock, no per-request engine clone. On a
-//! new bundle we rebuild the compiled policy and swap it atomically.
+//! The policy is whatever the control plane pushed in the bundle, falling back to the
+//! compiled-in default. A new bundle rebuilds the compiled policy from the current
+//! module + data and swaps it atomically: a pushed module replaces the policy in use, a
+//! data-only bundle keeps it.
 
 use std::sync::Arc;
 
@@ -18,37 +18,39 @@ use crate::authz::{Decision, OpaInput};
 use crate::error::{GatewayError, Result};
 
 pub struct RegorusPdp {
-    /// Policy-loaded, data-less template. Cloned (cheap, Arc-backed) to rebuild the
-    /// compiled policy when the bundle changes.
-    base: Engine,
     entrypoint: Arc<str>,
+    /// The policy module currently loaded — the pushed module, or the compiled-in
+    /// default. Kept so a data-only reload can recompile without losing the policy.
+    policy: ArcSwap<String>,
     compiled: ArcSwap<CompiledPolicy>,
 }
 
 impl RegorusPdp {
-    pub fn new(policy: &str, initial_bundle: &serde_json::Value) -> Result<Self> {
-        let mut base = Engine::new();
-        // OPA parity: builtins yield `undefined` on error rather than raising, matching
-        // the sidecar engine so the parity gate can compare byte-for-byte (§4.3.1).
-        base.set_strict_builtin_errors(false);
-        base.add_policy("gateway/authz.rego".to_string(), policy.to_string())
-            .map_err(|e| GatewayError::Pdp(format!("add_policy: {e}")))?;
+    /// `policy` is the initial rego module — the compiled-in default, or a module read
+    /// from the boot bundle. A later [`reload`](RegorusPdp::reload) may replace it.
+    pub fn new(policy: &str, initial_data: &serde_json::Value) -> Result<Self> {
         let entrypoint: Arc<str> = Arc::from(DECISION_RULE);
-        let compiled = Self::compile(&base, &entrypoint, initial_bundle)?;
+        let compiled = Self::compile(policy, initial_data, &entrypoint)?;
         Ok(RegorusPdp {
-            base,
             entrypoint,
+            policy: ArcSwap::from_pointee(policy.to_string()),
             compiled: ArcSwap::from_pointee(compiled),
         })
     }
 
     fn compile(
-        base: &Engine,
+        policy: &str,
+        data: &serde_json::Value,
         entrypoint: &Arc<str>,
-        bundle: &serde_json::Value,
     ) -> Result<CompiledPolicy> {
-        let mut engine = base.clone();
-        let data = Value::from_json_str(&bundle.to_string())
+        let mut engine = Engine::new();
+        // OPA parity: builtins yield `undefined` on error rather than raising, which is
+        // what a sidecar OPA does.
+        engine.set_strict_builtin_errors(false);
+        engine
+            .add_policy("gateway/authz.rego".to_string(), policy.to_string())
+            .map_err(|e| GatewayError::Pdp(format!("add_policy: {e}")))?;
+        let data = Value::from_json_str(&data.to_string())
             .map_err(|e| GatewayError::Bundle(format!("bundle to value: {e}")))?;
         engine
             .add_data(data)
@@ -69,7 +71,7 @@ impl Pdp for RegorusPdp {
         let decision_value = compiled
             .eval_with_input(input_value)
             .map_err(|e| GatewayError::Pdp(format!("eval: {e}")))?;
-        // Undefined rule ⇒ deny (fail closed, §6.2).
+        // Undefined rule ⇒ deny (fail closed).
         if matches!(decision_value, Value::Undefined) {
             return Ok(Decision::deny("regorus: undefined decision"));
         }
@@ -79,10 +81,82 @@ impl Pdp for RegorusPdp {
         Ok(serde_json::from_str(&decision_json)?)
     }
 
-    /// Rebuild + atomically swap the compiled policy for a new bundle revision.
-    async fn reload(&self, bundle: &serde_json::Value) -> Result<()> {
-        let compiled = Self::compile(&self.base, &self.entrypoint, bundle)?;
+    /// Rebuild + atomically swap the compiled policy for a new bundle revision. A pushed
+    /// `policy` replaces the module in use; `None` keeps the current one (a data-only
+    /// change).
+    async fn reload(&self, policy: Option<&str>, data: &serde_json::Value) -> Result<()> {
+        let current = self.policy.load();
+        let effective = policy.unwrap_or(current.as_str());
+        let compiled = Self::compile(effective, data, &self.entrypoint)?;
+        if let Some(pushed) = policy {
+            self.policy.store(Arc::new(pushed.to_string()));
+        }
         self.compiled.store(Arc::new(compiled));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::authz::{Backend, Principal, PrincipalAttributes, RequestMeta};
+    use crate::model::{Action, BackendKind, PrincipalType};
+
+    fn data() -> serde_json::Value {
+        serde_json::json!({
+            "org_settings": { "freeze_writes": false },
+            "tenants": { "acme": {
+                "user_attributes": { "alice": { "groups": [], "attributes": [] } },
+                "bucket_attributes": {},
+                "s3_grants": { "alice": [
+                    { "bucket": "b", "actions": ["read_objects"], "prefixes": [""] }
+                ] },
+                "group_grants": {}
+            }}
+        })
+    }
+
+    fn read_bx() -> OpaInput {
+        OpaInput {
+            principal: Principal {
+                sub: "alice".into(),
+                kind: PrincipalType::User,
+                attributes: PrincipalAttributes::default(),
+            },
+            backend: Backend {
+                id: "b1".into(),
+                kind: BackendKind::RemoteS3,
+            },
+            tenant: "acme".into(),
+            organization_id: "org-acme".into(),
+            action: Action::ReadObjects,
+            bucket: "b".into(),
+            object: Some("x".into()),
+            prefix: None,
+            copy_source: None,
+            delete_keys: None,
+            object_tags: None,
+            requested_tags: None,
+            acl_grants: vec![],
+            bypass_governance: false,
+            request: RequestMeta::default(),
+        }
+    }
+
+    const DENY_ALL: &str = "package s3.authz\n\ndecision := {\"allow\": false, \"reason\": \"test deny-all\", \"obligations\": {}}\n";
+
+    #[tokio::test]
+    async fn pushed_policy_overrides_default_and_survives_data_reload() {
+        // The compiled-in default grants alice read on b/x.
+        let pdp = RegorusPdp::new(crate::pdp::GATEWAY_REGO, &data()).unwrap();
+        assert!(pdp.decide(&read_bx()).await.unwrap().allow);
+
+        // A pushed deny-all module replaces the default: the same input now denies.
+        pdp.reload(Some(DENY_ALL), &data()).await.unwrap();
+        assert!(!pdp.decide(&read_bx()).await.unwrap().allow);
+
+        // A data-only reload (policy = None) keeps the pushed module in force.
+        pdp.reload(None, &data()).await.unwrap();
+        assert!(!pdp.decide(&read_bx()).await.unwrap().allow);
     }
 }
