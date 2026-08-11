@@ -119,7 +119,7 @@ jobs:
           sha256sum "${staging}.tar.gz" > "${staging}.tar.gz.sha256"
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.BINARY }}-${{ matrix.target }}
           path: |
@@ -218,7 +218,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload digest artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.BINARY }}-image-digest
           path: ${{ env.BINARY }}-*.image-digest.txt
