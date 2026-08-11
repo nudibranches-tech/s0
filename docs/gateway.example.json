@@ -9,7 +9,13 @@
     "signing_key_hex": "REPLACE_ME_openssl_rand_hex_32_1111111111111111111111111111",
     "session_ttl_secs": 3600
   },
-  "_derived_keys_note": "OPTIONAL and OFF here on purpose. Add a `derived_keys` section (same two forms as `sts`: `master_key_hex`, or `master_keys` + `current_kid`) to accept long-lived per-principal S3 keys (`HFSA<kid>.<payload>.<mac>` — see src/auth/derived.rs). It must NOT share key material with `sts`, and the gateway refuses to load if it does. Switching it on is only half the opt-in: the policy bundle must also publish `tenants.<tenant>.s3_key_epoch`, because the ABSENCE of that number denies every derived key for that tenant. Whether the section is present or not, the `HFSA*` namespace is reserved and a static_credentials entry inside it is refused at load.",
+  "_derived_keys_note": "Long-lived per-principal S3 keys (`HFSA<kid>.<payload>.<mac>` \u2014 see src/auth/derived.rs). Same two forms as `sts`: `master_key_hex`, or `master_keys` + `current_kid`. It must NOT share key material with `sts`, and the gateway refuses to load if it does. Present here because the section switching the FEATURE on is only half the opt-in: the policy bundle must also publish `tenants.<tenant>.s3_key_epoch`, whose ABSENCE denies every derived key for that tenant. Omit the whole section to answer the HFSA namespace with nothing \u2014 it stays reserved either way, so a static_credentials entry inside it is refused at load.",
+  "derived_keys": {
+    "master_keys": {
+      "k0": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    "current_kid": "k0"
+  },
   "pdp": {
     "mode": "embedded",
     "cache_capacity": 100000
@@ -73,7 +79,11 @@
     "jwks_timeout_secs": 5,
     "jwks_refresh_secs": 300,
     "web_identity_enabled": true,
-    "web_identity_audiences": ["acme-storage", "hf-console", "control-plane-sa"],
+    "web_identity_audiences": [
+      "acme-storage",
+      "hf-console",
+      "control-plane-sa"
+    ],
     "role_name_template": "{tenant}-sts-role",
     "max_duration_secs": 3600,
     "max_connections": 256,

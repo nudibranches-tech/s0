@@ -1413,9 +1413,23 @@ mod tests {
 
     #[test]
     fn the_derived_key_ring_shape_is_settled_at_load_and_shares_no_key_with_sts() {
-        // Absent is the default and is not an error: the feature is simply off.
+        // The shipped example now DECLARES the section, because the platform's
+        // operator renders it for every gateway and the example is the schema
+        // that cross-repo check reads. So it must load, and it must load as a
+        // ring.
+        let shipped = GatewayConfig::from_json(&example().to_string()).unwrap();
+        let derived = shipped
+            .derived_keys
+            .as_ref()
+            .expect("the shipped example declares derived_keys");
+        assert_eq!(derived.key_ring().1, "k0");
+
+        // And absent is still not an error: the feature is simply off, which is
+        // what a deployment that has not opted in looks like.
+        let mut without = example();
+        without.as_object_mut().unwrap().remove("derived_keys");
         assert!(
-            GatewayConfig::from_json(&example().to_string())
+            GatewayConfig::from_json(&without.to_string())
                 .unwrap()
                 .derived_keys
                 .is_none()
