@@ -1,35 +1,13 @@
-//! Golden capture — the mechanism that makes a policy fixture a *record* of what the
-//! gateway emits rather than a guess at it.
+//! Golden capture — what makes a policy fixture a *record* of what the gateway emits
+//! rather than a guess at it. A fixture written by hand can carry fields no producer
+//! sends, leaving the policy correct about a request that does not exist.
 //!
-//! The failure this exists to prevent is on record: 35 rego tests were green while
-//! production was deny-all, because every fixture injected an `input.op` field the real
-//! producer never sent. Hand-written fixtures test the policy against a shape nobody
-//! produces; the policy is then correct about a request that does not exist.
-//!
-//! So the corpus is *captured*, at the one point every PDP question passes through —
-//! [`crate::access::GatewayAccess::decide`], the sole caller of `Pdp::decide` on the
-//! request path. One tap there sees 100% of emitted inputs, including both halves of a
-//! copy and every key of a multi-delete, which per-hook instrumentation would miss.
-//!
-//! Two properties make the capture trustworthy:
-//!
-//! 1. **It is the emitted document, never a reconstruction.** [`CaptureSink::record`]
-//!    serializes the same `&OpaInput` value the engine is about to receive.
-//! 2. **It round-trips.** [`round_trip`] re-parses the captured JSON into an `OpaInput`
-//!    and re-serializes it; anything that does not come back byte-for-byte is a field
-//!    the type system and the wire disagree about. Combined with
-//!    `#[serde(deny_unknown_fields)]` this is what catches a renamed or dropped field —
-//!    and it is checked *at record time*, so a harness cannot produce a fixture that
-//!    silently fails the gate.
-//!
-//! ## Why there is no global switch
-//!
-//! A capture sink retains principal identifiers and object keys in memory. It is
-//! therefore reachable only through [`crate::gateway::Gateway::capture`], which
-//! `Gateway::build` — the one production construction path — always sets to `None`.
-//! There is no setter, no environment variable and no feature flag, so enabling capture
-//! in a deployed binary is not a configuration mistake anyone can make: it requires
-//! constructing a `Gateway` literally, which only tests do.
+//! The tap sits at [`crate::access::GatewayAccess::decide`], the sole caller of
+//! `Pdp::decide` on the request path, so it sees both halves of a copy and every key of
+//! a multi-delete. It records the emitted `&OpaInput`, and [`round_trip`] re-checks it
+//! at record time so a renamed or dropped field cannot reach a fixture. A sink retains
+//! principal identifiers and object keys, so it is reachable only through
+//! [`crate::gateway::Gateway::capture`], which `Gateway::build` always sets to `None`.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -45,9 +23,9 @@ pub struct CapturedInput {
     /// re-capturing the same wire shape yields the same id and a corpus reference does
     /// not churn on every run.
     pub id: String,
-    /// The s3s operation name the request resolved to. Not (yet) a field of `OpaInput`
-    /// — `S2-opa-input` moves it inside — so it is captured alongside, because
-    /// "which op emitted this?" is the first question a corpus reader has.
+    /// The s3s operation name the request resolved to. Not a field of `OpaInput`, so it
+    /// is captured alongside: "which op emitted this?" is the first question a corpus
+    /// reader has.
     pub operation: String,
     /// The emitted document. Never rebuilt from parts.
     pub raw: Value,
@@ -58,11 +36,10 @@ pub struct CapturedInput {
 
 /// The round-trip gate: `to_value(from_value::<OpaInput>(raw)?) == raw`.
 ///
-/// This is the only check that catches a field the producer emits and the type no
-/// longer has (or vice versa). It works because [`OpaInput`] and its nested structs
-/// carry `#[serde(deny_unknown_fields)]`; without that, an extra key parses, disappears
-/// on the way back out, and the comparison below would be comparing the document to
-/// itself minus the interesting part.
+/// Catches a field the producer emits and the type no longer has, or vice versa. It only
+/// works because [`OpaInput`] and its nested structs carry
+/// `#[serde(deny_unknown_fields)]` — otherwise an extra key parses, vanishes on the way
+/// back out, and the comparison holds.
 pub fn round_trip(raw: &Value) -> Result<(), String> {
     let typed: OpaInput = serde_json::from_value(raw.clone())
         .map_err(|e| format!("captured input does not parse back into OpaInput: {e}"))?;
@@ -76,11 +53,8 @@ pub fn round_trip(raw: &Value) -> Result<(), String> {
     ))
 }
 
-/// Collects captured inputs for the duration of a test run.
-///
-/// Bounded on purpose: the sink is unreachable from a deployed binary (see the module
-/// docs), but a bound costs nothing and means a runaway harness drops records loudly
-/// instead of growing without limit.
+/// Collects captured inputs for the duration of a test run. Bounded so a runaway
+/// harness drops records loudly instead of growing without limit.
 #[derive(Debug)]
 pub struct CaptureSink {
     records: Mutex<Vec<CapturedInput>>,
@@ -103,8 +77,8 @@ impl CaptureSink {
     /// Record the document about to be handed to the PDP.
     ///
     /// `pub(crate)` so the only producer is the tap in `GatewayAccess::decide`: a test
-    /// that could push a hand-made document into the sink would reintroduce the exact
-    /// class of fixture this module exists to abolish.
+    /// able to push a hand-made document into the sink would reintroduce the class of
+    /// fixture this module exists to abolish.
     pub(crate) fn record(&self, operation: &str, input: &OpaInput) {
         let raw = match serde_json::to_value(input) {
             Ok(v) => v,
@@ -216,8 +190,7 @@ mod tests {
 
     #[test]
     fn an_injected_field_fails_the_round_trip() {
-        // `input.op` — the literal field the failed attempt's fixtures injected and no
-        // producer ever sent. This assertion is the whole point of the gate.
+        // A field no producer ever sends: exactly what the gate exists to catch.
         let mut raw = serde_json::to_value(input()).unwrap();
         raw.as_object_mut()
             .unwrap()

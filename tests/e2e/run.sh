@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
-# Real-stack end-to-end: real S3 clients (aws-cli) -> s0-gas gateway -> MinIO
-# backend, with the embedded OPA (regorus) engine and a pushed policy bundle.
-# Proves the security properties against a real S3 stack, not mocks — most
-# importantly that a server-side copy whose SOURCE is denied is blocked (the
-# Ceph RGW-OPA copy gap), enforced through an off-the-shelf client.
+# Real-stack end-to-end: real S3 clients (aws-cli) -> s0-gas gateway -> MinIO backend,
+# with a pushed policy bundle. Proves the security properties against a real S3 stack
+# rather than mocks — most importantly that a server-side copy whose SOURCE is denied is
+# blocked, enforced through an off-the-shelf client.
 #
-# Uses `docker --network host` throughout so it works even where the Docker NAT
-# chain for published ports is unavailable, and identically in CI.
+#   PDP_MODE=embedded  (default) the in-process regorus engine
+#   PDP_MODE=sidecar             a real OPA container on loopback — the shipping default
 #
-# Env overrides: GW_ENDPOINT, MINIO_ENDPOINT, MINIO_IMAGE, AWSCLI_IMAGE,
-# GW_BIN (prebuilt binary; else cargo build).
+# Both modes run the identical scenario list, so an engine divergence shows up here as
+# well as in the parity gate.
+#
+# Uses `docker --network host` throughout so it works even where the Docker NAT chain for
+# published ports is unavailable, and identically in CI.
+#
+# Env overrides: PDP_MODE, GW_ENDPOINT, MINIO_ENDPOINT, MINIO_IMAGE, OPA_IMAGE,
+# AWSCLI_IMAGE, GW_BIN (prebuilt binary; else cargo build).
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -19,9 +24,16 @@ STATE="/tmp/s0-gas-e2e"
 GW_ENDPOINT="${GW_ENDPOINT:-http://127.0.0.1:8014}"
 MINIO_ENDPOINT="${MINIO_ENDPOINT:-http://127.0.0.1:9000}"
 MINIO_IMAGE="${MINIO_IMAGE:-minio/minio:latest}"
+# Pinned to the parity gate's oracle: the OPA major version selects the rego dialect
+# (>=1.0 parses v1, 0.x parses v0), so a sidecar on the wrong side of that line answers
+# different questions than the embedded engine. Held equal to `EXPECTED_OPA_VERSION` in
+# tests/parity.rs by `the_opa_oracle_is_pinned_to_the_production_version_everywhere`.
+OPA_IMAGE="${OPA_IMAGE:-openpolicyagent/opa:1.13.1-static}"
+PDP_MODE="${PDP_MODE:-embedded}"
 AWSCLI_IMAGE="${AWSCLI_IMAGE:-amazon/aws-cli:latest}"
 
 MINIO_NAME="s0gas-e2e-minio"
+OPA_NAME="s0gas-e2e-opa"
 BACKEND_AK="minioadmin"; BACKEND_SK="minioadmin"
 WORK="$(mktemp -d)"
 GW_PID=""
@@ -34,6 +46,7 @@ info() { echo "${c_dim}==> $*${c_rst}"; }
 
 cleanup() {
   info "cleanup"
+  docker rm -f "$OPA_NAME" >/dev/null 2>&1
   if [ -n "$GW_PID" ]; then
     kill "$GW_PID" 2>/dev/null
     for _ in 1 2 3 4 5; do kill -0 "$GW_PID" 2>/dev/null || break; sleep 0.3; done
@@ -99,7 +112,7 @@ expect_code() {
 }
 
 echo "============================================================"
-echo " s0-gas end-to-end: aws-cli -> gateway -> MinIO (embedded OPA)"
+echo " s0-gas end-to-end: aws-cli -> gateway -> MinIO (PDP: $PDP_MODE)"
 echo "============================================================"
 
 # --- 1. backend ------------------------------------------------------------
@@ -132,8 +145,54 @@ fi
 info "seeding pushed policy bundle -> $STATE/bundle.json"
 mkdir -p "$STATE"
 cp "$E2E/bundle.e2e.json" "$STATE/bundle.json"
+
+# In sidecar mode OPA is the engine, so it needs the same document s0 polls. s0's bundle
+# is `{policy, data}`; OPA wants them as two files. Re-run after any bundle rewrite, or
+# the sidecar keeps deciding against the previous revision — which is exactly how a
+# revocation test passes while revocation is broken.
+sync_opa_data() {
+  [ "$PDP_MODE" = sidecar ] || return 0
+  mkdir -p "$STATE/opa"
+  python3 - "$STATE/bundle.json" "$STATE/opa" "$ROOT/policy/gateway/authz.rego" <<'PYEOF'
+import json, pathlib, shutil, sys
+# Mirror s0's own `parse_bundle`: a `data` key means `{policy, data}`; anything else is
+# the data document itself. Getting this wrong hands OPA an empty document, which denies
+# every request while looking perfectly healthy.
+bundle = json.loads(pathlib.Path(sys.argv[1]).read_text())
+out = pathlib.Path(sys.argv[2])
+if isinstance(bundle, dict) and "data" in bundle:
+    data, policy = bundle["data"], bundle.get("policy")
+else:
+    data, policy = bundle, None
+(out / "data.json").write_text(json.dumps(data))
+if policy:
+    (out / "authz.rego").write_text(policy)
+else:
+    shutil.copyfile(sys.argv[3], out / "authz.rego")
+PYEOF
+}
+
+GW_CONFIG="$E2E/gateway.e2e.json"
+if [ "$PDP_MODE" = sidecar ]; then
+  sync_opa_data
+  info "starting sidecar OPA ($OPA_IMAGE)"
+  docker rm -f "$OPA_NAME" >/dev/null 2>&1
+  # --watch reloads on file change, so the revocation scenario reaches OPA too.
+  docker run -d --network host --name "$OPA_NAME" -v "$STATE/opa:/policy:ro" \
+    "$OPA_IMAGE" run --server --watch --addr=0.0.0.0:8181 --log-level=error \
+    /policy/authz.rego /policy/data.json >/dev/null || { echo "failed to start opa"; exit 1; }
+  wait_http "http://127.0.0.1:8181/health" opa || exit 1
+  GW_CONFIG="$STATE/gateway.sidecar.json"
+  python3 - "$E2E/gateway.e2e.json" "$GW_CONFIG" <<'PYEOF'
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+cfg["pdp"] = {"mode": "sidecar", "base_url": "http://127.0.0.1:8181", "timeout_ms": 2000}
+json.dump(cfg, open(sys.argv[2], "w"), indent=2)
+PYEOF
+fi
+
 info "starting gateway -> $GW_ENDPOINT"
-GATEWAY_CONFIG="$E2E/gateway.e2e.json" RUST_LOG="${RUST_LOG:-s0=info,warn}" \
+GATEWAY_CONFIG="$GW_CONFIG" RUST_LOG="${RUST_LOG:-s0=info,warn}" \
   "$GW_BIN" > "$WORK/gateway.log" 2>&1 &
 GW_PID=$!
 wait_http "$GW_ENDPOINT/" gateway || { echo "gateway failed to start"; tail -n 20 "$WORK/gateway.log"; exit 1; }
@@ -141,7 +200,12 @@ wait_http "$GW_ENDPOINT/" gateway || { echo "gateway failed to start"; tail -n 2
 # --- 4. scenarios through the gateway (virtual creds, real client) --------
 echo ""; echo "-- object read / list / write ------------------------------"
 expect ok   "AKIAOPEN GET open/pub/greeting.txt"              aws_open s3api get-object --bucket open --key pub/greeting.txt /work/dl1.txt
-expect ok   "AKIAOPEN LIST open (narrowed to pub/)"           aws_open s3api list-objects-v2 --bucket open
+# An unbounded list — no prefix at all — is denied for a prefix-scoped principal, the
+# same way `s3:ListBucket` with an `s3:prefix` condition denies it in AWS. The gateway
+# deliberately does NOT narrow a listing the caller never scoped: a filtered listing
+# comes back with no signal that it was filtered, and reads as the whole bucket.
+expect deny "AKIAOPEN LIST open (unbounded, no prefix)"       aws_open s3api list-objects-v2 --bucket open
+expect ok   "AKIAOPEN LIST open --prefix pub/ (inside grant)" aws_open s3api list-objects-v2 --bucket open --prefix pub/
 expect deny "AKIAOPEN GET secret/classified.txt (no grant)"   aws_open s3api get-object --bucket secret --key classified.txt /work/dl2.txt
 expect deny "AKIAOPEN GET open/private/secret.txt (off-prefix)" aws_open s3api get-object --bucket open --key private/secret.txt /work/dl3.txt
 expect ok   "AKIAOPEN PUT open/pub/uploaded.txt"              aws_open s3api put-object --bucket open --key pub/uploaded.txt --body /work/report.txt
@@ -204,6 +268,8 @@ cat > "$STATE/bundle.json" <<'JSON'
   }
 }
 JSON
+# The sidecar decides against its own copy, so the revocation has to reach it too.
+sync_opa_data
 sleep 4
 expect deny "AKIAOPEN GET open/pub/greeting.txt (grant revoked => denied)" \
   aws_open s3api get-object --bucket open --key pub/greeting.txt /work/dl6.txt

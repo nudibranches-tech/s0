@@ -1,10 +1,9 @@
 //! s0 — S3 authorization gateway.
 //!
-//! An S3-compatible **authorization gateway**: it terminates the S3
-//! protocol, makes a per-request OPA decision on the *parsed* request, and re-issues
-//! allowed requests to a backend under a per-tenant credential. Enforcement lives in
-//! the gateway's own policy — never in a backend-native feature — so one model
-//! holds uniformly over Ceph RGW and remote S3, with one per-user audit trail.
+//! Terminates the S3 protocol, makes a per-request OPA decision on the *parsed*
+//! request, and re-issues allowed requests to a backend under a per-tenant credential.
+//! Enforcement lives in the gateway's own policy — never in a backend-native feature —
+//! so one model holds uniformly over Ceph RGW and remote S3, with one per-user trail.
 //!
 //! Module map:
 //! - [`authz`]    — the OPA input contract and the decision type: the core seam.
@@ -16,11 +15,11 @@
 //! - [`gateway`]  — assembled shared context.
 //! - [`server`]   — S3 front + hyper serving.
 //! - [`admin`]    — health / readiness / metrics, on a listener of its own.
-//! - [`internal`] — the **authenticated** console-mediated session mint, on a
-//!   listener of its own (never the admin listener, never the data plane).
+//! - [`internal`] — the authenticated control-plane mint, on a listener of its own
+//!   (never the admin listener, never the data plane).
 //! - [`mint`]     — the OIDC badge desk, on a listener of its own.
-//! - [`webidentity`] — `AssumeRoleWithWebIdentity` in the AWS STS wire protocol, served
-//!   on the mint's listener: the door every S3 SDK can open with stock configuration.
+//! - [`webidentity`] — `AssumeRoleWithWebIdentity` in the AWS STS wire protocol, on the
+//!   mint's listener: the door every S3 SDK can open with stock configuration.
 //! - [`shutdown`] — the one signal every listener drains on.
 //! - [`secret`]   — `Secret<T>`: a configured credential that cannot be printed.
 

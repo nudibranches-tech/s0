@@ -42,8 +42,8 @@ fixes.
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.1.x   | :white_check_mark: |
-| < 0.1   | :x:                |
+| 0.3.x   | :white_check_mark: |
+| < 0.3   | :x:                |
 
 Once 1.0 ships this table will be updated to reflect the supported release
 window.

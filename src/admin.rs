@@ -1,26 +1,13 @@
 //! The admin listener: liveness, readiness, and metrics, on a port of its own.
 //!
-//! Three things forced this to exist:
+//! Separate from the S3 data plane because these endpoints are unauthenticated (a probe
+//! cannot sign SigV4); they expose no policy data, no principal and no secret. The
+//! runtime image is distroless, so an HTTP probe is the only one available — a TCP check
+//! on the S3 port would pass on a pod that never reached the control plane.
 //!
-//! 1. The runtime image is distroless — there is no shell, so a kubernetes probe
-//!    cannot `exec` anything. Without an HTTP endpoint the only available probe is a
-//!    TCP check on the S3 port, which passes on a pod that has never reached the
-//!    control plane and is deciding on a stale bundle.
-//! 2. `dropped_total` — audit records this process is *known to have lost* — was an
-//!    in-memory counter exposed nowhere. In a regulated deployment, unobservable
-//!    audit loss is indistinguishable from no audit loss, which is the worse of the
-//!    two to be wrong about.
-//! 3. A pod that is shutting down must fail readiness *before* it stops accepting,
-//!    so the endpoint controller pulls it out of the Service while it still drains.
-//!
-//! Kept deliberately on a separate listener from the S3 data plane: these endpoints
-//! are unauthenticated (a probe cannot sign SigV4), so they must never share a port
-//! with anything that is. They expose no policy data, no principal, and no secret —
-//! only counters and timestamps.
-//!
-//! **Liveness never depends on the control plane.** `/healthz` answers 200 as long as
-//! the process runs. If it failed on a stale bundle, a control-plane outage would
-//! restart every replica in the fleet — turning a degradation into an outage.
+//! **Liveness never depends on the control plane**: failing `/healthz` on a stale bundle
+//! would turn a control-plane outage into a fleet-wide restart. Readiness fails *before*
+//! the data plane stops accepting, so the pod leaves the Service while it still drains.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -54,10 +41,9 @@ pub struct AdminState {
     bundles: Arc<BundleStore>,
     /// The mint listener's counters, when this process runs a mint.
     ///
-    /// `Option` rather than a zeroed struct, deliberately: a gateway with no
-    /// `sts_mint` section binds no mint port, and publishing `s0_mint_*` series that
-    /// are structurally 0 would put a flat line on a dashboard where the honest answer
-    /// is "this pod has no mint". A missing series is the correct absence.
+    /// `Option` rather than a zeroed struct: a gateway with no `sts_mint` section binds
+    /// no mint port, and a structurally-0 `s0_mint_*` series would put a flat line on a
+    /// dashboard where the honest answer is "this pod has no mint".
     mint: Option<Arc<MintMetrics>>,
     instance: String,
     shutting_down: AtomicBool,
@@ -75,7 +61,7 @@ impl AdminState {
         }
     }
 
-    /// Publish the mint listener's bounds and counters (F13). Call it only when a mint
+    /// Publish the mint listener's bounds and counters. Call it only when a mint
     /// is actually served; see the field docs.
     #[must_use]
     pub fn with_mint_metrics(mut self, metrics: Arc<MintMetrics>) -> Self {
@@ -306,10 +292,9 @@ fn prometheus(state: &AdminState) -> Response<Full<Bytes>> {
         state.ready().is_ok() as u64,
     );
 
-    // The mint listener (F13). Present only on a pod that serves one — see
-    // `AdminState::mint`. These are the only numbers that distinguish "the credential
-    // path is bounded and the bound is biting" from "the IdP is broken", which look
-    // identical from every other angle.
+    // The mint listener. Present only on a pod that serves one — see `AdminState::mint`.
+    // These are the only numbers that distinguish "the credential path is bounded and the
+    // bound is biting" from "the identity provider is broken".
     if let Some(m) = &state.mint {
         metric(
             &mut out,
@@ -431,8 +416,8 @@ mod tests {
     async fn readiness_gates_on_a_successful_poll_not_on_holding_a_revision() {
         let dir = tmpdir();
         let (st, health) = state(true, &dir);
-        // The store already carries a seeded revision — exactly the situation that
-        // made a revision check vacuous. Readiness must still be false.
+        // The store already carries a seeded revision, so holding one proves nothing
+        // about control-plane reachability. Readiness must still be false.
         assert_eq!(st.bundles.revision(), "rev-1");
         assert!(
             st.ready().is_err(),
@@ -472,12 +457,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// The mint's bounds are only useful if an operator can see them bite.
-    ///
-    /// A refused or queued mint and a broken IdP produce the same symptom — "clients
-    /// cannot get credentials" on a gateway that looks healthy — and the two have
-    /// opposite remedies. These counters are the only thing that tells them apart, so
-    /// the scrape carrying them is pinned rather than assumed.
+    /// A queued mint and a broken identity provider produce the same symptom — "clients
+    /// cannot get credentials" on a gateway that looks healthy — with opposite remedies.
+    /// These counters are the only thing that tells them apart, so the scrape is pinned.
     #[tokio::test]
     async fn metrics_expose_the_mint_bounds_and_the_counters_that_show_them_biting() {
         let dir = tmpdir();

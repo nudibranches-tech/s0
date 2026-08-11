@@ -16,33 +16,23 @@ pub struct Decision {
     pub obligations: Obligations,
 }
 
-/// Side-effects the PEP must apply to a *permitted* request before forwarding.
-/// These only exist because we are on the parsed path; a byte proxy could
-/// not honor them.
+/// Side-effects the PEP must apply to a *permitted* request before forwarding. They only
+/// exist because we are on the parsed path; a byte proxy could not honor them.
 ///
-/// `deny_unknown_fields` is a fail-closed rule, not tidiness. The policy module is
-/// hot-swapped from the control-plane bundle ([`crate::pdp::embedded::RegorusPdp`]),
-/// so a bundle can emit an obligation this binary does not implement — an
-/// `excluded_prefixes` narrowing a listing, say. Dropping it silently would turn a
-/// *restriction* into an unrestricted forward: the fail-open twin of a policy reading a
-/// field no producer emits. Refusing to deserialize instead surfaces as an `Err` out of
-/// `Pdp::decide`, which [`crate::access::GatewayAccess::decide`] turns into a denial.
-/// So an obligation we do not understand denies the request. Adding a field here is
-/// what makes it honored; until then it is enforced by refusal.
-///
-/// **That is a control-plane rollout ordering constraint, not an implementation
-/// detail.** A policy that emits `visible_buckets` denies *every request it touches* on
-/// a binary built before this field existed. The binary must therefore reach every
-/// replica before the policy that uses the field is pushed — never the other way round.
-/// The same applies to the next field added here.
+/// `deny_unknown_fields` is fail-closed, not tidiness: the policy module is hot-swapped
+/// from the control-plane bundle, so a bundle can emit an obligation this binary does not
+/// implement, and dropping it silently would turn a *restriction* into an unrestricted
+/// forward. Refusing to deserialize becomes a denial at
+/// [`crate::access::GatewayAccess::decide`] instead — which is a rollout ordering
+/// constraint: a new binary must reach every replica before a policy using its new field
+/// is pushed, never the other way round.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Obligations {
     /// Narrow an over-broad `ListObjects*` to a single granted prefix — a request whose
-    /// prefix is WIDER than the grant but overlaps it. Not an *unbounded* list: since
-    /// 2026-08-09 a list naming no prefix at all is denied rather than narrowed (AWS
-    /// parity; see `policy/gateway/authz.rego` `narrowed`), so this obligation is never
-    /// emitted for one.
+    /// prefix is WIDER than the grant but overlaps it. Never emitted for an *unbounded*
+    /// list: a list naming no prefix at all is denied rather than narrowed (AWS parity;
+    /// see `narrowed` in `policy/gateway/authz.rego`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub narrow_prefix: Option<String>,
     /// Prefix scopes the subject holds on this bucket. When more than one, a
@@ -52,15 +42,12 @@ pub struct Obligations {
     pub allowed_prefixes: Vec<String>,
     /// `ListBuckets`: the bucket names this principal may **see**.
     ///
-    /// **READ THIS: the empty case is the opposite of [`Self::allowed_prefixes`].**
-    /// Empty means *nothing is visible*, not "unrestricted". That asymmetry is
-    /// deliberate and it is the whole reason the field exists: every request is
-    /// re-signed with the tenant-owner credential, so the backend answers `ListBuckets`
-    /// with the entire tenant namespace regardless of what the caller was granted.
-    /// A missing or empty obligation therefore has to mean *withhold everything*, or a
-    /// policy that forgot to emit one would hand out the tenant's whole bucket list.
-    /// [`crate::access::GatewayAccess::list_buckets`] and
-    /// `bucket_visibility_defaults_to_nothing_visible` pin it.
+    /// **The empty case is the opposite of [`Self::allowed_prefixes`]**: empty means
+    /// *nothing is visible*, not "unrestricted". Every request is re-signed with the
+    /// tenant-owner credential, so the backend answers `ListBuckets` with the entire
+    /// tenant namespace regardless of what the caller was granted; a policy that forgot to
+    /// emit this field would otherwise hand out that whole list. Pinned by
+    /// `bucket_visibility_defaults_to_nothing_visible`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub visible_buckets: Vec<String>,
     /// `ListBuckets`: the **only** unfiltered path, and a rego author has to type it.
@@ -72,11 +59,10 @@ pub struct Obligations {
     pub all_buckets_visible: bool,
     /// Obligation names the PEP must implement, or deny.
     ///
-    /// Forward compatibility in the safe direction. `deny_unknown_fields` already
-    /// refuses an obligation *field* this binary does not know, but it cannot express
-    /// "you must apply `visible_buckets`, and if you are too old to know what that means,
-    /// refuse". This can: a name outside [`IMPLEMENTED_OBLIGATIONS`] is a denial, so a
-    /// policy can make a new restriction mandatory before every replica understands it.
+    /// `deny_unknown_fields` refuses a *field* this binary does not know, but cannot
+    /// express "apply this, and refuse if you are too old to know what it means". This
+    /// can: a name outside [`IMPLEMENTED_OBLIGATIONS`] is a denial, so a policy can make a
+    /// new restriction mandatory before every replica understands it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub must_understand: Vec<String>,
 }
@@ -140,12 +126,9 @@ mod tests {
 
     #[test]
     fn an_unknown_obligation_is_a_deserialization_error() {
-        // The unit-level half of
-        // `security_regressions::an_obligation_this_binary_does_not_implement_denies_
-        // rather_than_being_ignored`. `Pdp::decide` deserializes the rego object, so a
-        // refusal here is an `Err` out of the PDP, which the access layer turns into a
-        // denial. Silently dropping the field would instead hand `classify_list` an
-        // empty `Obligations` and forward the request.
+        // `Pdp::decide` deserializes the rego object, so a refusal here is an `Err` out
+        // of the PDP, which the access layer turns into a denial. Silently dropping the
+        // field would instead hand `classify_list` an empty `Obligations` and forward.
         let err = serde_json::from_str::<Decision>(
             r#"{"allow":true,"reason":"ok","obligations":{"excluded_prefixes":["p/"]}}"#,
         )

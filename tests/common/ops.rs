@@ -1,11 +1,9 @@
 //! The enforced operations, with a real typed input for each.
 //!
-//! Shared because three files need exactly the same list and getting it out of step is
-//! the failure mode: `gate_invariants.rs` probes every entry for a hook, a dispatch arm
-//! and a minted proof, and `golden_capture.rs` requires each to contribute at least one
-//! captured input. Every walk of the list cross-checks itself against
-//! `optable::enforced_ops()`, so flipping an operation to `Enforced` without adding it
-//! here fails the suite rather than quietly losing coverage.
+//! Shared because several test files need exactly the same list. Every walk of the list
+//! cross-checks itself against `optable::enforced_ops()`, so flipping an operation to
+//! `Enforced` without adding it here fails the suite rather than quietly losing
+//! coverage.
 
 use s0::access::optable::enforced_ops;
 use s3s::dto::*;
@@ -60,11 +58,6 @@ pub fn delete_objects_input() -> DeleteObjectsInput {
 }
 
 /// `PutObjectTaggingInput` carries a required body and so has no `Default`.
-///
-/// It used to have two siblings here, `put_bucket_policy_input` and
-/// `put_bucket_cors_input`, plus the two policy documents the `PutBucketPolicy` hook
-/// parsed. All four went with the ops on 2026-08-08: bucket policy and CORS are
-/// control-plane, so nothing in this repository constructs one any more.
 pub fn put_object_tagging_input() -> PutObjectTaggingInput {
     PutObjectTaggingInput {
         bucket: "reports".into(),

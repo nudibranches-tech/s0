@@ -1,43 +1,13 @@
-//! Own STS. Mints short-lived S3 credentials from an OIDC token and verifies
-//! them on the hot path **without any per-session secret at rest and without a
-//! hot-path store lookup**:
+//! Own STS: mints short-lived S3 credentials from an OIDC token and verifies them on the
+//! hot path with no per-session secret at rest and no store lookup. The session secret is
+//! derived (`HMAC(master_keys[kid], kid ‖ 0x00 ‖ sid)`) and re-derived from the access-key
+//! id, which carries both halves; the claims ride in a signed session token
+//! (`X-Amz-Security-Token`) MAC-bound to the same `sid`; revocation stays live because
+//! policy lives in OPA/grants, not in the token.
 //!
-//! - The session **secret** is derived deterministically:
-//!   `secret = HMAC(master_keys[kid], kid ‖ 0x00 ‖ sid)`. `get_secret_key` re-derives it
-//!   from the access-key id alone, which carries both `kid` and `sid`.
-//! - The session **claims** (sub, groups, tenant, org, expiry) ride in a signed
-//!   session token (`X-Amz-Security-Token`), MAC-bound to the same `sid`. No store.
-//! - **Revocation stays live** because policy lives in OPA/grants, not in the token:
-//!   a revoked grant denies at the PDP even while the token is unexpired.
-//!
-//! This mints the platform's identity shape — `principal.sub` is the OIDC `sub` — so
-//! gateway decisions and audit line up with the rest of the platform.
-//!
-//! ## Master-key rotation (plan task 11)
-//!
-//! Because the secret is *derived* rather than stored, replacing the master key
-//! silently invalidates every live session: the client keeps presenting a secret the
-//! gateway can no longer reproduce, and every request 403s until the session expires.
-//! There is no signal that says "your credential was rotated out from under you", so a
-//! rotation would look to an operator exactly like a fleet-wide auth outage.
-//!
-//! The key **ring** removes the coupling. The access-key id names the key that derived
-//! it (`HFST<kid>.<sid>`), so a retired key stays usable for verification while a new
-//! one mints:
-//!
-//! 1. add the new key to `sts.master_keys` under a fresh `kid`; deploy;
-//! 2. point `sts.current_kid` at it; deploy. New sessions mint under the new key, live
-//!    ones keep verifying under the old;
-//! 3. wait one full `session_ttl_secs` (every session minted under the old key has now
-//!    expired);
-//! 4. delete the old entry. Any straggler fails closed — an unknown `kid` derives
-//!    nothing, so the credential is simply not honoured.
-//!
-//! The **signing** key is deliberately NOT a ring here. It authenticates the session
-//! token rather than the credential, so rotating it does invalidate live sessions; the
-//! JWT `kid` header is the mechanism for that and it is a separate change. Rotate the
-//! master key with the procedure above; rotate the signing key during a maintenance
-//! window, or accept re-minting.
+//! Rotating a master key must not invalidate live sessions, so the access-key id names the
+//! key that derived it (`HFST<kid>.<sid>`): add the new key, point `sts.current_kid` at it,
+//! wait one `session_ttl_secs`, then delete the old entry. Stragglers fail closed.
 
 use std::collections::BTreeMap;
 
@@ -100,10 +70,10 @@ pub struct SessionCredentials {
     pub expires_at: u64,
 }
 
-/// Holds the long-term secrets: the ring of `master` keys that derive session secrets
-/// (see the module docs for the rotation procedure) and the `signing` key that
-/// authenticates session tokens. Keep them distinct so a token-forgery bug cannot
-/// yield a usable signing secret.
+/// Holds the long-term secrets: the ring of `master` keys that derive session secrets and
+/// the `signing` key that authenticates session tokens. Kept distinct so a token-forgery
+/// bug cannot yield a usable signing secret. The signing key is deliberately not a ring —
+/// rotating it invalidates live sessions, so it needs a maintenance window.
 #[derive(Clone)]
 pub struct StsAuthority {
     /// `kid -> master key`. Every entry can *verify*; only `current_kid` mints.
@@ -179,10 +149,8 @@ impl StsAuthority {
     /// `secret = hex(HMAC-SHA256(master_keys[kid], kid ‖ 0x00 ‖ sid))`. Deterministic,
     /// store-free. `None` when `kid` is not (or is no longer) in the ring.
     ///
-    /// The `kid` is inside the MAC message as well as selecting the key: an operator
-    /// who files the same key bytes under two ids then gets two distinct secrets
-    /// rather than one credential that verifies under either, which keeps "retire the
-    /// old kid" a real revocation. The `0x00` separator keeps `kid ‖ sid` unambiguous.
+    /// The `kid` is inside the MAC message, so the same key bytes filed under two ids give
+    /// two distinct secrets — which keeps "retire the old kid" a real revocation.
     pub fn derive_secret(&self, kid: &str, sid: &str) -> Option<String> {
         let key = self.master_keys.get(kid)?;
         let mut mac = HmacSha256::new_from_slice(key).expect("hmac accepts any key length");
@@ -204,11 +172,9 @@ impl StsAuthority {
 
     /// Does this access-key id claim to be one of ours?
     ///
-    /// Deliberately separate from [`parse_access_key`](Self::parse_access_key): a key
-    /// that carries the prefix but does not decompose is a *malformed STS credential*,
-    /// not a static one, and callers must not let it fall through to the static store
-    /// (where a colliding entry would shadow the STS namespace). `GatewayConfig`
-    /// rejects such entries at load; this makes the property hold without that.
+    /// Separate from [`parse_access_key`](Self::parse_access_key): a key that carries the
+    /// prefix but does not decompose is a *malformed STS credential*, not a static one, and
+    /// must not fall through to the static store, where an entry could shadow the namespace.
     pub fn is_sts_access_key(access_key_id: &str) -> bool {
         access_key_id.starts_with(STS_PREFIX)
     }
@@ -247,12 +213,10 @@ impl StsAuthority {
         let secret = self
             .derive_secret(&self.current_kid, sid)
             .ok_or_else(|| GatewayError::Sts("current_kid is not in the key ring".into()))?;
-        // The minting `kid` goes in the JWS header — the registered place for it, and
-        // covered by the signature, so it cannot be edited in flight. `verify_session`
-        // requires it to match the `kid` in the presented access-key id: without that,
-        // the two halves of the credential name keys independently, and anyone holding
-        // a leaked *retired* master key could re-label a current session's access-key
-        // id onto it, derive the secret themselves, and ride an otherwise valid token.
+        // The minting `kid` goes in the JWS header, covered by the signature.
+        // `verify_session` requires it to match the `kid` in the presented access-key id:
+        // without that, anyone holding a leaked retired master key could re-label a live
+        // session's access-key id onto it, derive the secret, and ride a valid token.
         let mut header = Header::new(Algorithm::HS256);
         header.kid = Some(self.current_kid.clone());
         let token = jsonwebtoken::encode(
@@ -272,9 +236,8 @@ impl StsAuthority {
     /// Verify a session token: signature, expiry, and `sid`-binding to the presented
     /// access-key id. Any failure is an auth failure (caller denies).
     ///
-    /// The `kid` must still be in the ring. A session minted under a key that has
-    /// since been retired is refused here as well as at secret derivation, so a
-    /// retirement is a revocation on both halves of the credential.
+    /// The `kid` must still be in the ring, so retiring a key revokes both halves of the
+    /// credentials minted under it, not just the derived secret.
     pub fn verify_session(
         &self,
         access_key_id: &str,
@@ -332,12 +295,9 @@ fn validate_kid(kid: &str) -> Result<()> {
 
 /// The character rule a `kid` must satisfy, in **both** credential namespaces.
 ///
-/// Shared with [`crate::auth::derived`] rather than restated there, because the two
-/// namespaces spell their access-key ids the same way (`<PREFIX><kid>.…`) and a rule that
-/// drifted apart would mean a `kid` that is decomposable in one and not the other — i.e.
-/// a credential class that silently stops verifying after a rotation. The load-bearing
-/// half is rejecting the separator: a `kid` containing one splits the id at the wrong
-/// place and selects a different key.
+/// Shared with [`crate::auth::derived`] rather than restated there: both namespaces spell
+/// their access-key ids `<PREFIX><kid>.…`, and a rule that drifted apart would leave a
+/// credential class that silently stops verifying after a rotation.
 pub(crate) fn kid_is_well_formed(kid: &str) -> bool {
     !kid.is_empty()
         && kid
@@ -425,7 +385,7 @@ mod tests {
         // where a colliding entry would shadow the whole STS namespace.
         for ak in [
             STS_PREFIX,                                     // bare prefix
-            &format!("{STS_PREFIX}sid-1"),                  // pre-key-ring format
+            &format!("{STS_PREFIX}sid-1"),                  // no separator
             &format!("{STS_PREFIX}{KID_SEP}sid-1"),         // empty kid
             &format!("{STS_PREFIX}{DEFAULT_KID}{KID_SEP}"), // empty sid
         ] {
@@ -450,12 +410,12 @@ mod tests {
         );
     }
 
-    // ── rotation (plan task 11) ─────────────────────────────────────────────────
+    // ── rotation ─────────────────────────────────────────────────
 
     #[test]
     fn a_session_minted_under_the_previous_key_survives_the_rotation() {
-        // The whole reason the ring exists: step 2 of the rotation procedure must not
-        // 403 every live session.
+        // The whole reason the ring exists: switching `current_kid` must not 403 every
+        // live session.
         let before = StsAuthority::with_key_ring(
             BTreeMap::from([("old".to_string(), vec![7u8; 32])]),
             "old",
@@ -488,7 +448,7 @@ mod tests {
 
     #[test]
     fn retiring_a_key_revokes_both_halves_of_its_credentials() {
-        // Step 4: after one session TTL the old entry is deleted, and any straggler
+        // Once one session TTL has passed the old entry is deleted, and any straggler
         // must fail closed on the secret AND on the token.
         let before = rotating_authority();
         let stale = before.mint("sid-1", claims("sid-1", far_future())).unwrap();

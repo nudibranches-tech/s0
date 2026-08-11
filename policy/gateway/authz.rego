@@ -25,13 +25,12 @@
 #
 #     THE GATEWAY IS DATA-PLANE ONLY. `create_bucket`, `delete_bucket`,
 #     `read_bucket_config` and `write_bucket_config` are gone: each was a way to make,
-#     unmake or re-configure a bucket with no `HFBucket` CR behind it — unmanaged,
-#     unquota'd, invisible to the console. That authority is control-plane now
-#     (console `bucket:create` / `bucket:delete` / `bucket:update`), and the six S3 ops
-#     that carried it are refused at the gate before deserialization.
-#     `write_object_acl` is gone with no successor: an object ACL grants access
-#     hyperfluid never projected and cannot revoke, so conferring one is refused in
-#     code (`s0::access::headers`).
+#     unmake or re-configure a bucket with no record in the control plane that owns it —
+#     unmanaged, unquota'd, invisible. That authority belongs to the control plane, and
+#     the six S3 ops that carried it are refused at the gate before deserialization.
+#     `write_object_acl` is gone with no successor: an object ACL grants access no
+#     projection emitted and none can revoke, so conferring one is refused in code
+#     (`s0::access::headers`).
 #     `read_bucket` + `list_buckets` merged into `read`, and `read_object_tags` into
 #     `read_objects`. Both merges widen a surviving verb rather than dropping authority.
 #
@@ -43,7 +42,7 @@
 #                     * without `input.bucket != ""` a `"bucket": "*"` grant matches the
 #                       empty string, so every account decision is covered by any
 #                       wildcard grant and the per-bucket denylist is keyed on a bucket
-#                       nobody named (plan defect B-2);
+#                       nobody named;
 #                     * without `input.bucket == ""` a permitted HeadBucket picks up the
 #                       `visible_buckets` obligation, which it cannot apply — and an
 #                       unapplicable obligation is a hard deny, so HeadBucket would
@@ -71,7 +70,7 @@
 #
 # ── data / grant contract ──────────────────────────────────────────────────────
 #   data.org_settings.freeze_writes : bool
-#   data.org_settings.reserved_tag_keys : ["hyperfluid/*", ...]
+#   data.org_settings.reserved_tag_keys : ["<platform-namespace>/*", ...]
 #     Read by the PEP (`s0::access::tagging`), NOT by this module — deliberately, so a
 #     pushed policy cannot forget it. Tag keys no S3 caller may write, because a policy
 #     may condition grants on them. ABSENT ⇒ every tag write is refused (tagging ships
@@ -155,7 +154,7 @@ frozen if {
 	data.org_settings.freeze_writes
 }
 
-# Gated on a non-empty bucket (plan defect B-2). `input.bucket` is "" for the
+# Gated on a non-empty bucket. `input.bucket` is "" for the
 # account-scoped ops, and a rule keyed on it would then be asking about a bucket nobody
 # named — silently false, which is the wrong direction for a *deny* rule to fail in.
 # `subject_denylisted_anywhere` below is the account-scope replacement.
@@ -189,7 +188,7 @@ bucket_matches(g) if {
 	g.bucket == input.bucket
 }
 
-# Plan defect B-2: without the guard, `"bucket": "*"` matches the EMPTY string, so every
+# Without the guard, `"bucket": "*"` matches the EMPTY string, so every
 # account-scoped decision (input.bucket == "") would be covered by any wildcard grant
 # through the ordinary bucket rules. The account scope has its own rules below, and they
 # are the only way to reach it.
@@ -379,13 +378,11 @@ whole_bucket_list if {
 # Calling `ListObjectsV2` with NO prefix against that policy is an `AccessDenied` in
 # AWS: the condition key is simply absent, so the condition fails. AWS does not narrow.
 # (The AWS console only appears to escape this because it always sends a prefix as the
-# user navigates.) Two reasons this module now answers the same way, and the second is
-# the one that decided it:
+# user navigates.) Two reasons this module answers the same way, and the second is the
+# one that decided it:
 #
-#   1. AWS PARITY. This is what people used to S3 expect, and hyperfluid's goal is
-#      parity with the rest of the cloud ecosystem — where we deviate, the deviation
-#      must be deliberate, defensible and written down (`s0-plan/AWS-PARITY.md`).
-#      This one was none of those: it was accidental.
+#   1. AWS PARITY. This is what people used to S3 expect. Where the gateway deviates,
+#      the deviation should be deliberate and written down; this one was neither.
 #   2. SILENT NARROWING PRESENTS A PARTIAL VIEW AS A COMPLETE ONE. The narrowed
 #      listing comes back with no signal that it was filtered, so a user running
 #      `aws s3 ls s3://bucket/` reads it as the bucket's contents and concludes the
@@ -393,11 +390,8 @@ whole_bucket_list if {
 #      error: an error is diagnosable and gets a support ticket, a short listing is
 #      believed. A 403 says "ask for a prefix, or ask for more access".
 #
-# This CLOSES the last known divergence rather than opening one. Hyperfluid's pushed
-# `s3.rego` — the module that actually runs in every real deployment — already denies
-# here (`list_scope_covers` requires the requested prefix to lie WITHIN a granted one),
-# and since hyperfluid `01d7f7f` the console's object routes refuse it too. This
-# compiled-in dev default was the last PEP still narrowing, so the three now agree.
+# A pushed module is expected to deny here too (requiring the requested prefix to lie
+# WITHIN a granted one); this compiled-in default was the last PEP still narrowing.
 #
 # WHAT DOES NOT CHANGE, which is most of the behaviour:
 #   * a request whose prefix lies INSIDE a grant is allowed and forwarded unrewritten
@@ -414,7 +408,7 @@ whole_bucket_list if {
 # manufacture a scope the caller never asked for. Clause 1 still matches `req == ""`
 # against a grant prefix of `""` — but such a grant already permits every key in the
 # bucket (`startswith(k, "")` holds for all k), so it is a whole-bucket grant spelled
-# oddly, and both hyperfluid's `s3.rego` and this module allow its unbounded list.
+# oddly, and its unbounded list is allowed.
 narrowed(p, req) := req if startswith(req, p)
 
 narrowed(p, req) := p if {

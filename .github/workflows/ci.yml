@@ -1,15 +1,18 @@
 name: ci
 
 on:
+  # `main` only on push: a topic branch is covered by its pull request, and listing both
+  # would run this suite twice on every PR.
   push:
-    branches: ["main", "master", "feat/**", "fix/**"]
+    branches: ["main"]
   pull_request:
-  # Callable, so `release.yml` can gate a tag on THIS definition of "s0 passes"
-  # rather than on a copy of it. A tag can be pointed at any commit, and the
-  # triggers above only fire for branches and pull requests — without this, a
-  # release could publish a commit the suite never ran on. One definition, two
-  # callers, no way for the release gate to drift from the merge gate.
+  # Callable, so `release.yml` gates a tag on THIS definition of "s0 passes" rather than a
+  # copy of it — a tag can point at any commit, which the triggers above do not cover.
   workflow_call:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -39,16 +42,12 @@ jobs:
       # Dual-engine parity gate: the embedded regorus fast path may only serve traffic
       # if it agrees with OPA over the golden decision corpus.
       #
-      # The version is pinned to what production deploys (openpolicyagent/opa:1.13.1)
-      # and must equal `EXPECTED_OPA_VERSION` in tests/parity.rs — the OPA major
-      # version selects the rego dialect (>=1.0 parses v1, 0.x parses v0), so an oracle
-      # on the wrong side of that line is answering different questions than the
-      # deployed engine. `parity::the_opa_oracle_is_pinned_to_the_production_version_everywhere`
-      # fails if this line and that constant drift apart.
+      # The version must equal `EXPECTED_OPA_VERSION` in tests/parity.rs — the OPA major
+      # version selects the rego dialect (>=1.0 parses v1, 0.x parses v0), so an oracle on
+      # the wrong side of that line answers different questions than the deployed engine.
       #
-      # Note that `S0_ALLOW_NO_OPA` is deliberately NOT set anywhere in this workflow:
-      # if the install below silently fails, the parity test panics instead of
-      # reporting a green gate it never ran.
+      # `S0_ALLOW_NO_OPA` is deliberately NOT set anywhere in this workflow: if the install
+      # below fails, the parity test panics instead of reporting a gate it never ran.
       - name: install OPA (parity gate)
         uses: open-policy-agent/setup-opa@v2
         with:
@@ -58,26 +57,8 @@ jobs:
       - name: verify the parity oracle
         run: opa version
 
-      # Cross-repo contract gate (`tests/cross_repo_contract.rs`): the rego package /
-      # decision entrypoint and the audit-log label literals that s0 shares with the
-      # hyperfluid platform. Three production defects came from those strings drifting
-      # with nothing checking them — a deny-all gateway and a 100%-dropped audit trail,
-      # both invisible because each repo only tested itself.
-      #
-      # This workflow deliberately does NOT set S0_REQUIRE_HYPERFLUID: s0-gas is a
-      # standalone repository and cannot check out the private platform repo, so the
-      # half of that file which reads hyperfluid's real sources skips here — loudly, on
-      # stderr, never silently. What still runs is the half that holds s0's own
-      # constants equal to the pinned platform literals, so nothing can drift from the
-      # s0 side unnoticed.
-      #
-      # Any pipeline that HAS both checkouts (the platform-side integration/release
-      # gate) must run this with `HYPERFLUID_REPO=<path> S0_REQUIRE_HYPERFLUID=1`, or
-      # it is running a gate that passes by absence.
-      - name: test (unit + e2e + corpus + parity + cross-repo contract)
+      - name: test (unit + typed-hook e2e + golden corpus + dual-engine parity)
         run: cargo test --all-targets
 
-  # S3 protocol conformance (Ceph s3-tests / MinIO Mint) per supported backend
-  # vendor. Scaffolded in .github/workflows/conformance.yml (manual trigger)
-  # because it needs a live backend service; wire into CI once a Ceph/MinIO service
-  # container is standardized.
+  # S3 protocol conformance against a live backend is scaffolded in conformance.yml
+  # (manual trigger, harness not yet wired). Fold it in here once it is.

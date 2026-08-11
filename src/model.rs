@@ -7,37 +7,13 @@ use serde::{Deserialize, Serialize};
 
 /// The grant vocabulary the gateway authorizes against — the **six projected verbs**.
 ///
-/// Deliberately coarser than the 99 S3 ops: every enforced S3 op maps onto exactly one
-/// of these (a `PutObject` to `write_objects`, a `HeadBucket` to `read`), and
-/// `CopyObject` maps to two (source read + dest write). The set is not a local choice:
-/// it is exactly what hyperfluid's grant projection emits
-/// (`s3_gateway_projection::verbs`), so adding a verb is a cross-repo contract change.
-/// `tests/cross_repo_contract.rs::the_gateway_vocabulary_is_what_hyperfluid_projects`
-/// holds the two sides equal against the real checkout.
+/// Deliberately coarser than the 99 S3 ops: every enforced op maps onto exactly one of
+/// these (`PutObject` to `write_objects`, `HeadBucket` to `read`), except `CopyObject`,
+/// which maps to two. The set is a contract with whatever control plane projects grants.
 ///
-/// ## THE GATEWAY IS DATA-PLANE ONLY (settled 2026-08-08)
-///
-/// Seven verbs were **removed** on 2026-08-08, and the reason is one sentence: each was
-/// a way to act on the bucket as a *managed resource* without going through the managed
-/// path. A bucket made with `create_bucket` has no `HFBucket` CR — unmanaged, unquota'd,
-/// invisible to the console, absent from `bucket_attributes`. So existence, policy,
-/// CORS and quota are control-plane, through the console and the operator, and never
-/// through S3:
-///
-/// | removed | where that authority lives now |
-/// |---|---|
-/// | `create_bucket`, `delete_bucket` | console `bucket:create` / `bucket:delete` |
-/// | `read_bucket_config`, `write_bucket_config` | console `bucket:read` / `bucket:update` |
-/// | `write_object_acl` | nowhere — conferring an ACL is refused in code ([`crate::access::headers`]) |
-/// | `read_bucket`, `list_buckets` | merged into [`Action::Read`] |
-/// | `read_object_tags` | merged into [`Action::ReadObjects`] |
-///
-/// The two merges are widenings of a surviving verb, not deletions of authority:
-/// reading an object's tags is strictly less than reading the object, and
-/// "this bucket exists, for me" is one question however it is asked.
-///
-/// `manage_lifecycle` was deleted earlier, and for the same family of reason: it was a
-/// keyless verb whose rego branch granted the whole bucket ignoring prefixes.
+/// **The gateway is data-plane only**, so there is no verb for acting on a bucket as a
+/// *managed resource*: existence, policy, CORS and quota are control-plane concerns, and
+/// `write_object_acl` is refused in code ([`crate::access::headers`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Action {
@@ -45,34 +21,27 @@ pub enum Action {
     ReadObjects,
     WriteObjects,
     DeleteObjects,
-    /// Kept **deliberately separate** from [`Action::WriteObjects`].
-    /// `OpaInput::object_tags` exists so a policy can key on tags; the moment it does, a
-    /// principal holding write_objects + tag-write could grant itself whatever the
-    /// policy keys on. Merging the two plants a trap that springs when tag-driven ABAC
-    /// is enabled.
+    /// Kept **deliberately separate** from [`Action::WriteObjects`]. `OpaInput::object_tags`
+    /// lets a policy key on tags; merging the two would let a principal holding both grant
+    /// itself whatever the policy keys on, a trap that springs when tag-driven ABAC is on.
     WriteObjectTags,
     // listing: bucket + prefix, and the *response* is in scope
     ListObjects,
-    /// The existence verb — hyperfluid's `bucket:read`, and the ONE dual-plane
-    /// permission in the family.
-    ///
-    /// It answers "does this bucket exist, for me?", which the console asks on its
-    /// bucket list and detail routes and which S3 asks as `ListBuckets`, `HeadBucket`
-    /// and `GetBucketLocation`. Those two PEPs must answer identically or a user is told
-    /// yes by one and no by the other — the defect the 2026-08-08 vocabulary exists to
-    /// remove — so it is one verb, and it is the only bucket-shaped verb left.
+    /// The existence verb, and the ONE dual-plane permission in the family: it answers
+    /// "does this bucket exist, for me?", which S3 asks as `ListBuckets`, `HeadBucket` and
+    /// `GetBucketLocation` and a control plane asks on its own bucket routes. Two policy
+    /// enforcement points answering that differently tell a user yes and no at once.
     ///
     /// It is bucket-scoped AND account-scoped: bucket-shaped for `HeadBucket` /
-    /// `GetBucketLocation` (`input.bucket` names one) and account-shaped for
-    /// `ListBuckets` (`input.bucket == ""`). The rego rules that read it are gated on
-    /// which, and those gates are load-bearing — see the module note in
-    /// `policy/gateway/authz.rego`.
+    /// `GetBucketLocation` (`input.bucket` names one), account-shaped for `ListBuckets`
+    /// (`input.bucket == ""`). The rego rules reading it are gated on which, and those
+    /// gates are load-bearing — see the module note in `policy/gateway/authz.rego`.
     Read,
 }
 
 impl Action {
-    /// Every verb, in declaration order. Exhaustively matched in [`Action::as_str`], so
-    /// a new variant is a compile error there, and cross-checked against
+    /// Every verb, in declaration order. Exhaustively matched in [`Action::as_str`], so a
+    /// new variant is a compile error there, and cross-checked against
     /// `optable::GATEWAY_VERBS` and the rego's own action sets by test.
     pub const ALL: &'static [Action] = &[
         Action::ReadObjects,
@@ -96,11 +65,10 @@ impl Action {
 
     /// Writes are subject to the org-global `freeze_writes` kill-switch.
     ///
-    /// This set MUST equal the rego's `write_actions`, or `freeze_writes` — the only
-    /// kill switch the live bundle carries — stops covering a verb on one side while
-    /// still claiming to on the other. `the_write_set_matches_the_shipped_rego` in
-    /// `tests/op_coverage.rs` extracts the rego's set from the shipped module and
-    /// compares it here, so a divergence fails the build rather than surfacing as a
+    /// This set MUST equal the rego's `write_actions`, or the switch stops covering a verb
+    /// on one side while still claiming to on the other.
+    /// `tests/op_coverage.rs::the_write_set_matches_the_shipped_rego` extracts the rego's
+    /// set and compares it here, so a divergence fails the build rather than surfacing as a
     /// freeze that did not freeze.
     pub const fn is_write(self) -> bool {
         matches!(
@@ -109,26 +77,21 @@ impl Action {
         )
     }
 
-    /// True for a verb decided against a **named bucket with no object key**. Such a
-    /// verb ignores grant prefixes by construction (there is no key to test a prefix
-    /// against), which is why it must be its own verb rather than a keyless
-    /// fall-through of the object verbs — a `read_objects` grant scoped to `2024/` must
-    /// never confer `HeadBucket`.
-    ///
-    /// Exactly one verb qualifies now, and that is the point: the other four keyless
-    /// verbs were the ones that bypassed the managed path.
+    /// True for a verb decided against a **named bucket with no object key**. Such a verb
+    /// ignores grant prefixes by construction (there is no key to test one against), which
+    /// is why it must be its own verb rather than a keyless fall-through of the object
+    /// verbs — a `read_objects` grant scoped to `2024/` must never confer `HeadBucket`.
     pub const fn is_bucket_scoped(self) -> bool {
         matches!(self, Action::Read)
     }
 
     /// True for a verb decided with **no bucket at all** (`input.bucket == ""`) — the
-    /// account scope, which today is `ListBuckets` alone.
+    /// account scope, which is `ListBuckets` alone.
     ///
-    /// [`Action::Read`] is in this set *and* in [`Action::is_bucket_scoped`], and the
-    /// overlap is deliberate: one verb, two request shapes. Every rego rule that reads
-    /// either set therefore has to carry the matching shape gate, or a permitted
-    /// `HeadBucket` picks up a `visible_buckets` obligation it cannot apply — which
-    /// `must_understand` turns into a hard deny.
+    /// [`Action::Read`] is in this set *and* in [`Action::is_bucket_scoped`]: one verb, two
+    /// request shapes. Every rego rule reading either set must therefore carry the matching
+    /// shape gate, or a permitted `HeadBucket` picks up a `visible_buckets` obligation it
+    /// cannot apply — which `must_understand` turns into a hard deny.
     pub const fn is_account_scoped(self) -> bool {
         matches!(self, Action::Read)
     }

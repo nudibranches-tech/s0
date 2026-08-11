@@ -1,56 +1,18 @@
 //! `reserved_tag_keys` — the guard that stops a tag write from being a privilege
 //! escalation.
 //!
-//! ## The self-elevation the guard exists for
+//! A policy can key grants on an object's tags ([`crate::authz::OpaInput::object_tags`]),
+//! and a principal holding both `write_objects` and `write_object_tags` on its own prefix
+//! could then satisfy such a condition with data it supplied. Two things close that: the
+//! decision is made against the **proposed** tag set
+//! ([`crate::authz::OpaInput::requested_tags`]), never the object's current one; and the
+//! key space a policy may *depend* on is reserved here, unwritable by any S3 caller.
 //!
-//! [`crate::authz::OpaInput::object_tags`] exists so a policy can key grants on an
-//! object's tags (ABAC). The moment any policy does that, a principal holding
-//! `write_objects` **and** `write_object_tags` can grant itself whatever the policy keys
-//! on: write the object, tag it `tier=public`, and the condition the policy reads is now
-//! satisfied by data the attacker supplied. The two verbs are already separate — that is
-//! necessary and not sufficient, because a principal legitimately holding both on its own
-//! prefix can still elevate *within* it.
-//!
-//! Two things close it, and this module is the second:
-//!
-//! 1. the decision is made against the **proposed** tag set
-//!    ([`crate::authz::OpaInput::requested_tags`]), never the object's current one, so a
-//!    policy sees what the write would install rather than what is already there;
-//! 2. the key space a policy is allowed to *depend* on is reserved: no S3 caller may
-//!    write it, whatever grants it holds.
-//!
-//! ## Absence means deny — and, since 2026-08-09, absence is an anomaly
-//!
-//! The reserved list is supplied by the control plane in the bundle. **An absent list
-//! denies every tag write** (master plan open question 5). Between the day this module
-//! shipped and 2026-08-09 that was the *production* state for every organization,
-//! because nothing published the field: `PutObjectTagging`, `DeleteObjectTagging` and an
-//! inline `x-amz-tagging` were refused for everyone, and `write_object_tags` was a verb
-//! in the settled vocabulary that could never succeed (runbook P7). Nothing was red;
-//! both repositories' suites were green, because each only tested itself and both agreed
-//! the behaviour was correct.
-//!
-//! **hyperfluid now publishes it on every bundle**
-//! (`s3_gateway_projection::bundle::derive_reserved_tag_keys`), so this reader's absent
-//! path is a diagnostic rather than the normal case. The published value is the platform
-//! namespace `hyperfluid/*` — AWS reserves the `aws:` tag prefix the same way — unioned
-//! with every tag key a grant in the same document conditions on. Which means the
-//! *coupling* argued below is now enforced by construction on the producing side rather
-//! than promised: a policy cannot come to depend on a tag key without that key being
-//! reserved in the same document. `tests/cross_repo_contract.rs` holds the two ends
-//! together in three places, one of which drives this very reader over the captured
-//! platform bundle.
-//!
-//! Absence still denies, and it has to be this way round. The alternative default (`[]`,
-//! nothing reserved) is indistinguishable from a correctly-configured deployment right up
-//! to the moment someone writes the first ABAC condition, at which point every
-//! tag-writing principal silently gains the ability to satisfy it. A missing
-//! security-relevant input must not read as "no restriction"; that is the same fail-open
-//! shape as an obligation this binary does not implement being dropped, and this project
-//! has a `deny_unknown_fields` and a `must_understand` because of it.
-//!
-//! A malformed list (present but not an array of strings) is treated as absent, i.e. as
-//! deny-all, for the same reason.
+//! The list comes from the control plane in the bundle, and **an absent or malformed list
+//! denies every tag write**. The alternative default (`[]`, nothing reserved) is
+//! indistinguishable from a correct deployment right up to the moment someone writes the
+//! first ABAC condition, at which point every tag-writing principal silently gains the
+//! ability to satisfy it.
 
 use std::collections::BTreeMap;
 
@@ -142,14 +104,11 @@ impl ReservedTagKeys {
 
     /// Refuse a proposed tag set that touches a reserved key.
     ///
-    /// Matching is exact, or by a single trailing `*` (`hyperfluid/*` reserves every key
-    /// under that namespace). Keys are compared case-sensitively, because S3 tag keys are
-    /// case-sensitive and a policy reading `tier` is genuinely not satisfied by `Tier`;
-    /// pretending otherwise would refuse writes that cannot elevate anything.
-    ///
-    /// A pattern in a *deny* list widens the denial, so an unvalidated one fails in the
-    /// safe direction — which is why a glob is acceptable here and is not in
-    /// `Obligations::visible_buckets`, where it would widen an allowlist.
+    /// Matching is exact, or by a single trailing `*` reserving a whole namespace (AWS
+    /// reserves its `aws:` tag prefix the same way). Comparison is case-sensitive because
+    /// S3 tag keys are: a policy reading `tier` is not satisfied by `Tier`. A glob is safe
+    /// in a *deny* list — an unvalidated pattern widens the denial — where the same glob
+    /// in `Obligations::visible_buckets` would widen an allowlist.
     pub fn check(&self, tags: &BTreeMap<String, String>) -> Result<(), String> {
         if let Some(reason) = self.inert_reason() {
             return Err(reason);
@@ -193,9 +152,8 @@ mod tests {
 
     #[test]
     fn an_absent_list_denies_every_tag_write() {
-        // The fail-closed floor. This was the PRODUCTION state for every org until
-        // 2026-08-09, when hyperfluid started publishing the list; it is now the
-        // diagnostic for a document that lost the field in transit.
+        // The fail-closed floor: a document that never carried the field, or lost it in
+        // transit, refuses every tag write rather than reserving nothing.
         let r = ReservedTagKeys::from_bundle(&serde_json::json!({
             "org_settings": { "freeze_writes": false }
         }));
@@ -233,7 +191,7 @@ mod tests {
     #[test]
     fn a_published_list_makes_tag_writes_live_and_reserves_exactly_its_keys() {
         let r = ReservedTagKeys::from_bundle(&serde_json::json!({
-            "org_settings": { "reserved_tag_keys": ["tier", "hyperfluid/*"] }
+            "org_settings": { "reserved_tag_keys": ["tier", "acme/*"] }
         }));
         assert!(!r.denies_all_tag_writes());
         assert!(r.inert_reason().is_none());
@@ -243,10 +201,7 @@ mod tests {
         // Exact.
         assert!(r.check(&tags(&[("tier", "public")])).is_err());
         // Namespace glob.
-        assert!(
-            r.check(&tags(&[("hyperfluid/classification", "phi")]))
-                .is_err()
-        );
+        assert!(r.check(&tags(&[("acme/classification", "phi")])).is_err());
         // Case-sensitive: `Tier` cannot satisfy a policy reading `tier`, so refusing it
         // would only break writes that cannot elevate anything.
         r.check(&tags(&[("Tier", "public")]))
@@ -261,7 +216,7 @@ mod tests {
 
     #[test]
     fn an_empty_published_list_reserves_nothing_and_is_a_deliberate_choice() {
-        // The other half of open question 5: `[]` is expressible, it just is not the
+        // The other half of the rule: `[]` is expressible, it just is not the
         // default. An operator that publishes it has said "no policy depends on a tag",
         // which is a claim the control plane makes, not one the gateway assumes.
         let r = ReservedTagKeys::from_bundle(&serde_json::json!({"org_settings":

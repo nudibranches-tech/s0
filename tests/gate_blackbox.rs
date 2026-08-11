@@ -1,39 +1,13 @@
 //! The gate over real HTTP, for **every** operation s3s can route.
 //!
-//! `tests/op_coverage.rs` drives `optable::gate_op` directly, because
-//! `s3s::access::S3AccessContext` has crate-private fields and cannot be built outside
-//! s3s — so no in-process test can call `check` itself. This file closes that gap:
-//! signed requests over TCP, into the assembled `S3Service` (`server::build_service`),
-//! through s3s's own route resolution, into the real `check`.
+//! `s3s::access::S3AccessContext` has crate-private fields, so no in-process test can
+//! call `check` — hence signed requests over TCP into the assembled `S3Service`. A bad
+//! signature also 403s, so every denial assertion checks that the error body *names the
+//! operation*, and the positive controls keep the sweep from passing vacuously.
 //!
-//! It is table-driven off `data/s3s-0.14.1-routes.tsv`, which is extracted from the
-//! pinned s3s crate's own `resolve_route`. That is what makes "all 76 denied ops"
-//! affordable: an SDK exposes one typed builder per operation, so the tail would be one
-//! hand-written call per op with no new information per call — and the SDK cannot
-//! express `PostObject` at all.
-//!
-//! ## Why this cannot pass vacuously
-//!
-//! s3s verifies the signature *before* it resolves the route, so a bad signature also
-//! produces a 403 — and a file that only asserted "403" would pass just as happily if
-//! the gateway refused everything for an unrelated reason. Three things prevent that:
-//!
-//! 1. every denial assertion checks the error body **names the operation**, which only
-//!    happens if s3s resolved the route to that op and `check` refused it by name;
-//! 2. the two structural denials are asserted to carry the *structural* reason, not the
-//!    ordinary not-enforced one;
-//! 3. positive controls: an allowed `GetObject` (and a `HeadObject`, since HEAD carries
-//!    no body and its assertion is necessarily weaker) must reach the forward path.
-//!
-//! ## Regenerating the route table
-//!
-//! The table is derived from `resolve_route` in the pinned crate:
-//! `~/.cargo/registry/src/*/s3s-0.14.1/src/ops/generated.rs`. Each row is the smallest
-//! request that resolves to that operation: method, path shape, the query parameters
-//! s3s discriminates on, and any header it keys off. `PostObject` is the one row not in
-//! `resolve_route` — `ops/mod.rs` routes a multipart/form-data POST to a bucket to it
-//! before `resolve_route` is consulted. If s3s moves, `tests/op_coverage.rs` fails
-//! first (it pins the version), and this table must be regenerated with it.
+//! The route table `data/s3s-0.14.1-routes.tsv` is regenerated from `resolve_route` in
+//! the pinned crate source — smallest request per op, plus `PostObject`, which
+//! `ops/mod.rs` routes ahead of `resolve_route`.
 
 mod common;
 
@@ -254,9 +228,9 @@ async fn every_denied_op_403s_over_real_http() {
     assert_eq!(
         checked.len(),
         76,
-        "70 until 2026-08-08, when the six control-plane ops (CreateBucket, DeleteBucket \
-         and the bucket policy/CORS pairs) went back to Denied — and this is the test \
-         that proves the removal reached the WIRE, not just the table"
+        "99 operations minus the 23 enforced. The six control-plane ops (CreateBucket, \
+         DeleteBucket and the bucket policy/CORS pairs) are among them, and this is the \
+         test that proves the refusal reaches the WIRE, not just the table"
     );
     drop(fx);
 }
@@ -321,12 +295,10 @@ async fn create_session_is_refused_even_if_policy_would_allow() {
 
 #[tokio::test]
 async fn an_enforced_op_passes_the_gate_and_reaches_the_forward_path() {
-    // The positive control for the whole file. Without it, the sweep above would pass
-    // just as happily if the gateway 403'd every request for an unrelated reason (bad
-    // signature, unknown credential, unroutable tenant).
-    //
-    // GetObject on a granted key is allowed by `check` AND by the policy, so it gets as
-    // far as the forward, where the configured backend (port 1) is not listening.
+    // The positive control for the whole file: without it, the sweep above would pass
+    // just as happily if the gateway 403'd everything for an unrelated reason. GetObject
+    // on a granted key is allowed by `check` and by the policy, so it gets as far as the
+    // forward, where the configured backend (port 1) is not listening.
     let (base, fx) = spawn_gateway("blackbox-allowed", common::alice_bundle()).await;
     let table = routes::all();
 
@@ -399,16 +371,11 @@ async fn a_form_upload_is_authorized_on_its_form_carried_key() {
 
 #[tokio::test]
 async fn a_bucket_listing_a_principal_may_not_make_is_an_empty_200_over_real_http() {
-    // The one enforced operation whose refusal is NOT a 403, asserted where it is
-    // actually observable: a real signed request, through the real serving path, with a
-    // real status line.
-    //
-    // Both principals below end up with nothing to show — one because the PDP denied the
-    // enumeration outright, one because the only bucket it was granted is one it is
-    // denylisted from — and the two answers must be byte-identical. A 403 for either
-    // would be an oracle reporting whether a credential holds `list_buckets` in this
-    // tenant; and since neither reaches the backend (port 1, closed), a *forwarded*
-    // listing would surface here as a 503 rather than as a 200.
+    // The one enforced operation whose refusal is NOT a 403. Both principals below end
+    // up with nothing to show — one denied the enumeration outright, one denylisted from
+    // the only bucket it was granted — and the two answers must be byte-identical, or
+    // the status is an oracle for whether a credential holds `list_buckets`. Neither
+    // reaches the backend (port 1, closed), so a *forwarded* listing would show as a 503.
     let bundle = serde_json::json!({
         "org_settings": { "freeze_writes": false },
         "tenants": { "acme": {
@@ -491,13 +458,9 @@ async fn a_policy_denial_is_still_a_403_on_an_enforced_op() {
 async fn a_public_acl_header_is_refused_over_real_http() {
     // The hook-level suite (`tests/request_riders.rs`) builds `PutObjectInput` directly,
     // so it proves the *decision* but assumes the *parse*: that `x-amz-acl` on the wire
-    // really lands in `PutObjectInput::acl`. This closes that assumption over real HTTP,
-    // through s3s's own header parsing, on the exact request `aws s3 cp --acl
-    // public-read` produces.
-    //
-    // It matters here specifically because everything the gateway does not read is
-    // reconstructed onto the forward from the parsed input — so "did the header parse?"
-    // and "is the header enforced?" are the same question with opposite answers.
+    // really lands in `PutObjectInput::acl`. That assumption is load-bearing, because
+    // everything the gateway does not read is reconstructed onto the forward from the
+    // parsed input — so a header that does not parse still reaches the backend.
     let (base, fx) = spawn_gateway("blackbox-acl", common::alice_bundle()).await;
     let host = base.trim_start_matches("http://").to_string();
 

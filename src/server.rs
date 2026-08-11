@@ -1,9 +1,8 @@
 //! S3 front assembly + hyper serving loop. Wires the auth, access, and proxy
 //! layers onto an `s3s::S3Service` and serves it with graceful shutdown.
 //!
-//! Both `set_auth` and `set_access` are required: without `set_auth` the general
-//! `check` backstop is silently skipped (a substrate trap), which would defeat the
-//! deny-by-default gate.
+//! Both `set_auth` and `set_access` are required: without `set_auth` the general `check`
+//! backstop is silently skipped, which would defeat the deny-by-default gate.
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -41,12 +40,9 @@ pub fn build_service(gw: Arc<Gateway>) -> S3Service {
 /// Map the gateway's hardening limits onto `s3s::S3Config`. `S3Config` is
 /// `#[non_exhaustive]`; mutate a `default()` rather than struct-literal it.
 ///
-/// These three are read **once**, at service assembly: `StaticConfigProvider` hands
-/// s3s an immutable `Arc<S3Config>`, so they are not reachable by
-/// `Gateway::apply_config` and changing them needs a restart. Said out loud because
-/// the fields sit in the same `LimitsConfig` as the caps that *are* hot-reloadable,
-/// and an operator editing one and watching the other take effect would reasonably
-/// conclude both had.
+/// These three are read **once**, at service assembly: `StaticConfigProvider` hands s3s an
+/// immutable `Arc<S3Config>`, so changing them needs a restart. Worth saying because they
+/// sit in the same `LimitsConfig` as the caps that *are* hot-reloadable.
 fn s3_config(gw: &Gateway) -> S3Config {
     let limits = gw.limits();
     let mut cfg = S3Config::default();
@@ -76,11 +72,9 @@ pub async fn serve_with_shutdown(
     tracing::info!(%listen, "gateway listening");
     tokio::pin!(shutdown);
 
-    // s3s does not protect the HTTP layer; we own connection bounding, the
-    // header-read (slowloris) timeout, h2 keep-alive, and graceful drain.
-    // NOTE: the auto builder's h1 `header_read_timeout` needs a timer that does not
-    // survive `into_owned()` below, so it panics per connection; a reliable request
-    // read-timeout is a follow-up. The connection cap + h2 keep-alive remain.
+    // s3s does not protect the HTTP layer; we own connection bounding, h2 keep-alive and
+    // graceful drain. The auto builder's h1 `header_read_timeout` is not set: it needs a
+    // timer that does not survive the `into_owned()` below, so it panics per connection.
     let mut http = ConnBuilder::new(TokioExecutor::new());
     http.http2()
         .timer(TokioTimer::new())
@@ -97,11 +91,9 @@ pub async fn serve_with_shutdown(
                 break;
             }
         };
-        // `accept` sits INSIDE the select: awaiting it outside means an idle listener
-        // (the common case at 3am, and the case during a rolling update) does not
-        // observe SIGTERM until the next connection happens to arrive — the pod is
-        // then killed by the grace period instead of draining. Both branches are
-        // cancel-safe.
+        // `accept` sits INSIDE the select: awaiting it outside means an idle listener does
+        // not observe SIGTERM until the next connection happens to arrive, and the process
+        // is killed by the grace period instead of draining. Both branches are cancel-safe.
         let accepted = tokio::select! {
             r = listener.accept() => r,
             _ = &mut shutdown => {

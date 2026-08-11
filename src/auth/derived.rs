@@ -1,25 +1,8 @@
-//! Long-lived **per-principal** S3 keys — the migration path for
-//! the five consumers that hold the per-harbor tenant-owner credential today.
-//!
-//! This is **not a new credential type**. It is the shape the platform already runs on —
-//! two fields in a Secret, no refresh loop — with the blast radius cut from "every bucket
-//! in the tenant" to "one principal's grants". The analogue is a **GCP HMAC key** or an
-//! **AWS IAM user access key**: a long-lived S3 credential that is an *identity*, whose
-//! permissions live outside it and are evaluated per request.
-//!
-//! ## The property that makes it safe
-//!
-//! **The key carries identity, never scope.** Groups and grants stay in the policy
-//! bundle, so a grant change lands at normal bundle latency without reissuing anything,
-//! and live revocation — invariant #1 of this project — is preserved. Baking permissions
-//! into the credential was rejected once already: RGW session policies were killed
-//! for exactly this reason, and F21 records the decision.
-//!
-//! ## The property that makes it multi-replica-correct
-//!
-//! Nothing is stored. Both halves are **derived** from the access-key id, exactly as
-//! [`crate::auth::sts`] derives a session secret, so a key minted against one pod
-//! verifies on any other and a pod restart changes nothing.
+//! Long-lived **per-principal** S3 keys: a credential that is an *identity*, like a GCP
+//! HMAC key or an AWS IAM user access key. It carries identity, never scope — groups and
+//! grants stay in the policy bundle, so a grant change lands at bundle latency and live
+//! revocation is preserved. Nothing is stored: both halves are derived from the access-key
+//! id as in [`crate::auth::sts`], so a key minted on one replica verifies on every other.
 //!
 //! ```text
 //! access_key_id = HFSA<kid>.<payload>.<mac>
@@ -28,76 +11,12 @@
 //!   secret_access_key = hex( HMAC-SHA256(k[kid], DOMAIN_SECRET ‖ 0 ‖ kid ‖ 0 ‖ access_key_id) )
 //! ```
 //!
-//! ## THE CROSS-REPO CONTRACT — read this before changing a single byte above
-//!
-//! hyperfluid mints these keys (F17b); s0 verifies them. The two repos must agree on the
-//! encoding **byte for byte**, and there is no negotiation and no version handshake on
-//! the wire — a mismatch is a credential that simply does not authenticate. That failure
-//! already happened once on this project, on the OPA entrypoint, and it cost 35 green
-//! tests over a deny-all production policy. So:
-//!
-//! * [`DerivedKeyAuthority::mint`] is the **only** sanctioned constructor. The platform
-//!   half must produce byte-identical output; the test
-//!   `the_wire_format_is_pinned_byte_for_byte` holds a golden vector (fixed key, fixed
-//!   inputs, exact strings) that either repo can replay to prove agreement.
-//! * The field order, the version byte, the domain-separation tags, the MAC truncation
-//!   length and the base64url alphabet are all part of the contract. Changing any of them
-//!   is a new `ver` byte, never an edit of version 1.
-//! * The MAC is computed over the **encoded payload text**, not over the decoded bytes.
-//!   That makes the minted string the only string that verifies: there is no re-encoding
-//!   a peer could do that would still check out.
-//!
-//! **`sub` is the RAW subject, never the bundle's prefixed spelling.** For a service
-//! account it is the client id (`trino-background`), for a user the OIDC sub — *not*
-//! `sa:trino-background` and not `user:<sub>`. The `sa:` / `user:` prefix is composed on
-//! the way out by [`crate::pdp::principal_subject_key`], and a minter that bakes it in
-//! produces a key that authenticates and is then denied everything, because every
-//! bundle lookup goes looking for `sa:sa:trino-background`. This is the easiest mistake
-//! for the platform half to make and the hardest to read off a 403, so the golden vector
-//! below deliberately carries the raw spelling.
-//!
-//! **The golden vector, reproduced here so it can be read without running the test.**
-//! Master key = 32 bytes of `0x07`, `kid = "k0"`, `tenant = "acme"`,
-//! `sub = "trino-background"`, service account, `epoch = 1`:
-//!
-//! ```text
-//! access_key_id     HFSAk0.AQEAAAABBGFjbWV0cmluby1iYWNrZ3JvdW5k.5WcSnIJ99Oc244wElX2Mag
-//! secret_access_key 5b7b3cae116417cefaa08d94c85ee7285678bfaded3405183a908fe996e63d5f
-//! ```
-//!
-//! Note what the payload decodes to, field by field:
-//! `01` (ver) `01` (typ = service account) `00000001` (epoch, BE u32) `04` (len tenant)
-//! `61636d65` (`acme`) `7472...` (`trino-background`, to the end).
-//!
-//! ## The alphabet, which is load-bearing outside this file
-//!
-//! Every character of a minted id is in `[A-Za-z0-9-_.]`:
-//!
-//! * `/` is **structurally excluded** — it delimits the SigV4 credential scope, so an id
-//!   containing one is refused by s3s before it reaches us (and AWS would refuse it too).
-//! * `'` and `\` are excluded, and that one is not cosmetic: hyperfluid's operator
-//!   interpolates `s3.aws-access-key` into a Trino `CREATE CATALOG … WITH (k = '<value>')`
-//!   SQL literal escaping only the single quote
-//!   (`hf_bin_operator/src/infrastructure/catalog/mod.rs:160`). base64url plus `.` is
-//!   safe; one alphabet change away it would not be.
-//!
-//! Pinned by `a_minted_id_stays_inside_the_alphabet_every_consumer_tolerates`.
-//!
-//! ## Revocation — see [`crate::auth::DerivedKeys`]
-//!
-//! A derived key cannot be deleted, because there is nothing to delete. The `epoch` field
-//! above is where revocation lives: the bundle publishes a floor and a key naming a lower
-//! one stops working at the next bundle refresh. The check is not in this file — this file
-//! is arithmetic on a string — it is in [`crate::auth::DerivedKeys::admit`], which is the
-//! only path the gateway calls.
-//!
-//! ## Rotation
-//!
-//! The `kid` works exactly as it does for STS: add a key, point `current_kid` at it, and
-//! outstanding keys keep verifying under the old entry until it is deleted. Unlike an STS
-//! session there is no TTL after which stragglers are gone, so retiring a `kid` is a
-//! **fleet-wide revocation** of everything minted under it and must be paired with
-//! reissuing those keys.
+//! That encoding is a wire contract with whatever mints the keys: field order, version
+//! byte, domain-separation tags, MAC truncation length and alphabet are all part of it, so
+//! a change is a new `ver`, never an edit of version 1. There is no handshake — a mismatch
+//! is simply a credential that does not authenticate. [`DerivedKeyAuthority::mint`] is the
+//! only sanctioned constructor, and `the_wire_format_is_pinned_byte_for_byte` holds a
+//! golden vector any independent implementation can replay to prove agreement.
 
 use std::collections::BTreeMap;
 
@@ -113,18 +32,15 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Access-key ids for derived long-lived keys carry this prefix.
 ///
-/// **It differs from [`crate::auth::sts::STS_PREFIX`] (`HFST`) in the fourth character
-/// only**, which is deliberate (both are "HF S3 …") and is exactly why the namespace
-/// guard is enforced in two places rather than one — see
+/// It differs from [`crate::auth::sts::STS_PREFIX`] in the fourth character only, which
+/// is why the namespace guard is enforced in two places rather than one — see
 /// [`DerivedKeyAuthority::is_derived_access_key`].
 pub const DERIVED_PREFIX: &str = "HFSA";
 
 /// Separates the three fields of a derived access-key id: `HFSA<kid>.<payload>.<mac>`.
 ///
-/// Neither the `kid` (rejected in [`validate_derived_kid`]) nor the payload nor the MAC
-/// (base64url) can contain it, so the decomposition is unambiguous. Parsing splits on the
-/// **last** occurrence for the MAC and the **first** for the kid, so it stays robust even
-/// if a future payload alphabet widened.
+/// Neither the `kid` (rejected in [`validate_derived_kid`]) nor the base64url payload and
+/// MAC can contain it, so the decomposition is unambiguous.
 pub const FIELD_SEP: char = '.';
 
 /// The `kid` a single-key configuration is filed under — the same spelling
@@ -133,37 +49,24 @@ pub const FIELD_SEP: char = '.';
 pub const DEFAULT_KID: &str = "k0";
 
 /// Payload format version. A change to the field order, the widths or the meaning of any
-/// field is a **new version**, never an edit of this one: the platform mints and s0
-/// verifies out of two separate repos, and a silently redefined field is a credential
-/// that resolves to the wrong principal rather than one that fails.
+/// field is a **new version**, never an edit of this one: minting and verification can
+/// live in different binaries, and a silently redefined field is a credential that
+/// resolves to the wrong principal rather than one that fails.
 pub const PAYLOAD_VERSION: u8 = 1;
 
 /// Bytes of HMAC-SHA256 kept as the id's MAC. 128 bits, base64url'd to 22 characters.
 ///
-/// Truncation is the standard construction (RFC 2104 §5); 128 bits is far beyond what an
-/// online forgery attempt against a gateway can reach, and the alternative — a full
-/// 256-bit tag — costs 22 more characters on every access-key id, which is 22 more bytes
-/// on every audit record (see the length note below).
+/// Truncation is the standard construction (RFC 2104 §5), and 128 bits is far beyond what
+/// an online forgery attempt against a gateway can reach.
 pub const MAC_LEN: usize = 16;
 
 /// Hard cap on the whole access-key id.
 ///
-/// No client-side ceiling was found: ten SDK stacks (boto3, aws-cli v2, mc, rclone,
-/// aws-sdk-go v1/v2, aws-sdk-s3 Rust, AWS SDK for Java v1/v2 and Trino's own
-/// `trino-filesystem-s3`) all returned 200 on ids up to 16 KiB. So the cap is not an
-/// interoperability limit; it bounds what an **unauthenticated** caller can write into
-/// the audit stream.
-///
-/// `audit::GateContext` copies the presented access-key id into every
-/// gate record, and a gate record is written precisely when a request is *refused*
-/// before it becomes a policy question — which anyone who can reach the socket can
-/// trigger, with an id they chose. Measured here: a real `identity_rejected` record
-/// carrying a 66-character id is 549 bytes. Gate denials are already rate-limited
-/// (`suppressed_since_last`), so this is a second bound rather than the only one.
-///
-/// Note for the register: an **allowed** request records no access-key id at all — the
-/// decision record identifies the principal, not the credential — so the cap is not
-/// about steady-state audit volume on the happy path.
+/// Not an interoperability limit — SDKs tolerate multi-KiB ids. It bounds what an
+/// **unauthenticated** caller can write into the audit stream: `audit::GateContext` copies
+/// the presented id into every gate record, and a gate record is written precisely when a
+/// request is refused before it becomes a policy question, which anyone who can reach the
+/// socket can trigger with an id they chose.
 pub const MAX_ACCESS_KEY_ID_LEN: usize = 1024;
 
 /// The tenant is length-prefixed with a single byte, so it cannot exceed this. The mint
@@ -173,11 +76,10 @@ pub const MAX_TENANT_LEN: usize = 255;
 
 /// Domain-separation tag for the id's MAC.
 ///
-/// The two derivations below use the **same** ring entry, so they must be separated by
-/// construction rather than by the improbability of a collision: without a tag, a message
-/// crafted for one could be a message for the other, and the MAC that proves an identity
-/// would be a secret that authenticates it. Distinct lengths plus a `0x00` terminator make
-/// the two message spaces disjoint.
+/// Both derivations below use the **same** ring entry, so they must be separated by
+/// construction: without a tag, the MAC that proves an identity could also be the secret
+/// that authenticates it. Distinct tag lengths plus a `0x00` terminator make the two
+/// message spaces disjoint.
 const DOMAIN_ID: &[u8] = b"s0-derived-key-id-v1";
 
 /// Domain-separation tag for the secret. See [`DOMAIN_ID`].
@@ -185,7 +87,7 @@ const DOMAIN_SECRET: &[u8] = b"s0-derived-key-secret-v1";
 
 /// `typ` byte for a human principal.
 const TYP_USER: u8 = 0;
-/// `typ` byte for a service account — which is what F18's five consumers are.
+/// `typ` byte for a service account.
 const TYP_SERVICE_ACCOUNT: u8 = 1;
 
 /// The three fields of a derived access-key id, before anything inside them is trusted.
@@ -203,8 +105,7 @@ pub struct DerivedKeyId<'a> {
 ///
 /// Note what is **not** here: no organization (that comes from the gateway's own
 /// tenant→org table, never from the credential — see [`crate::auth::DerivedKeys`]), no
-/// groups and no grants (both live in the bundle and are read live), no scope and no
-/// expiry.
+/// groups and no grants (both live in the bundle and are read live), no scope, no expiry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DerivedPrincipal {
     pub tenant: String,
@@ -227,9 +128,9 @@ pub struct DerivedKeyCredential {
 /// Holds the ring that mints and verifies derived keys.
 ///
 /// **A ring of its own, not the STS ring.** The two credential classes have different
-/// lifetimes (one hour vs. indefinite) and different revocation stories, and
-/// `GatewayConfig::validate` refuses a configuration that files the same key bytes under
-/// both — so compromise of one class's material cannot forge the other's.
+/// lifetimes and different revocation stories, and `GatewayConfig::validate` refuses a
+/// configuration that files the same key bytes under both, so compromise of one class's
+/// material cannot forge the other's.
 #[derive(Clone)]
 pub struct DerivedKeyAuthority {
     /// `kid -> key`. Every entry can *verify*; only `current_kid` mints.
@@ -248,6 +149,11 @@ impl DerivedKeyAuthority {
 
     /// Build from a full key ring. `current_kid` must name an entry — minting under a key
     /// the operator did not choose is worse than refusing to start.
+    ///
+    /// Rotation: add a key, point `current_kid` at it, and outstanding keys keep verifying
+    /// under the old entry. There is no TTL after which stragglers are gone, so deleting an
+    /// entry is a fleet-wide revocation of everything minted under it and has to be paired
+    /// with reissuing those keys.
     pub fn with_key_ring(
         master_keys: BTreeMap<String, Vec<u8>>,
         current_kid: &str,
@@ -290,13 +196,11 @@ impl DerivedKeyAuthority {
 
     /// Does this access-key id claim to be a derived long-lived key?
     ///
-    /// **Deliberately a prefix test and deliberately separate from
-    /// [`Self::parse_access_key`]**, for the same reason
-    /// [`crate::auth::sts::StsAuthority::is_sts_access_key`] is: an id carrying the prefix
-    /// but not decomposing is a *malformed derived credential*, not a static one, and it
-    /// must never fall through to the static credential store — where a colliding entry
-    /// would shadow the whole namespace. `GatewayConfig::validate` refuses such entries at
-    /// load; this makes the property hold even for a store built some other way.
+    /// A prefix test, deliberately separate from [`Self::parse_access_key`] and for the
+    /// same reason [`crate::auth::sts::StsAuthority::is_sts_access_key`] is: an id carrying
+    /// the prefix but not decomposing is a *malformed derived credential*, not a static
+    /// one, and must never fall through to the static credential store, where a colliding
+    /// entry would shadow the whole namespace.
     pub fn is_derived_access_key(access_key_id: &str) -> bool {
         access_key_id.starts_with(DERIVED_PREFIX)
     }
@@ -320,16 +224,13 @@ impl DerivedKeyAuthority {
         })
     }
 
-    /// **The verification gate.** Check the MAC, and only then decode the payload.
+    /// **The verification gate.** Check the MAC, and only then decode the payload — a
+    /// caller that decoded first would be reading attacker-chosen tenant and subject
+    /// strings.
     ///
     /// Every failure — unknown prefix shape, retired `kid`, bad MAC, malformed payload,
     /// unknown version — answers the same `None`, so a forged id is indistinguishable
     /// from an unknown one to the caller.
-    ///
-    /// The ordering is the whole point: nothing inside the payload is looked at, let
-    /// alone believed, until the MAC over the payload has checked out against the key the
-    /// `kid` selects. A caller that decoded first would be reading attacker-chosen tenant
-    /// and subject strings.
     pub fn verify(&self, access_key_id: &str) -> Option<DerivedPrincipal> {
         let id = Self::parse_access_key(access_key_id)?;
         let key = self.master_keys.get(id.kid)?;
@@ -347,17 +248,11 @@ impl DerivedKeyAuthority {
 
     /// `secret = hex(HMAC-SHA256(k[kid], DOMAIN_SECRET ‖ 0 ‖ kid ‖ 0 ‖ access_key_id))`.
     ///
-    /// **Verifies the MAC first.** Deriving a secret for an unverified id would be
-    /// harmless in itself (the holder could not know it), but it would answer
-    /// `SignatureDoesNotMatch` where an unknown key answers `InvalidAccessKeyId` — and
-    /// that difference is an oracle telling a prober which of their forgeries was
-    /// structurally right.
-    ///
-    /// **Hot-path cost, stated because this runs per S3 request:** re-verifying rather
-    /// than trusting an earlier `verify` in the same request costs one extra
-    /// HMAC-SHA256 over ~100 bytes, against the four HMACs SigV4 itself performs plus a
-    /// SHA-256 of the payload. Not worth a `_unchecked` variant that a future caller
-    /// could reach for by mistake.
+    /// **Verifies the MAC first**, even if the caller already did. Deriving a secret for
+    /// an unverified id would answer `SignatureDoesNotMatch` where an unknown key answers
+    /// `InvalidAccessKeyId`, and that difference is an oracle telling a prober which of
+    /// their forgeries was structurally right. The redundant HMAC is noise beside the four
+    /// SigV4 itself performs, so there is no `_unchecked` variant to reach for by mistake.
     pub fn secret_for_access_key(&self, access_key_id: &str) -> Option<String> {
         let id = Self::parse_access_key(access_key_id)?;
         self.verify(access_key_id)?;
@@ -369,14 +264,15 @@ impl DerivedKeyAuthority {
         ))
     }
 
-    /// **The helper the platform half (F17b) needs, and the contract it must match.**
+    /// Mint under `current_kid`, returning both halves once; nothing is stored. `key_epoch`
+    /// is the tenant's current key epoch, which revocation compares against the floor the
+    /// bundle publishes (see [`crate::auth::DerivedKeys`]).
     ///
-    /// Mints under `current_kid`. `epoch` is the tenant's current key epoch, which the
-    /// minter reads from the same place the gateway reads its floor — see
-    /// [`crate::auth::DerivedKeys`]. Returns both halves once; nothing is stored.
-    ///
-    /// Every refusal names the field, and nothing is ever truncated: two principals
-    /// sharing a truncated id would share a credential.
+    /// `sub` is the RAW subject — a client id or an OIDC sub, never the bundle's `sa:` /
+    /// `user:` spelling, which [`crate::pdp::principal_subject_key`] composes on the way
+    /// out; a key baking the prefix in authenticates and is then denied everything.
+    /// Refusals name the field and nothing is truncated: two principals sharing a
+    /// truncated id would share a credential.
     pub fn mint(&self, principal: &DerivedPrincipal) -> Result<DerivedKeyCredential> {
         let payload = encode_payload(principal)?;
         let key = self
@@ -415,9 +311,10 @@ impl DerivedKeyAuthority {
 /// `HMAC(k, DOMAIN_ID ‖ 0 ‖ kid ‖ 0 ‖ payload)`, returned unfinalized so the caller can
 /// either finalize it (minting) or verify against it in constant time (the hot path).
 ///
-/// The `kid` is inside the message as well as selecting the key, for the reason
-/// `sts::derive_secret` gives: an operator who files the same bytes under two ids then
-/// gets two distinct MAC spaces, which keeps "retire the old kid" a real revocation.
+/// The MAC covers the **encoded payload text**, not the decoded bytes, so the minted
+/// string is the only string that verifies. The `kid` is inside the message as well as
+/// selecting the key, so the same bytes filed under two ids give two distinct MAC spaces
+/// and retiring a kid stays a real revocation.
 fn id_mac(key: &[u8], kid: &str, payload: &str) -> HmacSha256 {
     let mut mac = HmacSha256::new_from_slice(key).expect("hmac accepts any key length");
     mac.update(DOMAIN_ID);
@@ -541,30 +438,25 @@ mod tests {
         DerivedPrincipal {
             tenant: "acme".into(),
             // The RAW client id. `sa:` is composed by `pdp::principal_subject_key` on the
-            // way out — baking it in here would teach the platform half (F17b) to
-            // double-prefix, and the vector is the thing it will copy.
+            // way out, and this vector is what another minter will copy — baking the
+            // prefix in here would teach it to double-prefix.
             sub: "trino-background".into(),
             principal_type: PrincipalType::ServiceAccount,
             key_epoch: 1,
         }
     }
 
-    /// **THE CROSS-REPO CONTRACT, as bytes rather than as prose.**
-    ///
-    /// hyperfluid's minter (F17b) must reproduce these two strings exactly from the same
-    /// inputs. If this test is ever edited to match new output, the platform half has to
-    /// be edited in the same breath — which is precisely the coupling the OPA-entrypoint
-    /// incident showed we cannot leave to memory.
+    /// The wire contract as bytes rather than as prose: any other minter must reproduce
+    /// these two strings exactly from the same inputs, so editing this test to match new
+    /// output means editing every minter in the same breath.
     const GOLDEN_SECRET: &str = "5b7b3cae116417cefaa08d94c85ee7285678bfaded3405183a908fe996e63d5f";
 
     #[test]
     fn the_wire_format_is_pinned_byte_for_byte() {
         // Key: 32 bytes of 0x07. kid: "k0". tenant "acme", sub "trino-background" (RAW,
-        // unprefixed — see the module header), service account, epoch 1.
-        //
-        // Reproduced independently from the module documentation alone by a Python
-        // implementation that never saw this code, which is the evidence that F17b can
-        // be written from the spec rather than from a port of this file.
+        // unprefixed — see `mint`), service account, epoch 1. The payload decodes as
+        // `01` (ver) `01` (typ = service account) `00000001` (epoch, BE u32) `04` (len
+        // tenant) `61636d65` (`acme`) then the subject to the end.
         let creds = authority().mint(&principal()).unwrap();
         assert_eq!(
             creds.access_key_id,
@@ -588,7 +480,7 @@ mod tests {
             },
             DerivedPrincipal {
                 tenant: "t".repeat(MAX_TENANT_LEN),
-                sub: "s".repeat(258), // iam_sa_client_id's VARCHAR(255) worst case
+                sub: "s".repeat(258), // longer than any realistic client id
                 principal_type: PrincipalType::ServiceAccount,
                 key_epoch: u32::MAX,
             },
@@ -605,8 +497,7 @@ mod tests {
     }
 
     /// The property the whole design rests on: no store, so a second process holding the
-    /// same key material answers identically. This is `F8`'s multi-replica question for
-    /// the new credential class, answered by construction.
+    /// same key material answers identically.
     #[test]
     fn a_second_instance_verifies_a_key_it_never_minted() {
         let minted = authority().mint(&principal()).unwrap();
@@ -709,9 +600,9 @@ mod tests {
         }
     }
 
-    /// Stage 1's alphabet finding, enforced rather than remembered. `/` breaks SigV4's
-    /// credential scope; `'` and `\` break the operator's Trino `CREATE CATALOG` SQL
-    /// literal, which escapes only the single quote.
+    /// Every character of a minted id stays in `[A-Za-z0-9-_.]`, which is load-bearing
+    /// outside this file: `/` delimits the SigV4 credential scope, and `'` and `\` break
+    /// consumers that interpolate an access key into a SQL or config string literal.
     #[test]
     fn a_minted_id_stays_inside_the_alphabet_every_consumer_tolerates() {
         let a = authority();
@@ -806,7 +697,7 @@ mod tests {
                 .starts_with("HFSAnew.")
         );
 
-        // Retiring the entry is a revocation, on both halves.
+        // Retiring the entry is a revocation.
         let retired = DerivedKeyAuthority::with_key_ring(
             BTreeMap::from([("new".to_string(), vec![8u8; 32])]),
             "new",

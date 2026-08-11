@@ -1,24 +1,13 @@
-//! The drift gate: the policy, the fixtures and the producer must all be talking about
-//! the same document.
+//! The drift gate: the policy, the fixtures and the producer must all be talking about the
+//! same document. A hand-written fixture carrying a field the gateway never emits leaves
+//! the policy correct about a request that does not exist — every rego test green while
+//! production is deny-all. Four checks close that gap:
 //!
-//! This is the direct countermeasure to the failure that defined the previous attempt.
-//! 35 rego tests were green while production was deny-all, because the fixtures carried
-//! an `input.op` field the gateway never emitted — so the policy was correct about a
-//! request that did not exist, and every test agreed with it. Nothing in that setup
-//! could notice, because the fixtures were the only description of the wire shape.
-//!
-//! Four checks close it, and each one fails on a different half of the mismatch:
-//!
-//! 1. **round-trip** — every captured document re-parses into `OpaInput` and
-//!    re-serializes identically. Catches a field the type has and the wire does not, or
-//!    vice versa. This is the check `#[serde(deny_unknown_fields)]` exists for.
-//! 2. **field inventory** — the union of keys across the captured corpus is contained
-//!    in `OPA_INPUT_FIELDS`, whose exhaustiveness is enforced at compile time by a
-//!    destructuring test in `authz::input`.
-//! 3. **rego references** — every `input.<path>` the shipped policy reads resolves in
-//!    at least one *captured* input. `input.op` would fail here, loudly, naming itself.
-//! 4. **hand-written corpus** — `policy/testdata/corpus.json` may only use fields that
-//!    the producer has been observed to emit.
+//! 1. every captured document re-parses into `OpaInput` and re-serializes identically;
+//! 2. captured keys are contained in `OPA_INPUT_FIELDS`;
+//! 3. every `input.<path>` the shipped policy reads resolves in at least one *captured*
+//!    input;
+//! 4. `policy/testdata/corpus.json` may only use fields the producer is observed to emit.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -145,10 +134,8 @@ fn the_captured_corpus_uses_only_declared_fields() {
         );
     }
     // The reverse is deliberately NOT asserted: `object_tags` and `delete_keys` are
-    // legitimately absent from every capture today (on-demand tags are not wired, and a
-    // batch-level `delete_keys` input is only built for the audit record). Requiring
-    // full coverage would either force fictional captures or force deleting fields the
-    // contract needs.
+    // legitimately absent from every capture, so requiring full coverage would force
+    // either fictional captures or deleting fields the contract needs.
     assert!(
         seen.contains("principal") && seen.contains("action") && seen.contains("bucket"),
         "the corpus is missing the fields every decision turns on: {seen:?}"
@@ -182,11 +169,9 @@ fn every_rego_input_reference_appears_in_a_captured_input() {
 
 #[test]
 fn the_hand_written_corpus_matches_the_captured_wire_shape() {
-    // `policy/testdata/corpus.json` is still hand-authored — it has to be, because it
-    // encodes *expected decisions* for bundles the gateway has never run against. What
-    // it may not do is invent input fields. Each case must parse (which
-    // `deny_unknown_fields` makes strict) and may only use fields observed in a real
-    // capture.
+    // `policy/testdata/corpus.json` is hand-authored — it encodes *expected decisions* for
+    // bundles the gateway has never run against. What it may not do is invent input fields:
+    // each case must parse and may only use fields observed in a real capture.
     let mut observed = BTreeSet::new();
     for (_, raw) in captured_inputs() {
         field_paths(&raw, &mut observed);
@@ -200,11 +185,10 @@ fn the_hand_written_corpus_matches_the_captured_wire_shape() {
         let raw = &case["input"];
         serde_json::from_value::<OpaInput>(raw.clone())
             .unwrap_or_else(|e| panic!("corpus case {name:?} is not a valid OpaInput: {e}"));
-        // The corpus must also round-trip, because `tests/parity.rs` now feeds BOTH
-        // engines the re-serialized value: if normalization changed a case, regorus and
-        // OPA would still agree with each other while both disagreeing with what the
-        // gateway emits. If this fires, spell the case out in full (every
-        // always-serialized field, `request` included) rather than relaxing it.
+        // The corpus must also round-trip: `tests/parity.rs` feeds BOTH engines the
+        // re-serialized value, so a normalization change would leave regorus and OPA
+        // agreeing with each other while both disagree with the gateway. Spell the case
+        // out in full rather than relaxing this.
         round_trip(raw).unwrap_or_else(|e| panic!("corpus case {name:?}: {e}"));
         let mut used = BTreeSet::new();
         field_paths(raw, &mut used);

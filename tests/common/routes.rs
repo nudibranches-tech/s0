@@ -1,17 +1,13 @@
-//! The s3s route table: the smallest request that resolves to each operation.
-//!
-//! Extracted from the pinned crate's own `resolve_route`
-//! (`~/.cargo/registry/src/*/s3s-0.14.1/src/ops/generated.rs`) and checked in, because
-//! s3s exposes no enumeration of its routes. Two files need it and for opposite
-//! reasons, which is why it lives here rather than in either:
+//! The s3s route table: the smallest request that resolves to each operation. Extracted
+//! from the pinned crate's own `resolve_route` and checked in, because s3s exposes no
+//! enumeration of its routes. Two consumers, which is why it lives here:
 //!
 //! - `tests/gate_blackbox.rs` drives every row over real HTTP, to prove `check` refuses
 //!   every operation `OP_TABLE` does not enforce;
 //! - `tests/golden_capture.rs` uses the method and URI so a captured `RequestMeta` is
 //!   the one a real client produces, not `GET /`.
 //!
-//! `tests/op_coverage.rs` pins the s3s version, so a dependency bump fails there first
-//! and this table is regenerated with the operation list.
+//! `tests/op_coverage.rs` pins the s3s version: a dependency bump fails there first.
 
 use std::sync::OnceLock;
 

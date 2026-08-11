@@ -1,14 +1,13 @@
 //! Process shutdown signalling, shared by every listener the gateway runs.
 //!
 //! Each listener awaits its own [`signal`] future: tokio delivers a signal to every
-//! registered stream, so one SIGTERM reaches the S3 front, the STS mint and the admin
-//! listener alike. That matters for a rolling update — a listener with no signal
-//! handling is not "quietly ignoring" the signal, it is *aborted* when the runtime
-//! drops, taking its in-flight requests with it.
+//! registered stream, so one SIGTERM reaches them all. A listener with no signal handling
+//! is not "quietly ignoring" the signal — it is *aborted* when the runtime drops, taking
+//! its in-flight requests with it.
 //!
-//! Ordering is the caller's job (`main`): the data plane drains first, the audit
-//! worker next, and the admin listener last, so probes keep answering (with a failing
-//! `/readyz`) for as long as the pod is still doing work.
+//! Ordering is the caller's job (`main`): the data plane drains first, the audit worker
+//! next, and the admin listener last, so probes keep answering (with a failing `/readyz`)
+//! for as long as the pod is still doing work.
 
 /// Resolves on SIGTERM (kubelet's stop signal) or Ctrl-C.
 ///

@@ -47,8 +47,9 @@ impl SidecarPdp {
         })
     }
 
-    /// The URL this PDP posts decisions to. Exposed so `tests/cross_repo_contract.rs`
-    /// can hold it equal to the entrypoint the platform ships.
+    /// The URL this PDP posts decisions to. Exposed so a test can hold it equal to the
+    /// entrypoint the pushed module declares — a mismatch evaluates to `undefined`, which
+    /// denies every request while the pod stays healthy.
     pub fn decision_url(&self) -> &str {
         &self.decision_url
     }

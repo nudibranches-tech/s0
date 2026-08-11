@@ -14,7 +14,9 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use s0::admin::{self, AdminState};
-use s0::audit::{self, AuditConfig, AuditRecord, BackendOutcome, GatewayMeta, Outcome};
+use s0::audit::{
+    self, AuditConfig, AuditRecord, BackendOutcome, GatewayMeta, LabelPolicy, Outcome,
+};
 use s0::auth::sts::StsAuthority;
 use s0::auth::{Identity, StaticCredentialStore};
 use s0::authz::{Backend, Decision, OpaInput, Principal, PrincipalAttributes, RequestMeta};
@@ -122,6 +124,7 @@ fn record(id: &str) -> AuditRecord {
             backend: BackendOutcome::NotAttempted,
             backend_status: None,
         },
+        &LabelPolicy::default(),
     )
 }
 
@@ -154,9 +157,9 @@ async fn sigterm_on_an_idle_listener_drains_immediately() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     stop.send(()).expect("listener still running");
 
-    // The accept was previously awaited OUTSIDE the shutdown select, so an idle
-    // listener only noticed the signal when the next connection happened to arrive —
-    // i.e. never, on a quiet pod, until the grace period killed it.
+    // The accept has to be awaited INSIDE the shutdown select, or an idle listener only
+    // notices the signal when the next connection happens to arrive — i.e. never, on a
+    // quiet pod, until the grace period kills it.
     let exited = tokio::time::timeout(Duration::from_secs(2), listener)
         .await
         .expect("an idle listener must drain promptly, not wait for a connection");
@@ -179,9 +182,8 @@ impl OidcVerifier for FixedVerifier {
 
 #[tokio::test]
 async fn the_mint_serves_then_drains_on_shutdown() {
-    // `mint::serve` was an infinite accept loop with no signal handling, so its task
-    // was aborted when main returned — every rolling update produced sporadic mint
-    // failures that looked like IdP flakiness.
+    // An accept loop with no signal handling is aborted when main returns, so every
+    // rolling update produces sporadic mint failures that look like IdP flakiness.
     let sts = Arc::new(StsAuthority::new(vec![4u8; 32], vec![8u8; 32]).unwrap());
     let mint = Arc::new(Mint::new(
         Arc::new(FixedVerifier),
@@ -331,10 +333,10 @@ async fn readiness_waits_for_a_real_poll_then_metrics_report_the_state() {
 
 #[tokio::test]
 async fn two_workers_do_not_destroy_each_others_spill() {
-    // Two replicas, one configured spill path (a shared RWX volume, or a ConfigMap
-    // whose ${POD_NAME} was never interpolated). Before the ownership claim, whichever
-    // replica replayed first deleted the whole file — including records the other had
-    // appended and it had never read. Silently.
+    // Two replicas, one configured spill path (a shared RWX volume, or a ConfigMap whose
+    // ${POD_NAME} was never interpolated). Without the ownership claim, whichever replica
+    // replays first deletes the whole file — including records the other appended and it
+    // never read. Silently.
     let dir = tmpdir("spill");
     let shared = dir.join("audit-spill.ndjson");
 
@@ -418,9 +420,7 @@ async fn two_workers_do_not_destroy_each_others_spill() {
 
     // Both workers have now exited with a non-empty spill file. That is not "pending":
     // the spill is node-local scratch that dies with the pod, so the honest count is
-    // lost — and it must show up in the exported total, which is the whole reason the
-    // total exists. (Before this was wired, these 16 records were reported as pending
-    // and `dropped_total` was 0 on precisely the shutdown where audit loss happens.)
+    // lost, and it must show up in the exported total.
     for (who, sink) in [("a", &sink_a), ("b", &sink_b)] {
         let m = sink.metrics();
         assert_eq!(

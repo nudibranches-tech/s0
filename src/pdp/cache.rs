@@ -1,11 +1,10 @@
-//! Decision cache — correct by construction.
+//! Decision cache.
 //!
-//! The key embeds the bundle revision, the full principal (so a differing group set
-//! never reuses another principal's verdict), and a digest of *every other field* of
-//! the input ([`OpaInput::resource_key`] — derived, not enumerated, so a field the
-//! policy can read is never outside the key). A revocation bumps the revision, so stale entries
-//! are simply never looked up again — no TTL, no invalidation. Decisions whose input
-//! carries on-demand data (object tags) are never cached: their freshness is not
+//! The key embeds the bundle revision, the full principal, and a digest of *every other
+//! field* of the input ([`OpaInput::resource_key`] — derived, not enumerated, so a field
+//! the policy can read is never outside the key). A revocation bumps the revision, so
+//! stale entries are never looked up again: no TTL, no invalidation. Decisions whose
+//! input carries on-demand data (object tags) are never cached — their freshness is not
 //! bounded by the revision.
 
 use std::sync::Arc;

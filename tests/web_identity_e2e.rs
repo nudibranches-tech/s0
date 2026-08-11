@@ -1,37 +1,13 @@
-//! **Stage 2, proven by execution: an off-the-shelf S3 client can get a credential and
-//! use it.**
-//!
-//! Before this surface existed, nothing outside the console could obtain an `HFST*`
-//! credential at all — `aws-cli`, `rclone`, Trino, Spark and every backup tool were
-//! simply unable to use the gateway (recorded as the
-//! finding that blocked the whole client matrix). So the claim this file has to
-//! establish is not "the handler returns 200". It is the full loop:
-//!
-//! 1. a **real Keycloak-shaped service-account token**, RS256-signed by a real keypair
-//!    (`testdata/oidc_test_rsa.pem`, the same one `tests/mint_oidc.rs` uses) with
-//!    `aud: "account"`, `azp: <clientId>` and
-//!    `preferred_username: service-account-<clientId>` — the exact document
-//!    `grant_type=client_credentials` produces, including the `aud` that would fail a
-//!    strict audience check;
-//! 2. posted **form-encoded** to the real `mint::serve_with_shutdown` accept loop as
-//!    `Action=AssumeRoleWithWebIdentity`, i.e. what an SDK puts on the wire;
-//! 3. an **XML** response, parsed the way an SDK parses it;
-//! 4. those credentials used to **SigV4-sign a real `GetObject`** over TCP against the
-//!    real `server::serve_with_shutdown` S3 front, carrying the returned session token;
-//! 5. the `OpaInput` the enforce path actually handed the PDP, read out of the capture
-//!    sink — asserting the decision was made against `sa:<clientId>`, in the tenant the
-//!    **RoleArn** named, in the organization s0 resolved from its **own** routing table.
-//!
-//! ## Why the service-account case is the whole point
+//! **An off-the-shelf S3 client can get a credential and use it**, proven by execution: an
+//! RS256-signed service-account token posted form-encoded to the production
+//! `mint::serve_with_shutdown` accept loop as `Action=AssumeRoleWithWebIdentity`, parsed
+//! out of XML the way an SDK does, then used to SigV4-sign a real `GetObject` against the
+//! production S3 front — with the decision document read out of the capture sink.
 //!
 //! The bundle keys a service account's grants under `sa:<clientId>` and a user's under
-//! `user:<oidc sub>`. An SA token's `sub` is the Keycloak service-account *user* id,
-//! which appears in no bundle. So a surface that resolved the principal wrongly would
-//! mint a credential that authenticates perfectly and is authorized against nothing —
-//! an unexplained 403 storm against a gateway reporting itself healthy. The two
-//! principals here are granted **different prefixes**, so neither direction can pass on
-//! a constant: the service account reaches its prefix and is refused on the user's, and
-//! the user reaches its prefix and is refused on the service account's.
+//! `user:<oidc sub>`; an SA token's `sub` is a user id in no bundle, so a surface that
+//! resolves the principal wrongly mints a credential authorized against nothing. The two
+//! principals here hold **different prefixes**, so neither direction passes on a constant.
 
 mod common;
 
@@ -49,7 +25,7 @@ use s0::webidentity::{WebIdentityConfig, WebIdentitySts};
 const PRIVATE_PEM: &str = include_str!("testdata/oidc_test_rsa.pem");
 const PUBLIC_PEM: &str = include_str!("testdata/oidc_test_rsa_pub.pem");
 
-/// The realm URL a hyperfluid Keycloak puts in `iss`.
+/// The realm URL the identity provider puts in `iss`.
 const ISSUER: &str = "https://kc.example/realms/default";
 /// The OIDC client the operator provisions for storage — the same value it already
 /// hands RGW's role as an accepted client id.
@@ -60,29 +36,28 @@ const STORAGE_CLIENT: &str = "acme-storage";
 const TENANT: &str = "acme";
 const ORG: &str = "org-acme";
 
-/// `{tenant}-sts-role` — byte-identical to the role name
-/// `harbor_binding_reconciler::ensure_harbor_sts` provisions in RGW, so a client
-/// repointed from RGW STS to s0 changes its endpoint and nothing else.
+/// `{tenant}-sts-role` — byte-identical to the role name the control plane provisions in
+/// RGW, so a client repointed from RGW STS to s0 changes its endpoint and nothing else.
 const ROLE_TEMPLATE: &str = "{tenant}-sts-role";
 fn role_arn() -> String {
     format!("arn:aws:iam::{TENANT}:role/{TENANT}-sts-role")
 }
 
-/// The service account's Keycloak **clientId** — the key the bundle uses.
+/// The service account's OIDC **clientId** — the key the bundle uses.
 const SA_CLIENT_ID: &str = "pipeline-runner";
-/// The Keycloak service-account *user* id the token carries in `sub`. In no bundle.
+/// The service-account *user* id the token carries in `sub`. In no bundle.
 const SA_TOKEN_SUB: &str = "b6d2c1f0-0000-0000-0000-000000000000";
 /// A human's OIDC subject.
 const USER_SUB: &str = "oidc-sub-alice";
 
-/// The ceiling the operator renders from `spec.s3Gateway.sessionTtlSecs`.
+/// The configured session-duration ceiling.
 const MAX_DURATION: u64 = 3600;
 
 /// `sa:pipeline-runner` may read under `sa/`; `user:oidc-sub-alice` may read under
 /// `human/`. Disjoint on purpose — see the module docs.
 fn bundle() -> serde_json::Value {
     serde_json::json!({
-        "org_settings": { "freeze_writes": false, "reserved_tag_keys": ["hyperfluid/*"] },
+        "org_settings": { "freeze_writes": false, "reserved_tag_keys": ["acme/*"] },
         "tenants": { TENANT: {
             "user_attributes": {
                 SA_CLIENT_ID: { "groups": ["editor"], "attributes": [] },
@@ -109,20 +84,13 @@ fn now() -> u64 {
         .as_secs()
 }
 
-/// A Keycloak service-account access token, field for field.
+/// A service-account access token, field for field. Two details are load-bearing:
 ///
-/// Two details are modelled deliberately and both are load-bearing:
-///
-/// * **`aud` is an array containing `account` *and* the storage client.** `account` is
-///   Keycloak's default and on its own means "issued for nothing in particular"; the
-///   storage client is what an **audience mapper** on the SA's client scope adds, and it
-///   is what makes the token say "issued for this gateway's STS". That mapper is a
-///   deployment prerequisite for this flow and is called out as one — see
-///   `the_audience_binding_is_required_and_account_alone_is_not_one` for what happens
-///   without it, and the deployment runbook for how to add it.
-/// * **`azp` is the SA's own clientId, not the audience.** It is the *subject* half, and
-///   it is what the bundle keys `sa:<clientId>` on. A token whose subject and audience
-///   were the same value would not distinguish the two roles the claims play here.
+/// * **`aud` holds `account` *and* the storage client.** `account` alone means "issued for
+///   nothing in particular"; the storage client is what an **audience mapper** adds, and
+///   what makes the token say "issued for this gateway's STS".
+/// * **`azp` is the SA's own clientId, not the audience** — the *subject* half, which the
+///   bundle keys `sa:<clientId>` on.
 fn service_account_token(client_id: &str) -> String {
     sign(serde_json::json!({
         "iss": ISSUER,
@@ -135,8 +103,8 @@ fn service_account_token(client_id: &str) -> String {
     }))
 }
 
-/// A human's console token: same realm, same audience binding, but `preferred_username`
-/// is a person and `azp` is the console client.
+/// A human user's token: same realm and audience binding, but `preferred_username` is a
+/// person and `azp` is an interactive client.
 fn user_token() -> String {
     sign(serde_json::json!({
         "iss": ISSUER,
@@ -169,7 +137,7 @@ fn mint_config() -> StsMintConfig {
         public_key_pem: Some(PUBLIC_PEM.to_string()),
         sub_claim: "sub".into(),
         groups_claim: "groups".into(),
-        tenant_claim: "harbor".into(),
+        tenant_claim: "tenant".into(),
         org_claim: "org".into(),
         jwks_timeout_secs: 5,
         jwks_refresh_secs: 0,
@@ -182,10 +150,9 @@ fn mint_config() -> StsMintConfig {
         ],
         role_name_template: Some(ROLE_TEMPLATE.into()),
         max_duration_secs: MAX_DURATION,
-        // The listener's own hardening bounds (F13). Left at the production
-        // defaults on purpose: every test in this file drives one request at a
-        // time, so if any of them ever starts tripping a bound, the bound is wrong
-        // for real traffic too. `tests/mint_hardening.rs` is where they are pushed.
+        // The listener's hardening bounds, left at the production defaults on purpose:
+        // every test here drives one request at a time, so a test tripping a bound means
+        // the bound is wrong for real traffic too. `tests/mint_hardening.rs` pushes them.
         max_connections: 256,
         connection_timeout_secs: 30,
     }
@@ -199,11 +166,8 @@ struct Harness {
 
 /// Boot the **production** serving paths: `server::serve_with_shutdown` for the S3 data
 /// plane and `mint::serve_with_shutdown` for the STS door, on two real sockets, over one
-/// `StsAuthority` and one `BackendRegistry` — the same expressions `main.rs` uses.
-///
-/// A second authority here would make the whole file measure a credential nothing else
-/// in the process could honour, which is exactly the failure a test like this exists to
-/// exclude.
+/// `StsAuthority` and one `BackendRegistry` — the same expressions `main.rs` uses. A
+/// second authority would make the file measure a credential nothing else could honour.
 async fn harness(tag: &str) -> Harness {
     harness_with(tag, mint_config()).await
 }
@@ -334,13 +298,9 @@ impl Session {
     }
 }
 
-/// Pull one element's text out of the document.
-///
-/// Hand-rolled rather than a parser dependency, and it is enough precisely because it
-/// is unforgiving: the tag must be present and closed. If the renderer emitted a
-/// different element name, or nested it differently, this panics rather than quietly
-/// returning an empty string that a later assertion would compare to something else
-/// empty.
+/// Pull one element's text out of the document. Hand-rolled and unforgiving on purpose:
+/// the tag must be present and closed, so a renamed element panics here rather than
+/// yielding an empty string a later assertion compares to something else empty.
 fn element(xml: &str, name: &str) -> String {
     let open = format!("<{name}>");
     let close = format!("</{name}>");
@@ -386,9 +346,9 @@ fn last_opa_input(h: &Harness) -> serde_json::Value {
 
 // ── the proof ──────────────────────────────────────────────────────────────────
 
-/// **The headline.** A Keycloak service-account token, through the real STS wire
-/// protocol, produces a credential the S3 data plane accepts and evaluates as
-/// `sa:<clientId>` in the tenant the RoleArn named.
+/// **The headline.** A service-account token, through the real STS wire protocol, produces
+/// a credential the S3 data plane accepts and evaluates as `sa:<clientId>` in the tenant
+/// the RoleArn named.
 #[tokio::test]
 async fn a_service_account_token_mints_a_credential_that_works_against_s3() {
     let h = harness("webid-e2e-sa").await;
@@ -467,8 +427,8 @@ async fn a_user_token_mints_a_user_session_and_cannot_reach_the_service_accounts
     let input = last_opa_input(&h);
     assert_eq!(input["principal"]["type"], serde_json::json!("user"));
     assert_eq!(input["principal"]["sub"], serde_json::json!(USER_SUB));
-    // `azp: hf-console` is on this token too. If it were read as a client id, the
-    // subject would be `hf-console` and every console user would share one key space.
+    // An `azp` is on this token too. If it were read as a client id, the subject would be
+    // that client and every interactive user would share one key space.
     assert_ne!(input["principal"]["sub"], serde_json::json!("hf-console"));
 
     let (status, _) = get_object(&h, &session, "sa/q1.csv").await;
@@ -508,10 +468,9 @@ async fn the_expiration_on_the_wire_is_iso8601_and_within_the_configured_ceiling
 }
 
 /// **Clamp, not refuse.** A `DurationSeconds` above the ceiling still yields a working
-/// credential with a shorter life, because an SDK reads `Expiration` and schedules its
-/// own refresh from it — whereas AWS's `ValidationError` would be a hard failure at
-/// credential acquisition, i.e. the workload never starts. Registered as a deliberate
-/// deviation in the AWS-parity register (D20).
+/// credential with a shorter life, because an SDK reads `Expiration` and schedules its own
+/// refresh from it — whereas AWS's `ValidationError` fails credential acquisition outright
+/// and the workload never starts. A deliberate deviation from AWS.
 #[tokio::test]
 async fn a_duration_above_the_ceiling_is_clamped_rather_than_refused() {
     let h = harness("webid-e2e-clamp").await;
@@ -754,22 +713,15 @@ async fn every_refusal_is_an_sts_error_document_with_the_aws_code() {
     assert!(session.access_key_id.starts_with("HFST"));
 }
 
-/// **A realm token is not a gateway token.** The audience binding is what stops a token
-/// a principal obtained *for some other service* from being spent here.
-///
-/// Keycloak's default `aud` for `grant_type=client_credentials` is `account`, which
-/// names nothing in particular and is carried by every token the realm issues. If that
-/// were accepted, any service in the realm holding a user's or an SA's token could
-/// exchange it for storage credentials — the classic confused deputy, on a credential
-/// mint. So it is refused, and the token must carry an audience the operator rendered
-/// (`aud`) or have been exchanged into one of the platform clients (`azp`).
-///
-/// **This is the one deployment prerequisite of the whole flow**: an SA client needs an
-/// audience mapper, or its clientId needs to be in `spec.s3Gateway.stsAudiences`.
+/// **A realm token is not a gateway token.** The default `aud` for
+/// `grant_type=client_credentials` is `account`, which rides on every token the realm
+/// issues; accepting it would let any service in the realm exchange a token it holds for
+/// storage credentials. So the token must carry a configured audience (`aud`) or a known
+/// client (`azp`) — that audience mapper is the flow's one deployment prerequisite.
 #[tokio::test]
 async fn the_audience_binding_is_required_and_account_alone_is_not_one() {
     let h = harness("webid-e2e-aud").await;
-    // Exactly what Keycloak issues with no audience mapper configured.
+    // Exactly what the IdP issues with no audience mapper configured.
     let unbound = sign(serde_json::json!({
         "iss": ISSUER,
         "aud": "account",
@@ -800,10 +752,9 @@ async fn the_audience_binding_is_required_and_account_alone_is_not_one() {
     assert!(session.access_key_id.starts_with("HFST"));
 }
 
-/// The escape hatch the operator renders from `spec.s3Gateway.stsAudiences`: naming a
-/// service account's own clientId lets it present its **unmapped** token. Same code
-/// path, different configured list — so an operator can switch one SA on declaratively
-/// rather than waiting for a Keycloak change.
+/// The escape hatch in the configured audience list: naming a service account's own
+/// clientId lets it present its **unmapped** token. Same code path, different list — so an
+/// operator can switch one SA on without an identity-provider change.
 #[tokio::test]
 async fn naming_a_service_accounts_client_id_lets_it_present_an_unmapped_token() {
     let cfg = StsMintConfig {
@@ -845,24 +796,21 @@ async fn naming_a_service_accounts_client_id_lets_it_present_an_unmapped_token()
     assert!(xml.contains("<Code>InvalidIdentityToken</Code>"), "{xml}");
 }
 
-// ── the bundle-driven route (stage 4) ──────────────────────────────────────────
+// ── the bundle-driven route ────────────────────────────────────────────────────
 
 /// A service account created by a **tenant**, not by the operator: its clientId is in no
-/// rendered audience list and never will be. This is the real one measured against dev1.
+/// configured audience list and never will be.
 const TENANT_SA: &str = "test-s0-before";
 
-/// [`bundle`] plus the PLATFORM-KEYED membership entry the STS door's bundle route
-/// reads: `sa:<clientId>` in `data.tenants[<tenant>].user_attributes`, which is what
-/// `org_s3_gateway_bundle::service_account_subject` writes for every service account of
-/// the organization.
+/// [`bundle`] plus the membership entry the STS door's bundle route reads: `sa:<clientId>`
+/// in `data.tenants[<tenant>].user_attributes`, which a control plane writes for every
+/// service account of the organization.
 ///
-/// **It carries no grant, deliberately** — that is the ordinary state of a
-/// freshly-created SA, it is the case `s3_grants` alone would have missed, and it is
-/// what makes the 403 in
+/// **It carries no grant, deliberately**: that is the ordinary state of a freshly-created
+/// SA, and it is what makes the 403 in
 /// `bundle_acceptance_is_not_authorization_a_grantless_subject_is_still_denied` mean
-/// something. The rest of the map keeps the raw keys the *compiled-in* module reads
-/// (this fixture runs `GATEWAY_REGO`, which keys on the unprefixed sub), so the two key
-/// spaces sit side by side here exactly as they do in a mixed deployment.
+/// something. The rest of the map keeps the raw keys `GATEWAY_REGO` reads, so the two key
+/// spaces sit side by side here as they do in a mixed deployment.
 fn bundle_with_a_tenant_service_account() -> serde_json::Value {
     let mut bundle = bundle();
     bundle["tenants"][TENANT]["user_attributes"]
@@ -875,8 +823,8 @@ fn bundle_with_a_tenant_service_account() -> serde_json::Value {
     bundle
 }
 
-/// The token such an SA really presents: Keycloak's `client_credentials` default, with
-/// no audience mapper and no entry in `stsAudiences`.
+/// The token such an SA really presents: the `client_credentials` default, with no
+/// audience mapper and no entry in the configured audience list.
 fn unmapped_service_account_token(client_id: &str) -> String {
     sign(serde_json::json!({
         "iss": ISSUER,
@@ -888,14 +836,14 @@ fn unmapped_service_account_token(client_id: &str) -> String {
     }))
 }
 
-/// **The case this stage exists for, end to end.** A tenant's own service account —
+/// **The case this route exists for, end to end.** A tenant's own service account —
 /// unmapped token, `aud: "account"`, clientId in none of the configured audiences —
-/// obtains a credential because the **policy bundle already knows it**, with no operator
-/// re-render and no Keycloak change.
+/// obtains a credential because the **policy bundle already knows it**, with no config
+/// re-render and no identity-provider change.
 ///
-/// The negative control is the same token, the same configured list and the same code
-/// path against a bundle that does *not* name it: refused. So this measures the bundle
-/// lookup and not a hole in the audience check.
+/// The negative control is the same token and the same code path against a bundle that
+/// does *not* name it: refused. So this measures the bundle lookup and not a hole in the
+/// audience check.
 #[tokio::test]
 async fn a_tenant_service_account_the_bundle_knows_mints_a_credential_with_no_operator_re_render() {
     let h = harness_over(
@@ -937,14 +885,11 @@ async fn a_tenant_service_account_the_bundle_knows_mints_a_credential_with_no_op
     assert!(!xml.contains(TENANT), "{xml}");
 }
 
-/// **Acceptance is not authorization**, measured on a real S3 request rather than
-/// argued.
+/// **Acceptance is not authorization**, measured on a real S3 request rather than argued.
 ///
 /// The subject above is in the bundle and holds no grant. Its credential is perfectly
-/// valid — it signs, the session token verifies, the identity resolves as
-/// `sa:<clientId>` in the tenant the RoleArn named — and every S3 request it makes is
-/// still refused, by the same policy as everyone else. If the bundle route had conferred
-/// anything, this is where it would show.
+/// valid, and every S3 request it makes is still refused by the same policy as everyone
+/// else. If the bundle route conferred anything, this is where it would show.
 #[tokio::test]
 async fn bundle_acceptance_is_not_authorization_a_grantless_subject_is_still_denied() {
     let h = harness_over(
@@ -981,12 +926,9 @@ async fn bundle_acceptance_is_not_authorization_a_grantless_subject_is_still_den
     assert_ne!(status, 403, "{body}");
 }
 
-/// A refusal must not tell an anonymous caller whether a tenant exists.
-///
-/// The endpoint is internet-reachable, so `AccessDenied` is uniform across "no such
-/// tenant" and "wrong role name" and names neither. The check that this is *real*
-/// rather than incidental is that the two answers are byte-identical apart from the
-/// request id.
+/// A refusal must not tell an anonymous caller whether a tenant exists. The endpoint is
+/// internet-reachable, so `AccessDenied` is uniform across "no such tenant" and "wrong
+/// role name": the two answers are byte-identical apart from the request id.
 #[tokio::test]
 async fn an_unroutable_tenant_and_a_wrong_role_are_indistinguishable_to_the_caller() {
     let h = harness("webid-e2e-oracle").await;
@@ -1065,12 +1007,9 @@ async fn a_caller_with_no_valid_token_cannot_probe_tenants_at_all() {
 
 // ── the two doors share one socket ─────────────────────────────────────────────
 
-/// The bearer door is untouched: a POST with no `Action` is still the JSON exchange,
-/// and still answers `401` with a JSON body when no bearer token is presented.
-///
-/// The dispatch is on the presence of `Action` in the body — which is what the AWS query
-/// protocol *is* — so there is no path to get subtly wrong, and neither door can shadow
-/// the other.
+/// The bearer door is untouched: a POST with no `Action` is still the JSON exchange, and
+/// still answers `401` with a JSON body when no bearer token is presented. Dispatch is on
+/// the presence of `Action` in the body, so neither door can shadow the other.
 #[tokio::test]
 async fn the_bearer_door_still_answers_on_the_same_socket() {
     let h = harness("webid-e2e-both").await;

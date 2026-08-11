@@ -1,9 +1,8 @@
-//! F17b's gateway half: `POST /internal/v1/derived-keys`, driven over a real socket.
+//! `POST /internal/v1/derived-keys`, driven over a real socket.
 //!
-//! The platform asks s0 for a long-lived key instead of deriving one itself, so the one
-//! property worth proving is that **the credential the platform is handed is a credential
-//! the data plane honours** — not that it matches a golden vector, which is a proxy for
-//! the thing that actually matters and drifts silently when the real thing does not.
+//! The control plane asks s0 for a long-lived key instead of deriving one itself, so the
+//! one property worth proving is that **the credential it is handed is one the data plane
+//! honours** — not that it matches a golden vector, which drifts silently.
 //!
 //! So every test here mints over HTTP through the production `internal::route`, then
 //! signs a real SigV4 request with what came back, against the **same** gateway process,
@@ -26,14 +25,14 @@ use s0::secret::Secret;
 const SECRET: &str = "platform-shared-secret-value";
 const DERIVED_KEY_HEX: &str = "abababababababababababababababababababababababababababababababab";
 
-/// The subject F18 migrates first: Trino's background compaction identity, which holds
-/// the tenant-owner key today.
+/// A background compaction identity — the kind of long-lived consumer this endpoint is
+/// for.
 const SUBJECT: &str = "trino-background";
 const ORG: &str = "org-acme";
 
 /// The same fixture shape as `derived_keys_e2e`: one grant, one prefix, and the epoch
-/// floor the whole revocation story hangs off. `include_epoch` is a state the platform
-/// can really be in — a tenant the projection has not yet published a floor for.
+/// floor the whole revocation story hangs off. `include_epoch` off is a real state — a
+/// tenant the projection has not yet published a floor for.
 fn bundle(key_epoch: u32, include_epoch: bool) -> serde_json::Value {
     let mut tenant = serde_json::json!({
         "user_attributes": { SUBJECT: { "groups": [], "attributes": [] } },
@@ -49,7 +48,7 @@ fn bundle(key_epoch: u32, include_epoch: bool) -> serde_json::Value {
         tenant["s3_key_epoch"] = key_epoch.into();
     }
     serde_json::json!({
-        "org_settings": { "freeze_writes": false, "reserved_tag_keys": ["hyperfluid/*"] },
+        "org_settings": { "freeze_writes": false, "reserved_tag_keys": ["acme/*"] },
         "tenants": { "acme": tenant }
     })
 }
@@ -94,8 +93,9 @@ impl Harness {
         let s3_base = serve(|addr| {
             let serving = gw.clone();
             tokio::spawn(async move {
-                let _ = s0::server::serve_with_shutdown(serving, addr, std::future::pending::<()>())
-                    .await;
+                let _ =
+                    s0::server::serve_with_shutdown(serving, addr, std::future::pending::<()>())
+                        .await;
             });
         })
         .await;
@@ -138,7 +138,7 @@ impl Harness {
             .store(Bundle::new(content_revision(&doc.to_string()), doc));
     }
 
-    /// `POST /internal/v1/derived-keys`, authenticated, as the console makes it.
+    /// `POST /internal/v1/derived-keys`, authenticated, as the control plane makes it.
     async fn mint(&self, tenant: &str, org: &str, sub: &str) -> (u16, serde_json::Value) {
         self.mint_at(tenant, org, sub, None).await
     }
@@ -233,10 +233,10 @@ fn assert_credential_not_honoured(status: u16, body: &str, what: &str) {
     assert!(body.contains("InvalidAccessKeyId"), "{what}: got {body}");
 }
 
-/// **The headline, and the reason minting lives in s0.** The platform makes one
-/// authenticated call and receives two fields that an ordinary SigV4 client uses to read
-/// a real object — authorized per prefix against grants the credential does not carry,
-/// and refused one prefix over. No golden vector, no second encoder.
+/// **The headline, and the reason minting lives in s0.** One authenticated call returns
+/// two fields that an ordinary SigV4 client uses to read a real object — authorized per
+/// prefix against grants the credential does not carry, and refused one prefix over. No
+/// golden vector, no second encoder.
 #[tokio::test]
 async fn a_key_minted_over_the_internal_api_is_honoured_by_the_data_plane() {
     let hx = Harness::boot("mint-honoured", 1, true).await;
@@ -289,10 +289,9 @@ async fn the_minted_epoch_tracks_the_bundle_and_a_raised_floor_revokes_the_key()
 /// **Rotation without a gap**, which is the whole reason `key_epoch` is a request field.
 ///
 /// A derived key is a pure function of its inputs, so re-minting a principal at the same
-/// epoch returns the *same* two strings — the epoch is the serial number. Rotation
-/// therefore mints one above the floor, runs both keys, and only then revokes: the
-/// consumer is never without a working credential, which is AWS's two-access-key
-/// rotation reached with a counter instead of a table.
+/// epoch returns the *same* two strings — the epoch is the serial number. Rotation mints
+/// one above the floor, runs both keys, and only then revokes, so the consumer is never
+/// without a working credential.
 #[tokio::test]
 async fn a_rotation_can_run_two_keys_before_the_old_one_is_cut() {
     let hx = Harness::boot("mint-rotate", 1, true).await;
@@ -327,9 +326,9 @@ async fn a_rotation_can_run_two_keys_before_the_old_one_is_cut() {
     assert_eq!(status, 409, "{body}");
 }
 
-/// **A tenant the platform has not opted in gets no key at all**, rather than a key that
-/// silently fails on first use. Absence denies at the mint for exactly the reason it
-/// denies at admission, and 409 says so — the tenant exists, the feature does not.
+/// **A tenant that has not opted in gets no key at all**, rather than a key that silently
+/// fails on first use. Absence denies at the mint for the same reason it denies at
+/// admission, and 409 says so: the tenant exists, the feature does not.
 #[tokio::test]
 async fn a_tenant_with_no_published_epoch_is_refused_at_the_mint() {
     let hx = Harness::boot("mint-no-epoch", 1, true).await;
@@ -364,10 +363,9 @@ async fn the_asserted_tenant_and_organization_are_checked_against_this_gateways_
     assert_eq!(status, 400, "empty subject: {body}");
 }
 
-/// Off is off, and it is **409, not 404**: the route exists on every build, so a platform
-/// that gets this back knows to look at the gateway's config rather than at its own URL.
-/// The distinction is the difference between "wrong version deployed" and "feature not
-/// switched on", which are days apart to diagnose.
+/// Off is off, and it is **409, not 404**: the route exists on every build, so a caller
+/// that gets this back knows to look at the gateway's config rather than at its own URL —
+/// the difference between "wrong version deployed" and "feature not switched on".
 #[tokio::test]
 async fn a_gateway_with_no_ring_refuses_rather_than_pretending_the_route_is_absent() {
     let hx = Harness::boot("mint-off", 1, false).await;
@@ -391,8 +389,10 @@ async fn the_mint_is_behind_the_same_shared_secret() {
 
     let resp = reqwest::Client::new()
         .post(format!("{}{DERIVED_KEY_PATH}", hx.internal_base))
-        .json(&serde_json::json!({ "sub": SUBJECT, "principal_type": "service_account",
-                                   "tenant": "acme", "organization_id": ORG }))
+        .json(
+            &serde_json::json!({ "sub": SUBJECT, "principal_type": "service_account",
+                                   "tenant": "acme", "organization_id": ORG }),
+        )
         .send()
         .await
         .expect("request");
@@ -400,14 +400,19 @@ async fn the_mint_is_behind_the_same_shared_secret() {
 }
 
 /// The request has **nowhere to put a scope, a duration or a group**, and a caller that
-/// tries is refused rather than silently having the field dropped. Dropping a field the
-/// console believed it had applied is the failure this endpoint exists to prevent, and
-/// for a credential that never expires it is permanent.
+/// tries is refused rather than silently having the field dropped — dropping a field the
+/// caller believed it had applied is permanent for a credential that never expires.
 #[tokio::test]
 async fn an_unknown_field_is_refused_rather_than_dropped() {
     let hx = Harness::boot("mint-unknown", 1, true).await;
 
-    for extra in ["duration_seconds", "groups", "prefixes", "scope", "organization"] {
+    for extra in [
+        "duration_seconds",
+        "groups",
+        "prefixes",
+        "scope",
+        "organization",
+    ] {
         let mut body = serde_json::json!({ "sub": SUBJECT, "principal_type": "service_account",
                                            "tenant": "acme", "organization_id": ORG });
         body[extra] = serde_json::json!(1);

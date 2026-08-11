@@ -1,21 +1,13 @@
 name: Release
 
 # One git tag produces the whole release: the binary tarballs AND the container image
-# hyperfluid pins. They are in one workflow on purpose — an image published without the
-# matching release (or a release with no image behind its tag) is exactly the state that
-# makes a consumer's pinned tag `ImagePullBackOff`, and a single tag event that either
-# does all of it or fails cannot get there.
+# consumers pin. One workflow, because an image without its matching release (or a release
+# with no image behind its tag) is what makes a consumer's pinned tag `ImagePullBackOff`.
+# The GitHub Release object is an OUTPUT of this workflow, not its trigger.
 #
-# The trigger is the git tag rather than a published GitHub Release: the tag is what a
-# `chore(release): X.Y.Z` commit already creates, it is what `git describe` reports from a
-# checkout, and it needs no click in a UI at the moment the artifact's identity is fixed.
-# The Release object is an OUTPUT of this workflow, not its trigger.
-#
-# THIS WORKFLOW IS THE ONLY THING THAT PUBLISHES THE s0 IMAGE. There is no local
-# `docker build && docker push` route, for production or for a dev cluster:
-# `scripts/release-image.sh` refuses to push anywhere but here. The binary that decides
-# who may read what is built from a tagged commit, by a job whose inputs are all in git,
-# or it is not shipped.
+# THIS WORKFLOW IS THE ONLY THING THAT PUBLISHES THE s0 IMAGE — `scripts/release-image.sh`
+# refuses to push anywhere else. The binary that decides who may read what is built from a
+# tagged commit, by a job whose inputs are all in git, or it is not shipped.
 
 on:
   push:
@@ -40,10 +32,9 @@ jobs:
   # ── the gate that makes a mistyped version unshippable ──────────────────────
   #
   # `Cargo.toml` is the source of truth for the version; the git tag must agree with it,
-  # and every downstream job takes the version from HERE rather than from the ref it was
-  # triggered by. So there is no step in which a human types a version, and a tag that
-  # disagrees with the crate fails in ~5 seconds instead of publishing a `v0.3.0` release
-  # full of `0.2.0` artifacts.
+  # and every downstream job takes the version from HERE rather than from the triggering
+  # ref. A tag that disagrees with the crate fails in seconds instead of publishing a
+  # `v0.3.0` release full of `0.2.0` artifacts.
   version:
     name: version guard
     runs-on: ubuntu-latest
@@ -75,11 +66,10 @@ jobs:
 
   # ── the tagged commit's own test run ────────────────────────────────────────
   #
-  # `ci.yml` triggers on branches and pull requests, so without this a tag could publish a
-  # commit that never ran the suite — and a tag can be pointed at any commit. It is CALLED
-  # rather than copied: one definition of "s0 passes", used by both, so the release gate
-  # cannot drift from the merge gate. This is what makes the image an artifact of a tested
-  # commit rather than of a green-looking branch.
+  # `ci.yml` triggers on branches and pull requests, and a tag can be pointed at any
+  # commit, so without this a tag could publish a commit that never ran the suite. It is
+  # CALLED rather than copied: one definition of "s0 passes", so the release gate cannot
+  # drift from the merge gate.
   test:
     name: gate
     needs: version
@@ -136,34 +126,24 @@ jobs:
             ${{ env.BINARY }}-*.tar.gz
             ${{ env.BINARY }}-*.tar.gz.sha256
 
-  # ── the container image hyperfluid pins ─────────────────────────────────────
+  # ── the container image consumers pin ───────────────────────────────────────
   #
-  # REGISTRY: ghcr.io, derived from `github.repository`. It is the only registry this
-  # workflow can authenticate to without provisioning a long-lived credential (GITHUB_TOKEN
-  # is scoped to this repository and expires with the job), and s0 already lives on GitHub,
-  # so the image sits beside the source and the release that produced it. Introducing a
-  # deploy credential for somebody else's registry, held as a secret in this repo, would be
-  # a standing key to the artifact that authorizes S3 traffic — the opposite trade.
+  # REGISTRY: ghcr.io, derived from `github.repository` — the only registry this workflow
+  # can authenticate to without a long-lived credential. A deploy secret for somebody
+  # else's registry would be a standing key to the artifact that authorizes S3 traffic.
   #
-  # This is the PUBLICATION point, not necessarily the pull point. A consumer either pins
-  # `ghcr.io/<owner>/s0-gas:<version>` directly, or copies that exact tag into its own
-  # registry — `skopeo copy` / `crane copy`, a registry-to-registry move of these bytes,
-  # never a rebuild — which is what an air-gapped private cloud has to do anyway and what
-  # hyperfluid's `registry.hyperfluid.cloud/hyperfluid/s3-gateway:<version>` pin expects.
-  # Note that GHCR publishes a new package PRIVATE: either mark the package public once,
-  # or give the pulling cluster a pull secret. See "Releasing" in README.md.
+  # PUBLICATION point, not necessarily the pull point: a consumer pins
+  # `ghcr.io/<owner>/s0-gas:<version>` or copies that exact tag into its own registry
+  # (`skopeo copy` / `crane copy` — never a rebuild). GHCR publishes a new package
+  # PRIVATE: mark it public once, or give the pulling cluster a pull secret. See
+  # "Releasing" in README.md.
   #
-  # TAGS: exactly one — the crate version. No `latest`, no floating `0.2`, no branch tag.
-  # A moving tag is precisely the failure this pipeline exists to prevent: the consumer
-  # pins a tag, so the tag must name one immutable set of bytes forever. Publishing a
-  # second, moving name for the same image would let someone pin it by accident.
+  # TAGS: exactly one, the crate version. No `latest`, no floating `0.2`, no branch tag —
+  # a pinned tag must name one immutable set of bytes forever.
   #
-  # PLATFORMS: linux/amd64 only, and that is a decision rather than an omission. Every
-  # target cluster is amd64; arm64 would have to be cross-compiled under QEMU (a Rust
-  # release build there is tens of minutes) or split across a second runner, and the result
-  # would be an OCI index — a shape some of the mirroring paths into private registries
-  # handle worse than a plain manifest. Adding it later is one line in PLATFORMS below,
-  # and it should be added when there is an arm64 node to run it on, not before.
+  # PLATFORMS: linux/amd64 only. arm64 would need QEMU cross-compilation or a second
+  # runner, and the resulting OCI index mirrors into private registries worse than a plain
+  # manifest. Adding it is one line in PLATFORMS below.
   image:
     name: publish container image
     needs: [version, test]
@@ -185,9 +165,8 @@ jobs:
 
       # A registry tag is only "immutable" because nothing overwrites it. GHCR would let a
       # re-run, or a deleted-and-recreated git tag, push different bytes under a version
-      # somebody has already pinned and deployed — which is F1 (a pinned tag whose bytes
-      # moved) reintroduced at the source. So: if the tag is already there, this is not a
-      # release, it is an overwrite. Bump the version instead.
+      # somebody has already pinned and deployed. If the tag is already there, this is not
+      # a release, it is an overwrite — bump the version instead.
       #
       # A successful inspect is the only signal treated as "exists"; any failure (absent
       # package on the first ever release, transient registry error) falls through to the
@@ -205,8 +184,8 @@ jobs:
           echo "$image is unpublished; proceeding"
 
       # The same script anyone can run locally to check that the image still builds. PUSH=1
-      # is honoured only under GitHub Actions, so there is one build recipe and only one
-      # place it can publish from.
+      # is honoured only under GitHub Actions: one build recipe, one place it can publish
+      # from.
       - name: Build and push
         env:
           PUSH: "1"
@@ -235,7 +214,7 @@ jobs:
             echo "$digest"
             echo '```'
             echo
-            echo "Pin in hyperfluid: \`operator.config.s3Gateway.image.tag: \"${{ needs.version.outputs.version }}\"\`"
+            echo "Consumers pin: \`${{ needs.version.outputs.version }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload digest artifact

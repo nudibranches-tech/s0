@@ -4,12 +4,11 @@
 //!
 //! **Every plaintext credential in this file is a [`Secret<String>`]**, not a `String`.
 //! These structs `derive(Debug)` and are reachable from a `tracing` call, a panic
-//! payload, or any error type that wraps them — and this deployment ships JSON logs
-//! into a shared pipeline. `Secret` makes the redaction a property of the type rather
-//! than of whoever writes the next log line, so a *new* secret field is safe by
-//! default instead of safe by memory. See `src/secret.rs`.
+//! payload, or any error type that wraps them. `Secret` makes redaction a property of
+//! the type rather than of whoever writes the next log line, so a *new* secret field is
+//! safe by default. See `src/secret.rs`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -30,14 +29,11 @@ pub struct GatewayConfig {
     #[serde(default = "default_admin_listen")]
     pub admin_listen: SocketAddr,
     pub sts: StsConfig,
-    /// Optional: the key ring for **derived long-lived per-principal keys**
-    ///. Absent ⇒ the gateway mints and honours none, and behaves
-    /// byte-identically to a build made before they existed.
-    ///
-    /// **Absent does not mean the namespace is free.** `HFSA*` is refused for static
-    /// credentials either way (see [`GatewayConfig::validate`]) and answered by nothing
-    /// at runtime, so enabling this later cannot silently activate a credential someone
-    /// parked in the namespace in the meantime.
+    /// Optional key ring for **derived long-lived per-principal keys**. Absent ⇒ the
+    /// gateway mints and honours none — but the namespace is not free: `HFSA*` is
+    /// refused for static credentials either way (see [`GatewayConfig::validate`]) and
+    /// answered by nothing at runtime, so enabling this later cannot silently activate a
+    /// credential someone parked in the namespace.
     #[serde(default)]
     pub derived_keys: Option<DerivedKeysConfig>,
     pub pdp: PdpConfig,
@@ -60,57 +56,44 @@ pub struct GatewayConfig {
     pub bundle_url: Option<String>,
     #[serde(default = "default_bundle_poll_secs")]
     pub bundle_poll_secs: u64,
-    /// Whole-request timeout for one bundle fetch. Without it a control plane that
-    /// accepts the connection and never answers stalls the refresh loop *forever*:
-    /// the poller is a single task, so one hung fetch stops all later polls and
-    /// revocation silently stops landing. Must be < `bundle_poll_secs` × a small
-    /// factor or polls queue up behind each other.
+    /// Whole-request timeout for one bundle fetch. The poller is a single task, so a
+    /// control plane that accepts the connection and never answers stalls every later
+    /// poll and revocation silently stops landing. Must stay well below
+    /// `bundle_poll_secs` or polls queue up behind each other.
     #[serde(default = "default_bundle_timeout_secs")]
     pub bundle_timeout_secs: u64,
-    /// Credential presented on every bundle fetch, when the bundle is polled from
-    /// the control plane.
-    ///
-    /// **Optional on purpose.** s0 must stay runnable against a plain file or an
-    /// unauthenticated URL (development, and any operator running it outside
-    /// hyperfluid), so a missing value is not an error — it is "this source needs no
-    /// credential". But when it *is* set it is sent on every request, never on the
-    /// first one only and never conditionally: see [`crate::bundle_refresh`].
-    ///
-    /// Rejected at load when `bundle_url` is unset, because a credential that is
-    /// never sent reads exactly like a credential that is.
+    /// Credential presented on every bundle fetch, when the bundle is polled from the
+    /// control plane. Optional: a plain file or an unauthenticated URL needs none. When
+    /// set it is sent on every request, never on the first one only and never
+    /// conditionally ([`crate::bundle_refresh`]). Rejected at load when `bundle_url` is
+    /// unset, because a credential that is never sent reads exactly like one that is.
     #[serde(default)]
     pub bundle_shared_secret: Option<Secret<String>>,
-    /// Optional STS mint (the badge desk). When present, a control-plane server
-    /// runs on its own listener and issues gateway session creds from OIDC tokens.
+    /// Optional STS mint. When present, a server runs on its own listener and issues
+    /// gateway session credentials from OIDC tokens.
     #[serde(default)]
     pub sts_mint: Option<StsMintConfig>,
-    /// Optional **authenticated** internal surface: the console-mediated session
-    /// endpoint. Absent by default, so a gateway that does not carry this section
-    /// behaves byte-identically to one built before it existed — no listener is
-    /// bound, no port is opened, nothing is served.
+    /// Optional **authenticated** internal surface: the control-plane-mediated session
+    /// endpoint. Absent by default — no listener is bound, nothing is served.
     #[serde(default)]
     pub internal: Option<InternalApiConfig>,
 }
 
-/// The authenticated internal control-plane surface (`POST
-/// /internal/v1/sts/sessions`).
+/// The authenticated internal control-plane surface (`POST /internal/v1/sts/sessions`).
 ///
-/// Deliberately **its own listener**, not a route on the admin listener and not a
-/// route on the S3 data plane. See [`crate::internal`] for the full argument; the
-/// short form is that the admin listener is unauthenticated by construction (probes
-/// cannot carry a secret) and mixing an authenticated credential-minting route onto
-/// the same port makes "is this request authenticated?" a routing question — which is
-/// how fail-open surfaces are built.
+/// Deliberately **its own listener**: the admin listener is unauthenticated by
+/// construction (probes cannot carry a secret), and a credential-minting route sharing
+/// that port would make "is this request authenticated?" a routing question — which is
+/// how fail-open surfaces are built. See [`crate::internal`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct InternalApiConfig {
     #[serde(default = "default_internal_listen")]
     pub listen: SocketAddr,
-    /// The platform `X-Shared-Secret`. **Optional in the schema, mandatory in
-    /// effect**: absent, empty or whitespace-only, every request to this listener is
-    /// refused. It is not a load-time error because that would crash-loop a pod whose
-    /// *data plane* is healthy and serving — refusing to mint is the smaller failure,
-    /// and it is loud (an `error!` at startup and a 401 per request) rather than
-    /// silent. It is never a reason to allow.
+    /// The caller's `X-Shared-Secret`. **Optional in the schema, mandatory in effect**:
+    /// absent, empty or whitespace-only, every request to this listener is refused. Not
+    /// a load-time error, because crash-looping a pod whose *data plane* is healthy is
+    /// the larger failure; the refusal is loud (an `error!` at startup, a 401 per
+    /// request) rather than silent, and is never a reason to allow.
     #[serde(default)]
     pub shared_secret: Option<Secret<String>>,
     /// Ceiling on a minted session's lifetime, in seconds. The caller asks for a
@@ -120,23 +103,13 @@ pub struct InternalApiConfig {
     pub max_session_ttl_secs: u64,
 }
 
-/// OIDC → gateway-credentials mint. Backend-agnostic: verifies a Keycloak token and
-/// mints the gateway's own session (never a backend STS).
+/// OIDC → gateway-credentials mint. Backend-agnostic: verifies an identity-provider
+/// token and mints the gateway's own session (never a backend STS). Neither door takes
+/// a separate credential, correctly: the OIDC token **is** the credential.
 ///
-/// This listener serves **two** doors, and the second one is the one clients use:
-///
-/// * the original bearer-token JSON exchange (`Authorization: Bearer <oidc>` ⇒ a JSON
-///   credential document), which requires `tenant_claim`/`org_claim` to be present in
-///   the token and can only ever mint a *user* session;
-/// * `Action=AssumeRoleWithWebIdentity` — the AWS STS query protocol, form-encoded
-///   request and XML response ([`crate::webidentity`]). This is what every S3 SDK can
-///   speak with stock configuration, it carries the tenant in the `RoleArn` rather than
-///   in a claim, and it can mint a service-account session. Configured by the
-///   `web_identity_*` / `role_name_template` / `max_duration_secs` fields below.
-///
-/// Both are unauthenticated in the sense that no *platform* credential is required —
-/// correctly, because the OIDC token **is** the credential. See
-/// [`crate::webidentity`] for why that posture belongs on this socket and on no other.
+/// * bearer-token JSON exchange: needs `tenant_claim`/`org_claim`, mints *user* sessions;
+/// * `Action=AssumeRoleWithWebIdentity` ([`crate::webidentity`]): the AWS STS query
+///   protocol stock SDKs speak, tenant from the `RoleArn`, service accounts included.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StsMintConfig {
     pub listen: SocketAddr,
@@ -171,41 +144,25 @@ pub struct StsMintConfig {
     // ── the AssumeRoleWithWebIdentity surface ──────────────────────────────────
     /// Serve `Action=AssumeRoleWithWebIdentity` on this listener.
     ///
-    /// Defaults **on**: this door is the whole reason to configure `sts_mint` on this
-    /// platform (the bearer door cannot serve hyperfluid — see [`crate::internal`]), and
-    /// an operator who has gone to the trouble of pointing s0 at an IdP wants clients to
-    /// be able to get a credential. Set it to `false` to run the bearer door alone.
+    /// Defaults **on**: an operator who has gone to the trouble of pointing s0 at an IdP
+    /// wants clients to be able to get a credential, and this is the door stock SDKs
+    /// speak. Set it to `false` to run the bearer door alone.
     #[serde(default = "default_true")]
     pub web_identity_enabled: bool,
 
     /// Audiences accepted on the web-identity door. Empty ⇒ `[audience]`.
     ///
-    /// A separate list from `audience` because the two doors have genuinely different
-    /// requirements, and collapsing them would break one of them:
-    ///
-    /// * the **bearer door** validates `aud` strictly, through `jsonwebtoken`'s own
-    ///   audience check, against this one configured value;
-    /// * a **Keycloak service-account token** obtained with
-    ///   `grant_type=client_credentials` carries `aud: "account"` and identifies the
-    ///   client in **`azp`**. Requiring a matching `aud` would refuse every service
-    ///   account on the platform — i.e. the primary consumer of the gateway.
-    ///
-    /// So the web-identity door accepts a match on `aud` **or** `azp`/`client_id`
-    /// against this list. That is not a local invention: it is exactly what Ceph RGW
-    /// does (`ensure_sts_role` is handed a list of client ids, not audiences) and what
-    /// MinIO documents ("validates `aud` first, then falls back to `azp`"), and the
-    /// operator renders the same list it already gives RGW. There is **no** setting in
-    /// which the check is skipped: an empty list falls back to `[audience]`, so a token
-    /// with no audience binding at all is always refused.
+    /// Separate from the strictly-checked `audience` because a `client_credentials`
+    /// service-account token typically carries `aud: "account"` and names the client in
+    /// **`azp`**; this door matches either, as Ceph RGW and MinIO do. Never skipped — an
+    /// empty list falls back to `[audience]`.
     #[serde(default)]
     pub web_identity_audiences: Vec<String>,
 
     /// Expected role name, with `{tenant}` substituted from the presented `RoleArn`.
-    ///
-    /// Absent ⇒ any non-empty role name is accepted (s0 must stay runnable outside
-    /// hyperfluid). Set, it makes a mistyped ARN a clear refusal instead of a working
-    /// session in a tenant the caller did not mean. It is a **diagnostic**, never an
-    /// authorization input — s0 has no role objects and authority comes from the bundle.
+    /// Absent ⇒ any non-empty role name is accepted; set, it turns a mistyped ARN into a
+    /// clear refusal instead of a session in a tenant the caller did not mean. A
+    /// **diagnostic**, never an authorization input — authority comes from the bundle.
     #[serde(default)]
     pub role_name_template: Option<String>,
 
@@ -216,56 +173,23 @@ pub struct StsMintConfig {
     #[serde(default = "default_max_session_ttl_secs")]
     pub max_duration_secs: u64,
 
-    // ── the listener's own hardening bounds (F13) ──────────────────────────────
+    // ── the listener's own hardening bounds ──────────────────────────────
     /// Max concurrent connections on the mint listener.
     ///
-    /// The same treatment `LimitsConfig::max_connections` gives the S3 data plane,
-    /// with its own number, because this listener's exposure is different in both
-    /// directions:
-    ///
-    /// * it is the **one socket that is both internet-facing and unauthenticated by
-    ///   design** — the web identity token *is* the credential, exactly as at
-    ///   `sts.amazonaws.com`, so there is nothing to present before being served, and
-    ///   the Ingress in front of it applies no rate limiting (Cilium has no
-    ///   rate-limit annotation, and an nginx-shaped key would be silently ignored).
-    ///   Whatever bound exists has to exist here;
-    /// * its natural concurrency is far *below* the data plane's. A client mints once
-    ///   and then uses the credential for an hour, so the mint sees roughly one
-    ///   request per client per session lifetime, against the data plane's one per
-    ///   object operation.
-    ///
-    /// **It is a queue, not a refusal.** The accept loop takes a permit *before* it
-    /// accepts, exactly as `server::serve_with_shutdown` does, so a connection beyond
-    /// the bound waits in the kernel's accept backlog rather than being answered with
-    /// an error. That is the point: a legitimate mint refused is worse than no bound
-    /// at all, and every mint is a few hundred microseconds of RS256, so a queue
-    /// drains as fast as it forms. Saturation is counted and logged rather than
-    /// returned to the caller (`s0_mint_connection_limit_saturated_total`).
-    ///
-    /// `0` is refused at load: a zero-permit semaphore is not "unbounded", it is a
-    /// listener that accepts nothing.
+    /// The one socket that is both internet-facing and unauthenticated by design, with
+    /// no rate limiting in front of it. It is a **queue, not a refusal**: the accept
+    /// loop takes its permit *before* it accepts, so excess connections wait in the
+    /// kernel backlog instead of getting an error, and saturation is only counted
+    /// (`s0_mint_connection_limit_saturated_total`). `0` is refused at load.
     #[serde(default = "default_mint_max_connections")]
     pub max_connections: usize,
 
     /// Hard ceiling on the lifetime of one accepted mint connection, in seconds.
     ///
-    /// Without it the connection bound above makes slowloris *easier*, not harder: an
-    /// attacker who dribbles bytes on `max_connections` sockets holds every permit
-    /// forever and locks out the whole fleet's credential path with a few hundred
-    /// connections. With it, a permit is always returned within this many seconds.
-    ///
-    /// **Deliberately not `hyper`'s `header_read_timeout`.** That knob needs a timer
-    /// installed on the h1 builder that does not survive `into_owned()`, so it panics
-    /// once per connection — this project already added it once and removed it (see
-    /// the NOTE in `server::serve_with_shutdown`). This is a plain
-    /// `tokio::time::timeout` around the already-`GracefulShutdown`-watched connection
-    /// future: no timer in the builder, no shape to get subtly wrong, and it bounds
-    /// the *whole* connection rather than only its header read.
-    ///
-    /// The default is far longer than any legitimate mint — a token verification plus,
-    /// worst case on a `kid` miss, one JWKS fetch bounded by `jwks_timeout_secs` — and
-    /// far shorter than "forever", which is what an unbounded socket grants. `0` is
-    /// refused at load rather than read as "no bound".
+    /// Without it the connection bound above makes slowloris *easier*: an attacker
+    /// dribbling bytes on `max_connections` sockets holds every permit forever. A plain
+    /// `tokio::time::timeout` rather than hyper's `header_read_timeout`, whose timer does
+    /// not survive `into_owned()`. `0` is refused at load, not read as "no bound".
     #[serde(default = "default_mint_connection_timeout_secs")]
     pub connection_timeout_secs: u64,
 }
@@ -327,10 +251,9 @@ impl StsConfig {
 
 /// The master-key ring for derived long-lived per-principal keys.
 ///
-/// Mirrors [`StsConfig`]'s ring exactly — the same two forms, the same `current_kid`
-/// rule — because an operator should not have to learn a second convention for the second
-/// derivation. There is **no signing key**: a derived key has no session token to sign;
-/// the MAC inside the access-key id is what proves it, and it is derived from this ring.
+/// Mirrors [`StsConfig`]'s ring exactly, so an operator learns one convention. There is
+/// **no signing key**: a derived key has no session token to sign; the MAC inside the
+/// access-key id is what proves it, and it is derived from this ring.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DerivedKeysConfig {
     /// Hex-encoded master key (≥32 bytes). Sugar for a one-entry `master_keys` ring
@@ -339,11 +262,9 @@ pub struct DerivedKeysConfig {
     pub master_key_hex: Option<Secret<String>>,
     /// The master-key **ring**: `kid -> hex key`. The `kid` lands in every access-key id
     /// minted from it (`HFSA<kid>.<payload>.<mac>`), which is what lets a key be rotated
-    /// without invalidating every outstanding one.
-    ///
-    /// Unlike the STS ring there is **no TTL after which stragglers are gone**: retiring
-    /// an entry here revokes every long-lived key minted under it, permanently, so it
-    /// must be paired with reissuing them.
+    /// without invalidating every outstanding one. Unlike the STS ring there is **no TTL
+    /// after which stragglers are gone**: retiring an entry here permanently revokes
+    /// every long-lived key minted under it, so it must be paired with reissuing them.
     #[serde(default)]
     pub master_keys: std::collections::BTreeMap<String, Secret<String>>,
     /// Which ring entry mints new keys. Required with `master_keys`, never inferred.
@@ -398,6 +319,25 @@ pub struct AuditFileConfig {
     /// tailing the pod, and ignores `sink_url`.
     #[serde(default)]
     pub backend: crate::audit::AuditBackendKind,
+    /// The label key carrying org attribution. Its *value* is always the request's
+    /// `organization_id`, resolved from the routing table and never from a claim.
+    ///
+    /// Configurable because a decision-log consumer routes on the key it already uses;
+    /// a consumer that reads a different one drops every record while still answering
+    /// `201`, so the producer never learns.
+    #[serde(default = "default_org_label_key")]
+    pub organization_label_key: String,
+    /// Static labels stamped on every record, decision and gate alike. Empty by default.
+    ///
+    /// This is the deployment's own routing vocabulary — a consumer that dispatches on
+    /// `{"acme.example/log-type": "s3-gateway"}` sets it here rather than having s0 ship
+    /// somebody else's domain as a constant.
+    #[serde(default)]
+    pub extra_labels: BTreeMap<String, String>,
+}
+
+fn default_org_label_key() -> String {
+    crate::audit::DEFAULT_ORG_LABEL_KEY.to_string()
 }
 
 impl Default for AuditFileConfig {
@@ -406,6 +346,8 @@ impl Default for AuditFileConfig {
             sink_url: "http://127.0.0.1:9000/api/v1/decision-logs".into(),
             spill_path: PathBuf::from("/var/lib/s0/audit-spill.ndjson"),
             backend: crate::audit::AuditBackendKind::default(),
+            organization_label_key: default_org_label_key(),
+            extra_labels: BTreeMap::new(),
         }
     }
 }
@@ -417,57 +359,39 @@ pub struct LimitsConfig {
     pub xml_max_body_size: usize,
     /// Ceiling on the file part of a browser form upload (`PostObject`).
     ///
-    /// This one is **not** an ordinary request cap: s3s aggregates the whole file into
-    /// memory during route resolution — before `check`, before the typed hook, before
-    /// any authorization happens at all (`s3s-0.14.1/src/ops/mod.rs:539-551`). So it
-    /// bounds what an *unauthorized* caller can make this process allocate, multiplied
-    /// by `max_connections`. s3s's own default is 5 GiB, which at 1024 connections is
-    /// not a bound at all; the default here is 64 MiB, on the grounds that the form-POST
-    /// path exists for browser uploads and anything larger belongs on `PutObject` or a
-    /// multipart upload, which stream.
-    ///
-    /// Defaulted (unlike its neighbours) so that a config which spells out `limits`
-    /// without naming this field gets the safe bound rather than s3s's 5 GiB.
+    /// **Not** an ordinary request cap: s3s aggregates the whole file into memory before
+    /// any authorization happens, so this bounds what an *unauthorized* caller can make
+    /// the process allocate, times `max_connections`. s3s's own default is 5 GiB.
+    /// Defaulted, unlike its neighbours, so a `limits` block that omits it is still safe.
     #[serde(default = "default_post_object_max_file_size")]
     pub post_object_max_file_size: u64,
     pub presigned_url_max_skew_time_secs: u32,
     /// AWS semantic cap: `DeleteObjects` ≤ 1000 keys (enforced before OPA).
     pub max_delete_keys: usize,
-    /// AWS semantic cap: ≤ 10 tags per object (`PutObjectTagging`, and the tag set a
-    /// future `PutObject`/`PostObject` retrofit parses).
+    /// AWS semantic cap: ≤ 10 tags per object (`PutObjectTagging`).
     ///
-    /// A cap here is a **resource bound**, never a deny mechanism: exceeding it
-    /// produces a real `write_object_tags` Deny sub-decision that is audited, not a
-    /// bare `InvalidRequest` that short-circuits ahead of the audit call (plan defect
-    /// B-1). Set it to 0 and every tag write is refused *and recorded*.
+    /// A **resource bound**, never a deny mechanism: exceeding it produces a real
+    /// `write_object_tags` Deny sub-decision that is audited, not a bare
+    /// `InvalidRequest` that short-circuits ahead of the audit call. Set it to 0 and
+    /// every tag write is refused *and recorded*.
     #[serde(default = "default_max_tag_count")]
     pub max_tag_count: usize,
-    // `max_bucket_policy_bytes` and `max_cors_rules` were removed on 2026-08-08 with the
-    // ops they bounded: `PutBucketPolicy` and `PutBucketCors` are `Coverage::Denied`, so
-    // neither body reaches this process. Both had `#[serde(default)]` and the operator
-    // renders neither (`hf_bin_operator/src/s3_gateway/config.rs::LimitsSection`), so a
-    // deployed `gateway.json` that still carries them keeps loading — they are simply
-    // ignored. A knob that bounds nothing is a claim the binary no longer makes.
     /// Multi-prefix list fan-out bound; above it the list fails closed.
     pub max_list_fanout: usize,
     /// Page size ceiling for a **filtered** `ListBuckets`.
     ///
     /// The gateway owns this pagination outright — filtering the backend's answer makes
     /// its `max-buckets` and `continuation-token` meaningless to the client — so a
-    /// caller-supplied `max-buckets` is clamped to this rather than honored. AWS's own
-    /// default page is 10 000; 1 000 keeps one response bounded in the same order as a
-    /// `ListObjectsV2` page.
+    /// caller-supplied `max-buckets` is clamped to this rather than honored.
     #[serde(default = "default_max_buckets_per_page")]
     pub max_buckets_per_page: usize,
     /// How many backend `ListBuckets` pages one client request may drain.
     ///
     /// A filtered listing cannot be produced incrementally: the gateway sorts the whole
     /// visible set before it can cut a stable page (see `proxy::bucketfilter`), so it
-    /// reads the tenant's bucket list to the end. This bounds that read. A tenant with
-    /// more buckets than this is **refused**, loudly — an under-reported bucket list is
-    /// indistinguishable from a revoked grant, and silently omitting buckets from an
-    /// authorization-filtered response is the failure mode this whole file exists to
-    /// avoid.
+    /// reads the tenant's bucket list to the end. A tenant with more buckets than this
+    /// is **refused**, loudly — an under-reported bucket list is indistinguishable from
+    /// a revoked grant.
     #[serde(default = "default_max_bucket_list_pages")]
     pub max_bucket_list_pages: usize,
     /// Max concurrent connections (slowloris / resource-exhaustion guard).
@@ -480,11 +404,10 @@ pub struct LimitsConfig {
     #[serde(default = "default_backend_connect_timeout_secs")]
     pub backend_connect_timeout_secs: u64,
     /// Time-to-first-response-byte bound for the backend client. `0` (the default)
-    /// disables it, deliberately: the SDK measures this from *request initiation*,
-    /// so on a bulk `PutObject`/`UploadPart` it includes the whole upload — any
-    /// finite value would cap the size of an object that can be written over a slow
-    /// link. Set it only on a deployment whose backends are known-local and whose
-    /// objects are known-small.
+    /// disables it, deliberately: the SDK measures this from *request initiation*, so on
+    /// a bulk `PutObject`/`UploadPart` any finite value caps the size of an object that
+    /// can be written over a slow link. Set it only where backends are known-local and
+    /// objects known-small.
     #[serde(default)]
     pub backend_read_timeout_secs: u64,
 }
@@ -569,12 +492,11 @@ fn instance_id_from(lookup: impl Fn(&str) -> Option<String>) -> String {
 impl GatewayConfig {
     /// Load, interpolating `${VAR}` / `${VAR:-default}` from the environment first.
     ///
-    /// The interpolation exists so a single ConfigMap can render per-pod values —
-    /// specifically the audit spill path, which **must** be pod-unique
+    /// The interpolation lets a single ConfigMap render per-pod values — above all the
+    /// audit spill path, which **must** be pod-unique
     /// (`"/var/lib/s0/audit-spill-${POD_NAME}.ndjson"`); two replicas sharing one
-    /// destroy each other's records. An unset variable with no default is a hard
-    /// error: a spill path that silently collapsed to `audit-spill-.ndjson` on every
-    /// pod would reintroduce exactly the bug this fixes.
+    /// destroy each other's records. An unset variable with no default is a hard error,
+    /// because a path collapsing to `audit-spill-.ndjson` on every pod is that same bug.
     pub fn load() -> Result<Self> {
         let path = std::env::var("GATEWAY_CONFIG").unwrap_or_else(|_| "gateway.json".into());
         let raw = std::fs::read_to_string(&path)
@@ -611,13 +533,12 @@ impl GatewayConfig {
             .map(|t| (t.tenant.as_str(), t.organization_id.as_str()))
             .collect();
         for c in &self.static_credentials {
-            // The STS namespace is `HFST*` in its entirety — not just the well-formed
-            // `HFST<kid>.<sid>` shape. `Identity` answers every key in it from the STS
-            // authority alone, so a static entry here is not "shadowed by derivation",
-            // it is simply never reachable: an operator would provision a credential
-            // that silently does not work. Both halves of the reason are worth saying,
-            // because the near-miss shapes (a bare prefix, the pre-key-ring
-            // `HFST<sid>` form) are exactly what a migration produces.
+            // The STS namespace is `HFST*` in its entirety, not just the well-formed
+            // `HFST<kid>.<sid>` shape: `Identity` answers every key in it from the STS
+            // authority alone, so a static entry here is simply never reachable and an
+            // operator would provision a credential that silently does not work. The
+            // near-miss shapes (a bare prefix, an `HFST<sid>` form) are what a migration
+            // produces.
             if crate::auth::sts::StsAuthority::is_sts_access_key(&c.access_key_id) {
                 return Err(GatewayError::Config(format!(
                     "static credential {} is inside the STS access-key namespace {:?}*; \
@@ -630,14 +551,11 @@ impl GatewayConfig {
                     crate::auth::sts::KID_SEP,
                 )));
             }
-            // The SAME rule for the derived long-lived namespace, and it is not a copy
-            // for symmetry's sake. `HFSA` differs from `HFST` in the fourth character
-            // only, so a hand-written credential list is one keystroke away from landing
-            // in it — and `Identity::secret_key` answers every key carrying this prefix
-            // from the derived-key half alone, INCLUDING when derived keys are switched
-            // off, where the answer is "no". Without this check an operator provisions a
-            // static credential that silently never resolves; worse, it would start
-            // resolving differently the day the feature is enabled.
+            // The same rule for the derived long-lived namespace. `HFSA` differs from
+            // `HFST` in one character, and `Identity::secret_key` answers every key with
+            // this prefix from the derived-key half alone, INCLUDING when derived keys
+            // are off, where the answer is "no". Without this check the credential
+            // silently never resolves — and starts resolving the day the feature is on.
             if crate::auth::derived::DerivedKeyAuthority::is_derived_access_key(&c.access_key_id) {
                 return Err(GatewayError::Config(format!(
                     "static credential {} is inside the DERIVED long-lived access-key \
@@ -668,9 +586,9 @@ impl GatewayConfig {
                 _ => {}
             }
         }
-        // A zero timeout is not "no timeout" anywhere in this file — it is either an
-        // instant failure or, historically, the unbounded wait we are fixing. Reject
-        // it at load rather than have an operator discover which one it meant.
+        // A zero timeout is not "no timeout" anywhere in this file: it is an instant
+        // failure. Reject it at load rather than let an operator discover that at
+        // runtime.
         if self.bundle_timeout_secs == 0 {
             return Err(GatewayError::Config(
                 "bundle_timeout_secs must be > 0; an unbounded bundle fetch stalls revocation"
@@ -708,22 +626,10 @@ impl GatewayConfig {
 
     /// The mint listener may not share a port with the data plane or with the probes.
     ///
-    /// This used to be unchecked, and it used to be *nearly* harmless because nothing
-    /// rendered a `sts_mint` section. That changed when the listener grew the
-    /// [`crate::webidentity`] door: it now mints credentials for anyone holding a valid
-    /// IdP token, it is deliberately unauthenticated, and the operator publishes it
-    /// through an Ingress. Sharing a port with either of the other two would be a
-    /// different failure in each direction:
-    ///
-    /// * with **`listen`**, the S3 data plane would never come up (whichever binds
-    ///   second loses), so a copy-pasted port takes the *storage* down;
-    /// * with **`admin_listen`**, the probe port would answer credential mints — and
-    ///   the probe port is published on the Service for Prometheus, whose network
-    ///   posture is nothing like a mint's.
-    ///
-    /// The `internal` collision is checked from the other side in
-    /// [`Self::validate_internal_listener`]; both are kept so neither section can be
-    /// added without the pair being enforced.
+    /// It is deliberately unauthenticated and published through an Ingress. Sharing
+    /// **`listen`** stops the S3 data plane coming up (whichever binds second loses);
+    /// sharing **`admin_listen`** puts credential minting on the probe/scrape port. The
+    /// `internal` collision is checked in [`Self::validate_internal_listener`].
     fn validate_mint_listener(&self) -> Result<()> {
         let Some(m) = &self.sts_mint else {
             return Ok(());
@@ -753,11 +659,9 @@ impl GatewayConfig {
             ));
         }
         // Both of these read like "no limit" and mean the opposite. A zero-permit
-        // semaphore never hands out a permit, so the accept loop would park forever and
-        // the listener would answer nothing while still being bound and still passing a
-        // TCP probe; a zero timeout closes every connection before its first byte. Both
-        // are silent, total outages of the credential path, so they are refused at load
-        // — the same reasoning as `max_duration_secs` above.
+        // semaphore parks the accept loop forever while the port stays bound and still
+        // passes a TCP probe; a zero timeout closes every connection before its first
+        // byte. Both are silent, total outages of the credential path.
         if m.max_connections == 0 {
             return Err(GatewayError::Config(
                 "sts_mint.max_connections must be > 0; zero is not 'unbounded', it is a \
@@ -780,20 +684,10 @@ impl GatewayConfig {
     /// The credential-minting listener may not share a port with anything else this
     /// process serves.
     ///
-    /// Both collisions are real config mistakes with the same shape — a
-    /// copy-pasted port — and both are catastrophic in the same direction:
-    ///
-    /// * **The admin listener** answers `/healthz`, `/readyz` and `/metrics` with no
-    ///   authentication at all, because a kubernetes probe cannot present a secret.
-    ///   Its port is published on the Service for scraping. Sharing it would put a
-    ///   credential mint behind whatever the probe port's network posture happens to be.
-    /// * **The S3 listener** is the data plane. It is fronted by an Ingress and is
-    ///   reachable from the public internet on `<org>.s3-gw.<domain>`. A minting route
-    ///   there is a credential-issuing endpoint on the open internet.
-    ///
-    /// Refusing at load rather than at bind time: `TcpListener::bind` would fail on a
-    /// real collision anyway, but only *after* the data plane is already serving, and
-    /// only for the loser of the race.
+    /// The **admin listener** is unauthenticated (a probe cannot present a secret) and
+    /// published for scraping; the **S3 listener** is Ingress-fronted. Either collision
+    /// puts a credential-issuing endpoint somewhere it must never be. Refused at load,
+    /// not at bind time, where only the loser of the race finds out.
     fn validate_internal_listener(&self) -> Result<()> {
         let Some(i) = &self.internal else {
             return Ok(());
@@ -835,10 +729,9 @@ impl GatewayConfig {
 
     /// The STS key ring must be unambiguous *at load*, not at first mint.
     ///
-    /// Every failure here is one where the gateway would otherwise come up and issue
-    /// credentials under a key nobody chose, or come up unable to mint at all — and
-    /// the mint is a control-plane endpoint, so the second failure is only discovered
-    /// by the first user who tries to get a credential.
+    /// Otherwise the gateway comes up issuing credentials under a key nobody chose, or
+    /// comes up unable to mint at all — and the second is only discovered by the first
+    /// user who tries to get a credential.
     fn validate_sts_key_ring(&self) -> Result<()> {
         let s = &self.sts;
         match (&s.master_key_hex, s.master_keys.is_empty()) {
@@ -883,12 +776,9 @@ impl GatewayConfig {
     /// The derived-key ring's shape, plus the one rule that is not a copy of the STS
     /// ring's: **no key may be shared between the two credential classes.**
     ///
-    /// The classes have different lifetimes (one hour against indefinite) and different
-    /// revocation stories, and sharing material would collapse them into one blast
-    /// radius: retiring a `kid` to revoke a long-lived key would silently 403 every live
-    /// session, and material recovered from either would forge both. The check covers the
-    /// STS signing key too — it is a second, differently-handled secret in the same
-    /// section, and "the operator pasted the wrong hex" is the failure being caught.
+    /// The classes have different lifetimes and revocation stories; sharing material
+    /// collapses them into one blast radius — retiring a `kid` to revoke a long-lived
+    /// key would silently 403 every live session. The STS signing key is covered too.
     fn validate_derived_key_ring(&self) -> Result<()> {
         let Some(d) = &self.derived_keys else {
             return Ok(());
@@ -1017,16 +907,13 @@ fn default_session_ttl_secs() -> u64 {
 fn default_admin_listen() -> SocketAddr {
     SocketAddr::from(([0, 0, 0, 0], 8016))
 }
-/// 8017: next to the admin port and deliberately *not* it. `0.0.0.0` because the
-/// caller is the console, in a different pod — loopback would make the endpoint
-/// unreachable and the whole console-mediated path dead. Reachability is fenced by
-/// the Service/NetworkPolicy (operator side) and by authentication (here), never by
-/// the bind address.
+/// 8017: next to the admin port and deliberately *not* it. `0.0.0.0` because the caller
+/// runs in a different pod — loopback would make the endpoint unreachable. Reachability
+/// is fenced by the network policy and by authentication, never by the bind address.
 fn default_internal_listen() -> SocketAddr {
     SocketAddr::from(([0, 0, 0, 0], 8017))
 }
-/// One hour, matching `default_session_ttl_secs` and the console's own
-/// `DurationSeconds=3600` on the legacy RGW path.
+/// One hour, matching `default_session_ttl_secs`.
 fn default_max_session_ttl_secs() -> u64 {
     3600
 }
@@ -1044,30 +931,19 @@ fn default_jwks_refresh_secs() -> u64 {
 }
 /// 256 concurrent connections on the mint.
 ///
-/// Sized against the largest legitimate burst anyone could point at it, not against a
-/// guess. The worst realistic case is a deployment rolling many pods at once, each
-/// minting a credential on startup: a 200-pod Deployment at the kubernetes default
-/// `maxSurge: 25%` brings up ~50 pods at a time, and even a whole-fleet restart is
-/// serialised by image pulls and readiness gates long before it is serialised here.
-/// 256 leaves that burst several times over, and one mint is a signature verification
-/// against a *cached* JWKS plus an HMAC — a few hundred microseconds — so 256 in flight
-/// is throughput this listener will never reach.
-///
-/// It is a quarter of the data plane's 1024, deliberately (F13: "the mint's natural
-/// concurrency is far below the data plane's"), and it is two orders of magnitude
-/// below what the unbounded loop allowed, which was the process file-descriptor limit.
+/// Sized against the largest legitimate burst: a deployment rolling many pods at once,
+/// each minting on startup, which the kubernetes default `maxSurge: 25%` already caps at
+/// a few dozen. A quarter of the data plane's 1024, because a client mints once and then
+/// uses the credential for an hour.
 fn default_mint_max_connections() -> usize {
     256
 }
 /// 30 s of connection lifetime.
 ///
-/// An order of magnitude above the worst legitimate request — a `kid`-miss mint pays
-/// one JWKS fetch, bounded by `jwks_timeout_secs` (5 s), on top of a verification
-/// measured in microseconds — and it is a *lifetime* rather than an idle timeout, so
-/// the only client it can inconvenience is one reusing a pooled connection more than
-/// 30 s after opening it. That client minted twice inside 30 s, which no SDK does
-/// (a session lasts an hour), and every HTTP client already retries a connection the
-/// server closed underneath it, because every HTTP server closes idle keep-alives.
+/// An order of magnitude above the worst legitimate request (a `kid`-miss mint pays one
+/// JWKS fetch, bounded by `jwks_timeout_secs`). A *lifetime*, not an idle timeout, so the
+/// only client it inconveniences is one reusing a pooled connection more than 30 s after
+/// opening it — which every HTTP client already retries.
 fn default_mint_connection_timeout_secs() -> u64 {
     30
 }
@@ -1118,11 +994,9 @@ mod tests {
 
     #[test]
     fn the_form_upload_buffer_is_bounded_well_below_the_substrate_default() {
-        // s3s aggregates a PostObject file into memory during route resolution —
-        // before `check`, before any authorization — so this number times
-        // `max_connections` is what an *unauthenticated* caller can make this process
-        // allocate. s3s's own default is 5 GiB, which at 1024 connections is not a
-        // bound at all.
+        // s3s aggregates a PostObject file into memory before any authorization, so this
+        // number times `max_connections` is what an *unauthenticated* caller can make
+        // this process allocate. s3s's own default is 5 GiB.
         let limits = LimitsConfig::default();
         assert_eq!(limits.post_object_max_file_size, 64 * 1024 * 1024);
         assert!(
@@ -1289,8 +1163,8 @@ mod tests {
             })
             .contains("current_kid is required")
         );
-        // A current_kid naming a key that is not there — the shape a botched step 4 of
-        // the rotation produces (delete the old entry while still pointing at it).
+        // A current_kid naming a key that is not there — the shape a botched rotation
+        // produces (delete the old entry while still pointing at it).
         assert!(reject(&|c| c["sts"]["current_kid"] = serde_json::json!("k9")).contains("k9"));
         // current_kid without a ring is a no-op that reads as if it did something.
         assert!(
@@ -1321,8 +1195,7 @@ mod tests {
         // Every one of these carries the STS prefix, so `Identity` answers it from the
         // STS authority and never consults the store — a credential provisioned here
         // would silently never work. The near-miss shapes matter as much as the exact
-        // one: the middle two are what a pre-key-ring config and a half-done migration
-        // look like.
+        // one: they are what a half-done migration looks like.
         for key in [
             "HFSTk0.sid-1",
             "HFSTsid-1",
@@ -1358,11 +1231,10 @@ mod tests {
 
     /// **The prefix-collision guard for the DERIVED namespace.**
     ///
-    /// `HFSA` differs from `HFST` in one character, so this is the near-miss the existing
-    /// STS guard's own comment warns about, one keystroke away. It must fire whether or
-    /// not `derived_keys` is configured: with the feature off the credential silently
-    /// never resolves, and with it on it resolves to a *different* principal than the
-    /// operator wrote down.
+    /// `HFSA` differs from `HFST` in one character, so it is one keystroke away. The
+    /// guard must fire whether or not `derived_keys` is configured: with the feature off
+    /// the credential silently never resolves, and with it on it resolves to a
+    /// *different* principal than the operator wrote down.
     #[test]
     fn a_static_credential_inside_the_derived_namespace_is_refused_switched_on_or_off() {
         let derived_section = serde_json::json!({ "master_key_hex": "cc".repeat(32) });
@@ -1413,10 +1285,7 @@ mod tests {
 
     #[test]
     fn the_derived_key_ring_shape_is_settled_at_load_and_shares_no_key_with_sts() {
-        // The shipped example now DECLARES the section, because the platform's
-        // operator renders it for every gateway and the example is the schema
-        // that cross-repo check reads. So it must load, and it must load as a
-        // ring.
+        // The shipped example declares the section, so it must load, and load as a ring.
         let shipped = GatewayConfig::from_json(&example().to_string()).unwrap();
         let derived = shipped
             .derived_keys
@@ -1512,22 +1381,20 @@ mod tests {
         );
     }
 
-    /// M0 issue 3: "plaintext secrets reachable via `{:?}`".
+    /// Plaintext secrets must not be reachable via `{:?}`.
     ///
     /// A loaded `GatewayConfig` is one `tracing::debug!(?cfg)` — or one panic whose
-    /// payload includes it — away from a JSON log pipeline. This asserts on the whole
-    /// rendered config rather than field by field, so a secret field added later is
-    /// covered without anyone remembering to extend this test.
+    /// payload includes it — away from a log pipeline. This asserts on the whole rendered
+    /// config rather than field by field, so a secret field added later is covered
+    /// without anyone remembering to extend this test.
     #[test]
     fn no_debug_rendering_of_the_config_contains_a_secret() {
         const MASTER: &str = "d0d0caca0000000000000000000000000000000000000000000000000000beef";
         const SIGNING: &str = "5ec2e7ba5e0000000000000000000000000000000000000000000000deadbeef";
         const OWNER: &str = "OWNER-SECRET-Wj4rXk9zQ2";
         const STATIC: &str = "STATIC-SECRET-Pq7mLt3v";
-        // The two machine-to-machine credentials added for P2/P3. Both are the
-        // platform shared secret — the single most reusable credential on the
-        // cluster — so a `{:?}` that printed either of them would be worse than any
-        // of the four above.
+        // The two machine-to-machine credentials. Both are a shared secret reused across
+        // the cluster, so a `{:?}` printing either would be worse than the four above.
         const BUNDLE: &str = "BUNDLE-SHARED-SECRET-Kx8nQ2";
         const INTERNAL: &str = "INTERNAL-SHARED-SECRET-Vb5tR9";
 
@@ -1604,16 +1471,12 @@ mod tests {
         assert!(!rendered.contains(STATIC), "{rendered}");
     }
 
-    /// The `AssumeRoleWithWebIdentity` knobs load off the shipped example, with the
-    /// values the operator renders.
+    /// The `AssumeRoleWithWebIdentity` knobs load off the shipped example.
     ///
-    /// The example is the schema the operator's own contract test
-    /// (`every_key_the_operator_renders_exists_in_s0s_own_schema`) checks its writer
-    /// against, and s0 **ignores unknown keys** — so a field misspelled on either side
-    /// is silent. Here it is silent in the worst direction: a mistyped
-    /// `web_identity_audiences` leaves the surface accepting only the bearer door's
-    /// single `audience`, which refuses every service account on the platform, with no
-    /// error anywhere.
+    /// The example is the schema operators write their config against, and s0 **ignores
+    /// unknown keys** — so a misspelled field is silent, and silent in the worst
+    /// direction: a mistyped `web_identity_audiences` leaves the surface accepting only
+    /// the bearer door's single `audience`, refusing every service account.
     #[test]
     fn the_web_identity_surface_loads_from_the_shipped_example() {
         let loaded = GatewayConfig::from_json(&example().to_string()).expect("the example loads");
@@ -1630,9 +1493,8 @@ mod tests {
         );
         assert_eq!(mint.max_duration_secs, 3600);
 
-        // …and a config that predates the surface still loads, with the surface ON by
-        // default. Absence of the section is the only "off" that matters, and it is
-        // still expressible; absence of these *fields* must not be.
+        // …and a config that omits these fields still loads, with the surface ON by
+        // default. Absence of the whole section is the only "off" that matters.
         let mut older = example();
         let m = older["sts_mint"].as_object_mut().expect("sts_mint");
         for k in [
@@ -1691,15 +1553,11 @@ mod tests {
         assert!(GatewayConfig::from_json(&example().to_string()).is_ok());
     }
 
-    /// The mint listener's own hardening bounds (F13): present in the shipped schema,
-    /// defaulted for every config that predates them, and never settable to a value
-    /// that reads as "no limit" and means "no service".
-    ///
-    /// The defaulting half is the part that matters most. This socket is the one that
-    /// is both internet-facing and unauthenticated by design, so a deployed
-    /// `gateway.json` written before these fields existed — which is every one of them
-    /// — must come up **bounded**. If absence meant "unbounded", the fix would land
-    /// only on operators who edited their config, i.e. on nobody.
+    /// The mint listener's own hardening bounds: present in the shipped schema, defaulted
+    /// when omitted, and never settable to a value that reads as "no limit" and means "no
+    /// service". The defaulting matters most — this socket is internet-facing and
+    /// unauthenticated by design, so a `gateway.json` naming neither field must still come
+    /// up **bounded**.
     #[test]
     fn the_mint_listeners_bounds_are_defaulted_and_cannot_be_set_to_zero() {
         let loaded = GatewayConfig::from_json(&example().to_string()).expect("the example loads");
@@ -1707,7 +1565,7 @@ mod tests {
         assert_eq!(mint.max_connections, 256);
         assert_eq!(mint.connection_timeout_secs, 30);
 
-        // A config written before F13 gets exactly the same numbers.
+        // A config that omits both fields gets exactly the same numbers.
         let mut older = example();
         let m = older["sts_mint"].as_object_mut().expect("sts_mint");
         m.remove("max_connections");
@@ -1786,8 +1644,8 @@ mod tests {
         );
     }
 
-    /// Omitting the whole section is the "off" state: no listener, and the config that
-    /// every gateway runs today (which has never heard of the field) still loads.
+    /// Omitting the whole section is the "off" state: no listener, and a config that
+    /// never mentions the field still loads.
     #[test]
     fn the_internal_listener_is_absent_unless_configured() {
         let mut cfg = example();

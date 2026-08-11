@@ -1,26 +1,13 @@
 //! Response obligations: what the gateway removes from an answer the backend produced.
 //!
-//! Every other enforcement in this project refuses or rewrites a **request**. This file
-//! covers the three places it edits a **response**, which is a different and more
-//! uncomfortable kind of correctness — the data was already fetched, and getting it wrong
-//! leaks rather than breaks.
+//! Every forward is re-signed with the per-`(backend, tenant)` **owner** credential, so
+//! the backend lists the tenant's whole bucket namespace no matter who asked, and stamps
+//! that shared identity on `Owner` / `Initiator`. The visibility obligation is the
+//! authorization; the identity fields are stripped.
 //!
-//! - **`ListBuckets`** is the big one, and the reason is structural rather than a policy
-//!   choice: every forward is re-signed with the per-`(backend, tenant)` **owner**
-//!   credential, so the backend answers with the tenant's entire bucket namespace no
-//!   matter which principal asked. Passing that through would publish the namespace to
-//!   anyone holding a single grant. The visibility obligation is the authorization.
-//! - **`ListMultipartUploads`** and **`ListParts`** carry `Owner` / `Initiator`, which
-//!   under this gateway always name that same shared owner credential rather than the
-//!   principal who started the upload.
-//!
-//! So these tests run against a **backend that answers**, unlike the rest of the suite —
-//! a filter is only observable if there is something to filter. The fake below is a raw
-//! HTTP responder speaking the real S3 XML wire shapes, driven through the real
-//! `aws-sdk-s3` client the proxy pool builds, so the parse path is production's.
-//!
-//! It also counts requests, which is what lets the empty cases assert something stronger
-//! than "the list was empty": they assert the backend was never contacted at all.
+//! These tests therefore run against a backend that answers: a raw HTTP responder speaking
+//! real S3 XML through the real `aws-sdk-s3` client the proxy pool builds. It counts
+//! requests, which lets the empty cases assert the backend was never contacted at all.
 
 mod common;
 
@@ -47,12 +34,9 @@ struct FakeBackend {
 
 /// Serve `names` as a real `ListBuckets` response, `page` entries at a time.
 ///
-/// The order of `names` is preserved exactly as given — including deliberately
-/// unsorted — because "the merged listing is gateway-ordered" is a claim that can only be
-/// tested against a backend whose order is something else.
-///
-/// Paging is by integer offset carried in `continuation-token`, which is enough to
-/// exercise the gateway's drain loop without pretending to be RGW.
+/// The order of `names` is preserved exactly as given — deliberately unsorted, because
+/// "the merged listing is gateway-ordered" can only be tested against a backend whose
+/// order is something else. Paging is by integer offset in `continuation-token`.
 async fn fake_backend(names: &[&str], page: usize) -> FakeBackend {
     let names: Vec<String> = names.iter().map(|s| (*s).to_string()).collect();
     spawn_fake(move |head| list_buckets_xml(&names, offset_in(head), page)).await
@@ -61,7 +45,7 @@ async fn fake_backend(names: &[&str], page: usize) -> FakeBackend {
 /// A backend answering every request with `body(request_head)`.
 ///
 /// Raw HTTP rather than a mock S3 crate: the point is to exercise the *real* aws-sdk-s3
-/// parse path the proxy pool uses, so what the gateway sees is what RGW would give it.
+/// parse path the proxy pool uses.
 async fn spawn_fake<F>(body: F) -> FakeBackend
 where
     F: Fn(&str) -> String + Send + Sync + 'static,
@@ -111,8 +95,7 @@ where
     }
 }
 
-/// The page offset the gateway asked for, carried in `continuation-token`. Enough to
-/// exercise the drain loop without pretending to be RGW.
+/// The page offset the gateway asked for, carried in `continuation-token`.
 fn offset_in(head: &str) -> usize {
     head.split("continuation-token=")
         .nth(1)
@@ -128,9 +111,9 @@ fn list_buckets_xml(names: &[String], start: usize, page: usize) -> String {
         .take(page)
         .map(|n| format!("<Bucket><Name>{n}</Name><CreationDate>2024-01-01T00:00:00.000Z</CreationDate></Bucket>"))
         .collect();
-    // The Owner the backend reports is the *tenant-owner* credential every request is
-    // re-signed with — the same value for every principal. The gateway must not forward
-    // it, and this element is what makes that assertable.
+    // The Owner the backend reports is the tenant-owner credential every request is
+    // re-signed with — the same value for every principal, so the gateway must not
+    // forward it.
     let next = start + page;
     let token = if next < names.len() {
         format!("<ContinuationToken>{next}</ContinuationToken>")
@@ -266,9 +249,9 @@ async fn the_owner_element_is_withheld() {
 
 #[tokio::test]
 async fn the_merged_listing_is_gateway_ordered() {
-    // Stated rather than assumed (accepted defect B-9): RGW promises no order across
-    // ListBuckets pages, so the gateway sorts. The fake serves an unsorted namespace
-    // across several pages precisely so this cannot pass by accident.
+    // The backend promises no order across ListBuckets pages, so the gateway sorts. The
+    // fake serves an unsorted namespace across several pages precisely so this cannot pass
+    // by accident.
     let backend = fake_backend(&TENANT_BUCKETS, 2).await;
     let fx = common::fixture_with_backend(
         "lb-order",
@@ -403,16 +386,10 @@ async fn a_cursor_issued_under_different_grants_is_refused_not_rebased() {
 
 #[tokio::test]
 async fn no_grants_is_an_empty_listing_not_a_403_and_never_reaches_the_backend() {
-    // Requirement, stated as a property: a principal holding nothing gets an empty list.
-    // And the two ways of holding nothing —
-    //
-    //   * `nobody` is a tenant member with no grants at all: the PDP DENIES (there is no
-    //     `read` grant anywhere), and
-    //   * `alice` here holds `read` but nothing visible: the PDP ALLOWS with an empty
-    //     visible set
-    //
-    // — must be indistinguishable to the caller. Same status, same body, and the same
-    // cost: neither contacts the backend, so the difference is not measurable with a
+    // A principal holding nothing gets an empty list, and the two ways of holding nothing
+    // — `nobody`, denied because it has no `read` grant anywhere, and `alice`, allowed to
+    // enumerate but with an empty visible set — must be indistinguishable to the caller:
+    // same status, same body, and neither contacts the backend, so not measurable with a
     // stopwatch either. The distinction survives only in the audit record.
     let backend = fake_backend(&TENANT_BUCKETS, 100).await;
     let fx = common::fixture_with_backend(
@@ -426,8 +403,7 @@ async fn no_grants_is_an_empty_listing_not_a_403_and_never_reaches_the_backend()
                 },
                 // Alice may enumerate, and the one bucket she is granted is one she is
                 // denylisted from — so the visible set is empty while the enumeration
-                // itself is allowed. This is the shape the assertion needs, and it is a
-                // real revocation rather than a contrived one.
+                // itself is allowed.
                 "bucket_attributes": { "payroll": { "denylist": { "alice": true } } },
                 "s3_grants": { "alice": [
                     { "bucket": "payroll", "actions": ["read"], "prefixes": [] }
@@ -517,7 +493,7 @@ async fn the_denial_and_the_empty_allow_are_still_different_in_the_audit_record(
                 .bucket,
             "",
             "ListBuckets is an ACCOUNT-scoped decision; a bucket name here would mean \
-             the wildcard-grant rules could match it (plan defect B-2)"
+             the wildcard-grant rules could match it"
         );
         assert_eq!(
             for_sub(sub).input.expect("input").action,
@@ -579,14 +555,11 @@ async fn a_denied_listing_mints_no_proof() {
 
 #[tokio::test]
 async fn a_wildcard_grant_alone_does_not_reach_the_account_scope_through_bucket_rules() {
-    // Plan defect B-2: `bucket_matches(g) if g.bucket == "*"` matches the EMPTY string,
-    // so before the fix a wildcard grant carrying *any* verb satisfied the ordinary
-    // bucket rules for an account-scoped decision. `read` — in the ACCOUNT shape — must
-    // be the only thing that opens enumeration.
-    //
-    // Since 2026-08-08 the grant below is every remaining data-plane verb, on every
-    // bucket, which makes the test stronger than it was: enumeration is not implied by
-    // any amount of access to the objects inside.
+    // `bucket_matches(g) if g.bucket == "*"` also matches the EMPTY bucket name an
+    // account-scoped decision carries, so a wildcard grant with any verb could otherwise
+    // satisfy the ordinary bucket rules. `read` in the ACCOUNT shape must be the only
+    // thing that opens enumeration: the grant below is every other data-plane verb on
+    // every bucket, and it must not enumerate.
     let backend = fake_backend(&TENANT_BUCKETS, 100).await;
     let fx = common::fixture_with_backend(
         "lb-b2",
@@ -620,11 +593,10 @@ async fn a_wildcard_grant_alone_does_not_reach_the_account_scope_through_bucket_
 
 #[tokio::test]
 async fn a_denylisted_subject_loses_the_unrestricted_view_rather_than_keeping_it() {
-    // The account-scope reading of the per-bucket denylist. The decision names no bucket,
-    // so the denylist cannot be evaluated against one — and the bundle cannot enumerate
-    // the tenant's buckets, so "all except these" is not expressible. The conservative
-    // substitution is to drop the wildcard view entirely and fall back to the named
-    // grants. Harsher than strictly necessary, and in the safe direction.
+    // The account-scope reading of the per-bucket denylist. The decision names no bucket
+    // and the bundle cannot enumerate the tenant's buckets, so "all except these" is not
+    // expressible: the wildcard view is dropped entirely and only the named grants remain.
+    // Harsher than strictly necessary, and in the safe direction.
     let backend = fake_backend(&TENANT_BUCKETS, 100).await;
     let fx = common::fixture_with_backend(
         "lb-denylist",
@@ -699,15 +671,13 @@ const OWNER_XML: &str = "<Owner><ID>tenant-owner-canonical-id</ID><DisplayName>a
 async fn list_multipart_uploads_strips_the_shared_identity_and_re_applies_the_prefix() {
     // Two transforms, two reasons. The identity fields are the same leak as on
     // ListBuckets' Owner. The prefix re-application is different: the hook narrowed the
-    // request to `2024/`, and whether the backend honored that is not something this
-    // gateway can observe — but the keys of in-flight uploads are exactly what a
-    // prefix-scoped principal must not see. So the fake answers with a key OUTSIDE the
-    // narrowed prefix, which is what RGW would do if it ignored the parameter.
+    // request to `2024/`, and whether the backend honored that is not observable here —
+    // so the fake answers with a key OUTSIDE the narrowed prefix, which is what a backend
+    // ignoring the parameter would do.
     //
-    // The request asks for `20` — WIDER than alice's `2024/` grant and overlapping it,
-    // which is the shape narrowing exists for. It used to ask for no prefix at all;
-    // since 2026-08-09 an unbounded list is denied rather than narrowed (AWS parity),
-    // so that shape can no longer reach the response path this test is about.
+    // The request asks for `20`, WIDER than alice's `2024/` grant and overlapping it,
+    // which is the shape narrowing exists for. An unbounded list is denied rather than
+    // narrowed, so it cannot reach this response path at all.
     let backend = spawn_fake(|_| {
         format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\

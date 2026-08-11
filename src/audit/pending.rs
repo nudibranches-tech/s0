@@ -1,28 +1,13 @@
-//! The decision record between the decision and the forward.
-//!
-//! An audit record used to be emitted the instant the PDP answered, which made
-//! `gateway.backend_status` permanently `None` and `Outcome::Error` a variant with no
-//! producer: at decision time the forward has not happened yet. Post-forward
-//! enrichment (plan task 18) requires holding the record across the forward, and this
-//! is the thing that holds it.
-//!
-//! Two properties are non-negotiable, and the type is built around them:
+//! The decision record held between the decision and the forward, so it can carry the
+//! backend outcome that is not yet known when the PDP answers.
 //!
 //! 1. **Exactly one record per request.** [`PendingAudit::settle`] takes the record out
-//!    from behind a mutex, so a second settle (or a settle racing the drop) finds
-//!    nothing and does nothing.
-//! 2. **A record is never lost by being forgotten.** If nothing ever settles it — a
-//!    hook that allowed the request and then failed before forwarding, an operation
-//!    with no dispatch arm, a `post_object` that 501s — `Drop` emits it unenriched,
-//!    with [`BackendOutcome::NotAttempted`]. Losing the enrichment is acceptable;
-//!    losing the record is not.
+//!    from behind a mutex, so a second settle (or one racing the drop) does nothing.
+//! 2. **A record is never lost by being forgotten.** If nothing settles it, `Drop` emits
+//!    it unenriched with [`BackendOutcome::NotAttempted`].
 //!
-//! The cost of deferral: on a hard kill (SIGKILL, OOM) the records of requests still
-//! in flight are gone, where before they would have been queued. That window is bounded
-//! by the forward duration, it is strictly smaller than the loss the in-memory queue
-//! already carries on the same event, and it is zero on graceful shutdown — `main`
-//! drains the S3 front (so in-flight requests finish and settle) *before* it drains the
-//! audit worker.
+//! On a hard kill the in-flight records are lost — a window bounded by the forward
+//! duration, and zero on graceful shutdown.
 
 use std::sync::Mutex;
 
@@ -32,9 +17,9 @@ use super::sink::AuditSink;
 /// A record that has been decided but not yet emitted, stashed in the request
 /// extensions by the access layer and settled by the forward path.
 ///
-/// Held as `Arc<PendingAudit>`: the forward path clones the handle out of the
-/// extensions *before* the request (and its extensions) are moved into the backend
-/// call, which is what keeps the record alive long enough to learn the outcome.
+/// Held as `Arc<PendingAudit>`: the forward path clones the handle out of the extensions
+/// *before* the request is moved into the backend call, which is what keeps the record
+/// alive long enough to learn the outcome.
 pub struct PendingAudit {
     sink: AuditSink,
     /// `None` once emitted. The mutex is uncontended in practice — one settle, one drop
@@ -71,10 +56,9 @@ impl PendingAudit {
 impl Drop for PendingAudit {
     fn drop(&mut self) {
         if let Some(record) = self.take() {
-            // The request was authorized and then never forwarded. That is not
-            // necessarily a bug (a `NotImplemented` arm, a hook error after the
-            // decision), but the decision was still made and must still be on the
-            // record.
+            // Authorized and then never forwarded — not necessarily a bug (a
+            // `NotImplemented` arm, a hook error after the decision), but the decision
+            // was still made and must still be on the record.
             tracing::debug!(
                 decision_id = %record.decision_id,
                 "audit record settled by drop: the request was decided but never forwarded"
@@ -145,6 +129,7 @@ mod tests {
                 backend: BackendOutcome::NotAttempted,
                 backend_status: None,
             },
+            &crate::audit::LabelPolicy::default(),
         )
     }
 
@@ -158,9 +143,9 @@ mod tests {
         collector.0.lock().unwrap().clone()
     }
 
-    /// `batch_max: 1` so a record ships on the worker's very next poll rather than on
-    /// the flush ticker. Dropping the returned `AuditHandle` detaches the worker rather
-    /// than stopping it, so the caller does not have to hold it.
+    /// `batch_max: 1` so a record ships on the worker's very next poll rather than on the
+    /// flush ticker. Dropping the `AuditHandle` detaches the worker rather than stopping
+    /// it, so the caller does not have to hold it.
     fn sink(collector: Arc<Collector>) -> AuditSink {
         let spill =
             std::env::temp_dir().join(format!("s0-pending-{}.ndjson", uuid::Uuid::new_v4()));

@@ -1,31 +1,13 @@
-//! Gateway entrypoint: init observability, load config, build the gateway, start the
-//! live bundle refresher, the admin listener, the STS mint and the authenticated
-//! internal API, and serve.
+//! Gateway entrypoint: load config, build the gateway, start its listeners, and serve.
 //!
-//! Four listeners, on four ports, with three different auth postures — which is the
-//! point, not an accident: the S3 data plane (SigV4, Ingress-fronted), the admin
-//! listener (**unauthenticated**, probes and metrics), the STS mint (**unauthenticated
-//! by design — the OIDC/web-identity token IS the credential**, exactly as at
-//! `sts.amazonaws.com`), and the internal API (platform shared secret, credential
-//! minting for the console). Whether a request is authenticated is a property of the
-//! socket it arrived on, never of the path it asked for. See `s0::internal` for the
-//! full argument and `s0::webidentity` for why the STS door belongs on the mint's
-//! socket and on none of the other three.
+//! Four listeners on four ports with three auth postures: the S3 data plane (SigV4), the
+//! admin listener (unauthenticated probes and metrics), the STS mint (unauthenticated by
+//! design — the OIDC/web-identity token IS the credential) and the internal API (shared
+//! secret). Authentication is a property of the socket, never of the path.
 //!
-//! Shutdown ordering is deliberate and is the whole reason this is not three detached
-//! `tokio::spawn`s:
-//!
-//! 1. SIGTERM ⇒ `/readyz` starts failing, so kubernetes takes this pod out of the
-//!    Service while it is still able to answer in-flight requests.
-//! 2. The S3 front, the mint and the internal API stop accepting and drain their
-//!    connections.
-//! 3. The audit worker drains, so records already emitted are shipped or spilled.
-//! 4. The admin listener stops last, so probes and a final scrape keep working for
-//!    the whole drain.
-//!
-//! That sums to just over the 30 s S3 drain + 10 s audit drain, so the deployment's
-//! `terminationGracePeriodSeconds` must exceed ~45 s; the kubernetes default of 30 s
-//! truncates the audit drain and loses records.
+//! Shutdown is ordered, not detached: readiness fails first, then the S3 front, mint and
+//! internal API drain, then the audit worker, and the admin listener last — ~45 s total,
+//! so `terminationGracePeriodSeconds` must exceed it or audit records are lost.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,7 +23,7 @@ use s0::{gateway::Gateway, server, shutdown};
 
 /// Budget for the mint's own drain once the S3 front is down.
 const MINT_JOIN_TIMEOUT: Duration = Duration::from_secs(15);
-/// Same budget for the console-mediated session endpoint, which drains the same way.
+/// Same budget for the internal session endpoint, which drains the same way.
 const INTERNAL_JOIN_TIMEOUT: Duration = Duration::from_secs(15);
 /// Budget for the audit worker to ship or spill everything queued.
 const AUDIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -61,22 +43,10 @@ async fn main() -> Result<()> {
     let config = GatewayConfig::load()?;
     let listen = config.listen;
     let instance = s0::config::instance_id();
-    // `version` is on the first line this process ever writes, deliberately.
-    //
-    // The question "which bytes is this pod running?" is the whole of follow-up
-    // F1, and until now the only way to answer it was to read the pod's
-    // `imageID` and resolve that digest against the registry — i.e. to ask the
-    // cluster, from outside, about a process that was right there able to say.
-    // A build identifier in the startup line makes the running binary
-    // self-describing in the one place anyone already looks first, and it costs
-    // a compile-time constant.
-    //
-    // It is deliberately the crate version rather than a digest: a process
-    // cannot know the digest of the image it was unpacked from, and inventing a
-    // build-time stamp would make the number a function of *when* it was built
-    // rather than of *what* was built. The digest remains the authority
-    // (`kubectl get pod -o jsonpath='{…imageID}'`); this is the corroborating
-    // line that turns "the pod is stale" from an inference into a reading.
+    // `version` rides on the first line this process writes, so "which bytes is this pod
+    // running?" is answerable from the log rather than only from the image digest. It is
+    // the crate version, not a build stamp: a process cannot know the digest it was
+    // unpacked from, and a timestamp would describe *when* it was built, not *what*.
     tracing::info!(
         %instance,
         version = env!("CARGO_PKG_VERSION"),
@@ -94,9 +64,8 @@ async fn main() -> Result<()> {
     };
     if source.is_remote() && !source.is_authenticated() {
         // Not fatal — s0 must stay runnable against an unauthenticated URL — but the
-        // control-plane bundle endpoint carries the org's grant rules and answers 304,
-        // which makes it a change-detection oracle over the grant table. An operator
-        // running against hyperfluid should be presenting a credential.
+        // bundle endpoint carries the org's grant rules and answers 304, which makes it
+        // a change-detection oracle over the grant table.
         tracing::warn!(
             "polling the bundle endpoint WITHOUT a credential; set bundle_shared_secret \
              if the control plane requires one"
@@ -157,12 +126,10 @@ async fn main() -> Result<()> {
         });
     }
 
-    // The badge desk: OIDC token -> gateway session creds, on its own listener. Since
-    // stage 2 it also serves `Action=AssumeRoleWithWebIdentity` in the AWS STS wire
-    // protocol, which is the only door an off-the-shelf S3 client can open — see
-    // `s0::webidentity`. Both are on THIS socket and on no other: the credential is the
-    // IdP token, so there is nothing else to authenticate with, and that posture must
-    // stay a property of the socket rather than of a path.
+    // OIDC token -> gateway session credentials, on its own listener, alongside
+    // `Action=AssumeRoleWithWebIdentity` in the AWS STS wire protocol — the only door an
+    // off-the-shelf S3 client can open. Both are on THIS socket and no other: the
+    // credential is the IdP token, so the posture is a property of the socket.
     let mint_task = match &config.sts_mint {
         Some(sts_cfg) => {
             let verifier = Arc::new(StandardVerifier::from_config(sts_cfg)?);
@@ -174,9 +141,8 @@ async fn main() -> Result<()> {
                 gateway.identity.sts(),
                 config.session_ttl(),
             )
-            // F13: this socket is internet-facing AND unauthenticated by design, and
-            // the Ingress in front of it deliberately rate-limits nothing, so its
-            // bounds exist here or nowhere. See `mint::serve_on`.
+            // This socket is internet-facing AND unauthenticated by design, and nothing
+            // in front of it rate-limits, so its bounds exist here or nowhere.
             .with_limits(MintLimits::from_config(sts_cfg))
             .with_metrics(mint_metrics.clone());
             if sts_cfg.web_identity_enabled {
@@ -193,11 +159,8 @@ async fn main() -> Result<()> {
                     )
                     // …and the SAME BundleStore the PDP decides against, so a tenant's
                     // own service account is addressed to this gateway when the bundle
-                    // already knows it — without an operator re-render per SA. Additive
-                    // to the configured audience list, never instead of it, and read
-                    // live so a revocation lands within one poll. See
-                    // `webidentity::WebIdentitySts::addressed_to_this_gateway` and
-                    // the AWS-parity register (D31).
+                    // already knows it. Additive to the configured audience list, never
+                    // instead of it, and read live so a revocation lands within a poll.
                     .with_bundle_subjects(gateway.bundles.clone()),
                 ));
                 tracing::info!(
@@ -228,10 +191,9 @@ async fn main() -> Result<()> {
         None => None,
     };
 
-    // The console-mediated session endpoint: authenticated, on a listener of its own.
-    // Absent from the config ⇒ no task, no bind, no port — byte-identical to a build
-    // that predates it. See `s0::internal` for why it is not a route on the admin
-    // listener.
+    // The internal session endpoint: authenticated, on a listener of its own. Absent
+    // from the config ⇒ no task, no bind, no port. See `s0::internal` for why it is not
+    // a route on the admin listener.
     let internal_task = match &config.internal {
         Some(internal_cfg) => {
             let api = Arc::new(
@@ -260,7 +222,7 @@ async fn main() -> Result<()> {
     server::serve(gateway, listen).await?;
 
     // The internal API saw the same signal; let it finish its own drain rather than
-    // being aborted with the runtime — an aborted mint looks to the console like an
+    // being aborted with the runtime — an aborted mint looks to its caller like an
     // unexplained credential failure on every deploy.
     if let Some(task) = internal_task
         && tokio::time::timeout(INTERNAL_JOIN_TIMEOUT, task)
@@ -282,7 +244,7 @@ async fn main() -> Result<()> {
     }
 
     // Then drain the audit worker so any queued/buffered records are shipped or
-    // spilled rather than aborted with the runtime (§9.2: on shutdown, no silent
+    // spilled rather than aborted with the runtime (on shutdown, no silent
     // audit loss).
     audit_handle.drain(AUDIT_DRAIN_TIMEOUT).await;
 

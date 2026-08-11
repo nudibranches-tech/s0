@@ -1,17 +1,13 @@
 //! Golden values for the two hashes that outlive a single process.
 //!
-//! Both were `DefaultHasher`, whose output is explicitly **not** stable across Rust
-//! releases. That is invisible in a single-toolchain test run and shows up in
-//! production as: a rebuild changes every bundle revision (a fleet-wide decision-cache
-//! flush, and two replicas of a rolling update disagreeing about whether they hold the
-//! same policy), and every outstanding list cursor rejected mid-rollout with "grant
-//! scope changed; restart listing".
+//! An unstable hash is invisible in a single-toolchain test run and shows up in
+//! production as a rebuild changing every bundle revision (a fleet-wide decision-cache
+//! flush, and two replicas of a rolling update disagreeing about the policy they hold),
+//! and as every outstanding list cursor rejected mid-rollout.
 //!
-//! These are checked-in constants, not self-consistency assertions: a test that merely
-//! compared `f(x) == f(x)` would pass on an unstable hash. Each value is independently
-//! reproducible with `sha256sum`, so the test does not just restate the implementation.
-//! If one fails, the hash function changed — a deliberate, cursor- and cache-
-//! invalidating decision, not something to fix by pasting in the new value.
+//! These are checked-in constants, not self-consistency assertions: a test comparing
+//! `f(x) == f(x)` would pass on an unstable hash. Each is reproducible with `sha256sum`.
+//! A failure means the hash changed — a cursor- and cache-invalidating decision.
 
 use s0::pdp::content_revision;
 use s0::proxy::fanout::{Cursor, scope_hash};

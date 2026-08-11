@@ -1,21 +1,13 @@
 //! The golden-capture harness: the corpus in `tests/data/captured_inputs/` is a
-//! **recording** of what the gateway emits, not a description of it.
+//! **recording** of what the gateway emits, not a description of it. Hand-written
+//! fixtures make the policy correct about a request that does not exist. So every fixture
+//! comes out of `GatewayAccess::decide` — the single funnel every PDP question passes
+//! through — driven by the real typed hooks; every captured document must survive the
+//! round-trip gate (`to_value(from_value::<OpaInput>(raw)?) == raw`), which catches a
+//! renamed or dropped field; and every `Coverage::Enforced` op contributes a capture.
 //!
-//! Why this file exists is on record. The previous attempt had 35 green rego tests
-//! while production authorized nothing, because every fixture injected an `input.op`
-//! field the real producer never sent. Hand-written fixtures make the policy correct
-//! about a request that does not exist. So:
-//!
-//! - every fixture here comes out of `GatewayAccess::decide` — the single funnel every
-//!   PDP question passes through — driven by the real typed hooks;
-//! - every captured document must survive the round-trip gate
-//!   (`to_value(from_value::<OpaInput>(raw)?) == raw`), which is what actually catches a
-//!   renamed or dropped field;
-//! - every `Coverage::Enforced` operation must contribute at least one capture, so an
-//!   op cannot be enforced and unrepresented in the corpus.
-//!
-//! Regenerate with `S0_CAPTURE_REGENERATE=1 cargo test --test golden_capture`. Read the
-//! resulting diff as a wire-contract change: it is the artifact a policy reviewer needs.
+//! Regenerate with `S0_CAPTURE_REGENERATE=1 cargo test --test golden_capture`, and read
+//! the resulting diff as a wire-contract change.
 
 mod common;
 
@@ -34,9 +26,9 @@ fn corpus_dir() -> PathBuf {
 /// Drive every enforced operation through its real hook and return what the PDP was
 /// asked, keyed by capture id.
 ///
-/// The request carries the method and URI the operation really arrives with (from the
-/// s3s route table), because `RequestMeta` is derived from both: a corpus built from
-/// `GET /` would record a method no client sends and a query string that never existed.
+/// The request carries the method and URI the operation really arrives with (from the s3s
+/// route table), because `RequestMeta` is derived from both: a corpus built from `GET /`
+/// would record a method no client sends and a query string that never existed.
 async fn capture_enforced_ops() -> (BTreeMap<String, serde_json::Value>, Vec<&'static str>) {
     let fx = common::fixture("golden-capture", common::alice_bundle());
     let access = GatewayAccess::new(fx.gw.clone());
@@ -70,12 +62,10 @@ async fn capture_enforced_ops() -> (BTreeMap<String, serde_json::Value>, Vec<&'s
         "ListObjectsV2",
         s3s::dto::ListObjectsV2Input {
             bucket: "reports".into(),
-            // No prefix at all — the shape a bare `aws s3 ls s3://reports/` sends, and
-            // one a policy author has to be able to see in the corpus. It used to
-            // produce the narrowing obligation; since 2026-08-09 it is a DENY for this
-            // prefix-scoped fixture (AWS parity — see `policy/gateway/authz.rego`
-            // `narrowed`). The *wire shape* recorded here is unchanged either way, which
-            // is what this harness records: the absence of `prefix` on the document.
+            // No prefix at all — the shape a bare `aws s3 ls s3://reports/` sends, and one
+            // a policy author has to be able to see in the corpus. It is a DENY for this
+            // prefix-scoped fixture, matching AWS (see `policy/gateway/authz.rego`,
+            // `narrowed`). What this harness records is the absence of `prefix`.
             prefix: None,
             ..Default::default()
         },
@@ -114,15 +104,11 @@ async fn capture_enforced_ops() -> (BTreeMap<String, serde_json::Value>, Vec<&'s
     );
     assert!(access.delete_objects(&mut req).await.is_ok());
 
-    // A write carrying **riders** — the M4 ACL/tag retrofit's wire shape. Without this
-    // the corpus would contain no document with a non-empty `acl_grants` or a
-    // header-derived `requested_tags`, so a policy author would never see either, and the
-    // drift gate could not tell that a canned ACL is emitted as `{source, value}`.
-    //
-    // Deliberately the *allowed* combination: `private` is the one canned ACL that
-    // confers nothing, and `tier` is outside the fixture's reserved namespace. The
-    // refusals this stage adds are screened in code before `decide`, so they emit no
-    // capture at all — which is itself the property being relied on.
+    // A write carrying **riders**. Without this the corpus would contain no document with a
+    // non-empty `acl_grants` or a header-derived `requested_tags`, so a policy author would
+    // never see either. Deliberately the *allowed* combination — `private` is the one canned
+    // ACL that confers nothing and `tier` is outside the reserved namespace — because the
+    // refusals this stage adds are screened in code before `decide` and emit no capture.
     let mut req = fx.request_on_route(
         "PutObject",
         s3s::dto::PutObjectInput {
@@ -153,11 +139,10 @@ async fn capture_enforced_ops() -> (BTreeMap<String, serde_json::Value>, Vec<&'s
          catch. Run with --nocapture and read the recorded error."
     );
 
-    // THE structural invariant: the number of questions the PDP was asked equals the
-    // number of documents captured. `GatewayAccess::decide` is the only place a capture
-    // is taken, so a second `pdp.decide` call site anywhere on the request path shows up
-    // here as a shortfall — and the corpus would silently stop being 100% of what is
-    // emitted. The counter sits OUTSIDE the decision cache, so cache hits count too.
+    // THE structural invariant: the number of questions the PDP was asked equals the number
+    // of documents captured. `GatewayAccess::decide` is the only place a capture is taken,
+    // so a second `pdp.decide` call site anywhere on the request path shows up here as a
+    // shortfall. The counter sits OUTSIDE the decision cache, so cache hits count too.
     let captured = fx.capture.snapshot();
     assert_eq!(
         captured.len(),
@@ -208,9 +193,9 @@ async fn every_enforced_op_contributes_at_least_one_captured_input() {
 
 #[tokio::test]
 async fn the_checked_in_corpus_is_what_the_gateway_emits_today() {
-    // The drift gate proper. A field rename, a dropped field, a changed default or a
-    // hook that stops asking a question all land here as a diff — which is the point:
-    // the corpus is the reviewable artifact, not a cache.
+    // The drift gate proper. A field rename, a dropped field, a changed default or a hook
+    // that stops asking a question all land here as a diff: the corpus is the reviewable
+    // artifact, not a cache.
     let (corpus, _) = capture_enforced_ops().await;
     let dir = corpus_dir();
 
@@ -270,9 +255,8 @@ async fn the_checked_in_corpus_is_what_the_gateway_emits_today() {
 
 #[tokio::test]
 async fn a_corpus_input_is_a_real_decision_when_replayed() {
-    // The corpus is only worth having if the PDP accepts it verbatim. Replaying every
-    // checked-in document through the same engine the gateway runs proves the files are
-    // still valid `OpaInput`s and not just well-formed JSON.
+    // Replaying every checked-in document through the same engine the gateway runs proves
+    // the files are still valid `OpaInput`s and not just well-formed JSON.
     use s0::pdp::{GATEWAY_REGO, Pdp, RegorusPdp};
     let engine = RegorusPdp::new(GATEWAY_REGO, &common::alice_bundle()).expect("regorus");
     let dir = corpus_dir();

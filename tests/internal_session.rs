@@ -1,21 +1,13 @@
-//! P3, end to end: the console-mediated session endpoint, driven over a real socket.
-//!
-//! Everything here goes through `internal::serve_on` — the production accept loop and
-//! the production `route` — with a real `StsAuthority` and a real `BackendRegistry`.
-//! The assertions that matter are not about status codes; they are:
+//! The internal session endpoint, end to end, over a real socket: `internal::serve_on`,
+//! the production `route`, a real `StsAuthority` and a real `BackendRegistry`. The
+//! assertions that matter are not about status codes; they are:
 //!
 //! * **an unauthenticated caller gets nothing**, including nothing about which paths
-//!   exist, and a gateway with no secret configured refuses *everything* rather than
-//!   defaulting to open;
-//! * **a service-account session reaches `OpaInput.principal.kind ==
-//!   ServiceAccount`**, through `Identity::resolve` — the same call the S3 data plane
-//!   makes on every request. This is the one property the existing OIDC mint cannot
-//!   express at all (it hard-codes `PrincipalType::User`), and service accounts are
-//!   the primary consumer of this gateway;
-//! * **the credential the console receives is one the data plane accepts**, verified
-//!   by re-deriving the secret from the access-key id and verifying the session token.
-//!   A mint that produced credentials the gateway could not honour would look
-//!   perfectly healthy from the console's side.
+//!   exist, and a gateway with no secret configured refuses *everything*;
+//! * **a service-account session reaches `OpaInput.principal.kind == ServiceAccount`**
+//!   through `Identity::resolve`, the same call the S3 data plane makes;
+//! * **the credential the caller receives is one the data plane accepts**, verified by
+//!   re-deriving the secret from the access-key id and verifying the session token.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -116,7 +108,7 @@ const ORG: &str = "11111111-1111-1111-1111-111111111111";
 
 // ── authentication ─────────────────────────────────────────────────────────────
 
-/// The P2/P3 headline: this surface is not reachable without the platform credential.
+/// The headline: this surface is not reachable without the shared-secret credential.
 #[tokio::test]
 async fn an_unauthenticated_call_to_the_session_endpoint_is_refused() {
     let (base, _stop) = serve(api_with(Some(SECRET), 3600, sts())).await;
@@ -302,29 +294,12 @@ async fn a_service_account_session_carries_its_principal_type_to_the_opa_input()
     assert_eq!(user_principal.principal_type, PrincipalType::User);
 }
 
-/// **Clamped, not refused** — and the answer says so.
-///
-/// The requested duration comes from a CR field in the other repository. Refusing an
-/// over-cap value would turn one number in a `kubectl patch` into a total credential
-/// outage for that organization, with no fallback (`decide_issuance_path` never
-/// returns to the legacy path once the flag is on). Clamping can only ever *shorten* a
-/// credential's life, and `Expiration` reports the truth.
-/// # Why this reads as a bracket rather than a subtraction (F12)
-///
-/// It used to sample one `before` and compare *two* later responses against it, with a
-/// ±10 s slack to absorb the drift. That made it depend on where the second boundaries
-/// happened to fall: the handler computes `Expiration = SystemTime::now() + ttl`, so a
-/// request that crosses one tick returns `before + ttl + 1` — one over the top of the
-/// `..=900` window — and the test reddened for a gateway that had done exactly the
-/// right thing.
-///
-/// The fix is not a wider window (that only moves the boundary). Each request is
-/// bracketed between two readings of the **same clock the handler uses**, and the
-/// answer must land in `[before + ttl, after + ttl]`. That interval is where a correct
-/// answer provably is, whatever the clock did in between — so the assertion is exact
-/// rather than approximate, and it holds for every possible interleaving instead of
-/// most of them. It is strictly *stronger* than the ±10 s window it replaces: 899 and
-/// 891 used to pass, and now only the true value does.
+/// **Clamped, not refused** — and the answer says so. The requested duration is an
+/// operator-editable control-plane field, so refusing an over-cap value would turn one
+/// number into a total credential outage for that organization; clamping can only ever
+/// *shorten* a life. Each mint is bracketed between two readings of the same clock the
+/// handler uses, so `Expiration` must land in `[before + ttl, after + ttl]` — exactly
+/// where a correct answer is, whatever the clock did in between.
 #[tokio::test]
 async fn a_ttl_over_the_cap_is_clamped_down_not_honoured() {
     let (base, _stop) = serve(api_with(Some(SECRET), 900, sts())).await;
@@ -403,8 +378,8 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
-/// Everything the console can get wrong about the facts it asserts, refused rather
-/// than minted. None of these is a downgrade to a weaker session.
+/// Everything the caller can get wrong about the facts it asserts, refused rather than
+/// minted. None of these is a downgrade to a weaker session.
 #[tokio::test]
 async fn the_asserted_facts_are_validated_against_this_gateways_own_tables() {
     let (base, _stop) = serve(api_with(Some(SECRET), 3600, sts())).await;
@@ -430,7 +405,7 @@ async fn the_asserted_facts_are_validated_against_this_gateways_own_tables() {
 
     // An org that disagrees with this gateway's tenant binding. The decision path
     // attributes from the route, not from the claim, so this would silently evaluate
-    // against a different organization than the console named.
+    // against a different organization than the caller named.
     let resp = post(body(
         "service_account",
         "acme-prod",

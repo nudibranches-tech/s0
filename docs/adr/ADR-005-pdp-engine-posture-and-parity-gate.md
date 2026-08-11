@@ -1,6 +1,6 @@
 # ADR-005: PDP engine posture — sidecar OPA by default, embedded regorus only behind a dual-engine parity gate
 
-- **Status**: Proposed
+- **Status**: Accepted — implemented (src/pdp/, tests/parity.rs)
 - **Date**: 2026-07-15
 - **Scope**: Operationalizes the PDP topology (sidecar default, gated regorus) and the
   decision-cache design. It fixes what the posture leaves open: the definition of "identical

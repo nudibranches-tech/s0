@@ -1,10 +1,9 @@
-//! Embedded regorus PDP — the in-process fast path: µs-scale, no hop, no serialization
-//! to a sidecar. Permitted in production only behind the dual-engine parity gate; until
-//! then it is the engine the tests run against.
+//! Embedded regorus PDP — the in-process fast path: no hop, no serialization to a
+//! sidecar.
 //!
-//! The policy is whatever the platform pushed in the bundle, falling back to the
-//! compiled-in default. On a new bundle we rebuild the compiled policy from the current
-//! module + data and swap it atomically: a pushed module replaces the policy in use, a
+//! The policy is whatever the control plane pushed in the bundle, falling back to the
+//! compiled-in default. A new bundle rebuilds the compiled policy from the current
+//! module + data and swaps it atomically: a pushed module replaces the policy in use, a
 //! data-only bundle keeps it.
 
 use std::sync::Arc;
@@ -45,8 +44,8 @@ impl RegorusPdp {
         entrypoint: &Arc<str>,
     ) -> Result<CompiledPolicy> {
         let mut engine = Engine::new();
-        // OPA parity: builtins yield `undefined` on error rather than raising, matching
-        // the sidecar engine so the parity gate can compare byte-for-byte.
+        // OPA parity: builtins yield `undefined` on error rather than raising, which is
+        // what a sidecar OPA does.
         engine.set_strict_builtin_errors(false);
         engine
             .add_policy("gateway/authz.rego".to_string(), policy.to_string())

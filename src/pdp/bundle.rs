@@ -1,18 +1,17 @@
-//! The pushed bundle: the policy the gateway enforces. The platform is the source of
-//! policy and delivers it as a bundle carrying the projected policy *data* (tenants,
-//! grants, denylists, `freeze_writes`) and, optionally, the policy *module* (the rego)
-//! itself. When a bundle omits the module the gateway falls back to the compiled-in
-//! default ([`GATEWAY_REGO`]).
+//! The pushed bundle: the policy the gateway enforces. The control plane is the source of
+//! policy and delivers a bundle carrying the projected policy *data* (tenants, grants,
+//! denylists, `freeze_writes`) and, optionally, the policy *module* (the rego) itself. When
+//! a bundle omits the module the gateway falls back to the compiled-in default
+//! ([`GATEWAY_REGO`]).
 //!
-//! Each fetch is content-hashed into a revision. The revision is the linchpin of cache
-//! correctness: a revocation lands as a new revision, so every decision cached under the
-//! old revision is unreachable by construction — there is no invalidation logic to get
-//! wrong.
+//! Each fetch is content-hashed into a revision, the linchpin of cache correctness: a
+//! revocation lands as a new revision, so every decision cached under the old revision is
+//! unreachable by construction — there is no invalidation logic to get wrong.
 
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 
-/// The default gateway policy, compiled into the binary. In production the platform
+/// The default gateway policy, compiled into the binary. In production the control plane
 /// pushes the authoritative module in the bundle; this is the fallback when a bundle
 /// carries data only, the policy used for local development, and the oracle the
 /// dual-engine parity gate replays against — so what we test is what we ship by default.
@@ -20,21 +19,17 @@ pub const GATEWAY_REGO: &str = include_str!("../../policy/gateway/authz.rego");
 
 /// The rule the engines evaluate.
 ///
-/// **This name is a cross-repo contract.** The platform ships the authoritative module
-/// as `package s3.authz` and pins this entrypoint as `S3_AUTHZ_ENTRYPOINT`
-/// (`hf_module_console_api/.../vauban/s3_gateway_projection/bundle.rs`). If s0 queries
-/// any other rule, a pushed bundle evaluates to **undefined** — which fails closed to a
-/// deny on every request, with no error anywhere and every test in both repos green.
-/// That is the failure that cost the previous attempt 35 green tests over a deny-all
-/// production policy. `tests/cross_repo_contract.rs` holds the two equal.
+/// **This name is a contract with the control plane**, which ships its authoritative
+/// module as `package s3.authz`. If s0 queries any other rule, a pushed bundle evaluates
+/// to **undefined** — which fails closed to a deny on every request, with no error
+/// anywhere and every test green over a deny-all production policy.
 pub const DECISION_RULE: &str = "data.s3.authz.decision";
 
 /// [`DECISION_RULE`] in OPA's Data API / decision-log path form:
 /// `data.s3.authz.decision` → `s3/authz/decision`.
 ///
-/// Derived rather than written out a second time — the sidecar's URL and the audit
-/// record's `path` are two places that would otherwise each hold their own copy of the
-/// entrypoint and drift from it independently.
+/// Derived rather than written out a second time, so the sidecar's URL and the audit
+/// record's `path` cannot drift from the entrypoint independently.
 pub fn decision_rule_path() -> String {
     DECISION_RULE
         .strip_prefix("data.")
@@ -45,7 +40,7 @@ pub fn decision_rule_path() -> String {
 /// A parsed bundle: the policy data and, optionally, the policy module pushed with it.
 #[derive(Debug, Clone)]
 pub struct ParsedBundle {
-    /// The rego module the platform pushed, if any. `None` ⇒ use the compiled-in
+    /// The rego module the control plane pushed, if any. `None` ⇒ use the compiled-in
     /// default ([`GATEWAY_REGO`]).
     pub policy: Option<String>,
     /// The projected policy data (`tenants`, `org_settings`, …), evaluated as `data`.
@@ -79,41 +74,17 @@ pub fn parse_bundle(raw: &str) -> Result<ParsedBundle, String> {
 }
 
 impl ParsedBundle {
-    /// A platform document that arrives **without its module** is a deny-all, and it
-    /// is silent. Say so.
+    /// A control-plane document that arrives **without its module** is a silent
+    /// deny-all: the compiled-in fallback keys grants on the RAW `principal.sub`, while
+    /// the projection keys them `user:<oidc sub>` / `sa:<client id>`, so every request in
+    /// the organization is denied despite valid grants. It fails closed, which is why
+    /// this logs rather than refuses to load — refusing leaves stale data in force.
     ///
-    /// The fallback in `gateway::build_pdp` / `bundle_refresh::refresh_once` is
-    /// `parsed.policy.unwrap_or(GATEWAY_REGO)`, and [`GATEWAY_REGO`] is a
-    /// *development* module: it reads `data.tenants[t].s3_grants[input.principal.sub]`
-    /// on the RAW subject, while hyperfluid's projection keys those maps
-    /// `user:<oidc sub>` / `sa:<client id>`. Measured against the captured platform
-    /// bundle with `opa eval` 1.13.1: the pushed module answers
-    /// `allow: grant matched`, the compiled-in default answers
-    /// `deny: principal not a tenant member` — for the same request, the same data and
-    /// a subject holding a real grant.
-    ///
-    /// So a data-only platform bundle is not "degraded", it is a total data-plane
-    /// outage for the whole organization, arrived at by a field going absent. It is
-    /// fail-CLOSED, which is why this is a log and not a refusal: refusing to load
-    /// would leave the previous data in force, which is a different and quieter lie.
-    /// But it must be loud, because every symptom (pod Ready, bundle revision moving,
-    /// 403s everywhere) points away from the cause.
-    ///
-    /// `grant_schema_version` is the discriminator: it is hyperfluid's own D-1 gate,
-    /// emitted by `S3GatewayBundle::assemble` and by nothing else. Its presence means
-    /// the document came from the platform's serializer, which *always* ships `policy`
-    /// — so if it is here and the module is not, something stripped it in transit.
-    ///
-    /// **Version 0 is excluded, deliberately.** That is the operator's seed bundle
-    /// (`s3_gateway/config.rs::seed_bundle`): `tenants: {}`, `freeze_writes: true`,
-    /// version `0` so the schema gate hard-denies, and no module because it is *meant*
-    /// to authorize nothing until the first real poll. Every pod reads it at boot, so
-    /// warning on it would put this line in every gateway's startup log and teach
-    /// everyone to ignore it — which is how a real occurrence gets missed.
-    ///
-    /// The condition itself lives in [`Self::is_platform_data_missing_its_module`] so it
-    /// can be asserted without a tracing subscriber: a log line whose condition is
-    /// untested is a log line that fires on every boot, or never at all.
+    /// `grant_schema_version` is the discriminator, and version 0 is excluded
+    /// deliberately: that is the operator's seed bundle, module-less by design and read
+    /// by every pod at boot, so warning on it would teach everyone to ignore this line.
+    /// The condition lives in [`Self::is_platform_data_missing_its_module`] so it can be
+    /// asserted without a tracing subscriber.
     fn warn_if_platform_data_without_policy(&self) {
         if !self.is_platform_data_missing_its_module() {
             return;
@@ -128,8 +99,8 @@ impl ParsedBundle {
         );
     }
 
-    /// True when this is a platform-projected document (`grant_schema_version ≥ 1`) that
-    /// arrived without its rego module. See
+    /// True when this is a control-plane-projected document (`grant_schema_version ≥ 1`)
+    /// that arrived without its rego module. See
     /// [`Self::warn_if_platform_data_without_policy`] for what that costs.
     #[must_use]
     pub fn is_platform_data_missing_its_module(&self) -> bool {
@@ -162,12 +133,10 @@ impl Bundle {
 /// Stable revision derived from raw bundle content: a content change is a new
 /// revision, which is exactly the cache-invalidation signal.
 ///
-/// **SHA-256, not `DefaultHasher`.** `DefaultHasher`'s output is explicitly not
-/// guaranteed stable across Rust releases, so a rebuild on a different toolchain
-/// would re-hash identical bundle bytes to a different revision — invalidating every
-/// cached decision fleet-wide mid-rollout, and (worse) making two replicas of a
-/// rolling update disagree about whether they hold the same policy. Pinned by
-/// `tests/golden_hash.rs`.
+/// **SHA-256, not `DefaultHasher`**, whose output is explicitly not stable across Rust
+/// releases: a rebuild on a different toolchain would re-hash identical bytes to a new
+/// revision, and two replicas of a rolling update would disagree about whether they hold
+/// the same policy.
 pub fn content_revision(raw: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -175,18 +144,11 @@ pub fn content_revision(raw: &str) -> String {
     hex::encode(h.finalize())
 }
 
-/// The subject key hyperfluid's projection writes for a service account:
-/// `sa:<iam_sa_client_id>`.
-///
-/// **Confirmed against the code that writes it and the document it produces**, not
-/// assumed: `org_s3_gateway_bundle::service_account_subject` emits
-/// `format!("sa:{iam_sa_client_id}")` keyed on the Keycloak **clientId** (not
-/// `iam_sa_id`), and the captured platform bundle in
-/// `tests/data/platform/s3_gateway_bundle.json` carries `sa:pipeline` alongside
-/// `user:sub-a` in both `user_attributes` and `s3_grants`. The module composes the same
-/// string with `sprintf("sa:%s", [input.principal.sub])`, so this is one key space
-/// spelled in three places — pinned by
-/// `tests::the_service_account_key_shape_is_the_one_the_platform_really_writes`.
+/// The subject key the control plane's projection writes for a service account:
+/// `sa:<client id>`, keyed on the identity provider's **client id** rather than any
+/// internal identifier. The rego module composes the same string, so this is one key
+/// space spelled in several places — pinned against the captured bundle in
+/// `tests/data/platform/s3_gateway_bundle.json`.
 pub fn service_account_subject_key(client_id: &str) -> String {
     format!("sa:{client_id}")
 }
@@ -194,11 +156,8 @@ pub fn service_account_subject_key(client_id: &str) -> String {
 /// The bundle's subject key for either principal class: `sa:<client id>` for a service
 /// account, `user:<oidc sub>` for a human.
 ///
-/// Both spellings are the platform projection's, read off the captured document rather
-/// than assumed — `user_attributes` in `tests/data/platform/s3_gateway_bundle.json`
-/// carries `sa:pipeline` and `user:sub-a` side by side, and the module composes the same
-/// two strings. This is the key a per-subject lookup in the bundle must use, and it exists
-/// as one function so the two key spaces cannot drift apart at a new call site.
+/// Both spellings are the projection's, read off the captured document rather than
+/// assumed. One function, so the two key spaces cannot drift apart at a new call site.
 pub fn principal_subject_key(principal_type: crate::model::PrincipalType, sub: &str) -> String {
     match principal_type {
         crate::model::PrincipalType::ServiceAccount => service_account_subject_key(sub),
@@ -209,9 +168,8 @@ pub fn principal_subject_key(principal_type: crate::model::PrincipalType, sub: &
 /// The bundle field publishing a tenant's **key epoch floor** — the lowest epoch a
 /// derived long-lived key ([`crate::auth::derived`]) may carry and still be honoured.
 ///
-/// A cross-repo contract: hyperfluid's projection writes it, s0 reads it, and nothing
-/// negotiates. Named here once so both the reader and any future writer point at the same
-/// string.
+/// A contract with the control plane: its projection writes the field, s0 reads it, and
+/// nothing negotiates. Named here once so reader and writer point at the same string.
 pub const KEY_EPOCH_FIELD: &str = "s3_key_epoch";
 
 /// The optional per-subject override map, keyed by [`principal_subject_key`]. See
@@ -222,15 +180,13 @@ pub const KEY_EPOCHS_FIELD: &str = "s3_key_epochs";
 /// published epoch and the subject's override, or `None` when the tenant publishes none.
 ///
 /// **`None` denies** — see [`crate::auth::KeyEpochFloor`] for the full argument. Every
-/// degenerate input lands there: a document that is not an object, no `tenants`, no such
-/// tenant, no `s3_key_epoch`, a value that is not a number, a negative number, or one
-/// above `u32::MAX`. So the operator's seed bundle, an empty bundle and a bundle from a
-/// platform that has not learned about this field all mean "no derived key works here",
-/// which is the only direction a revocation channel may fail in.
+/// degenerate input lands there, so an empty bundle, the operator's seed bundle, and a
+/// control plane that does not publish this field all mean "no derived key works here",
+/// the only direction a revocation channel may fail in.
 ///
-/// A malformed **per-subject** entry is likewise ignored rather than defaulted, which
-/// leaves the tenant floor in force: a subject override can only ever raise the floor, so
-/// discarding a broken one can never admit a key the tenant epoch already refuses.
+/// A malformed **per-subject** entry is likewise ignored rather than defaulted, leaving
+/// the tenant floor in force: an override can only raise the floor, so discarding a broken
+/// one can never admit a key the tenant epoch already refuses.
 pub fn bundle_key_epoch_floor(
     data: &serde_json::Value,
     tenant: &str,
@@ -253,15 +209,12 @@ pub fn bundle_key_epoch_floor(
 /// Does this bundle's policy data know `sa:<client_id>` as a **member subject** of
 /// `tenant`?
 ///
-/// The predicate is `s3.rego`'s own membership rule, evaluated in Rust:
-/// `is_object(data.tenants[<tenant>].user_attributes["sa:<client id>"])`. Nothing looser
-/// — a key whose value is not an object is not a member to the policy either, and
-/// accepting one would vend a credential denied `principal is not a tenant member` on
-/// every request.
+/// The predicate is the policy's own membership rule, evaluated in Rust:
+/// `is_object(data.tenants[<tenant>].user_attributes["sa:<client id>"])`. Nothing looser —
+/// a key whose value is not an object is not a member to the policy either, and accepting
+/// one would vend a credential denied on every request.
 ///
-/// Fails closed on every degenerate input there is: no `tenants`, no such tenant, no
-/// `user_attributes`, an empty tenant or client id, or a document that is not an object
-/// at all all answer `false`. An empty bundle therefore accepts nothing, which is the
+/// Every degenerate input answers `false`, so an empty bundle accepts nothing — the
 /// direction a bundle-driven check has to fail in.
 pub fn bundle_knows_service_account(
     data: &serde_json::Value,
@@ -287,11 +240,9 @@ pub struct BundleStore {
 /// The STS door's bundle-driven audience acceptance, answered from **this** store — the
 /// same one the PDP decides against and the poller swaps.
 ///
-/// `current()` is loaded per call and dropped before returning, so the answer is always
-/// the revision in force at that instant: a subject removed by a poll stops being
-/// accepted on the next request, with no cache to invalidate and no snapshot to go
-/// stale. See [`crate::webidentity::TenantSubjects`] for why there must not be a second
-/// one.
+/// `current()` is loaded per call, so the answer is always the revision in force at that
+/// instant: a subject removed by a poll stops being accepted on the next request. See
+/// [`crate::webidentity::TenantSubjects`] for why there must not be a second one.
 impl crate::webidentity::TenantSubjects for BundleStore {
     fn knows_service_account(&self, tenant: &str, client_id: &str) -> bool {
         bundle_knows_service_account(&self.current().data, tenant, client_id)
@@ -299,12 +250,9 @@ impl crate::webidentity::TenantSubjects for BundleStore {
 }
 
 /// Derived-key revocation, answered from **this** store — the same one the PDP decides
-/// against and the poller swaps, for the same reason the audience check is: the answer
-/// must be the revision in force at this instant, not a snapshot taken at boot.
-///
-/// `current()` is loaded per call and dropped before returning, so a key epoch raised by
-/// a poll revokes on the very next request, with no cache to invalidate. That is what
-/// makes "revocation lands at normal bundle latency" true rather than aspirational.
+/// against and the poller swaps. `current()` is loaded per call, so a key epoch raised by
+/// a poll revokes on the very next request, with no cache to invalidate: revocation lands
+/// at normal bundle latency.
 impl crate::auth::KeyEpochFloor for BundleStore {
     fn key_epoch_floor(&self, tenant: &str, subject_key: &str) -> Option<u32> {
         bundle_key_epoch_floor(&self.current().data, tenant, subject_key)
@@ -338,17 +286,15 @@ mod tests {
     use super::*;
     use crate::webidentity::TenantSubjects;
 
-    /// The captured platform document — the same bytes `tests/cross_repo_contract.rs`
-    /// reads. Compiled into the test binary only.
+    /// A captured control-plane document. Compiled into the test binary only.
     const PLATFORM_BUNDLE: &str = include_str!("../../tests/data/platform/s3_gateway_bundle.json");
 
-    /// **The key shape, read off the platform's own document rather than assumed.**
+    /// **The key shape, read off a real projected document rather than assumed.**
     ///
-    /// If hyperfluid ever changed `service_account_subject` — to `iam_sa_id`, to an
-    /// unprefixed client id, to `service-account:` — the STS door's bundle route would
-    /// look up a key nobody writes and refuse every tenant service account, while every
-    /// test that made up its own bundle stayed green. So the assertion is made against
-    /// the captured document.
+    /// If the control plane ever changed the spelling — an unprefixed client id, an
+    /// internal id, `service-account:` — the STS door would look up a key nobody writes
+    /// and refuse every tenant service account, while every test that made up its own
+    /// bundle stayed green.
     #[test]
     fn the_service_account_key_shape_is_the_one_the_platform_really_writes() {
         let parsed = parse_bundle(PLATFORM_BUNDLE).expect("the captured bundle parses");
@@ -451,10 +397,9 @@ mod tests {
 
     /// **The lookup reads the bundle in force, not the one that was in force.**
     ///
-    /// The store is hot-swapped on every poll, and the handle the STS door holds is the
-    /// store itself rather than a snapshot of it. A subject added by a poll is accepted
-    /// immediately; a subject *removed* by one stops being accepted immediately — which
-    /// is the half that matters, because that is a revocation.
+    /// The STS door holds the store itself, not a snapshot. A subject added by a poll is
+    /// accepted immediately; a subject *removed* by one stops being accepted immediately,
+    /// which is the half that matters, because that is a revocation.
     #[test]
     fn the_lookup_follows_the_store_across_a_swap_in_both_directions() {
         let with = |subjects: serde_json::Value| serde_json::json!({ "tenants": { "acme": { "user_attributes": subjects } } });
@@ -482,8 +427,8 @@ mod tests {
     }
 
     /// **The revocation channel for derived long-lived keys, and the direction absence
-    /// fails in.** This is the half of F17 that makes the credential class safe, so the
-    /// degenerate cases are the point rather than an afterthought.
+    /// fails in.** This is what makes the credential class safe, so the degenerate cases
+    /// are the point rather than an afterthought.
     #[test]
     fn the_key_epoch_floor_is_published_per_tenant_and_its_absence_denies() {
         let data = serde_json::json!({
@@ -494,8 +439,7 @@ mod tests {
                     // other four.
                     "s3_key_epochs": { "sa:leaked-registry": 9, "user:alice": 4 }
                 },
-                // A tenant that publishes no epoch at all — the state every tenant is in
-                // before the platform learns about this field.
+                // A tenant that publishes no epoch at all.
                 "quiet": { "user_attributes": {} }
             }
         });
@@ -572,15 +516,14 @@ mod tests {
             Some(5)
         );
 
-        // The field names are a cross-repo contract; assert them rather than trust the
-        // literals above.
+        // The field names are a contract with the control plane; assert them rather than
+        // trust the literals above.
         assert_eq!(KEY_EPOCH_FIELD, "s3_key_epoch");
         assert_eq!(KEY_EPOCHS_FIELD, "s3_key_epochs");
     }
 
     /// The floor is read from the bundle **in force**, through the same store the PDP
-    /// decides against — which is what makes "revocation lands at normal bundle latency"
-    /// a fact rather than a hope.
+    /// decides against — which is what makes revocation land at normal bundle latency.
     #[test]
     fn the_key_epoch_floor_follows_the_store_across_a_swap() {
         use crate::auth::KeyEpochFloor;
@@ -604,8 +547,7 @@ mod tests {
     }
 
     /// Both subject key spaces, composed in one place so a new call site cannot invent a
-    /// third spelling. Asserted against the captured platform document, like the service
-    /// account key shape above.
+    /// third spelling. Asserted against the captured document, like the key shape above.
     #[test]
     fn the_subject_key_is_the_platforms_own_for_both_principal_classes() {
         use crate::model::PrincipalType;
@@ -654,7 +596,7 @@ mod tests {
     /// every boot gets ignored, and an ignored log line is not a control.
     #[test]
     fn a_platform_document_without_its_module_is_recognized_but_the_seed_is_not() {
-        // A real platform document stripped of `policy`: the compiled-in default keys
+        // A real projected document stripped of `policy`: the compiled-in default keys
         // grants on the raw sub and would deny the whole organization. Say so.
         let stripped = parse_bundle(
             r#"{ "data": { "grant_schema_version": 2,
@@ -664,8 +606,8 @@ mod tests {
         .unwrap();
         assert!(stripped.is_platform_data_missing_its_module());
 
-        // The operator's seed bundle (s3_gateway/config.rs::seed_bundle) is version 0,
-        // module-less ON PURPOSE, and read by every pod at boot. It must stay quiet.
+        // The operator's seed bundle is version 0, module-less ON PURPOSE, and read by
+        // every pod at boot. It must stay quiet.
         let seed = parse_bundle(
             r#"{ "data": { "grant_schema_version": 0,
                            "org_settings": { "freeze_writes": true,

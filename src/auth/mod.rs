@@ -1,16 +1,14 @@
 //! Identity / credential authority. The gateway owns identity: it verifies
 //! inbound SigV4 signatures itself and never depends on a backend's STS.
 //!
-//! Three credential kinds share the `S3Auth` path:
+//! Three credential kinds share the `S3Auth` path, in access-key-id namespaces that are
+//! disjoint **by prefix** — a property of the dispatch in `Identity::secret_key`, not of
+//! the configuration:
 //! - **STS sessions** — derived secrets, no store, claims in a signed token ([`sts`]).
 //! - **Derived long-lived per-principal keys** — derived secrets, no store, identity in
-//!   the access-key id itself ([`derived`]). The migration path for consumers that hold
-//!   a static key and cannot refresh.
+//!   the access-key id itself ([`derived`]), for consumers that cannot refresh.
 //! - **Long-lived static keys** — issued to external apps / service accounts, each
 //!   its own principal ([`CredentialStore`]).
-//!
-//! The three namespaces are disjoint **by prefix**, and the dispatch below is what makes
-//! that a property of the code rather than of the configuration.
 
 pub mod derived;
 pub mod sts;
@@ -53,14 +51,12 @@ pub struct StaticCredential {
 pub type StaticCredentials = HashMap<String, StaticCredential>;
 
 /// The long-lived static keys, behind an [`ArcSwap`] so a rotated credential list can
-/// be applied without restarting (plan task 10).
+/// be applied without restarting.
 ///
-/// The swap lives **inside** the store rather than around it because
-/// `Identity::new` erases the concrete handle into `Arc<dyn CredentialStore>`
-/// immediately (plan defect A-8): an `ArcSwap<Arc<dyn CredentialStore>>` held by the
-/// caller would not reach the copy `Identity` is holding. Callers keep an
-/// `Arc<StaticCredentialStore>` and call [`replace`](Self::replace); every reader,
-/// including the one behind the trait object, sees the new table on its next lookup.
+/// The swap lives **inside** the store because `Identity::new` erases the concrete
+/// handle into `Arc<dyn CredentialStore>`: an `ArcSwap<Arc<dyn CredentialStore>>` held by
+/// the caller would not reach the copy `Identity` holds. Callers keep an
+/// `Arc<StaticCredentialStore>` and call [`replace`](Self::replace).
 #[derive(Debug, Default)]
 pub struct StaticCredentialStore {
     by_access_key: ArcSwap<StaticCredentials>,
@@ -151,15 +147,9 @@ impl CredentialStore for StaticCredentialStore {
 /// The gateway's own **tenant → organization** table.
 ///
 /// Implemented by [`crate::proxy::BackendRegistry`], which builds it from the operator's
-/// rendered config. It exists as a trait so [`DerivedKeys`] can state, in its own
-/// signature, that the organization is something it *asks for* rather than something it
-/// reads out of a credential.
-///
-/// This is the settled rule for every credential class in this gateway: a static
-/// credential's `organization_id` is cross-checked against the tenant's authoritative org
-/// at config load (`GatewayConfig::validate`), an STS session's org comes from the route
-/// the internal mint resolved, and every S3 decision is attributed from the
-/// `RouteSnapshot` `access::check` looks up. A long-lived key is the credential class
+/// rendered config. A trait so [`DerivedKeys`] can state in its own signature that the
+/// organization is something it *asks for* rather than something it reads out of a
+/// credential — the rule for every credential class here. A long-lived key is the class
 /// most likely to outlive the binding it was minted against, so it is the last place the
 /// rule may be weakened.
 pub trait TenantDirectory: Send + Sync {
@@ -168,56 +158,27 @@ pub trait TenantDirectory: Send + Sync {
     fn organization_of(&self, tenant: &str) -> Option<String>;
 }
 
-/// **How a derived key is revoked.** Read from the policy bundle in force, so a
-/// revocation lands at exactly the latency every other revocation in this system lands
-/// at, through exactly the same channel.
-///
-/// ## Why an epoch floor and not a revoked-key list
-///
-/// A derived key cannot be deleted — there is no row to delete, which is the property
-/// that makes it multi-replica-correct — so the bundle has to be able to *invalidate*
-/// one. Both shapes were considered:
-///
-/// * **A revoked-key list** fails in the wrong direction. Its absence means "nothing is
-///   revoked", so a bundle that lost the field, or a tenant the projection has not
-///   learned about yet, silently un-revokes every key ever revoked. It also grows without
-///   bound (a long-lived credential's revocation can never be aged out, unlike an STS
-///   session's) and it puts credential identifiers into a document every gateway pod
-///   holds in memory.
-/// * **An epoch floor** fails closed by construction. The key carries the epoch it was
-///   minted at; the bundle publishes the lowest epoch it still honours; a key below the
-///   floor is refused. **Absence of the floor denies**, so an empty bundle, a tenant the
-///   bundle does not carry, the operator's `seed_bundle`, and a field of the wrong type
-///   all mean "no derived key works here" rather than "every derived key works here".
-///   Publishing the floor is therefore the platform's explicit opt-in to the whole
-///   credential class, and one number revokes a whole tenant's keys at once.
-///
-/// The floor is composed from **two** published values so revocation is not all-or-
-/// nothing: a per-tenant epoch (the blunt instrument — rotate everybody) and an optional
-/// per-subject epoch (the surgical one — cut off one compromised consumer without
-/// touching the other four). The effective floor is the **greater** of the two, so a
-/// subject entry can only ever tighten, never loosen, what the tenant published.
-///
-/// The epoch carries **no scope and no permissions**. It is a revocation counter, and
-/// that distinction is what keeps session-scoped credentials closed out: the
-/// credential stays an identity, and everything about what it may do is still read live
-/// from the bundle at decision time.
+/// **How a derived key is revoked.** A derived key has no row to delete — the property
+/// that makes it multi-replica-correct — so the bundle in force invalidates it instead,
+/// via an epoch floor rather than a revoked-key list because **absence of the floor
+/// denies**: an empty bundle, an unknown tenant or a field of the wrong type all mean
+/// "no derived key works here". The effective floor is the **greater** of a per-tenant
+/// epoch (rotate everybody) and an optional per-subject one (cut off one consumer), so a
+/// subject entry can only tighten. The epoch carries no scope and no permissions: what a
+/// key may do is still read live from the bundle at decision time.
 pub trait KeyEpochFloor: Send + Sync {
     /// The lowest `key_epoch` a derived key for this `(tenant, subject_key)` may carry.
     ///
-    /// `None` means the bundle in force publishes no floor for this tenant, which
-    /// **denies** — see the trait docs. `subject_key` is the bundle's own key space
-    /// (`sa:<client id>` / `user:<sub>`), composed by
-    /// [`crate::pdp::principal_subject_key`].
+    /// `None` means the bundle publishes no floor for this tenant, which **denies**.
+    /// `subject_key` is the bundle's own key space (`sa:<client id>` / `user:<sub>`),
+    /// composed by [`crate::pdp::principal_subject_key`].
     fn key_epoch_floor(&self, tenant: &str, subject_key: &str) -> Option<u32>;
 }
 
 /// The derived-key half of [`Identity`]: the ring that verifies, the tenant→org table
-/// that attributes, and the bundle that revokes.
-///
-/// Held as a unit because all three are required to admit a key, and a construction that
-/// let one be omitted would be a construction in which a key is admitted without being
-/// revocable, or attributed from its own payload.
+/// that attributes, and the bundle that revokes. Held as a unit because a construction
+/// that let one be omitted would admit a key that is not revocable, or one attributed
+/// from its own payload.
 pub struct DerivedKeys {
     authority: Arc<DerivedKeyAuthority>,
     tenants: Arc<dyn TenantDirectory>,
@@ -243,18 +204,15 @@ impl DerivedKeys {
     }
 
     /// **The single admission path.** Verify, then revoke-check, then attribute — in that
-    /// order, and every failure answers the same `None`.
+    /// order, and every failure answers the same `None`:
     ///
     /// 1. the MAC is checked before any field inside the id is read
     ///    ([`DerivedKeyAuthority::verify`]);
-    /// 2. the key's epoch is checked against the floor the **bundle in force** publishes,
-    ///    which is where revocation happens and where the absence of data denies;
-    /// 3. the organization is resolved from the gateway's own tenant→org table. A tenant
-    ///    this gateway does not route is refused here, which is also what refuses a key
-    ///    minted for another deployment's tenant.
-    ///
-    /// The organization inside the credential is not consulted, because there is none:
-    /// [`DerivedPrincipal`] has no such field, by design.
+    /// 2. the epoch is checked against the floor the **bundle in force** publishes, where
+    ///    absence denies;
+    /// 3. the organization comes from the gateway's own tenant→org table, never from the
+    ///    credential ([`DerivedPrincipal`] has no such field) — which is also what refuses
+    ///    a key minted for another deployment's tenant.
     fn admit(&self, access_key_id: &str) -> Option<(DerivedPrincipal, String)> {
         let principal = self.authority.verify(access_key_id)?;
         let subject_key =
@@ -283,8 +241,8 @@ impl DerivedKeys {
         Some((principal, organization_id))
     }
 
-    /// The SigV4 secret for an admitted key. A key that is forged, revoked, or names a
-    /// tenant this gateway does not route derives nothing — so all four are one answer.
+    /// The SigV4 secret for an admitted key. Forged, revoked, or naming a tenant this
+    /// gateway does not route all derive nothing — one answer for every refusal.
     fn secret(&self, access_key_id: &str) -> Option<String> {
         self.admit(access_key_id)?;
         self.authority.secret_for_access_key(access_key_id)
@@ -294,10 +252,8 @@ impl DerivedKeys {
     ///
     /// **`groups` is empty, deliberately.** Group membership is read live from the bundle
     /// by the policy (`data.tenants[t].user_attributes[sub].groups`), never from the
-    /// credential — which is the same reason an STS session's groups are advisory and a
-    /// web-identity session carries none at all (AWS-PARITY D27). A long-lived key that
-    /// froze its groups at mint time would be a permanent grant of whatever those groups
-    /// confer, which is the scope-in-the-credential mistake this design exists to avoid.
+    /// credential. A long-lived key that froze its groups at mint time would be a
+    /// permanent grant of whatever those groups confer.
     fn resolve(&self, access_key_id: &str) -> Option<ResolvedPrincipal> {
         let (principal, organization_id) = self.admit(access_key_id)?;
         Some(ResolvedPrincipal {
@@ -309,46 +265,20 @@ impl DerivedKeys {
         })
     }
 
-    /// **Mint a key this same object will admit.**
+    /// **Mint a key this same object will admit.** Every input [`Self::admit`] reads is
+    /// checked here first, against the same sources:
     ///
-    /// Every input [`Self::admit`] reads on the hot path is checked here first, against
-    /// the same sources, so a key this returns is one the data plane accepts on its next
-    /// request rather than one whose usability is discovered by a consumer:
+    /// 1. the tenant must be routable and the caller's asserted organization must be the
+    ///    one this gateway binds it to, since attribution comes from the route;
+    /// 2. the tenant must have a **published key-epoch floor**, and the key is stamped at
+    ///    exactly it: below, a key is revoked on arrival; above, the floor could no
+    ///    longer revoke it; absent, minting refuses as admission does.
     ///
-    /// 1. the tenant must be routable, and the organization the caller asserts must be
-    ///    the one this gateway binds it to — the same cross-check
-    ///    [`crate::internal::InternalApi::mint_session`] applies to a session, for the
-    ///    same reason (attribution comes from the route, so a disagreement would produce
-    ///    a credential evaluated against an organization nobody named);
-    /// 2. the tenant must have a **published key-epoch floor**, and the key is stamped
-    ///    with exactly that floor. Minting below it would produce a credential that is
-    ///    revoked on arrival; minting above it would produce one the floor could no
-    ///    longer revoke. Reading the number here rather than accepting it from the caller
-    ///    is what makes those two states unreachable.
-    ///
-    /// Refusing when the floor is absent is the same fail-closed rule as admission: a
-    /// tenant the platform has not opted in gets no keys, rather than keys that do not
-    /// work.
-    ///
-    /// ## `requested_epoch`, and why gapless rotation needs it
-    ///
-    /// A derived key is a **pure function** of `(ring, tenant, sub, principal_type,
-    /// epoch)` — there is no nonce — so two mints with the same inputs return the same
-    /// two strings. The epoch is therefore the only thing that distinguishes one key for
-    /// a principal from the next, which makes it the serial number as well as the
-    /// revocation counter.
-    ///
-    /// With `None` the key is stamped at the floor, which is what a first issue wants.
-    /// Rotation wants one above the key it is replacing: mint at `floor + 1`, roll the
-    /// consumer, *then* revoke — at which point the floor rises past the old key and the
-    /// new one survives. Without this the two keys would be the same key, and rotation
-    /// would mean an outage bounded by the bundle poll rather than by nothing at all.
-    /// That is AWS's two-access-key rotation, reached with a counter instead of a table.
-    ///
-    /// **Below the floor is refused, never clamped up.** A caller asking for an epoch the
-    /// bundle has already revoked past has stale state, and quietly handing back a
-    /// working credential at a different epoch than the one it recorded would put the
-    /// platform's ledger out of step with what it can actually revoke.
+    /// `requested_epoch` buys gapless rotation: the key is a pure function of
+    /// `(ring, tenant, sub, principal_type, epoch)`, so the epoch is its serial number
+    /// too — mint at `floor + 1`, roll the consumer, *then* revoke. Below the floor is
+    /// refused, never clamped up: a caller with stale state must not get a credential at
+    /// an epoch it did not record.
     pub fn mint(
         &self,
         tenant: &str,
@@ -382,7 +312,9 @@ impl DerivedKeys {
         let key_epoch = match requested_epoch {
             None => floor,
             Some(requested) if requested >= floor => requested,
-            Some(requested) => return Err(DerivedMintRefusal::EpochBelowFloor { requested, floor }),
+            Some(requested) => {
+                return Err(DerivedMintRefusal::EpochBelowFloor { requested, floor });
+            }
         };
 
         let credential = self
@@ -402,11 +334,10 @@ impl DerivedKeys {
     }
 }
 
-/// A freshly minted derived key, plus the two facts the platform's issuance ledger needs
-/// and cannot recompute: the epoch it was stamped at and the key id that minted it.
-///
-/// Nothing is stored on this side, so that ledger is the only inventory of which keys
-/// exist — and `key_epoch` is what tells a later revocation how high the floor must go.
+/// A freshly minted derived key, plus the two facts an issuance ledger needs and cannot
+/// recompute: the epoch it was stamped at and the key id that minted it. Nothing is
+/// stored on this side, so that ledger is the only inventory of which keys exist, and
+/// `key_epoch` is what tells a later revocation how high the floor must go.
 #[derive(Debug, Clone)]
 pub struct MintedDerivedKey {
     pub credential: DerivedKeyCredential,
@@ -425,8 +356,8 @@ pub enum DerivedMintRefusal {
     /// The asserted organization disagrees with this gateway's tenant→org binding.
     OrganizationMismatch,
     /// The bundle in force publishes no `s3_key_epoch` for this tenant, so the key would
-    /// be refused the moment it was used. Publishing the number is the platform's opt-in
-    /// to the credential class; see [`KeyEpochFloor`].
+    /// be refused the moment it was used. Publishing the number is the control plane's
+    /// opt-in to the credential class; see [`KeyEpochFloor`].
     NotEnabledForTenant(String),
     /// The caller asked for an epoch the bundle has already revoked past. Refused rather
     /// than clamped: see [`DerivedKeys::mint`].
@@ -482,47 +413,35 @@ impl Identity {
         }
     }
 
-    /// Switch on derived long-lived keys (F17).
-    ///
-    /// **Additive by construction, and the signature is where that is stated:** every
-    /// existing call site keeps the two-argument [`Identity::new`], gets `derived: None`,
-    /// and behaves byte-identically to a build made before this existed. Nothing about
-    /// the STS path, the static path or the web-identity door changes here or below.
+    /// Switch on derived long-lived keys. Additive by construction: a caller that keeps
+    /// the two-argument [`Identity::new`] gets `derived: None`, and nothing about the STS
+    /// path, the static path or the web-identity door changes.
     pub fn with_derived_keys(mut self, derived: Arc<DerivedKeys>) -> Self {
         self.derived = Some(derived);
         self
     }
 
-    /// The STS authority, shared with the mint (the badge desk) so minted sessions and
-    /// inbound verification use the same keys.
+    /// The STS authority, shared with the mint so minted sessions and inbound
+    /// verification use the same keys.
     pub fn sts(&self) -> Arc<StsAuthority> {
         self.sts.clone()
     }
 
     /// The derived-key half, or `None` when this deployment has not configured a ring.
-    ///
-    /// Shared with the internal API for the same reason [`Identity::sts`] is: the
-    /// endpoint that mints a derived key and the data plane that admits one must be the
-    /// same object, or a key one side produces is a key the other cannot verify.
+    /// Shared with the internal API for the same reason [`Identity::sts`] is: the mint
+    /// and the data plane must be the same object, or one side produces keys the other
+    /// cannot verify.
     pub fn derived(&self) -> Option<Arc<DerivedKeys>> {
         self.derived.clone()
     }
 
-    /// The three credential namespaces are disjoint **by construction**, not by
-    /// configuration: anything carrying the STS prefix is answered by the STS
-    /// authority alone, and anything carrying the derived-key prefix by the derived-key
-    /// half alone, even when it is malformed or names a retired key id.
-    ///
-    /// **The `HFSA` namespace is reserved even when derived keys are switched off**, and
-    /// that `None` is not an oversight. If an unconfigured deployment fell through to the
-    /// static store, whoever can write the credential list could provision a credential
-    /// there and have it start working the day derived keys are enabled — or, worse, keep
-    /// working under a principal the derived path would have resolved differently. So an
-    /// id in this namespace is answered here or not at all.
-    ///
-    /// `GatewayConfig::validate` also rejects a static credential in either namespace,
-    /// but that guard protects one config-loading path; this one holds for every store a
-    /// `CredentialStore` impl could ever be.
+    /// The three credential namespaces are disjoint **by construction**: a prefixed id is
+    /// answered by its own authority alone, even when malformed or naming a retired key
+    /// id, and the `HFSA` namespace stays reserved when derived keys are switched off.
+    /// Falling through to the static store would let whoever writes the credential list
+    /// park an id there that starts working the day derived keys are enabled.
+    /// `GatewayConfig::validate` rejects such an entry too, but that guard covers one
+    /// config-loading path; this holds for every `CredentialStore` impl.
     fn secret_key(&self, access_key_id: &str) -> Option<String> {
         if StsAuthority::is_sts_access_key(access_key_id) {
             return self.sts.secret_for_access_key(access_key_id);
@@ -679,12 +598,12 @@ mod tests {
     #[test]
     fn a_static_credential_cannot_shadow_the_sts_namespace() {
         // The config loader rejects this at startup; here the store is built by hand,
-        // which is exactly the case the loader does not cover. An access key in the
-        // STS namespace must be answered by the STS authority even when it is
-        // malformed — falling through to the store would let whoever can write the
-        // credential list hand out a credential the gateway then treats as a session.
+        // which the loader does not cover. An id in the STS namespace must be answered by
+        // the STS authority even when malformed — falling through to the store would let
+        // whoever writes the credential list hand out a credential the gateway then
+        // treats as a session.
         let sts = StsAuthority::new(vec![3u8; 32], vec![5u8; 32]).unwrap();
-        let squatted = format!("{}sid-1", sts::STS_PREFIX); // the pre-key-ring shape
+        let squatted = format!("{}sid-1", sts::STS_PREFIX); // no kid segment
         let store = StaticCredentialStore::new();
         store.insert(
             squatted.clone(),
@@ -702,7 +621,7 @@ mod tests {
         assert!(id.resolve(&squatted, Some("any-token")).is_err());
     }
 
-    // ── derived long-lived per-principal keys (F17) ──────────────────────────────
+    // ── derived long-lived per-principal keys ──────────────────────────────
 
     mod derived_keys {
         use super::*;
@@ -794,10 +713,9 @@ mod tests {
             assert!(id.resolve(&newer.access_key_id, None).is_ok());
         }
 
-        /// The one place the organization could leak in from the credential is the
-        /// payload, so this asserts the payload has nowhere to put it: two gateways with
-        /// different tables read the same key as different organizations, and neither
-        /// reads it as anything the minter chose.
+        /// The payload has nowhere to put an organization: two gateways with different
+        /// tables read the same key as different organizations, and neither reads it as
+        /// anything the minter chose.
         #[test]
         fn the_organization_comes_from_the_table_and_the_credential_cannot_name_one() {
             struct OtherOrg;
@@ -909,9 +827,9 @@ mod tests {
             assert!(id.resolve(&reissued.access_key_id, None).is_err());
         }
 
-        /// The multi-replica property (F8) at the identity layer: a key minted on one
-        /// pod, verified on a second process that has only the key material — no shared
-        /// store, nothing carried across the restart.
+        /// The multi-replica property at the identity layer: a key minted on one pod,
+        /// verified on a second process that has only the key material — no shared store,
+        /// nothing carried across the restart.
         #[test]
         fn a_key_survives_a_pod_restart_and_works_on_a_second_instance() {
             let (pod_a, authority, _) = identity_with(Epochs::at(1));
@@ -933,9 +851,8 @@ mod tests {
             );
         }
 
-        /// **The additive guarantee.** With derived keys switched on, the two existing
-        /// credential classes behave exactly as they did — same secrets, same principals,
-        /// same refusals.
+        /// **The additive guarantee.** With derived keys switched on, the other two
+        /// credential classes are unaffected — same secrets, principals and refusals.
         #[test]
         fn sts_and_static_credentials_are_untouched_by_the_new_class() {
             let (with_derived, _, sts) = identity_with(Epochs::at(0));

@@ -1,58 +1,36 @@
-# Client compatibility matrix — the 29-op scope (plan task 63, risk 8)
+# Client compatibility matrix
 
-> ## ⚠ AMENDMENT — 2026-08-08: this matrix was measured against the 29-op scope
->
-> **It has NOT been re-measured against the 23-op scope**, and it is left in place rather
-> than edited because a measurement you did not take is not a measurement. Read every row
-> below as "what the M4 gateway did", and apply these three deltas:
+> **Scope of these numbers.** Every row was measured against a 29-op enforced scope. The
+> scope is now 23 ops and the matrix has **not** been re-measured — a measurement you did
+> not take is not a measurement. Read each row as written and apply four deltas:
 >
 > 1. **`CreateBucket`, `DeleteBucket`, `GetBucketPolicy`, `PutBucketPolicy`,
->    `GetBucketCors`, `PutBucketCors` are now `Coverage::Denied`.** Every row that shows
->    one of them allowed under some grant now shows a **gate** 403 under every grant,
->    including the wildcard **W**. This does not change any row's *fatality*, only its
->    reason: BLOCKER-1 (rclone's pre-upload `CreateBucket`) is now unconditional rather
->    than grant-dependent, so `--s3-no-check-bucket` moves from "needed for principal O"
->    to **required for every principal**. That is a real, measured-in-principle
->    regression in client compatibility, accepted deliberately: a bucket made through S3
->    has no `HFBucket` CR behind it.
+>    `GetBucketCors`, `PutBucketCors` are `Coverage::Denied`.** Any row showing one of them
+>    allowed under some grant is a **gate** 403 under every grant, including the wildcard
+>    **W**. Fatality is unchanged, only the reason: BLOCKER-1 (rclone's pre-upload
+>    `CreateBucket`) is unconditional rather than grant-dependent, so `--s3-no-check-bucket`
+>    is **required for every principal**. Accepted deliberately — a bucket made through S3
+>    has no control-plane record behind it.
 > 2. **`read_bucket` and `list_buckets` are one verb, `read`.** Wherever the grant column
->    below says either, read `read`. BLOCKER-2 (`mc ls <alias>/<bucket>` without
->    `read_bucket`) keeps its shape but loses a failure mode it used to have: a principal
->    could previously hold `list_buckets` and not `read_bucket`, so `mc ls` listed a
->    bucket that `mc stat` then refused. That is no longer expressible.
-> 3. **A conferring ACL is refused in code.** The
->    `aws s3 cp --acl bucket-owner-full-control` row said "allowed under a wildcard
->    grant"; it is now refused under every grant, because `write_object_acl` no longer
->    exists. `--acl private` is unaffected, which is what keeps `s3cmd` and `rclone`
->    working on ordinary uploads.
->
-> `run.sh` has been updated to the new vocabulary so the harness still stands the stack
-> up; the numbers in this file have not.
-
-> ## ⚠ AMENDMENT — 2026-08-09: an unbounded list is now denied
->
-> Also not re-measured. One further delta, and it touches the most common command in the
-> matrix:
->
+>    below says either, read `read`. BLOCKER-2 keeps its shape but loses one failure mode:
+>    holding `list_buckets` without `read_bucket` is no longer expressible.
+> 3. **A conferring ACL is refused in code.** `aws s3 cp --acl bucket-owner-full-control`
+>    is refused under every grant, because `write_object_acl` no longer exists.
+>    `--acl private` is unaffected, which is what keeps `s3cmd` and `rclone` working on
+>    ordinary uploads.
 > 4. **A list with NO prefix is a 403 for a prefix-scoped principal.** `aws s3 ls
->    s3://<bucket>/` sends `Prefix=` (empty) + `Delimiter=/`; s0 used to answer it by
->    silently rewriting the request into the granted prefix, and it now answers
->    `403 AccessDenied … deny: an unbounded list needs a whole-bucket grant; name a
->    prefix inside your grant`. **Affected rows:** every `ListObjectsV2`-issuing row read
->    under principal **S** — `aws s3 ls s3://b/`, `aws s3 sync`, `aws s3 rm --recursive`,
->    `mc ls <bucket>`, `mc mirror`, `rclone` listings — when the command is pointed at
->    the bucket ROOT. Pointed inside the grant (`aws s3 ls s3://b/team-a/`) they are
->    unchanged and still rc=0. Principals **W** and **O**… **W** is unaffected (its
->    `{bucket:"*"}` grant has `prefixes: []`, i.e. whole-bucket, which still authorizes
->    an unbounded list); **O**'s listing behaviour is governed by BLOCKER-2, not by this.
+>    s3://<bucket>/` sends `Prefix=` (empty) + `Delimiter=/` and answers
+>    `403 AccessDenied … deny: an unbounded list needs a whole-bucket grant; name a prefix
+>    inside your grant`. **Affected rows:** every `ListObjectsV2`-issuing row under
+>    principal **S** pointed at the bucket ROOT; pointed inside the grant they are unchanged
+>    and still rc=0. **W** is unaffected (its `{bucket:"*"}` grant has `prefixes: []`, i.e.
+>    whole-bucket); **O**'s listing behaviour is governed by BLOCKER-2. A deliberate loss of
+>    client convenience: AWS denies the same request (`s3:ListBucket` under an `s3:prefix`
+>    condition), and a narrowed listing is a filtered view returned with no signal that it
+>    is filtered — see `policy/gateway/authz.rego::narrowed`.
 >
->    This is a **deliberate loss of client convenience**, taken for AWS parity and
->    because a narrowed listing is a filtered view returned with no signal that it is
->    filtered — see the AWS-parity register and `policy/gateway/authz.rego::narrowed`.
->    AWS behaves the same way: `s3:ListBucket` under a `s3:prefix` condition denies a
->    request that carries no prefix. The AWS console only appears to escape it because it
->    always sends the prefix it is navigating.
-
+> `run.sh` uses the current vocabulary, so the harness still stands the stack up; the
+> numbers in this file predate it.
 
 **Measured, not asserted.** Every row below was produced by running the real client
 against a real `s0` binary in front of a real S3 backend, and reading the requests off
@@ -67,14 +45,13 @@ row could not be measured it says so.
 | boto3 / botocore | **1.40.72 / 1.40.72** — measured |
 | mc | **RELEASE.2025-08-13T08-35-41Z** — measured |
 | rclone | **v1.74.4**, `provider = Ceph` — measured |
-| s3fs | **out of scope** (settled; see plan §6.4) |
+| s3fs | **out of scope** |
 
-**Independently re-measured at the end of M4** on a second harness — a recording endpoint
-that answers *every* op successfully (so a client that aborts on its first denial cannot
-hide what it would have issued next), then the same commands against the real gateway.
-Both blockers below reproduced; the `mc alias set` and `mc stat <bucket>` rows were
-corrected as a result, and the plan's risk-8 premise was corrected in §2. Where the two
-harnesses disagreed, the real-stack number is the one written down.
+**Independently re-measured** on a second harness — a recording endpoint that answers
+*every* op successfully, so a client that aborts on its first denial cannot hide what it
+would have issued next — and then again against the real gateway. Both blockers below
+reproduced. Where the two harnesses disagreed, the real-stack number is the one written
+down.
 
 Three principals were used, because the answer depends on the *grant*, not only on the op:
 
@@ -131,14 +108,14 @@ in the rclone instructions the product ships before rclone is called supported.
 This is not a gateway defect, it is the projection invariant from ADR-006 §D2 made
 visible: **a projection that emits object verbs without `read_bucket` and `list_buckets`
 produces a principal whose data path works and whose navigation does not.** With
-`read_bucket` added to the same grant, `mc ls` returns rc=0 and the listing. The
-hyperfluid-side creator-grant and the seeded system bundles must carry both verbs.
+`read_bucket` added to the same grant, `mc ls` returns rc=0 and the listing. The control
+plane's creator grant and the seeded system bundles must carry both verbs.
 
 ---
 
 ## 2. Denied-and-degraded — noisy, not fatal
 
-These are ops outside the 29 that a client probes and then copes with. Each was measured
+These are ops outside the enforced scope that a client probes and then copes with. Each was measured
 returning `403 AccessDenied: operation is not permitted by the gateway: <Op>`.
 
 | op | client | when | client behaviour | fatal |
@@ -160,16 +137,12 @@ s0 client. If a bucket is versioned **out of band**, `rclone purge` will delete 
 versions only and `mc rb --force` will leave versions behind, and both will then report a
 `BucketNotEmpty` failure they cannot explain. Recorded, not fixed.
 
-**Plan risk 8 was partly out of date, and in the safe direction.** It named
-`GetBucketVersioning` / `GetBucketNotification` / `GetBucketLocation` as the connect
-probes. Measured on current versions: **none of the three is a connect probe.**
-`GetBucketNotificationConfiguration` appears only inside `mc stat <bucket>`, a diagnostic
-command, and only there; `GetBucketVersioning` appears only on bucket-level *delete*
-paths and in `mc version info`; `GetBucketLocation` **is** in the 29 and is what
-`mc alias set` probes (together with `HeadBucket`, on a random bucket name — and mc
-tolerates a 403 on both, measured). The premise was wrong in the safe direction: the
-probes are rarer than the plan feared, and the one that is ubiquitous is already
-enforced.
+**Connect probes are rarer than they look.** `GetBucketNotificationConfiguration` appears
+only inside `mc stat <bucket>`, a diagnostic command; `GetBucketVersioning` appears only on
+bucket-level *delete* paths and in `mc version info`. Neither is a connect probe. The one
+that is ubiquitous — `GetBucketLocation`, what `mc alias set` probes together with
+`HeadBucket` on a random bucket name — is in the enforced scope, and mc tolerates a 403 on
+both (measured).
 
 ---
 
@@ -252,19 +225,19 @@ else still works.
 
 ### boto3 1.40.72 — no fatal cells
 
-boto3 issues exactly the API called and probes nothing, so its matrix is the op list. All
-29 behaved as designed. Two rows are worth writing down:
+boto3 issues exactly the API called and probes nothing, so its matrix is the op list. Every
+op behaved as designed. Two rows are worth writing down:
 
 | call | result | note |
 |---|---|---|
-| `get_object_attributes(["ETag","ObjectSize"])` | **200 after the fix in this change** | it was `400 InvalidArgument` before — see §5 |
+| `get_object_attributes(["ETag","ObjectSize"])` | **200** | the multi-attribute defect in §5 |
 | `put_bucket_cors` | `501 NotImplemented` | **from MinIO**, not from s0. The identical call direct to MinIO fails identically. The gateway authorized and forwarded it. Untested against RGW. |
 
 ---
 
 ## 4. The ACL regression fix, over the wire
 
-The M4 ACL work is the one place where the gateway deliberately refuses something the
+The ACL screen is the one place where the gateway deliberately refuses something the
 backend would have accepted, so it is measured with a positive control on every row.
 
 | request | outcome |
@@ -284,11 +257,11 @@ backend would have accepted, so it is measured with a positive control on every 
 | `aws s3 cp --acl log-delivery-write` | **403** — a canned name this build does not recognize is treated as public. Stricter than S3, deliberate, one-line reversible. |
 | `aws s3api delete-object --bypass-governance-retention` | **403** — refused in code, unconditionally; no verb can express a WORM override |
 | `aws s3api put-object --tagging tier=gold` (key not reserved) | **allowed** |
-| `aws s3api put-object-tagging` on `hyperfluid/…` | **403** — reserved key |
-| any tag write with `org_settings.reserved_tag_keys` **absent** | **403** — the fail-closed floor. Tag *reads* and plain writes are unaffected (measured). **Amendment 5 (2026-08-09):** this row no longer describes any deployed org. The control plane publishes the list on every bundle (runbook P7 closed), so the rows above it are the live behaviour and this one is what a bundle that lost the field in transit looks like. |
+| `aws s3api put-object-tagging` on a reserved key prefix | **403** — reserved key |
+| any tag write with `org_settings.reserved_tag_keys` **absent** | **403** — the fail-closed floor. Tag *reads* and plain writes are unaffected (measured). The control plane publishes the list on every bundle, so this row is what a bundle that lost the field in transit looks like, not a deployed configuration. |
 
-The rows above were re-measured end to end at the close of M4: 19 of 19 behaved as
-written, each with its own positive control on the same identity.
+The rows above were re-measured end to end: 19 of 19 behaved as written, each with its own
+positive control on the same identity.
 
 `mc` and `rclone` (Ceph provider) send no ACL header by default, so the common path costs
 nothing. `s3cmd`, which sends `x-amz-acl: private` on every upload, is covered by the
@@ -301,7 +274,7 @@ turn on object lock for a new bucket, and the gateway refuses every bypass after
 
 ---
 
-## 5. A defect this matrix found, and the change fixed
+## 5. A defect this matrix found
 
 `GetObjectAttributes` with **more than one attribute** was broken by the gateway:
 
@@ -320,9 +293,9 @@ Fixed in `access::split_comma_list`, applied in the `get_object_attributes`,
 `list_objects` and `list_objects_v2` hooks (the only two `list`-shaped headers s3s
 forwards), and pinned by
 `tests/security_regressions.rs::a_comma_separated_list_header_survives_the_forward_intact`.
-Re-measured end to end afterwards: one, two and three attributes all return 200.
+One, two and three attributes all return 200.
 
-This is the argument for the matrix existing. No unit test would have found it — every
+This is the argument for the matrix existing: no unit test would have found it — every
 in-repo test stops at the decision, and this was a forward-path encoding bug in an op the
 gateway correctly *authorized*.
 
@@ -341,6 +314,6 @@ gateway correctly *authorized*.
   (`X-Amz-Security-Token` in header and query) has its own tests but is not in this matrix.
 - **s3cmd, Cyberduck, Hadoop `s3a`, the AWS SDKs other than Python.** Not measured. `s3a`
   in particular is a known sender of `bucket-owner-full-control`, which lands in the
-  conferring tier and needs a `write_object_acl` grant the projection does not emit today.
+  conferring tier and is refused in code.
 - **`s3fs`** — explicitly out of scope.
 - **Versioned buckets**, for the reason in §2.

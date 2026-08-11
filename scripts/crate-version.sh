@@ -2,7 +2,7 @@
 #
 # Print the version of the `s0` crate — the ONE place anything is allowed to learn it.
 #
-# The image tag, the git tag and the pin in the hyperfluid chart all have to be the same
+# The image tag, the git tag and the consumer's pin all have to be the same
 # string, and every previous way of getting there involved a human retyping it somewhere.
 # So: `Cargo.toml` is the source of truth, this script is the only reader, and both the
 # release workflow and `scripts/release-image.sh` call it rather than parsing their own

@@ -1,13 +1,9 @@
-//! Named regressions for the ways this gateway has been, or could be, wrong.
+//! Named regressions for the ways this gateway could be wrong. They run against the
+//! real typed hooks, the real embedded regorus engine and the real shipped rego — the
+//! same path a request takes in production, minus the backend.
 //!
-//! Every test here corresponds to a lesson from the failed attempt (see
-//! `S0-INTEGRATION-SYNTHESIS.md` §10) or to a hazard the current design still carries.
-//! They run against the real typed hooks, the real embedded regorus engine and the real
-//! shipped rego — the same path a request takes in production, minus the backend.
-//!
-//! Each one has a **positive control**: a nearly identical request that must be
-//! allowed. Without it a deny-all bug makes the whole file green, which is exactly how
-//! 35 rego tests once passed against a production that authorized nothing.
+//! Each one has a **positive control**: a nearly identical request that must be allowed.
+//! Without it a deny-all bug makes the whole file green.
 
 mod common;
 
@@ -79,20 +75,17 @@ async fn send_signed(
         .as_u16()
 }
 
-/// Four principals, each holding exactly one thing, so "grant X does not confer Y" is
-/// answerable without a second bundle:
+/// One narrow grant per principal, so "grant X does not confer Y" is answerable without
+/// a second bundle:
 ///
-/// - `writer`  — write on `staging`, and nothing anywhere else. No read on `secrets`.
-/// - `reader`  — read on `staging`.
-/// - `lister`  — list on `reports/2024/`, no read.
+/// - `writer` — write on `staging`; `reader` — read on `staging`; `lister` — list on
+///   `reports/2024/`; `wholelister` — list on all of `reports`.
 /// - `copyist` — read on `secrets` *and* write on `staging`: the one principal for whom
 ///   a copy out of `secrets` is legitimate.
-/// - `alice`   — the subject the checked-in static credential resolves to, with a read
-///   on `staging`. Only the black-box tests, which must sign as a credential the
-///   gateway really knows, use it.
-/// - `spanner` — list on **two** prefixes of `reports`, so its listing carries a
-///   multi-prefix obligation and only `ListObjectsV2` (without a delimiter) can serve
-///   it. The principal that exercises the fan-out refusal paths.
+/// - `alice` — the subject the checked-in static credential resolves to, so the
+///   black-box tests can sign as a credential the gateway really knows.
+/// - `spanner` — list on **two** prefixes of `reports`, a multi-prefix obligation only
+///   `ListObjectsV2` without a delimiter can serve.
 fn bundle() -> serde_json::Value {
     serde_json::json!({
         "org_settings": { "freeze_writes": false },
@@ -112,9 +105,9 @@ fn bundle() -> serde_json::Value {
                 "reader":  [ { "bucket": "staging", "actions": ["read_objects"], "prefixes": [] } ],
                 "alice":   [ { "bucket": "staging", "actions": ["read_objects"], "prefixes": [] } ],
                 "lister":  [ { "bucket": "reports", "actions": ["list_objects"], "prefixes": ["2024/"] } ],
-                // The positive control for the unbounded-list deny: same verb, same
-                // bucket, WHOLE-bucket scope. Without it, a rego change that denied
-                // every list would look like a pass.
+                // Positive control for the unbounded-list deny: same verb, same bucket,
+                // WHOLE-bucket scope. Without it a rego change that denied every list
+                // would look like a pass.
                 "wholelister": [ { "bucket": "reports", "actions": ["list_objects"], "prefixes": [] } ],
                 "spanner": [ { "bucket": "reports", "actions": ["list_objects"], "prefixes": ["2024/", "2025/"] } ],
                 "copyist": [
@@ -167,12 +160,10 @@ fn oid(key: &str) -> ObjectIdentifier {
 
 #[tokio::test]
 async fn copy_object_from_a_read_denied_bucket_is_refused() {
-    // THE latent hole in this design, and the reason it stayed hidden last time: with
-    // the gateway deny-all, nobody could observe that a copy authorizes only its
-    // destination. `x-amz-copy-source` is a *read* of another bucket performed by the
-    // backend under the tenant-owner credential — so a principal with write-only access
-    // to a scratch bucket can name any object in the tenant as a source and read it out
-    // through a bucket it is allowed to read. It must be two decisions, not one.
+    // `x-amz-copy-source` is a *read* of another bucket performed by the backend under
+    // the tenant-owner credential, so a principal with write-only access to a scratch
+    // bucket could name any object in the tenant as a source and read it out through a
+    // bucket it may read. A copy must be two decisions, not one.
     let fx = common::fixture("sec-copy", bundle());
     let access = GatewayAccess::new(fx.gw.clone());
 
@@ -201,10 +192,8 @@ async fn copy_object_from_a_read_denied_bucket_is_refused() {
 
 #[tokio::test]
 async fn upload_part_copy_from_a_read_denied_bucket_is_refused() {
-    // The same exfiltration, one API away: UploadPartCopy carries the identical
-    // `x-amz-copy-source` header and is trivially the workaround if only CopyObject is
-    // covered. It goes through the same `enforce_copy`, and this test is what keeps
-    // that true.
+    // The same exfiltration one API away: UploadPartCopy carries the identical
+    // `x-amz-copy-source` header, so it must go through the same `enforce_copy`.
     let fx = common::fixture("sec-upc", bundle());
     let access = GatewayAccess::new(fx.gw.clone());
 
@@ -233,9 +222,8 @@ async fn upload_part_copy_from_a_read_denied_bucket_is_refused() {
 
 #[tokio::test]
 async fn a_write_grant_does_not_confer_delete() {
-    // Pre-fix, the projection collapsed verbs and `write` conferred `delete`. A write
-    // grant is "you may add objects here"; deletion is destruction of someone else's
-    // data and needs its own grant.
+    // A write grant is "you may add objects here"; deletion destroys someone else's data
+    // and needs its own grant.
     let fx = common::fixture("sec-write-delete", bundle());
     let access = GatewayAccess::new(fx.gw.clone());
 
@@ -272,8 +260,8 @@ async fn a_write_grant_does_not_confer_delete() {
 
 #[tokio::test]
 async fn a_list_grant_does_not_confer_read() {
-    // The other half of the same lesson: `list` conferred `read`, so a principal
-    // allowed to see key *names* could fetch their contents.
+    // The other half: if `list` conferred `read`, a principal allowed to see key *names*
+    // could fetch their contents.
     let fx = common::fixture("sec-list-read", bundle());
     let access = GatewayAccess::new(fx.gw.clone());
 
@@ -343,30 +331,11 @@ async fn a_read_grant_does_not_confer_write() {
 
 #[tokio::test]
 async fn an_unbounded_list_is_denied_not_silently_narrowed() {
-    // Lesson 4: a client-supplied list prefix is only safe fail-closed. A prefix-scoped
-    // subject asking for the whole bucket must not get the whole bucket.
-    //
-    // CHANGED 2026-08-09, and the old comment on this test is the reason it is worth
-    // spelling out. It used to read: "the master plan phrases this as *unbounded list
-    // denied*; the shipped design *narrows* instead, which is strictly better for
-    // clients and equally safe as long as the narrowing really happens." Both halves
-    // of that were wrong.
-    //
-    //   1. It is not AWS behaviour. AWS grants prefix-scoped listing as a BUCKET
-    //      resource plus a `s3:prefix` condition, and a `ListObjectsV2` with no prefix
-    //      fails that condition — `AccessDenied`. AWS does not narrow. Hyperfluid's
-    //      goal is parity with the ecosystem, and a deviation has to be deliberate and
-    //      documented; this one was neither.
-    //   2. It is not "equally safe". Narrowing leaks nothing, but it returns a
-    //      FILTERED listing with no signal that it was filtered. A user running
-    //      `aws s3 ls s3://reports/` sees `2024/` and concludes that is all the bucket
-    //      holds. In a regulated product, presenting a partial view as a complete one
-    //      is worse than an error: the error gets a support ticket, the short listing
-    //      gets believed.
-    //
-    // This CLOSES a divergence rather than opening one — hyperfluid's pushed `s3.rego`
-    // and the console's object routes (`01d7f7f`) already denied here; this
-    // compiled-in default was the last PEP still narrowing.
+    // A prefix-scoped subject asking for the whole bucket is DENIED, not narrowed. AWS
+    // grants prefix-scoped listing as a bucket resource plus an `s3:prefix` condition,
+    // which an unbounded `ListObjectsV2` fails. And narrowing returns a filtered listing
+    // with no signal that it was filtered — a partial view presented as a complete one
+    // is worse than an error.
     let fx = common::fixture("sec-unbounded-list", bundle());
     let access = GatewayAccess::new(fx.gw.clone());
 
@@ -446,10 +415,9 @@ async fn an_unbounded_list_is_denied_not_silently_narrowed() {
         "a list outside every granted prefix must be denied, not narrowed"
     );
 
-    // NARROWING IS NOT WHAT WAS REMOVED. A request WIDER than the grant but overlapping
-    // it is still allowed and still rewritten into the grant: the caller named a scope
-    // and gets a genuine subset of the scope it named, so nothing is being passed off
-    // as complete. Only the case where the caller named NO scope became a deny.
+    // Narrowing itself is not gone. A request WIDER than the grant but overlapping it is
+    // allowed and rewritten into the grant: the caller named a scope and gets a genuine
+    // subset of it, so nothing is passed off as complete. Only naming NO scope denies.
     let mut req = fx.request_as(
         "lister",
         "ListObjectsV2",
@@ -523,9 +491,9 @@ async fn a_subject_with_no_list_grant_cannot_enumerate_a_bucket_it_can_write() {
 
 #[tokio::test]
 async fn multi_delete_strips_denied_keys_rather_than_allowing_the_batch() {
-    // Blind spot #2: the keys live in the XML body, so a single decision on the bucket
-    // would authorize every key in the batch. Each key is its own decision and the
-    // forwarded request carries only the allowed ones.
+    // The keys live in the XML body, so a single decision on the bucket would authorize
+    // every key in the batch. Each key is its own decision, and the forwarded request
+    // carries only the allowed ones.
     let fx = common::fixture("sec-multidelete", common::alice_bundle());
     let access = GatewayAccess::new(fx.gw.clone());
 
@@ -640,11 +608,10 @@ async fn every_multi_delete_key_is_its_own_pdp_question() {
 
 #[tokio::test]
 async fn a_copy_emits_a_source_read_and_a_destination_write() {
-    // The structural claim the exfiltration test rests on, checked at the wire: a copy
-    // asks two questions, the first a `read_objects` on the *source* bucket. If the
-    // source half ever stopped being emitted, the exfiltration test would still pass
-    // for a while (the destination write is denied for `writer` too, on other buckets)
-    // — this is what makes that impossible.
+    // The claim the exfiltration test rests on, checked at the wire: a copy asks two
+    // questions, the first a `read_objects` on the *source* bucket. If the source half
+    // stopped being emitted the exfiltration test could still pass, since `writer`'s
+    // destination write is denied anyway.
     let fx = common::fixture("sec-copy-shape", bundle());
     let access = GatewayAccess::new(fx.gw.clone());
     let mut req = fx.request_as("copyist", "CopyObject", copy_object_input(), Method::PUT);
@@ -671,8 +638,8 @@ async fn a_copy_emits_a_source_read_and_a_destination_write() {
 
 #[tokio::test]
 async fn freeze_writes_stops_writes_and_deletes_but_not_reads() {
-    // `freeze_writes` is the only control the live production bundle actually carries,
-    // and M5 trades RGW's own enforcement of it for this one. It had better work.
+    // `freeze_writes` is the org-global kill switch, and the gateway is the only thing
+    // enforcing it. It had better work.
     let mut frozen = bundle();
     frozen["org_settings"]["freeze_writes"] = serde_json::json!(true);
     let fx = common::fixture("sec-freeze", frozen);
@@ -734,20 +701,15 @@ async fn a_denied_request_is_attributed_to_the_right_tenant_and_org() {
 
 #[tokio::test]
 async fn an_obligation_this_binary_does_not_implement_denies_rather_than_being_ignored() {
-    // The fail-open twin of the 35-green-tests bug. The policy module is hot-swapped
-    // from the control-plane bundle (`RegorusPdp::reload`), so a newer control plane can
-    // emit an obligation this binary predates — `excluded_prefixes`, say, which
-    // *narrows* a listing. Without `deny_unknown_fields` on `Obligations` the field is
-    // dropped, the decision deserializes to `allow: true` with `Obligations::default()`,
-    // `classify_list` returns `AllowAsIs`, and the listing the obligation existed to
-    // bound is forwarded unbounded. The restriction becomes an unrestriction.
+    // The policy module is hot-swapped from the control-plane bundle, so a newer control
+    // plane can emit an obligation this binary predates. Without `deny_unknown_fields`
+    // on `Obligations` the field would be dropped and the listing it existed to bound
+    // forwarded unbounded — a restriction turned into an unrestriction. An obligation
+    // that cannot be honored is a denial.
     //
-    // The required behaviour is a refusal: an obligation we cannot honor is a denial.
-    //
-    // Each phase below lists a *different* prefix on purpose. The decision cache is
-    // keyed by bundle revision and the revision does not move across a `reload` here,
-    // so reusing one prefix would answer phases 2 and 3 out of phase 1's cache entry
-    // and the test would prove nothing about the pushed policy.
+    // Each phase lists a *different* prefix on purpose: the decision cache is keyed by
+    // bundle revision and the revision does not move across a `reload`, so reusing one
+    // prefix would answer later phases out of the first phase's cache entry.
     let fx = common::fixture("sec-unknown-obligation", bundle());
     let access = GatewayAccess::new(fx.gw.clone());
 
@@ -770,9 +732,8 @@ async fn an_obligation_this_binary_does_not_implement_denies_rather_than_being_i
         .await
         .expect("the shipped policy allows a listing inside the grant");
 
-    // A control plane now pushes a policy carrying an obligation from the future. The
-    // module compiles and the verdict is `allow`; the only thing this binary cannot do
-    // is honor the obligation.
+    // A pushed policy carrying an obligation from the future: the module compiles and
+    // the verdict is `allow`, but this binary cannot honor the obligation.
     const FUTURE_OBLIGATION: &str = concat!(
         "package s3.authz\n\n",
         "decision := {\"allow\": true, \"reason\": \"allowed, minus a deny-grant\", ",
@@ -820,13 +781,10 @@ async fn an_obligation_this_binary_does_not_implement_denies_rather_than_being_i
 
 #[tokio::test]
 async fn a_policy_that_allows_a_bucket_listing_without_saying_which_buckets_shows_none() {
-    // The `visible_buckets` twin of the test above, and the reason its empty case is the
-    // OPPOSITE of `allowed_prefixes`'. A policy author who allows `list_buckets` and
-    // forgets the obligation has, in every other obligation's convention, said
-    // "unrestricted". Here that would publish the tenant's entire bucket namespace —
-    // because the forward is re-signed with the owner credential and the backend answers
-    // with all of it. So the absent obligation must mean *nothing*, and this is what
-    // holds it there.
+    // `visible_buckets` is the one obligation whose empty case means *nothing* rather
+    // than "unrestricted": the forward is re-signed with the owner credential, so a
+    // policy author who allows `list_buckets` and forgets the obligation would otherwise
+    // publish the tenant's entire bucket namespace.
     let fx = common::fixture("sec-listbuckets-default", bundle());
     let access = GatewayAccess::new(fx.gw.clone());
 
@@ -862,9 +820,8 @@ async fn a_policy_that_allows_a_bucket_listing_without_saying_which_buckets_show
     );
 
     // Positive control: the same push, with the obligation spelled out, does show them.
-    // A DIFFERENT principal, on purpose: the decision cache is keyed by bundle revision
-    // and the revision does not move across a `reload`, so re-asking as `lister` would be
-    // answered out of the entry above and this control would prove nothing.
+    // A DIFFERENT principal, on purpose — the decision cache is keyed by bundle revision
+    // and the revision does not move across a `reload`.
     const ALLOW_WITH_OBLIGATION: &str = concat!(
         "package s3.authz\n\n",
         "decision := {\"allow\": true, \"reason\": \"allowed\", ",
@@ -893,11 +850,10 @@ async fn a_policy_that_allows_a_bucket_listing_without_saying_which_buckets_show
 
 #[tokio::test]
 async fn a_must_understand_obligation_this_gateway_cannot_apply_denies() {
-    // `deny_unknown_fields` covers the case where the *field* is unknown. It cannot cover
-    // the reverse skew: a policy that needs an obligation applied, pushed to a fleet where
-    // some replicas are older. `must_understand` names what has to be honored, and a name
-    // this binary does not implement is a denial — so a premature policy push is a loud,
-    // uniform outage rather than a silent partial enforcement across the fleet.
+    // `deny_unknown_fields` cannot cover the reverse skew: a policy needing an obligation
+    // applied, pushed to a fleet where some replicas are older. `must_understand` names
+    // what has to be honored, and a name this binary does not implement is a denial — so
+    // a premature push is a uniform outage rather than silent partial enforcement.
     let fx = common::fixture("sec-must-understand", bundle());
     let access = GatewayAccess::new(fx.gw.clone());
     let get = || GetObjectInput {
@@ -951,20 +907,14 @@ async fn a_must_understand_obligation_this_gateway_cannot_apply_denies() {
 
 #[tokio::test]
 async fn a_list_the_gateway_refuses_is_audited_as_denied_not_allowed() {
-    // Defect 4. `enforce_list` audited `Outcome::Allowed` and minted a proof for any
-    // non-`Deny` verdict, and the *caller* then refused a fan-out it had no dispatch
-    // for. Two refusal sites, both after the record was written: a `FanOut` on
-    // `ListObjects`/`ListMultipartUploads`, and a `ListObjectsV2` carrying a delimiter.
-    // The decision log said allowed; the client got a 403.
-    //
-    // For a regulated audit trail that is worse than no record at all: a missing record
+    // A list the gateway itself refuses — a `FanOut` verdict on an op with no fan-out
+    // dispatch, or a `ListObjectsV2` carrying a delimiter — is refused after the PDP
+    // said allow. The record must follow the client, not the verdict: a missing record
     // is a gap you can see, a wrong one is evidence that exonerates the wrong thing.
     //
-    // Every request below asks for `20` — wider than both of `spanner`'s granted
-    // prefixes and overlapping both, which is what produces the multi-prefix verdict.
-    // They used to send no prefix at all; since 2026-08-09 an unbounded list is refused
-    // one layer earlier (in the policy, for being unbounded — AWS parity), which would
-    // make this test measure that deny instead of the fan-out refusal it is about.
+    // Every request asks for `20`, wider than both of `spanner`'s granted prefixes and
+    // overlapping both, which is what produces the multi-prefix verdict. An unbounded
+    // list would be refused one layer earlier and measure the wrong denial.
     let fx = common::fixture("sec-audit-refused-list", bundle());
     let access = GatewayAccess::new(fx.gw.clone());
 
@@ -1040,8 +990,7 @@ async fn a_list_the_gateway_refuses_is_audited_as_denied_not_allowed() {
     }
 
     // Positive control: the identical grant on the one operation that *can* fan out is
-    // allowed, and audited as allowed. Without this, a gateway that denied every list
-    // would pass everything above.
+    // allowed, and audited as allowed.
     let mut req = fx.request_as(
         "spanner",
         "ListObjectsV2",
@@ -1074,24 +1023,18 @@ async fn a_list_the_gateway_refuses_is_audited_as_denied_not_allowed() {
 
 #[tokio::test]
 async fn a_gate_denial_emits_exactly_one_audit_record() {
-    // Defect 5. Anonymous requests, all 76 gate-denied operations, rejected credentials
-    // and unroutable tenants produced a `tracing::warn!` and nothing else — so the
-    // decision log held zero evidence of the entire deny-by-default surface and zero
-    // evidence of credential-forgery attempts. "Was this gateway probed?" was
-    // unanswerable from the audit trail, which is the artifact the question is supposed
-    // to be answered from.
+    // Anonymous requests, gate-denied operations, rejected credentials and unroutable
+    // tenants must all reach the decision log. Without them "was this gateway probed?"
+    // is unanswerable from the audit trail, which is the artifact meant to answer it.
     //
     // This has to run over real HTTP: `S3AccessContext` has crate-private fields, so
     // `check` is not callable in-process.
     let (base, fx) = spawn_gateway("sec-gate-audit", bundle()).await;
     let host = base.trim_start_matches("http://").to_string();
 
-    // A denied operation, signed with a credential the gateway really knows — so the
-    // 403 is the gate's, not a signature failure's. `GetBucketAcl` has been outside the
-    // enforced scope in every milestone: it was chosen over `DeleteBucket` when M4
-    // enforced that one, and it outlived the 2026-08-08 re-scoping that denied
-    // `DeleteBucket` again. A policy denial and a gate denial are both 403, and only the
-    // record distinguishes them — which is exactly what is under test.
+    // A denied operation, signed with a credential the gateway really knows — so the 403
+    // is the gate's, not a signature failure's. A policy denial and a gate denial are
+    // both 403, and only the record distinguishes them, which is what is under test.
     let status = send_signed(
         &base,
         &host,
@@ -1145,11 +1088,10 @@ async fn a_gate_denial_emits_exactly_one_audit_record() {
     assert_eq!(records[1].requested_by, "");
 
     // A session credential presented **without** its session token: the shape of a
-    // stripped or replayed STS session. It gets past s3s's signature check (an STS
-    // secret is derived, not stored, so the signature verifies) and is refused by
-    // identity resolution — which is the only stage that can distinguish it. An access
-    // key s3s has never heard of cannot reach `check` at all: s3s asks for its secret
-    // first and 403s on the signature, so this is the reachable identity-rejection.
+    // stripped or replayed STS session. An STS secret is derived rather than stored, so
+    // the signature verifies and identity resolution is the only stage that can refuse
+    // it. An access key s3s has never heard of 403s on the signature and never reaches
+    // `check`, so this is the reachable identity-rejection.
     let sts = s0::auth::sts::StsAuthority::new(vec![0u8; 32], vec![1u8; 32]).expect("sts");
     let forged_key = sts.access_key_id("no-such-session");
     let derived_secret = sts
@@ -1193,10 +1135,9 @@ async fn a_gate_denial_emits_exactly_one_audit_record() {
     assert_eq!(input.bucket, "staging");
     assert_eq!(input.principal.sub, "alice");
 
-    // …and, since the fixture points at a closed port, the forward failed. That is the
-    // post-forward enrichment (plan task 18): the record is written after the backend
-    // leg, so `outcome: error` has a producer for the first time. The policy verdict is
-    // still readable and still an allow — the request was authorized and then broke.
+    // …and since the fixture points at a closed port, the forward failed. The record is
+    // written after the backend leg, so it carries `outcome: error` while the policy
+    // verdict is still readable and still an allow: authorized, then broke.
     assert!(
         matches!(decision.gateway.outcome, Outcome::Error),
         "{decision:#?}"
@@ -1215,15 +1156,13 @@ async fn a_gate_denial_emits_exactly_one_audit_record() {
 
 #[tokio::test]
 async fn an_unauthenticated_scanner_cannot_flood_the_audit_sink() {
-    // The cardinality half of defect 5, and the reason gate records are rate-limited
-    // rather than emitted one-for-one. An unsigned request costs the attacker nothing
-    // and would otherwise cost the gateway one audit record each: at line rate that
-    // fills the bounded queue and starts dropping the *decision* records of real
-    // access. An attacker able to suppress the audit trail of genuine access is a worse
-    // outcome than an attacker being under-logged, so the gate stream is budgeted.
+    // Why gate records are rate-limited rather than emitted one-for-one: an unsigned
+    // request costs the attacker nothing, and one record each would fill the bounded
+    // queue and start dropping the *decision* records of real access. An attacker able
+    // to suppress the trail of genuine access is worse than one under-logged.
     //
     // What must NOT happen is silent sampling: the count is preserved in
-    // `s0_audit_gate_suppressed_total` and handed to the next record that is emitted.
+    // `s0_audit_gate_suppressed_total` and handed to the next record emitted.
     let (base, fx) = spawn_gateway("sec-gate-flood", bundle()).await;
     let host = base.trim_start_matches("http://").to_string();
 
@@ -1278,15 +1217,13 @@ async fn an_unauthenticated_scanner_cannot_flood_the_audit_sink() {
     );
 }
 
-// ── M4 semantic caps and control-plane bodies ───────────────────────────────────
+// ── semantic caps ───────────────────────────────────────────────────────────────
 //
-// Accepted review defect B-1: a cap implemented as `return Err(s3_error!(
-// InvalidRequest, …))` short-circuits ahead of every audit site, so an over-cap request
-// produces NO record at all and reaches the client as a 400 — a refusal on
-// authorization grounds, reported as a client formatting mistake and invisible to the
-// decision log. Every cap below is therefore a real Deny sub-decision on the op's own
-// verb. Each test asserts both halves: the request is refused, AND the refusal is on
-// the record as a decision (`gate: None`, a real `input`), not as a gate denial.
+// A cap implemented as an early `InvalidRequest` short-circuits ahead of every audit
+// site: no record at all, and a refusal on authorization grounds reaching the client as
+// a client formatting mistake. Every cap is therefore a real Deny sub-decision on the
+// op's own verb, and each test asserts both halves — the request is refused, AND the
+// refusal is on the record as a decision (`gate: None`, a real `input`).
 
 /// The record a locally-decided refusal must leave. Returns it so callers can assert on
 /// the verb and the reason.
@@ -1363,10 +1300,9 @@ async fn an_over_cap_tag_set_is_denied_and_audited() {
 
 #[tokio::test]
 async fn a_tag_set_with_a_duplicate_key_is_refused() {
-    // A TagSet is a list, so it can carry one key twice. Folding it into a map keeps
-    // one of them and the backend keeps whichever *it* prefers — the policy would then
-    // have authorized a tag set the object never receives. Same class as the parser
-    // differentials the canonicalize-before-forward rule exists to prevent.
+    // A TagSet is a list, so it can carry one key twice. Folding it into a map keeps one
+    // of them and the backend keeps whichever *it* prefers, so the policy would have
+    // authorized a tag set the object never receives — a parser differential.
     let fx = common::fixture("sec-tag-dup", common::alice_bundle());
     let access = GatewayAccess::new(fx.gw.clone());
     let mut req = fx.request(
@@ -1411,11 +1347,11 @@ async fn a_tag_set_with_a_duplicate_key_is_refused() {
     );
 }
 
-// ── the gateway is data-plane only (settled 2026-08-08) ─────────────────────────
+// ── the gateway is data-plane only ──────────────────────────────────────────────
 
-/// The six operations M4 enforced and the 2026-08-08 settlement sent back to `Denied`,
-/// each with the S3 request that reaches it, so the refusal is measured over the wire
-/// rather than asserted against the table that decides it.
+/// The six control-plane operations that must stay `Denied`, each with the S3 request
+/// that reaches it, so the refusal is measured over the wire rather than asserted
+/// against the table that decides it.
 ///
 /// `(op, method, path, query)`. Query strings are what route a bucket sub-resource:
 /// `PUT /reports?policy` is `PutBucketPolicy` and `PUT /reports` is `CreateBucket`.
@@ -1437,19 +1373,14 @@ const RE_DENIED_REQUESTS: [ReDeniedRequest; 6] = [
 
 #[tokio::test]
 async fn the_six_control_plane_ops_are_refused_at_the_gate_and_on_the_record() {
-    // THE regression for the 2026-08-08 settlement, and it is deliberately a black-box
-    // test: every one of these six had a working hook, a dispatch arm and a passing
-    // authorization path in M4, so "we deleted the code" is only half the claim. The
-    // other half is that a real, correctly-signed S3 request for each is refused by the
-    // *gate* — before deserialization, with no policy question asked — and leaves a
-    // record saying so.
+    // Deliberately black-box: a real, correctly-signed S3 request for each of the six is
+    // refused by the *gate* — before deserialization, with no policy question asked —
+    // and leaves a record saying so. It matters that the refusal is the gate's rather
+    // than a bundle's: the bundle is pushed by the control plane and can be wrong.
     //
-    // The `input.is_none()` assertion is the one that distinguishes this from a policy
-    // denial. A gate denial must not fabricate an `OpaInput`, because a decision log
-    // that shows a question nobody asked is worse than one that shows nothing.
-    //
-    // Why it matters that these are refused at the GATE rather than by a bundle: the
-    // bundle is pushed by the control plane and can be wrong. `check` cannot.
+    // `input.is_none()` is what distinguishes this from a policy denial. A gate denial
+    // must not fabricate an `OpaInput`: a decision log showing a question nobody asked
+    // is worse than one showing nothing.
     let (base, fx) = spawn_gateway("sec-data-plane-only", common::alice_bundle()).await;
     let host = base.trim_start_matches("http://").to_string();
 
@@ -1513,10 +1444,9 @@ async fn the_six_control_plane_ops_are_refused_at_the_gate_and_on_the_record() {
 #[tokio::test]
 async fn the_positive_control_the_six_refusals_need() {
     // Without this, `the_six_control_plane_ops_are_refused_at_the_gate_and_on_the_record`
-    // is equally true of a gateway that refuses everything — the exact shape of the bug
-    // this repository has already paid for once. `HeadBucket` is the right control: it
-    // is a bucket-shaped request on the same bucket, signed with the same credential,
-    // and it is enforced.
+    // is equally true of a gateway that refuses everything. `HeadBucket` is the right
+    // control: a bucket-shaped request on the same bucket, signed with the same
+    // credential, and enforced.
     let (base, fx) = spawn_gateway("sec-data-plane-control", common::alice_bundle()).await;
     let host = base.trim_start_matches("http://").to_string();
     let status = send_signed(
@@ -1548,10 +1478,9 @@ async fn the_positive_control_the_six_refusals_need() {
 
 #[tokio::test]
 async fn the_existence_verb_answers_head_bucket_and_list_buckets_identically() {
-    // The defect that started the 2026-08-08 change was two PEPs answering one question
-    // differently. Its gateway-local form: a principal whose `aws s3 ls` came back empty
-    // while its next `head-bucket` on a bucket in that list succeeded — or the reverse.
-    // One verb, so one answer.
+    // The hazard is two request shapes answering one question differently: a principal
+    // whose `aws s3 ls` comes back empty while its next `head-bucket` on a bucket in
+    // that list succeeds, or the reverse. One verb, so one answer.
     let one_read_grant = serde_json::json!({
         "org_settings": { "freeze_writes": false },
         "tenants": { "acme": {
@@ -1624,23 +1553,11 @@ async fn the_existence_verb_answers_head_bucket_and_list_buckets_identically() {
 
 #[tokio::test]
 async fn a_bucket_shaped_read_carries_no_visible_buckets_obligation() {
-    // The subtlest hazard the merge introduced, and the reason every rego rule reading
-    // `read` carries a shape gate. `read` is in both `bucket_actions` and
-    // `account_actions`; if the account-scope obligations rule loses its
-    // `account_scoped` gate, a permitted HeadBucket comes back carrying an obligation
-    // about a listing it is not.
-    //
-    // Which way that fails depends on the bundle, and both directions are bad:
-    //
-    //   * against the SHIPPED module, which emits no `must_understand`, `enforce_bucket`
-    //     simply ignores the obligation — a restriction the policy declared and the PEP
-    //     silently did not apply, the exact fail-open shape this project exists to avoid;
-    //   * against a pushed module that DOES mark it `must_understand` (the recommended
-    //     way to ship a visibility rule), `unimplemented_obligations` turns it into a
-    //     hard deny and HeadBucket breaks for every principal in every organization.
-    //
-    // So the assertion is on the obligation itself rather than on allow/deny: it is the
-    // only observation that catches both.
+    // Why every rego rule reading `read` carries a shape gate: `read` is in both
+    // `bucket_actions` and `account_actions`, so an account-scope obligations rule that
+    // loses its `account_scoped` gate hangs a listing obligation on a HeadBucket. That
+    // is a silently unapplied restriction, or a hard deny under `must_understand` —
+    // asserting on the obligation itself is the only observation catching both.
     let wildcard = serde_json::json!({
         "org_settings": { "freeze_writes": false },
         "tenants": { "acme": {
@@ -1670,7 +1587,7 @@ async fn a_bucket_shaped_read_carries_no_visible_buckets_obligation() {
         .await
         .expect("a bucket-shaped `read` must not pick up the account scope's obligation");
     // The record of an ALLOWED request is held for the forward leg. Nothing forwards
-    // here, so dropping the request is what settles it — `PendingAudit`'s `Drop` emits it
+    // here, so dropping the request settles it: `PendingAudit`'s `Drop` emits it
     // unenriched rather than losing it.
     drop(req);
 
@@ -1686,10 +1603,9 @@ async fn a_bucket_shaped_read_carries_no_visible_buckets_obligation() {
 
 #[tokio::test]
 async fn an_over_cap_multi_delete_is_denied_and_audited() {
-    // The cap that predates defect B-1 and had the shape the defect describes: it
-    // returned `InvalidRequest` ahead of `ReqCtx`, so an over-cap multi-delete left no
-    // audit record at all and reached the client as a 400. It refuses like every other
-    // cap now — one record, `Outcome::Denied`, no proof.
+    // The multi-delete cap refuses like every other cap: one record, `Outcome::Denied`,
+    // no proof — rather than an `InvalidRequest` ahead of `ReqCtx` that would leave no
+    // audit record at all.
     let fx = common::fixture("sec-delete-cap", common::alice_bundle());
     let access = GatewayAccess::new(fx.gw.clone());
     let objects: Vec<ObjectIdentifier> = (0..1001).map(|i| oid(&format!("2024/{i}"))).collect();
@@ -1730,23 +1646,15 @@ async fn an_over_cap_multi_delete_is_denied_and_audited() {
 
 // ── the forward must send what the caller signed ────────────────────────────────
 
-/// A `list`-shaped header arrives as ONE header with comma-separated values, and s3s
-/// does not split it — so the forward re-encoded it as a single quoted element and the
-/// backend answered `400 InvalidArgument`.
+/// A `list`-shaped header arrives as ONE header with comma-separated values, and s3s's
+/// `parse_list_header` never splits on the comma: `x-amz-object-attributes:
+/// ETag,ObjectSize` parses to the one-element list `["ETag,ObjectSize"]`. The AWS SDK
+/// then quotes any element containing a comma, so the forward re-encodes it as a single
+/// quoted element and the backend answers `400 InvalidArgument`.
 ///
-/// Found by driving `boto3` through the gateway at a real MinIO backend, not by a unit
-/// test: `get_object_attributes(ObjectAttributes=["ETag"])` worked, `["ETag",
-/// "ObjectSize"]` did not, and both worked when the same client talked to MinIO
-/// directly. `s3s`'s `parse_list_header` (`http/de.rs:118-132`) iterates
-/// `headers.get_all(name)` and never splits on the comma, so
-/// `x-amz-object-attributes: ETag,ObjectSize` parses to the one-element list
-/// `["ETag,ObjectSize"]`; the AWS SDK then quotes any element containing a comma, and
-/// the backend receives `"ETag,ObjectSize"`.
-///
-/// This is not an authorization hole — the attribute list is not separately authorized,
-/// which is a recorded blind spot on `GetObjectAttributes` — but a gateway that changes
-/// a signed request's meaning is a gateway whose audit record describes something other
-/// than what the backend was asked, and that is worth pinning.
+/// Not an authorization hole — the attribute list is a recorded blind spot on
+/// `GetObjectAttributes` — but a gateway that changes a signed request's meaning has an
+/// audit record describing something other than what the backend was asked.
 #[tokio::test]
 async fn a_comma_separated_list_header_survives_the_forward_intact() {
     let fx = common::fixture("comma-list", common::alice_bundle());

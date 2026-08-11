@@ -1,8 +1,8 @@
-//! Backend proxy. Forwards allowed, canonicalized requests to the
-//! target backend, re-signed with a **per-tenant / per-backend** credential — never
-//! the caller's. `s3s_aws::Proxy` wraps exactly one `aws_sdk_s3::Client`, so
-//! per-tenant credentials require a client pool keyed on `(backend, tenant)` with a
-//! dispatching `impl S3` in front (this is the real architecture, not a line item).
+//! Backend proxy. Forwards allowed, canonicalized requests to the target backend,
+//! re-signed with a **per-tenant / per-backend** credential — never the caller's.
+//! `s3s_aws::Proxy` wraps exactly one `aws_sdk_s3::Client`, so per-tenant credentials
+//! require a client pool keyed on `(backend, tenant)` with a dispatching `impl S3` in
+//! front.
 //!
 //! Canonicalize-before-forward holds by construction: the typed hook mutates
 //! `S3Request<Input>` and we forward that same value — there is no raw passthrough.
@@ -40,14 +40,10 @@ struct TenantRoute {
     organization_id: String,
 }
 
-/// The secret-free half of a [`TenantRoute`]: everything the request pipeline needs
-/// to route and attribute a request, and nothing it must not hold.
-///
-/// `S3Access::check` resolves one of these per request and stashes it in
-/// `req.extensions`, so every later stage reads the *same* snapshot instead of
-/// re-querying a routing table that may swap underneath it. The owner credentials
-/// stay in the registry — they must never reach the request extensions, which are
-/// visible to every layer above (see the module invariant).
+/// The secret-free half of a [`TenantRoute`]. `S3Access::check` resolves one per request
+/// into `req.extensions`, so every later stage reads the *same* snapshot instead of a
+/// routing table that may swap underneath it. Owner credentials stay in the registry:
+/// the extensions are visible to every layer above.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteSnapshot {
     pub tenant: String,
@@ -67,35 +63,26 @@ type PoolKey = (String, String);
 /// Resolves a tenant to a re-signing `Proxy`, building and caching one client per
 /// `(backend, tenant)`. Backend credentials never leave this registry.
 ///
-/// The routing table lives behind an [`ArcSwap`] so an operator-rendered config can be
-/// applied without restarting the process ([`BackendRegistry::apply_config`], plan task
-/// 10). Two properties are load-bearing and are what the tests at the bottom of this
-/// file pin:
-///
-/// 1. **One snapshot per request.** `check` resolves a [`RouteSnapshot`] once and
-///    stashes it in `req.extensions`; every later stage reads that value, never the
-///    table. A swap therefore cannot move a request from under itself — see
-///    [`BackendRegistry::proxy_for`], which takes the snapshot rather than a tenant
-///    name and refuses if the table has since disagreed with it.
-/// 2. **A swap invalidates the client pool.** The pooled clients hold owner
-///    credentials baked into their signing config, so keeping them across a config
-///    apply would let a rotated-out key keep signing indefinitely.
+/// The routing table lives behind an [`ArcSwap`] so a config can be applied without
+/// restarting the process ([`BackendRegistry::apply_config`]).
+/// [`BackendRegistry::proxy_for`] takes a [`RouteSnapshot`] rather than a tenant name and
+/// refuses if the table has since disagreed with it; a swap also drops the client pool,
+/// because pooled clients bake in the owner credential they were built with.
 pub struct BackendRegistry {
     routes: ArcSwap<Routes>,
     pool: Mutex<HashMap<PoolKey, Arc<Proxy>>>,
-    /// Connection bounds applied to every pooled backend client (see [`build_proxy`]).
-    /// Not swappable: they are baked into a built client, and re-reading them without
-    /// rebuilding the pool would report a change that did not happen.
+    /// Connection bounds applied to every pooled backend client. Not swappable: they are
+    /// baked into a built client, so re-reading them without rebuilding the pool would
+    /// report a change that did not happen.
     timeouts: TimeoutConfig,
 }
 
 /// The gateway's own tenant→organization table, exposed to the credential layer.
 ///
-/// **This is the only place a derived long-lived key's organization may come from.** The
-/// credential itself carries no organization field (see [`crate::auth::derived`]), so
-/// there is nothing to prefer over this — and because the table is behind the same
-/// `ArcSwap` the routing table is, an operator re-binding a tenant to another organization
-/// re-attributes its keys on the next request rather than at the next pod roll.
+/// **The only place a derived long-lived key's organization may come from**: the
+/// credential itself carries no organization field (see [`crate::auth::derived`]). It sits
+/// behind the same `ArcSwap` as the routing table, so re-binding a tenant to another
+/// organization re-attributes its keys on the next request rather than at the next restart.
 impl crate::auth::TenantDirectory for BackendRegistry {
     fn organization_of(&self, tenant: &str) -> Option<String> {
         self.routes
@@ -117,13 +104,10 @@ impl BackendRegistry {
     /// Install a new routing table from a freshly-loaded config.
     ///
     /// The table is built **before** anything is swapped, so a config that does not
-    /// resolve leaves the running one untouched — a half-applied routing table is a
-    /// tenant pointed at the wrong backend, which is worse than not applying at all.
-    ///
-    /// The client pool is dropped afterwards. That costs a connection re-establish per
-    /// active tenant, and it is not optional: a pooled client carries the owner
-    /// credential it was built with, so a rotated secret would otherwise stay in use
-    /// for the life of the process.
+    /// resolve leaves the running one untouched — a half-applied routing table is a tenant
+    /// pointed at the wrong backend. The client pool is dropped afterwards: a pooled client
+    /// carries the owner credential it was built with, so a rotated secret would otherwise
+    /// stay in use for the life of the process.
     pub fn apply_config(&self, cfg: &GatewayConfig) -> Result<()> {
         let routes = build_routes(cfg)?;
         let tenants = routes.len();
@@ -157,13 +141,10 @@ impl BackendRegistry {
     /// Get (or lazily build) the re-signing proxy for the route this request was
     /// **authorized against**.
     ///
-    /// Takes the snapshot rather than a tenant name so the forward cannot silently
-    /// land on a different backend than the decision contemplated: if the table has
-    /// been swapped since `check` resolved the snapshot and now routes this tenant
-    /// elsewhere, the request is refused rather than forwarded. The window is one
-    /// config apply wide and the client's retry is re-authorized against the new
-    /// table, so failing closed costs a retry and buying the alternative costs a
-    /// request landing in the wrong Org's bucket.
+    /// Takes the snapshot rather than a tenant name so the forward cannot land on a
+    /// backend the decision never saw: if the table swapped between `check` and here, the
+    /// request is refused. Failing closed costs a retry, which is re-authorized against the
+    /// new table; the alternative costs a request landing in the wrong Org's bucket.
     pub fn proxy_for(&self, snapshot: &RouteSnapshot) -> Result<Arc<Proxy>> {
         let routes = self.routes.load();
         let route = routes.get(&snapshot.tenant).ok_or_else(|| {
@@ -221,11 +202,10 @@ fn build_routes(cfg: &GatewayConfig) -> Result<Routes> {
 
 /// Connection bounds for the backend client.
 ///
-/// Only `connect_timeout` is set by default. The SDK's `read_timeout` is measured
-/// from *request initiation*, so on a bulk `PutObject`/`UploadPart` it spans the whole
-/// upload — a finite value there would cap object size over a slow link rather than
-/// catch a hung backend. It is therefore opt-in (`limits.backend_read_timeout_secs`),
-/// and no `operation_timeout` is set at all.
+/// Only `connect_timeout` is set by default. The SDK's `read_timeout` is measured from
+/// *request initiation*, so on a bulk `PutObject`/`UploadPart` a finite value would cap
+/// object size over a slow link rather than catch a hung backend. It is therefore opt-in
+/// (`limits.backend_read_timeout_secs`), and no `operation_timeout` is set at all.
 fn backend_timeouts(limits: &LimitsConfig) -> TimeoutConfig {
     let mut b = TimeoutConfig::builder().connect_timeout(limits.backend_connect_timeout());
     if let Some(read) = limits.backend_read_timeout() {
@@ -249,7 +229,7 @@ fn build_proxy(
     );
     let conf: Config = Config::builder()
         // behavior-version-latest is NOT enabled in s3s-aws's aws-sdk pin; setting it
-        // explicitly is required or build() panics (a substrate quirk).
+        // explicitly is required or build() panics.
         .behavior_version(BehaviorVersion::latest())
         .endpoint_url(backend.endpoint_url.clone())
         .region(Region::new(backend.region.clone()))
@@ -260,16 +240,13 @@ fn build_proxy(
     Proxy::from(Client::from_conf(conf))
 }
 
-/// Everything the forwarding path draws on. A struct rather than a bare registry
-/// because the forward half keeps growing (limits, response obligations, the
-/// pending-audit handle) — and deliberately *not* the whole `Gateway`: by the time a
-/// request reaches here it is already authorized, so this layer must not hold a PDP
-/// handle it could be tempted to re-decide with.
+/// Everything the forwarding path draws on — deliberately *not* the whole `Gateway`: by
+/// the time a request reaches here it is already authorized, so this layer must not hold a
+/// PDP handle it could be tempted to re-decide with.
 pub struct S3GatewayState {
     pub registry: Arc<BackendRegistry>,
-    /// The *live* limits handle, not a copy: the forward path has no readers today,
-    /// and whoever adds the first one must get the value a config apply installed
-    /// rather than the one this service was assembled with.
+    /// The *live* limits handle, not a copy: a reader must get the value a config apply
+    /// installed rather than the one this service was assembled with.
     limits: Arc<ArcSwap<LimitsConfig>>,
 }
 
@@ -284,11 +261,8 @@ impl S3GatewayState {
     }
 
     /// The two bounds a filtered `ListBuckets` page is cut with: `(page size, backend
-    /// pages this request may drain)`.
-    ///
-    /// Read as owned values rather than handed out as a guard because the caller holds
-    /// them across an `await` — and read *here*, from the live handle, so a config apply
-    /// lands rather than being frozen at service-assembly time.
+    /// pages this request may drain)`. Owned values rather than a guard because the caller
+    /// holds them across an `await`, and read from the live handle so a config apply lands.
     fn bucket_listing_bounds(&self) -> (usize, usize) {
         let limits = self.limits();
         (
@@ -298,14 +272,11 @@ impl S3GatewayState {
     }
 }
 
-/// The dispatching `impl S3` in front of the per-tenant proxies. Only the ops
-/// `OP_TABLE` marks `Coverage::Enforced` have an arm here; every other op is denied at
-/// `S3Access::check` before reaching this layer, and falls to the trait's
-/// `NotImplemented` default if it somehow does not — with the one exception noted on
-/// [`GatewayS3::post_object`], whose trait default forwards rather than refusing.
-///
-/// `tests/gate_invariants.rs` probes both halves of that claim: every enforced op has
-/// an arm, and a sample of denied ops still lands on `NotImplemented`.
+/// The dispatching `impl S3` in front of the per-tenant proxies. Only the ops `OP_TABLE`
+/// marks `Coverage::Enforced` have an arm here; every other op is denied at
+/// `S3Access::check`, and falls to the trait's `NotImplemented` default if it somehow does
+/// not — except [`GatewayS3::post_object`], whose trait default forwards rather than
+/// refusing. `tests/gate_invariants.rs` probes both halves of that claim.
 pub struct GatewayS3 {
     state: Arc<S3GatewayState>,
 }
@@ -315,14 +286,10 @@ impl GatewayS3 {
         GatewayS3 { state }
     }
 
-    /// The re-signing proxy for this request's tenant, taken from the route
-    /// `check` already resolved — the forward must use the same route the decision
-    /// was made against, never a freshly-resolved one.
-    ///
-    /// Every arm below goes through here, which makes it the single place the
-    /// authorization proof is demanded: a hook that forgets to enforce cannot reach a
-    /// backend client, because the client is only obtainable after the proof checks
-    /// out.
+    /// The re-signing proxy for this request's tenant, taken from the route `check`
+    /// already resolved — never a freshly-resolved one. Every arm goes through here, which
+    /// makes it the single place the authorization proof is demanded: a hook that forgets
+    /// to enforce cannot reach a backend client.
     fn proxy_for_req<T>(&self, req: &S3Request<T>) -> S3Result<Arc<Proxy>> {
         proof::require(req)?;
         let route = req
@@ -336,17 +303,13 @@ impl GatewayS3 {
     }
 
     /// Resolve the proxy, run the backend call, and settle this request's audit record
-    /// with what the backend leg actually did (plan task 18).
+    /// with what the backend leg actually did.
     ///
-    /// Every arm goes through here, which is what makes the enrichment total rather
-    /// than per-op: `backend_status` and `outcome: "error"` used to be a hardcoded
-    /// `None` and a variant with no producer, because the record was emitted before the
-    /// forward existed.
-    ///
-    /// The pending handle is cloned out **before** `call` takes ownership of `req`:
-    /// otherwise the request's extensions — and the last reference to the record —
-    /// would be dropped inside the backend call, and the record would be emitted
-    /// unenriched a moment before the answer arrived.
+    /// Every arm goes through here, which is what makes the enrichment total rather than
+    /// per-op. The pending handle is cloned out **before** `call` takes ownership of `req`:
+    /// otherwise the request's extensions — and the last reference to the record — would be
+    /// dropped inside the backend call, and the record emitted unenriched a moment before
+    /// the answer arrived.
     async fn forward<T, O, F, Fut>(&self, req: S3Request<T>, call: F) -> S3Result<S3Response<O>>
     where
         F: FnOnce(Arc<Proxy>, S3Request<T>) -> Fut + Send,
@@ -367,24 +330,11 @@ impl GatewayS3 {
 
 /// The backend's HTTP status — **only** when it is genuinely the backend's.
 ///
-/// `S3Error::status_code()` falls back to the status implied by the error *code*
-/// (`s3s-0.14.1/src/error/mod.rs:133`), so it happily answers `500` for a connection
-/// refused that never reached the backend, and `400` for a malformed continuation token
-/// this gateway rejected itself. Writing either into a regulated record as the
-/// backend's status would be asserting something nobody observed — the same class of
-/// mistake as synthesizing `200` on the success path (plan defect E-1).
-///
-/// So the status is reported only when both hold:
-///
-/// - the error carries a `source`, which only s3s-aws sets (`s3s-aws/src/error.rs:26`);
-///   a gateway-minted `s3_error!` never does; and
-/// - the code is not `InternalError`, which s3s-aws only ever replaces from
-///   `meta.code()` on the `SdkError::ServiceError` branch — and that same branch is the
-///   only one that calls `set_status_code` with a real response status
-///   (`s3s-aws/src/error.rs:11-24,38-41`).
-///
-/// An `InternalError` from s3s-aws is genuinely ambiguous (a service error whose code
-/// we could not map looks identical to a dispatch failure), so it reports nothing.
+/// `S3Error::status_code()` falls back to the status implied by the error *code*, so it
+/// answers `500` for a connection refused that never reached the backend. Reporting that
+/// asserts something nobody observed, so a status is returned only when the error carries a
+/// `source` (which only s3s-aws sets) and the code is not `InternalError` (ambiguous: an
+/// unmapped service code looks identical to a dispatch failure).
 fn backend_status(err: &S3Error) -> Option<u16> {
     if err.source().is_none() || *err.code() == s3s::S3ErrorCode::InternalError {
         return None;
@@ -515,13 +465,11 @@ impl S3 for GatewayS3 {
 
     /// Parts of one upload, with the identity fields stripped.
     ///
-    /// The parts themselves disclose nothing new: the caller already holds `read_objects`
-    /// on this key, and part sizes and ETags describe the object it may read. `Owner` and
-    /// `Initiator` are different — under this gateway they always name the **shared
-    /// tenant-owner credential** every request is re-signed with, never the principal who
-    /// created the upload. Forwarding them publishes the backend identity the whole
-    /// re-signing design exists to keep off the wire, and answers a question the caller
-    /// did not ask, so they are dropped.
+    /// The parts disclose nothing new: the caller already holds `read_objects` on this key.
+    /// `Owner` and `Initiator` are different — they always name the **shared tenant-owner
+    /// credential** every request is re-signed with, never the principal who created the
+    /// upload, so forwarding them would publish the backend identity the whole re-signing
+    /// design exists to keep off the wire.
     async fn list_parts(
         &self,
         req: S3Request<ListPartsInput>,
@@ -537,17 +485,12 @@ impl S3 for GatewayS3 {
     /// In-flight uploads under the granted prefix, with the identity fields stripped and
     /// the prefix re-applied.
     ///
-    /// Two transforms, for two different reasons:
-    ///
     /// - **`Owner` / `Initiator` are dropped**, for the reason on [`Self::list_parts`]:
     ///   they name the tenant-owner credential, not the caller.
-    /// - **uploads outside the request's prefix are dropped.** The access hook narrows
-    ///   `prefix` to a granted scope and the backend is expected to honor it, but "the
-    ///   backend honored the filter" is not something this gateway can observe — and the
-    ///   keys of in-flight uploads are exactly what a prefix-scoped principal must not
-    ///   see. Re-applying the filter costs a string comparison per row and removes the
-    ///   assumption. The markers are left as the backend set them, so pagination still
-    ///   works; a page may simply come back short.
+    /// - **Uploads outside the request's prefix are dropped.** The access hook narrows
+    ///   `prefix` to a granted scope, but "the backend honored it" is not observable here,
+    ///   and in-flight upload keys are what a prefix-scoped principal must not see. Markers
+    ///   are left as the backend set them, so a page may simply come back short.
     async fn list_multipart_uploads(
         &self,
         req: S3Request<ListMultipartUploadsInput>,
@@ -559,9 +502,8 @@ impl S3 for GatewayS3 {
         if let Some(uploads) = resp.output.uploads.as_mut() {
             uploads.retain(|u| match (&prefix, &u.key) {
                 (Some(p), Some(k)) => k.starts_with(p.as_str()),
-                // No prefix on the request ⇒ a whole-bucket list grant, nothing to
-                // re-apply. A row with no key at all was never authorized against
-                // anything, so it goes.
+                // No prefix ⇒ a whole-bucket list grant, nothing to re-apply. A row with
+                // no key at all was never authorized against anything, so it goes.
                 (None, Some(_)) => true,
                 _ => false,
             });
@@ -575,23 +517,11 @@ impl S3 for GatewayS3 {
 
     /// Enumerate buckets — the one arm that **withholds** what the backend returned.
     ///
-    /// Everything here follows from one fact: the forward is re-signed with the
-    /// per-`(backend, tenant)` owner credential, so the backend answers with the tenant's
-    /// entire bucket namespace regardless of the caller. The visibility obligation the
-    /// access hook installed is therefore not an optimization — it is the authorization.
-    ///
-    /// Three branches, in order:
-    ///
-    /// 1. **no obligation** ⇒ refuse. Only [`GatewayAccess::list_buckets`] installs one,
-    ///    so its absence means no decision was made about this request. This is the same
-    ///    fail-closed argument as the [`AuthzProof`](crate::access::AuthzProof), applied
-    ///    to a response transform: forwarding here would publish the namespace.
-    /// 2. **[`BucketVisibility::Nothing`]** ⇒ an empty listing, produced without touching
-    ///    the backend and without demanding a proof (there is nothing to fetch). This is
-    ///    the single branch serving both "denied" and "allowed with no grants", which is
-    ///    what makes them indistinguishable to the caller — see the hook for why that
-    ///    matters.
-    /// 3. otherwise ⇒ drain, filter, sort, page.
+    /// The forward is re-signed with the owner credential, so the backend answers with the
+    /// tenant's entire bucket namespace regardless of the caller: the visibility obligation
+    /// the access hook installed *is* the authorization, and its absence is refused rather
+    /// than forwarded. [`BucketVisibility::Nothing`] serves both "denied" and "allowed with
+    /// no grants", so the caller cannot tell them apart.
     async fn list_buckets(
         &self,
         req: S3Request<ListBucketsInput>,
@@ -608,7 +538,7 @@ impl S3 for GatewayS3 {
         if visibility == BucketVisibility::Nothing {
             // `Some(vec![])`, not `None`: an S3 client reads a missing `<Buckets>` and a
             // present-but-empty one differently, and the honest statement is "you have
-            // zero buckets", not "this field was not populated".
+            // zero buckets".
             return Ok(S3Response::new(ListBucketsOutput {
                 buckets: Some(Vec::new()),
                 prefix: req.input.prefix.clone(),
@@ -616,9 +546,8 @@ impl S3 for GatewayS3 {
             }));
         }
         let (max_page, max_pages) = self.state.bucket_listing_bounds();
-        // A caller-supplied `max-buckets` is clamped, not honored: the page boundaries
-        // are the gateway's now, so an unbounded request must not turn into an unbounded
-        // response.
+        // A caller-supplied `max-buckets` is clamped, not honored: the page boundaries are
+        // the gateway's now, so an unbounded request must not become an unbounded response.
         let page_size = req
             .input
             .max_buckets
@@ -630,22 +559,12 @@ impl S3 for GatewayS3 {
     }
 
     /// PostObject: the ONE `S3` method whose s3s default is not `NotImplemented` — it
-    /// re-dispatches through `put_object` (`s3_trait.rs:4401-4406`).
-    ///
-    /// M1 carried an explicit `NotImplemented` override here precisely because of that:
-    /// while the op was `Coverage::Denied`, inheriting the default would have let a form
-    /// upload *forward* on the strength of a trait default, out of reach of the "denied
-    /// ops fall to NotImplemented" argument the whole table rests on. Now that PostObject
-    /// is `Coverage::Enforced` the override is gone and this arm forwards deliberately —
-    /// but the hazard has not: for this one op, deleting the arm below does **not**
-    /// produce a 501, it produces a silent forward through `put_object`. What stops that
-    /// from being a fail-open is [`Self::forward`], which demands the [`AuthzProof`]
-    /// before any client exists; `tests/gate_invariants.rs::post_object_forwards_only_with_a_proof`
-    /// is the guard.
-    ///
-    /// `s3s_aws::Proxy` has no `post_object` either, so the forward lands on the same
-    /// default: the input is converted to a `PutObjectInput` and sent as a PUT. The
-    /// proof is checked against `OperationName` = `PostObject` before that conversion.
+    /// re-dispatches through `put_object`. So for this one op, deleting the arm below does
+    /// **not** produce a 501, it produces a silent forward. What stops that from being a
+    /// fail-open is [`Self::forward`], which demands the [`AuthzProof`] before any client
+    /// exists; `tests/gate_invariants.rs::post_object_forwards_only_with_a_proof` guards it.
+    /// `s3s_aws::Proxy` has no `post_object` either, so the forward converts the input to a
+    /// `PutObjectInput` and sends a PUT — after the proof is checked against `PostObject`.
     async fn post_object(
         &self,
         req: S3Request<PostObjectInput>,
@@ -674,17 +593,11 @@ impl S3 for GatewayS3 {
 
     // ── bucket lifecycle and sub-resources: NO ARMS, DELIBERATELY ───────────────
     //
-    // `create_bucket`, `delete_bucket`, `{get,put}_bucket_policy` and
-    // `{get,put}_bucket_cors` had arms here from M4 until 2026-08-08. They are gone, not
-    // stubbed, because an arm that answers `AccessDenied` is still an arm: it proves the
-    // op is routable, and the next person to add a `forward` to it has no gate to trip
-    // over. With no arm at all these six fall to `s3s`'s `NotImplemented` default, which
-    // is the layer that holds even if `check` is wrong —
-    // `tests/gate_invariants.rs::denied_ops_have_no_dispatch_arm` measures exactly that.
-    //
-    // Bucket existence, policy, CORS and quota are control-plane: they change through the
-    // console and the operator, so every bucket has an `HFBucket` CR behind it and none is
-    // unmanaged, unquota'd or invisible. See `access::optable::NON_GATEWAY_VERBS`.
+    // No arm rather than an `AccessDenied` stub: a stub still proves the op is routable, and
+    // the next person to add a `forward` to it has no gate to trip over. With no arm these
+    // fall to `s3s`'s `NotImplemented` default, which holds even if `check` is wrong
+    // (`tests/gate_invariants.rs::denied_ops_have_no_dispatch_arm`). Bucket existence,
+    // policy, CORS and quota are control-plane — see `access::optable::NON_GATEWAY_VERBS`.
 
     // ── object tagging and attributes ───────────────────────────────────────────
 
@@ -794,17 +707,11 @@ async fn fan_out_list_v2(
 /// Drain the backend's bucket list, intersect it with the principal's visibility, and
 /// return one gateway-cut page.
 ///
-/// The drain is the part worth reading twice. A filtered listing cannot be produced
-/// page-by-page against the backend's pagination: entries are removed, so the backend's
-/// offsets stop describing the client's sequence, and the *order* the pages arrive in is
-/// not something RGW promises (defect B-9). So the whole list is read, sorted
-/// gateway-side, and paged from there. Two things bound it, and both fail loudly rather
-/// than truncating: a page cap, and a check that the backend's token actually advances —
-/// a backend echoing one token forever would otherwise spin here.
-///
-/// A short answer is never acceptable on this path. An authorization-filtered listing
-/// that quietly omitted buckets would look exactly like a revoked grant, which is the one
-/// thing a caller cannot debug.
+/// A filtered listing cannot be paged against the backend's own pagination: entries are
+/// removed, so its offsets stop describing the client's sequence. The whole list is
+/// drained, sorted gateway-side and paged from there, bounded by a page cap and a check
+/// that the backend's token advances — both fail loudly rather than truncating, because a
+/// listing that quietly omitted buckets looks exactly like a revoked grant.
 // ListBucketsOutput is constructed field-by-field: struct-update syntax on a
 // `#[non_exhaustive]`-adjacent generated DTO is unavailable, as in fan_out_list_v2.
 #[allow(clippy::field_reassign_with_default)]
@@ -831,8 +738,7 @@ async fn filtered_bucket_listing(
         let mut sub = req.clone();
         sub.input.continuation_token = token.clone();
         // The backend's page size is its own business; the gateway's page is cut after
-        // filtering. Asking for the client's `max-buckets` here would just make the
-        // drain longer.
+        // filtering, so asking for the client's `max-buckets` would only lengthen the drain.
         sub.input.max_buckets = None;
         let out = proxy.list_buckets(sub).await?.output;
         if let Some(buckets) = out.buckets {
@@ -840,9 +746,9 @@ async fn filtered_bucket_listing(
         }
         match out.continuation_token {
             Some(next) if !next.is_empty() && Some(&next) != token.as_ref() => token = Some(next),
-            // Either the backend is done, or it handed back the token it was given.
-            // The second is a backend bug; stopping is right either way, and the page
-            // cap above is what catches a backend that cycles between two tokens.
+            // Either the backend is done, or it handed back the token it was given (a
+            // backend bug). Stopping is right either way; the page cap above catches a
+            // backend that cycles between two tokens.
             _ => break,
         }
     }
@@ -854,11 +760,9 @@ async fn filtered_bucket_listing(
     output.buckets = Some(page.buckets);
     output.continuation_token = page.next.map(|c| c.encode());
     output.prefix = name_prefix;
-    // `Owner` is withheld, not mapped. What the backend reports is the tenant-owner
-    // credential this gateway re-signed as — the same value for every principal in the
-    // tenant — so forwarding it would publish the shared backend identity, and
-    // substituting the caller would be inventing a canonical user id the backend never
-    // issued.
+    // `Owner` is withheld, not mapped: the backend reports the tenant-owner credential this
+    // gateway re-signed as — the same value for every principal in the tenant — and
+    // substituting the caller would invent a canonical user id the backend never issued.
     output.owner = None;
     Ok(S3Response::new(output))
 }
@@ -867,15 +771,10 @@ async fn filtered_bucket_listing(
 ///
 /// A token we cannot decode is an **error**, never "start over from page 1". Restarting
 /// silently hands the client the first page with a fresh token and no signal that its
-/// position was lost: a paginating job re-reads what it already processed and believes
-/// it paginated correctly. That is not hypothetical — widening `scope_hash` from 16 to
-/// 64 hex characters made every cursor issued by an older build undecodable, so the
-/// rollout that shipped it would have restarted every in-flight listing in the fleet.
-///
-/// A cursor whose *scope* changed is already a loud `InvalidArgument`
-/// (`fanout::Cursor::validate`); a cursor that is malformed, truncated or forged is the
-/// same class of fault and gets the same answer. Losing your place is recoverable;
-/// silently reprocessing is not.
+/// position was lost: a paginating job re-reads what it already processed and believes it
+/// paginated correctly. A cursor whose *scope* changed is already a loud `InvalidArgument`
+/// (`fanout::Cursor::validate`); malformed, truncated or forged gets the same answer.
+/// Losing your place is recoverable; silently reprocessing is not.
 fn decode_cursor(token: Option<&str>) -> S3Result<Option<fanout::Cursor>> {
     match token {
         None => Ok(None),
@@ -931,8 +830,7 @@ mod tests {
     fn route_snapshot_carries_no_owner_credentials() {
         // Destructured WITHOUT `..` on purpose: adding a field to RouteSnapshot is a
         // compile error here, so the next person must justify it against the module
-        // invariant — backend credentials never leave this registry, and this value
-        // goes into the request extensions where every layer can read it.
+        // invariant — this value goes into the request extensions, which every layer reads.
         let RouteSnapshot {
             tenant,
             backend_id,
@@ -950,7 +848,7 @@ mod tests {
         assert!(registry().route_snapshot("not-a-tenant").is_none());
     }
 
-    // ── hot-swappable routing (plan task 10) ────────────────────────────────────
+    // ── hot-swappable routing ────────────────────────────────────
 
     #[test]
     fn applying_a_config_replaces_the_routing_table() {
@@ -989,14 +887,13 @@ mod tests {
 
     #[test]
     fn a_config_that_does_not_resolve_leaves_the_running_one_untouched() {
-        // Half-applying a routing table means a tenant pointed at somebody else's
-        // backend. The build must therefore complete before anything is stored.
+        // Half-applying a routing table means a tenant pointed at somebody else's backend,
+        // so the build must complete before anything is stored.
         let reg = registry();
-        // Built by hand, past `GatewayConfig::from_json`, on purpose. Load-time
-        // validation already refuses an unknown `backend_id` — assert that first, so
-        // this test cannot quietly become a test of the loader — but `apply_config`
-        // must not *depend* on having been handed a validated config: it is a `&self`
-        // method on a running gateway and its ordering guarantee has to stand alone.
+        // Built by hand, past `GatewayConfig::from_json`, on purpose: load-time validation
+        // already refuses an unknown `backend_id` (asserted first, so this cannot quietly
+        // become a test of the loader), but `apply_config`'s ordering guarantee must stand
+        // on its own rather than depend on having been handed a validated config.
         assert!(
             GatewayConfig::from_json(
                 &serde_json::json!({
@@ -1044,9 +941,8 @@ mod tests {
 
     #[test]
     fn a_forward_cannot_cross_a_routing_change_it_was_not_authorized_against() {
-        // The invariant the RouteSnapshot exists for, at the one place the snapshot
-        // meets the mutable table. `check` resolved this snapshot; between then and the
-        // forward, the operator repointed the tenant.
+        // The invariant the RouteSnapshot exists for, at the one place it meets the mutable
+        // table: `check` resolved this snapshot, then the operator repointed the tenant.
         let reg = registry();
         let authorized_against = reg.route_snapshot("acme").expect("routable");
         assert!(reg.proxy_for(&authorized_against).is_ok());
@@ -1068,10 +964,9 @@ mod tests {
 
     #[test]
     fn applying_a_config_drops_the_pooled_clients() {
-        // A pooled client bakes in the owner credential it was built with, so surviving
-        // a config apply would mean a rotated-out secret keeps signing for the life of
-        // the process. Observed through client identity: same Arc before, different
-        // after.
+        // A pooled client bakes in the owner credential it was built with, so surviving a
+        // config apply would mean a rotated-out secret keeps signing for the life of the
+        // process. Observed through client identity: same Arc before, different after.
         let reg = registry();
         let route = reg.route_snapshot("acme").expect("routable");
         let first = reg.proxy_for(&route).expect("proxy");
@@ -1095,17 +990,16 @@ mod tests {
     fn only_a_status_the_backend_really_reported_reaches_the_audit_record() {
         use s3s::S3ErrorCode;
 
-        // What s3s-aws produces for a real service error: the backend's own code, and a
-        // status it explicitly set from the HTTP response. This one is genuine and must
-        // be recorded.
+        // What s3s-aws produces for a real service error: the backend's own code and a
+        // status it set from the HTTP response. Genuine, so it must be recorded.
         let mut real = S3Error::new(S3ErrorCode::NoSuchKey);
         real.set_source(Box::new(std::io::Error::other("sdk service error")));
         real.set_status_code(http::StatusCode::NOT_FOUND);
         assert_eq!(backend_status(&real), Some(404));
 
-        // A gateway-minted refusal. `S3Error::status_code()` falls back to the status
-        // implied by the *code*, so asking it directly would write `400` into the record
-        // as though a backend had answered — for a request that never left the process.
+        // A gateway-minted refusal. `S3Error::status_code()` falls back to the status the
+        // *code* implies, so asking it directly would write `400` into the record as though
+        // a backend had answered a request that never left the process.
         let ours = s3_error!(InvalidArgument, "malformed continuation token");
         assert_eq!(
             ours.status_code().map(|s| s.as_u16()),
@@ -1147,8 +1041,8 @@ mod tests {
             .expect("some");
         assert_eq!(back.last_key, "2024/a.csv");
 
-        // Anything else is an error, not page 1. The three shapes that matter: garbage,
-        // a token from a build whose cursor encoding differed, and the empty string.
+        // Anything else is an error, not page 1: garbage, a token from a build whose cursor
+        // encoding differed, and the empty string.
         for bad in ["garbage", "v1.notahash.32303234", ""] {
             let err = decode_cursor(Some(bad)).expect_err(
                 "an undecodable cursor must be refused; restarting the listing silently \

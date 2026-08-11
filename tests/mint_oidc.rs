@@ -1,7 +1,7 @@
-//! End-to-end OIDC verification for the STS mint (the badge desk), with a real
-//! RS256 keypair: sign a token with the private key, verify it through the production
-//! `StandardVerifier` path (signature + issuer/audience/expiry + claim extraction).
-//! No Keycloak needed — the keypair stands in for the IdP's signing key.
+//! End-to-end OIDC verification for the STS mint with a real RS256 keypair: sign a token
+//! with the private key, verify it through the production `StandardVerifier` path
+//! (signature + issuer/audience/expiry + claim extraction). The keypair stands in for the
+//! identity provider's signing key, so no live IdP is needed.
 //!
 //! Plus the JWKS refresh loop, against a real (counting) HTTP endpoint.
 
@@ -26,21 +26,19 @@ fn verifier() -> StandardVerifier {
         public_key_pem: Some(PUBLIC_PEM.to_string()),
         sub_claim: "sub".into(),
         groups_claim: "groups".into(),
-        tenant_claim: "harbor".into(),
+        tenant_claim: "tenant".into(),
         org_claim: "org".into(),
         jwks_timeout_secs: 5,
         jwks_refresh_secs: 300,
-        // The web-identity door's settings. Irrelevant to every assertion in this
-        // file — it exercises `verify()`, the BEARER door — and spelled out rather than
-        // defaulted so that adding a field to the surface cannot silently change what
-        // the bearer door's tests are measuring.
+        // The web-identity door's settings, irrelevant here (this file exercises
+        // `verify()`, the bearer door) but spelled out rather than defaulted so adding a
+        // field cannot silently change what these tests measure.
         web_identity_enabled: true,
         web_identity_audiences: Vec::new(),
         role_name_template: None,
         max_duration_secs: 3600,
-        // The listener's own bounds (F13). Irrelevant to every assertion in this
-        // file — nothing here binds a socket — and spelled out for the same reason
-        // as the web-identity fields above.
+        // The listener's own bounds — nothing here binds a socket — spelled out for the
+        // same reason as the web-identity fields above.
         max_connections: 256,
         connection_timeout_secs: 30,
     };
@@ -67,7 +65,7 @@ fn sign(claims: serde_json::Value) -> String {
 async fn verifies_a_real_rs256_token_and_extracts_identity() {
     let token = sign(serde_json::json!({
         "iss": ISSUER, "aud": AUDIENCE, "exp": now() + 3600,
-        "sub": "oidc-sub-alice", "harbor": "acme", "org": "org-acme",
+        "sub": "oidc-sub-alice", "tenant": "acme", "org": "org-acme",
         "groups": ["analysts", "radiology"]
     }));
     let id = verifier().verify(&token).await.expect("verify");
@@ -84,7 +82,7 @@ async fn verifies_a_real_rs256_token_and_extracts_identity() {
 async fn rejects_wrong_audience() {
     let token = sign(serde_json::json!({
         "iss": ISSUER, "aud": "some-other-service", "exp": now() + 3600,
-        "sub": "alice", "harbor": "acme", "org": "org-acme"
+        "sub": "alice", "tenant": "acme", "org": "org-acme"
     }));
     assert!(verifier().verify(&token).await.is_err());
 }
@@ -94,7 +92,7 @@ async fn rejects_token_missing_audience() {
     // A token that simply omits `aud` must be rejected, not accepted.
     let token = sign(serde_json::json!({
         "iss": ISSUER, "exp": now() + 3600,
-        "sub": "alice", "harbor": "acme", "org": "org-acme"
+        "sub": "alice", "tenant": "acme", "org": "org-acme"
     }));
     assert!(verifier().verify(&token).await.is_err());
 }
@@ -103,7 +101,7 @@ async fn rejects_token_missing_audience() {
 async fn rejects_token_missing_issuer() {
     let token = sign(serde_json::json!({
         "aud": AUDIENCE, "exp": now() + 3600,
-        "sub": "alice", "harbor": "acme", "org": "org-acme"
+        "sub": "alice", "tenant": "acme", "org": "org-acme"
     }));
     assert!(verifier().verify(&token).await.is_err());
 }
@@ -112,7 +110,7 @@ async fn rejects_token_missing_issuer() {
 async fn rejects_expired_token() {
     let token = sign(serde_json::json!({
         "iss": ISSUER, "aud": AUDIENCE, "exp": 1_000_000_000u64,
-        "sub": "alice", "harbor": "acme", "org": "org-acme"
+        "sub": "alice", "tenant": "acme", "org": "org-acme"
     }));
     assert!(verifier().verify(&token).await.is_err());
 }
@@ -124,7 +122,7 @@ async fn rejects_token_signed_by_a_different_key() {
         &Header::new(Algorithm::HS256),
         &serde_json::json!({
             "iss": ISSUER, "aud": AUDIENCE, "exp": now() + 3600,
-            "sub": "mallory", "harbor": "acme", "org": "org-acme"
+            "sub": "mallory", "tenant": "acme", "org": "org-acme"
         }),
         &EncodingKey::from_secret(b"attacker-secret"),
     )
@@ -182,7 +180,7 @@ async fn jwks_is_refreshed_in_the_background_not_only_on_a_kid_miss() {
         public_key_pem: None,
         sub_claim: "sub".into(),
         groups_claim: "groups".into(),
-        tenant_claim: "harbor".into(),
+        tenant_claim: "tenant".into(),
         org_claim: "org".into(),
         jwks_timeout_secs: 5,
         jwks_refresh_secs: 0, // overridden below; 0 must mean "no background task"
@@ -190,9 +188,8 @@ async fn jwks_is_refreshed_in_the_background_not_only_on_a_kid_miss() {
         web_identity_audiences: Vec::new(),
         role_name_template: None,
         max_duration_secs: 3600,
-        // The listener's own bounds (F13). Irrelevant to every assertion in this
-        // file — nothing here binds a socket — and spelled out for the same reason
-        // as the web-identity fields above.
+        // The listener's own bounds — nothing here binds a socket — spelled out for the
+        // same reason as the web-identity fields above.
         max_connections: 256,
         connection_timeout_secs: 30,
     };
@@ -206,10 +203,9 @@ async fn jwks_is_refreshed_in_the_background_not_only_on_a_kid_miss() {
         "nothing should poll the IdP when the background refresh is off"
     );
 
-    // With an interval, the cache is warmed at startup and kept warm — WITHOUT any
-    // mint traffic. Refresh-on-kid-miss alone would show zero fetches here, and would
-    // instead make the first request after a key rotation pay (and possibly fail) the
-    // fetch, on every replica at once.
+    // With an interval, the cache is warmed at startup and kept warm WITHOUT any mint
+    // traffic. Refresh-on-kid-miss alone shows zero fetches here, and makes the first
+    // request after a key rotation pay (and possibly fail) the fetch on every replica.
     let verifier = Arc::new(
         StandardVerifier::from_config(&StsMintConfig {
             jwks_refresh_secs: 1,

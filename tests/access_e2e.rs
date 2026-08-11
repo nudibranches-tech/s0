@@ -1,8 +1,7 @@
-//! End-to-end enforcement through the real `S3Access` typed hooks: principal →
-//! OPA input → regorus decision → obligation/mutation. Exercises the object
-//! read/deny path, per-key multi-delete filtering (blind spot #2), and single-prefix
-//! list rewrite against the shipped rego — no live backend needed (the hooks
-//! only read the routing table, they never open a backend connection).
+//! End-to-end enforcement through the real `S3Access` typed hooks: principal → OPA input
+//! → regorus decision → obligation/mutation. Exercises the object read/deny path, per-key
+//! multi-delete filtering and single-prefix list rewrite against the shipped rego — no
+//! live backend needed, since the hooks only read the routing table.
 //!
 //! The *security* properties these paths carry (copy exfiltration, verb separation,
 //! unbounded listing) live in `tests/security_regressions.rs`; this file is the happy
@@ -108,10 +107,9 @@ async fn multi_delete_filters_to_authorized_keys() {
 #[tokio::test]
 async fn an_over_broad_list_is_narrowed_to_grant_prefix() {
     // `20` is WIDER than alice's `2024/` grant and overlaps it, so narrowing is the
-    // correct enforcement: the caller named a scope and gets a genuine subset of the
-    // scope it named. An UNBOUNDED list (`prefix: None`) is a different question and
-    // since 2026-08-09 it is a deny, not a narrowing — see
-    // `security_regressions::an_unbounded_list_is_denied_not_silently_narrowed`.
+    // correct enforcement: the caller named a scope and gets a genuine subset of it. An
+    // UNBOUNDED list (`prefix: None`) is a different question and a deny, not a narrowing
+    // — see `security_regressions::an_unbounded_list_is_denied_not_silently_narrowed`.
     let fx = common::fixture("e2e-list-narrow", bundle());
     let access = GatewayAccess::new(fx.gw.clone());
     let mut req = fx.request(
@@ -168,8 +166,7 @@ async fn list_multipart_uploads_is_narrowed_to_grant_prefix() {
         ListMultipartUploadsInput {
             bucket: "reports".into(),
             // Wider than alice's `2024/` grant, and overlapping it. An unbounded
-            // request (`None`) is denied since 2026-08-09, so it cannot exercise the
-            // narrowing this test is about.
+            // request (`None`) is denied, so it cannot exercise this narrowing.
             prefix: Some("20".into()),
             ..Default::default()
         },
@@ -185,9 +182,7 @@ async fn multi_prefix_list_allows_and_stashes_fanout() {
     let fx = common::fixture("e2e-fanout", bundle());
     let access = GatewayAccess::new(fx.gw.clone());
     // `multi` holds list grants on two prefixes. A request for `20` is wider than both
-    // and overlaps both, so it fans out to the two granted scopes. (The same fan-out
-    // used to be reachable with no prefix at all; since 2026-08-09 an unbounded list is
-    // denied instead, which changed the request shape here but not the fan-out.)
+    // and overlaps both, so it fans out to the two granted scopes.
     let mut req = fx.request_as(
         "multi",
         "ListObjectsV2",

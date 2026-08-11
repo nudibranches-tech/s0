@@ -1,24 +1,12 @@
-//! The ACL / grant-header / tagging / governance-bypass retrofit.
+//! ACL / grant-header / tagging / governance-bypass screening on write paths.
 //!
-//! This is a **regression suite on operations that already shipped**, not new coverage.
-//! Before it existed, `PutObject` was authorized on `(bucket, key)` and nothing else, so
-//! a request carrying `x-amz-acl: public-read` passed the hook untouched, reached RGW,
-//! and made the object world-readable — behind a decision record that said "allowed
-//! write". `CopyObject`, `CreateMultipartUpload`, `CreateBucket` and `PostObject` had the
-//! same hole; `x-amz-grant-*`, `x-amz-tagging` on write and
-//! `x-amz-bypass-governance-retention` were uninspected on top of it.
+//! Without it, a request carrying `x-amz-acl: public-read` would pass the hook untouched,
+//! reach the backend and make the object world-readable behind a decision record that said
+//! "allowed write". `x-amz-grant-*`, `x-amz-tagging` on write and
+//! `x-amz-bypass-governance-retention` are the same class of unauthorized rider.
 //!
-//! **2026-08-08.** M4 answered a *conferring* (non-public) ACL with a second decision on
-//! `write_object_acl`. That verb is gone — an object ACL grants access hyperfluid never
-//! projected and cannot revoke — so those requests are now refused in code too, on all
-//! four write paths, with a real `Deny` record rather than a bare 400. `CreateBucket` is
-//! no longer one of the four: it is `Coverage::Denied`, so its create-time bucket ACL is
-//! refused a step earlier, by the gate, and `security_regressions.rs` covers that.
-//!
-//! Every test here has a positive control, for the reason stated in
-//! `security_regressions.rs`: a deny-all bug would otherwise make the whole file green.
-//!
-//! Two properties are asserted over and over, because they are the ones that matter:
+//! Every test has a positive control: a deny-all bug would otherwise make the file green.
+//! Two properties are asserted throughout:
 //!
 //! 1. **no `AuthzProof` is minted.** A refusal that still stamped the proof would be
 //!    forwarded by the dispatcher regardless of the 403 the hook returned.
@@ -48,13 +36,13 @@ const ALL_USERS: &str = "uri=\"http://acs.amazonaws.com/groups/global/AllUsers\"
 
 /// [`common::alice_bundle`] with a `bucket: "*", actions: ["*"]` grant.
 ///
-/// The DEFAULT ACCESS MODEL seeds exactly this for every org Owner, which is what makes
-/// the code-level refusals load-bearing: a policy-only guard on public ACLs would leave
-/// every Owner one `--acl public-read` away from publishing a patient record. Every
-/// "refused in code" test re-runs against this bundle.
+/// Every org Owner is seeded exactly this, which is what makes the code-level refusals
+/// load-bearing: a policy-only guard on public ACLs would leave every Owner one
+/// `--acl public-read` away from publishing sensitive data. Every "refused in code" test
+/// re-runs against this bundle.
 fn wildcard_bundle() -> serde_json::Value {
     serde_json::json!({
-        "org_settings": { "freeze_writes": false, "reserved_tag_keys": ["hyperfluid/*"] },
+        "org_settings": { "freeze_writes": false, "reserved_tag_keys": ["acme/*"] },
         "tenants": { "acme": {
             "user_attributes": { "alice": { "groups": [], "attributes": [] } },
             "bucket_attributes": { "reports": { "denylist": {} } },
@@ -92,16 +80,13 @@ async fn sole_refusal(fx: &common::Fixture) -> AuditRecord {
     rec
 }
 
-// ── the headline defect: a public ACL on a write ────────────────────────────────
+// ── a public ACL on a write ─────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn put_object_with_x_amz_acl_public_read_is_refused() {
-    // THE regression. `aws s3 cp --acl public-read` used to succeed against a gateway
-    // whose entire purpose is to be the authorization point.
-    //
-    // Refused rather than stripped, deliberately: see `s0::access::headers` for the
-    // argument. A strip would answer 200 to a request whose stated intent was not
-    // honoured, and nothing in the response would say so.
+    // Refused rather than stripped, deliberately: see `s0::access::headers`. A strip would
+    // answer 200 to a request whose stated intent was not honoured, and nothing in the
+    // response would say so.
     for bundle in [common::alice_bundle(), wildcard_bundle()] {
         let fx = common::fixture("riders-acl-public", bundle);
         let access = GatewayAccess::new(fx.gw.clone());
@@ -142,13 +127,10 @@ async fn put_object_with_x_amz_acl_public_read_is_refused() {
 
 #[tokio::test]
 async fn every_public_canned_acl_is_refused_on_every_write_shaped_op() {
-    // The hole was never PutObject-specific. CopyObject is the worse case of the four:
-    // its destination bucket need not be the source's, so a public ACL there publishes
-    // a copy of data the caller only held read on.
-    //
-    // `CreateBucket` used to be a fifth case here. It is refused at the gate now, which
-    // is strictly earlier and is pinned by
-    // `security_regressions::the_six_control_plane_ops_are_refused_at_the_gate_and_on_the_record`.
+    // The hole is not PutObject-specific. CopyObject is the worst of the four: its
+    // destination bucket need not be the source's, so a public ACL there publishes a copy
+    // of data the caller only held read on. `CreateBucket` is refused at the gate instead,
+    // which is strictly earlier, and `security_regressions.rs` pins that.
     let fx = common::fixture("riders-acl-ops", wildcard_bundle());
     let access = GatewayAccess::new(fx.gw.clone());
     for acl in ["public-read", "public-read-write", "authenticated-read"] {
@@ -264,8 +246,8 @@ async fn each_x_amz_grant_header_is_refused_when_it_names_a_public_group() {
     }
 
     // Positive control: the SAME headers, absent, on the same bundle. It has to be this
-    // rather than "a named grantee is allowed" — since 2026-08-08 a named grantee is
-    // refused too — and without it every assertion above would hold on a deny-all build.
+    // rather than "a named grantee is allowed", since a named grantee is refused too, and
+    // without it every assertion above would hold on a deny-all build.
     let fx = common::fixture("riders-grant-hdr-ok", wildcard_bundle());
     let access = GatewayAccess::new(fx.gw.clone());
     let mut req = fx.request(
@@ -283,15 +265,10 @@ async fn each_x_amz_grant_header_is_refused_when_it_names_a_public_group() {
         .expect("a write carrying no grant header at all");
 }
 
-// `x_amz_grant_write_on_a_bucket_create_is_refused` lived here from M4 until
-// 2026-08-08. `grant-write` exists only on the bucket ACL, and `CreateBucket` was the
-// only enforced op that could carry one — so with `CreateBucket` back to
-// `Coverage::Denied` the header cannot reach a hook at all, and the test would have been
-// asserting a refusal produced by the gate rather than by the rider screening this file
-// is about. `security_regressions::the_six_control_plane_ops_are_refused_at_the_gate_and_on_the_record`
-// covers it now. `AclFields::write` is kept for exactly one reason: it is what makes the
-// ACL normalizer complete, so a future op that CAN carry the header is screened the day
-// it is added rather than the day someone notices.
+// `grant-write` exists only on the bucket ACL, and no enforced op can carry one — the
+// gate refuses `CreateBucket` outright — so there is nothing to screen here.
+// `AclFields::write` is kept anyway: it is what makes the ACL normalizer complete, so a
+// future op that CAN carry the header is screened the day it is added.
 
 #[tokio::test]
 async fn a_canned_acl_this_build_does_not_recognize_is_refused() {
@@ -356,22 +333,15 @@ async fn a_benign_canned_private_acl_is_still_allowed_and_still_recorded() {
 
 #[tokio::test]
 async fn a_named_grantee_acl_is_refused_in_code_on_every_write_path() {
-    // The 2026-08-08 change to this file, and the one that needs the most care, because
-    // it makes the gateway STRICTER than M4 on a request an Owner could previously make.
+    // An object ACL is a SECOND access-control list, held by the backend, that the control
+    // plane does not project, cannot display and cannot revoke. Granting through it is
+    // granting outside the managed access model, so there is no verb to ask the PDP about
+    // and the refusal is unconditional.
     //
-    // M4 modelled a `PutObject` carrying an ACL as two requests — write these bytes, and
-    // set who may read them — and asked the PDP about the second under
-    // `write_object_acl`. AWS models it the same way (`s3:PutObject` + `s3:PutObjectAcl`).
-    // What that modelling could not express is the thing that actually matters here: an
-    // object ACL is a SECOND access-control list, held by the backend, that hyperfluid
-    // does not project, cannot display and cannot revoke. Granting through it is granting
-    // outside the managed access model, which is the one thing the settlement forbids —
-    // so the verb was removed and there is nothing left to ask.
-    //
-    // Four write paths, all four asserted, because the refusal now lives in
-    // `screen_riders` and a hook that stopped routing through it would silently reopen
-    // exactly the hole this file exists for. The bundle is the WILDCARD one on purpose:
-    // `"actions": ["*"]` is what every org Owner is seeded, and it must not help.
+    // All four write paths are asserted, because the refusal lives in `screen_riders` and a
+    // hook that stopped routing through it would silently reopen the hole. The bundle is
+    // the WILDCARD one on purpose: `"actions": ["*"]` is what every org Owner is seeded,
+    // and it must not help.
     let fx = common::fixture("riders-acl-conferring", wildcard_bundle());
     let access = GatewayAccess::new(fx.gw.clone());
 
@@ -575,8 +545,8 @@ async fn a_multi_delete_carrying_the_bypass_header_is_refused_whole() {
 
 #[tokio::test]
 async fn a_tag_write_to_a_reserved_key_is_refused() {
-    // The self-elevation guard. If a policy conditions a grant on `hyperfluid/*`, a
-    // principal that can write that key can satisfy the condition with data it supplies
+    // The self-elevation guard. If a policy conditions a grant on a reserved tag key, a
+    // principal that can write that key satisfies the condition with data it supplies
     // itself — write_object_tags being a separate verb is necessary and not sufficient,
     // because a principal legitimately holding it on its own prefix can still elevate
     // *within* that prefix.
@@ -588,7 +558,7 @@ async fn a_tag_write_to_a_reserved_key_is_refused() {
             PutObjectTaggingInput {
                 tagging: Tagging {
                     tag_set: vec![Tag {
-                        key: Some("hyperfluid/classification".into()),
+                        key: Some("acme/classification".into()),
                         value: Some("public".into()),
                     }],
                 },
@@ -610,7 +580,7 @@ async fn a_tag_write_to_a_reserved_key_is_refused() {
         // The proposed set is on the record, not the object's current one: the decision
         // is about the state the object is entering.
         let tags = rec.input.expect("an input").requested_tags.expect("tags");
-        assert_eq!(tags["hyperfluid/classification"], "public");
+        assert_eq!(tags["acme/classification"], "public");
     }
 
     // Positive control: an unreserved key under the same bundle is allowed.
@@ -630,12 +600,11 @@ async fn a_tag_write_to_a_reserved_key_is_refused() {
 
 #[tokio::test]
 async fn tagging_is_inert_when_reserved_tag_keys_is_absent() {
-    // THE shipped default. Until hyperfluid publishes the list, every tag write is
+    // THE shipped default. Until the control plane publishes the list, every tag write is
     // refused — including one that names no keys at all (`DeleteObjectTagging`) and one
     // riding inline on a `PutObject`. An absent security-relevant input must not read as
-    // "no restriction"; the alternative default is indistinguishable from a correctly
-    // configured deployment right up to the moment someone writes the first ABAC
-    // condition.
+    // "no restriction": that default is indistinguishable from a correctly configured
+    // deployment right up to the first ABAC condition someone writes.
     let fx = common::fixture("riders-inert", common::bundle_without_reserved_tag_keys());
     let access = GatewayAccess::new(fx.gw.clone());
 
@@ -862,11 +831,10 @@ async fn an_ambiguous_tagging_header_is_refused_rather_than_guessed() {
 
 #[tokio::test]
 async fn no_strip_obligation_exists_and_a_policy_emitting_one_denies() {
-    // Master plan §2.3 offers `strip_request_fields`; open question 6 asks whether it
-    // should exist at all. It does not, and `deny_unknown_fields` on `Obligations` turns
-    // a policy that emits it into a denial — the correct behaviour for an obligation this
-    // PEP will not apply, and the same mechanism that protects every other unimplemented
-    // obligation.
+    // There is no `strip_request_fields` obligation, and `deny_unknown_fields` on
+    // `Obligations` turns a policy that emits one into a denial — the correct behaviour
+    // for an obligation this PEP will not apply, and the same mechanism that protects
+    // every other unimplemented obligation.
     assert!(
         !s0::authz::IMPLEMENTED_OBLIGATIONS.contains(&"strip_request_fields"),
         "shipping a strip switch means the first thing a frustrated operator does when \

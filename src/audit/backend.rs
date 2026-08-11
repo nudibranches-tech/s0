@@ -1,26 +1,13 @@
-//! Where a batch of audit records actually goes.
+//! Where a batch of audit records actually goes. **A backend must never fail the
+//! request**: `ship` returns `Err(String)` and the worker spills.
 //!
-//! The worker in [`super::sink`] owns batching, spilling, replay and the drop counters
-//! — all of which are transport-independent. This trait is the one seam that is not:
-//! it exists so the destination can be retargeted without reopening any of that.
+//! The worker in [`super::sink`] owns batching, spilling, replay and the drop counters,
+//! all of which are transport-independent. This trait is the one seam that is not, so
+//! retargeting the destination never means reopening the spill state machine.
 //!
-//! That is not speculative. The audit trail is scheduled to move to Kafka → Iceberg,
-//! and the control-plane HTTP endpoint it POSTs to today is a decision-log ingest that
-//! predates this gateway. A `KafkaBackend` must be a new file, not a rewrite of the
-//! spill state machine — the part of the pipeline whose failure mode is silent record
-//! loss is the part that must stop being edited.
-//!
-//! Two backends ship:
-//!
-//! - [`ControlPlaneBackend`] — the batched POST that exists today. Default.
-//! - [`StdoutNdjsonBackend`] — one flat JSON line per record on stdout, which the
-//!   `vlagent` already tailing every pod ships to VictoriaLogs for free. This is the
-//!   pattern hyperfluid's Bifrost access events use
-//!   (`rust/hf_module_bifrost/src/access_event.rs`), down to the `hf_event`
-//!   discriminator LogsQL filters on.
-//!
-//! **A backend must never fail the request.** `ship` returns `Err(String)` and the
-//! worker spills; nothing here is on the data path.
+//! - [`ControlPlaneBackend`] — batched POST to the decision-log endpoint. Default.
+//! - [`StdoutNdjsonBackend`] — one flat JSON line per record on stdout, for whatever log
+//!   agent already tails the pod.
 
 use std::io::Write;
 
@@ -28,10 +15,10 @@ use serde::Serialize;
 
 use super::record::AuditRecord;
 
-/// The `hf_event` discriminator on every stdout line. LogsQL selects the gateway
-/// decision stream out of the namespace's combined log firehose with this literal, so
-/// it is a cross-service contract: do not rename it without the Console-side query.
-pub const HF_EVENT: &str = "s3_gateway_decision";
+/// The `event` discriminator on every stdout line. A log-query language selects the
+/// gateway decision stream out of a namespace's combined firehose with this literal, so
+/// it is a consumer contract: do not rename it without the query that reads it.
+pub const EVENT_KIND: &str = "s3_gateway_decision";
 
 /// A destination for assembled batches of audit records.
 ///
@@ -39,9 +26,8 @@ pub const HF_EVENT: &str = "s3_gateway_decision";
 /// worker calls `ship` from its own task, but replay and flush can both be in flight.
 #[async_trait::async_trait]
 pub trait AuditBackend: Send + Sync + 'static {
-    /// Stable name, for logs and for the startup line that tells an operator where
-    /// their audit trail is going. A gateway whose audit destination is a mystery is
-    /// the same problem as one with no audit at all.
+    /// Stable name, for logs and for the startup line that tells an operator where their
+    /// audit trail is going.
     fn name(&self) -> &'static str;
 
     /// Ship a whole batch, atomically from the worker's point of view: on `Err` the
@@ -85,21 +71,19 @@ impl AuditBackend for ControlPlaneBackend {
 }
 
 /// One record per line on stdout, as a flat top-level JSON object carrying the
-/// [`HF_EVENT`] discriminator.
+/// [`EVENT_KIND`] discriminator.
 ///
-/// Written **directly** to stdout rather than through `tracing::info!`, for the same
-/// reason Bifrost does: `main` installs `tracing_subscriber::fmt().json()`, which wraps
-/// a message inside `{"timestamp":…,"fields":{"message":"…"}}`. The record would arrive
-/// as a JSON *string* nested two levels down, and `unpack_json` on the query side would
-/// see one opaque field. A direct write guarantees the printed line is byte-for-byte
-/// the object the contract promises.
+/// Written **directly** to stdout rather than through `tracing::info!`, whose JSON
+/// formatter wraps a message in `{"timestamp":…,"fields":{"message":"…"}}` — the record
+/// would arrive as a string nested two levels down, and a log query would see one opaque
+/// field.
 pub struct StdoutNdjsonBackend;
 
 /// The wire line: the discriminator, then the record's own fields flattened up to the
-/// top level so LogsQL's `unpack_json` yields queryable fields rather than one blob.
+/// top level, so a log query yields queryable fields rather than one opaque blob.
 #[derive(Serialize)]
 struct NdjsonLine<'a> {
-    hf_event: &'static str,
+    event: &'static str,
     #[serde(flatten)]
     record: &'a AuditRecord,
 }
@@ -111,7 +95,7 @@ impl StdoutNdjsonBackend {
         let mut out = String::with_capacity(batch.len() * 512);
         for record in batch {
             let line = serde_json::to_string(&NdjsonLine {
-                hf_event: HF_EVENT,
+                event: EVENT_KIND,
                 record,
             })
             .map_err(|e| e.to_string())?;
@@ -130,14 +114,10 @@ impl AuditBackend for StdoutNdjsonBackend {
 
     async fn ship(&self, batch: &[AuditRecord]) -> Result<(), String> {
         let rendered = Self::render(batch)?;
-        // One locked write for the whole batch: interleaving with the tracing writer
-        // mid-line would corrupt both streams, and a partial line is an unparseable
-        // record on the ingest side.
-        //
-        // On `spawn_blocking` rather than a bare write or `block_in_place`: writing to
-        // stdout blocks when the consumer (the container runtime's log pipe) is slow,
-        // and `block_in_place` panics outright on a current-thread runtime, which is
-        // what every `#[tokio::test]` uses. This shape works on both flavours.
+        // One locked write per batch: interleaving with the tracing writer mid-line
+        // corrupts both streams, and a partial line is an unparseable record. On
+        // `spawn_blocking` because a slow log consumer blocks the write, and
+        // `block_in_place` panics on the current-thread runtime `#[tokio::test]` uses.
         tokio::task::spawn_blocking(move || {
             let stdout = std::io::stdout();
             let mut lock = stdout.lock();
@@ -194,6 +174,7 @@ mod tests {
                 backend: BackendOutcome::NotAttempted,
                 backend_status: None,
             },
+            &crate::audit::LabelPolicy::default(),
         )
     }
 
@@ -209,10 +190,10 @@ mod tests {
 
         for (line, id) in lines.iter().zip(["a", "b"]) {
             // Each line must be a complete, bare JSON object — nothing before it, no
-            // continuation after it. A wrapped or split line is unparseable by
-            // `unpack_json` on the ingest side, which is a silently lost record.
+            // continuation after it. A wrapped or split line is unparseable on the
+            // ingest side, which is a silently lost record.
             let v: serde_json::Value = serde_json::from_str(line).expect("a bare JSON object");
-            assert_eq!(v["hf_event"], HF_EVENT);
+            assert_eq!(v["event"], EVENT_KIND);
             // The record's own fields are at the TOP level, not nested under a key.
             assert_eq!(v["decision_id"], id);
             assert_eq!(v["requested_by"], "alice");
@@ -228,11 +209,11 @@ mod tests {
         // newline stays inside one line — this asserts that rather than assuming it.
         let mut rec = record("nl");
         if let Some(input) = rec.input.as_mut() {
-            input.object = Some("evil\n{\"hf_event\":\"forged\"}".into());
+            input.object = Some("evil\n{\"event\":\"forged\"}".into());
         }
         let rendered = StdoutNdjsonBackend::render(&[rec]).unwrap();
         assert_eq!(rendered.lines().count(), 1, "{rendered}");
         let v: serde_json::Value = serde_json::from_str(rendered.trim_end()).unwrap();
-        assert_eq!(v["input"]["object"], "evil\n{\"hf_event\":\"forged\"}");
+        assert_eq!(v["input"]["object"], "evil\n{\"event\":\"forged\"}");
     }
 }

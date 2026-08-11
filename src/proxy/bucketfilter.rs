@@ -1,35 +1,13 @@
 //! `ListBuckets`: intersect what the backend returned with what the principal was
 //! granted, and paginate the result **gateway-side**.
 //!
-//! ## Why the backend's own pagination cannot be reused
-//!
-//! Filtering breaks it. `max-buckets` and `continuation-token` describe positions in the
-//! backend's list, and once entries are removed from a page those positions no longer
-//! mean anything to the client: a page of 1000 comes back with 3 visible buckets, the
-//! token points into the backend's sequence, and the client is told "here are 3 of your
-//! 1000". So the gateway owns both — it asks the backend for *everything*, filters,
-//! sorts, and cuts its own page. The token a client receives is a gateway token
-//! (`fanout::Cursor`), and one issued under a different grant set is rejected loudly
-//! rather than silently re-based (`Cursor::validate` semantics, same as ADR-004).
-//!
-//! ## Why the merged listing is explicitly **gateway-ordered**
-//!
-//! Accepted review defect B-9. The obvious cursor — "skip while name <= last_name" over
-//! the backend's pages — is only correct if the backend returns buckets in a stable
-//! ascending order across pages, and that is *unverified for RGW*: the S3 API documents
-//! no ordering guarantee for `ListBuckets`, and RGW's bucket listing comes off the user's
-//! bucket index, not a sorted key namespace. Rather than assume it, this module sorts by
-//! name after filtering and pages over the sorted vector. The consequence is stated
-//! rather than hidden: **the order of a `ListBuckets` response from this gateway is the
-//! gateway's, not the backend's**, and it is byte-stable across replicas because it is a
-//! plain lexicographic sort of the names.
-//!
-//! ## Cost
-//!
-//! One request drains the tenant's whole bucket list. That is bounded by
-//! `limits.max_bucket_list_pages` in the caller, and it is the price of not trusting an
-//! ordering the backend does not promise. Bucket counts are per *tenant*, not per
-//! object, so this is tens to hundreds of entries in the deployments this targets.
+//! Filtering breaks the backend's pagination — `max-buckets` and `continuation-token`
+//! describe positions in an unfiltered list — so the gateway drains everything, filters,
+//! sorts by name and cuts its own page. The token is a gateway token (`fanout::Cursor`),
+//! and one issued under a different grant set is refused rather than silently re-based
+//! (ADR-004). The sort is ours because neither S3 nor RGW promises an order for
+//! `ListBuckets`: **the response order is the gateway's, not the backend's**. Draining
+//! costs one full bucket list per request, bounded by `limits.max_bucket_list_pages`.
 
 use s3s::dto::Bucket;
 
@@ -48,10 +26,9 @@ pub struct BucketPage {
 ///
 /// `all` is everything the backend reported (already drained across its own pages).
 /// `name_prefix` is the client's `prefix` parameter, re-applied here because a backend
-/// that ignores it must not be able to widen the answer.
-///
-/// Fails only on a cursor issued under a different visibility scope — the client must
-/// restart the listing, and is told so rather than silently served page 1 again.
+/// that ignores it must not be able to widen the answer. Fails only on a cursor issued
+/// under a different visibility scope: the client is told to restart the listing rather
+/// than silently served page 1 again.
 pub fn page(
     all: Vec<Bucket>,
     visibility: &BucketVisibility,
@@ -71,10 +48,8 @@ pub fn page(
     let mut kept: Vec<Bucket> = all
         .into_iter()
         .filter(|b| {
-            // A bucket the backend returned with no name is dropped, not forwarded: the
-            // decision was made about names, so an entry that has none was never
-            // authorized. It is also not a shape RGW produces — this is the fail-closed
-            // reading of an impossible response rather than a live concern.
+            // The decision was made about names, so a nameless entry was never
+            // authorized. Dropped rather than forwarded.
             let Some(name) = b.name.as_deref() else {
                 return false;
             };

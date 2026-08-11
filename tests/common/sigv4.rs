@@ -1,16 +1,9 @@
-//! A minimal AWS SigV4 signer for raw S3 requests.
+//! A minimal AWS SigV4 signer for raw S3 requests, so the black-box gate test can be
+//! table-driven over every operation s3s can route — including `PostObject`, which no
+//! SDK can express.
 //!
-//! The black-box gate test has to reach **every** operation s3s can route, and an SDK
-//! cannot get there: it exposes one typed builder per operation, so covering the tail
-//! means one hand-written call per op, and it has no way at all to express `PostObject`
-//! (a browser form upload). Driving raw HTTP instead lets the test be table-driven off
-//! the route table extracted from s3s itself.
-//!
-//! The signature must be *real*: s3s verifies it before it resolves the route, so a
-//! bad signature produces a 403 that looks exactly like a gate denial. That failure
-//! mode would make the whole file pass vacuously, which is why every assertion in
-//! `gate_blackbox.rs` checks the error *body* names the operation, and why there are
-//! positive controls signed by this same code.
+//! The signature must be *real*: s3s verifies it before it resolves the route, so a bad
+//! signature produces a 403 that looks exactly like a gate denial.
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
@@ -148,8 +141,7 @@ impl RawRequest {
 }
 
 /// The signature over a base64 POST policy — the only authentication a browser form
-/// upload carries. `PostObject` is unreachable any other way, and it is the operation
-/// whose s3s default *forwards* rather than 501s, so it is the one most worth reaching.
+/// upload carries, and so the only way to reach `PostObject`.
 pub fn sign_post_policy(policy_b64: &str, secret_key: &str, date: &str) -> String {
     hex::encode(hmac(&signing_key(secret_key, date), policy_b64.as_bytes()))
 }
@@ -184,8 +176,8 @@ pub fn uri_encode(input: &str, encode_slash: bool) -> String {
     out
 }
 
-/// Standard base64 with padding. Needed only for the POST policy document; pulling in a
-/// base64 crate for 20 lines would be a dependency for a test fixture.
+/// Standard base64 with padding, for the POST policy document. Hand-rolled to keep a
+/// test fixture from adding a dependency.
 pub fn base64(input: &[u8]) -> String {
     const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);

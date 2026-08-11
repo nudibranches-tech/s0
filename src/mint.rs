@@ -1,31 +1,13 @@
-//! STS mint — the "badge desk". A backend-agnostic control-plane endpoint:
-//! it verifies a Keycloak OIDC token and issues short-lived **gateway** credentials
-//! that the gateway itself later verifies (derived secrets, [`crate::auth::sts`]).
+//! STS mint: a backend-agnostic control-plane endpoint that verifies an OIDC token and
+//! issues short-lived **gateway** credentials the gateway itself later verifies
+//! (derived secrets, [`crate::auth::sts`]). No object-store backend is involved.
 //!
-//! No backend (Ceph/RGW/RustFS/…) is ever involved — this supersedes RGW's STS
-//! and works identically regardless of what object store sits behind the gateway.
-//!
-//! # Two doors, one socket
-//!
-//! This listener serves two protocols, and which one a request gets is decided by the
-//! request itself — not by a path:
-//!
-//! * **`Action=AssumeRoleWithWebIdentity`** (a form-encoded body carrying an `Action`
-//!   parameter) ⇒ the AWS STS query protocol, XML in and out. This is the door every S3
-//!   SDK can use with stock configuration, and it is the only one that can mint a
-//!   *service-account* session. It lives in [`crate::webidentity`], which carries the
-//!   design argument.
-//! * **anything else** ⇒ the original bearer-token JSON exchange below.
-//!
-//! Discriminating on the presence of `Action` rather than on a URL path is what the AWS
-//! query protocol *is* — an SDK POSTs to `/` and puts the action in the body — so there
-//! is no path to get subtly wrong, and a request that carries no `Action` cannot reach
-//! the STS surface at all.
-//!
-//! Both doors are unauthenticated in the sense that no *platform* credential is
-//! presented, and that is correct rather than tolerated: the OIDC token **is** the
-//! credential, exactly as at `sts.amazonaws.com`. It is why this socket is not, and must
-//! never become, the socket [`crate::internal`] serves on.
+//! One socket, two protocols, told apart by the request rather than by a path: a body
+//! carrying `Action=AssumeRoleWithWebIdentity` gets the AWS STS query protocol
+//! ([`crate::webidentity`], XML in and out, the only door that can mint a
+//! service-account session); anything else gets the bearer-token JSON exchange below.
+//! Both doors are unauthenticated because the OIDC token **is** the credential, exactly
+//! as at `sts.amazonaws.com` — which is why [`crate::internal`] never shares this socket.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -65,7 +47,7 @@ pub struct VerifiedIdentity {
     pub org: String,
 }
 
-/// Which claims carry tenant/org/groups (Keycloak custom claims are deployment-named).
+/// Which claims carry tenant/org/groups (custom claim names are deployment-specific).
 #[derive(Debug, Clone)]
 pub struct ClaimNames {
     pub sub: String,
@@ -163,12 +145,10 @@ impl StandardVerifier {
 
     /// Keep the JWKS cache warm in the background.
     ///
-    /// Refresh-on-`kid`-miss alone is a cold cache: the first request after a key
-    /// rotation pays an inline IdP fetch and *fails* if the IdP is briefly
-    /// unreachable — for every replica independently, which is exactly when a
-    /// rotation looks like a fleet-wide mint outage. A no-op for a PEM key source or
-    /// a zero interval. Returns the task handle so the caller can abort it on
-    /// shutdown; dropping it detaches the task.
+    /// Refresh-on-`kid`-miss alone is a cold cache: the first request after a rotation
+    /// pays an inline IdP fetch and fails if the IdP is briefly unreachable, on every
+    /// replica at once. A no-op for a PEM key source or a zero interval; the returned
+    /// handle lets the caller abort the task on shutdown.
     pub fn spawn_jwks_refresh(self: &Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
         let KeySource::Jwks {
             refresh_interval, ..
@@ -291,26 +271,13 @@ impl OidcVerifier for StandardVerifier {
     }
 }
 
-/// The web-identity door's verification, which is deliberately **not** `verify()`.
-///
-/// Same signing key, same issuer, same expiry enforcement — three differences, each one
-/// a thing the bearer door gets right for itself and wrong for this one:
-///
-/// 1. it returns the **raw claims**, because the tenant and organization are resolved
-///    from the `RoleArn` and the routing table rather than from claims that hyperfluid's
-///    Keycloak does not mint;
-/// 2. the audience check is the `aud`-or-`azp` rule ([`Self::audience_is_accepted`])
-///    rather than `jsonwebtoken`'s strict `aud`, so a service-account token is usable —
-///    and it is applied by [`crate::webidentity::WebIdentitySts::addressed_to_this_gateway`]
-///    rather than here, because since the bundle route it also needs the tenant out of
-///    the `RoleArn`, which this trait never sees;
-/// 3. an **expired** token is reported as `ExpiredTokenException` rather than folded
-///    into a generic invalid-token error, because an SDK treats the two differently: an
-///    expiry means "re-read the projected token file and retry", and any other invalid
-///    token means "stop".
-///
-/// `verify()` is untouched by all of this. Two doors with two threat models sharing one
-/// verification function is how one of them silently acquires the other's leniency.
+/// The web-identity door's verification, deliberately **not** `verify()`: it returns the
+/// **raw claims** (tenant and org come from the `RoleArn` and the routing table), leaves
+/// the audience check to [`Self::audience_is_accepted`], applied by
+/// [`crate::webidentity::WebIdentitySts::addressed_to_this_gateway`] where the `RoleArn`
+/// tenant is also in scope, and reports an expired token as `ExpiredTokenException` so an
+/// SDK retries instead of stopping. Two threat models sharing one verification function
+/// is how one of them silently acquires the other's leniency.
 #[async_trait::async_trait]
 impl WebIdentityVerifier for StandardVerifier {
     async fn verify_token(&self, token: &str) -> std::result::Result<Value, StsRefusal> {
@@ -336,16 +303,11 @@ impl WebIdentityVerifier for StandardVerifier {
 
     /// Does this token name one of the audiences this gateway serves?
     ///
-    /// Accepts a match on `aud` (string **or** array — a JWT `aud` is legally either)
-    /// or on `azp`/`client_id`. The `azp` fallback is what makes a Keycloak
-    /// service-account token usable at all: `grant_type=client_credentials` produces
-    /// `aud: "account"` and names the client only in `azp`. Ceph RGW and MinIO both do
-    /// exactly this, and the operator renders the same client-id list it already gives
-    /// RGW's role, so a token that works against one works against the other.
-    ///
-    /// **Unchanged by the bundle route.** This is still the whole of the configured
-    /// answer; the bundle is consulted only where this returns `false`, and only for the
-    /// tenant the `RoleArn` named.
+    /// Matches `aud` (string **or** array — a JWT `aud` is legally either) or
+    /// `azp`/`client_id`. The `azp` fallback is what makes a service-account token usable
+    /// at all: `grant_type=client_credentials` commonly yields `aud: "account"` with the
+    /// client named only in `azp`. This is the whole of the *configured* answer; the
+    /// bundle is consulted only where this returns `false`, for the `RoleArn`'s tenant.
     fn audience_is_accepted(&self, claims: &Value) -> bool {
         let accepted = self.accepted_audiences();
         let matches = |v: &str| accepted.contains(&v);
@@ -386,7 +348,7 @@ fn empty_jwks() -> JwkSet {
     serde_json::from_str(r#"{"keys":[]}"#).expect("empty jwks")
 }
 
-/// What an anonymous caller may make this listener do (F13).
+/// What an anonymous caller may make this listener do.
 ///
 /// Every field here bounds something an **unauthenticated** caller controls, because
 /// this is the one socket on which nothing else does. See [`StsMintConfig`] for the
@@ -421,14 +383,10 @@ impl MintLimits {
 
 /// Counters for the mint listener, scraped through the admin listener.
 ///
-/// These exist because **a silently refused mint looks to an operator exactly like a
-/// broken IdP**. Both produce "clients cannot get credentials" with a healthy-looking
-/// gateway, and the two have opposite remedies — raise a bound here, or go and fix
-/// Keycloak. Without a counter at the point where the bound bites, the only way to
-/// tell them apart is to guess.
-///
-/// Held behind an `Arc` shared by the mint and `admin::AdminState`, so the numbers on
-/// `/metrics` are the ones the accept loop is actually keeping and not a second copy.
+/// A silently refused mint looks to an operator exactly like a broken identity provider:
+/// both read as "clients cannot get credentials" with a healthy-looking gateway, and the
+/// remedies are opposite. The `Arc` is shared with `admin::AdminState`, so `/metrics`
+/// publishes the numbers the accept loop actually keeps rather than a second copy.
 #[derive(Debug, Default)]
 pub struct MintMetrics {
     /// The configured `max_connections`, published so the saturation counter below is
@@ -458,11 +416,10 @@ impl MintMetrics {
 
 /// A once-per-interval gate on a log line an anonymous caller can trigger at will.
 ///
-/// The counters above are always exact; only the *line* is throttled. Without this,
-/// the two lines that report a bound biting are themselves an amplification: an
-/// attacker holding the cap open would emit one `warn` per accepted connection, and
-/// this deployment ships logs off the node — so the observability added to make an
-/// attack visible would be the second half of the attack.
+/// The counters above stay exact; only the *line* is throttled. Unthrottled, the warning
+/// that reports a bound biting is itself an amplification — one `warn` per accepted
+/// connection, shipped off the node — so the observability added to make an attack
+/// visible would be the second half of the attack.
 #[derive(Debug)]
 struct LogThrottle {
     interval: Duration,
@@ -510,18 +467,12 @@ pub struct Mint {
     metrics: Arc<MintMetrics>,
 }
 
-/// AssumeRoleWithWebIdentity-shaped response.
+/// AssumeRoleWithWebIdentity-shaped response, shared with [`crate::internal`] on purpose:
+/// a session minted through either door is then indistinguishable on the wire as well as
+/// in the key ring. The four field names are a control-plane contract.
 ///
-/// Public and shared with [`crate::internal`] on purpose: the console-mediated
-/// session endpoint answers with **this** type rather than a second credential shape,
-/// so a session minted through either door is indistinguishable on the wire as well
-/// as in the key ring. hyperfluid's `MintedSession` deserializes exactly these four
-/// field names; they are pinned from both sides by `tests/cross_repo_contract.rs`.
-///
-/// No `Debug`: three of its four fields are a live credential, and the strongest
-/// available guarantee that they never reach a log line is that `{:?}` on this type
-/// does not compile. (Its hyperfluid counterpart makes the same choice, for the same
-/// stated reason.)
+/// No `Debug`: three of its four fields are a live credential, and `{:?}` failing to
+/// compile is the strongest available guarantee that they never reach a log line.
 #[derive(Serialize)]
 pub struct MintedCredentials {
     #[serde(rename = "AccessKeyId")]
@@ -547,11 +498,9 @@ impl From<crate::auth::sts::SessionCredentials> for MintedCredentials {
 
 /// Ceiling on a mint request body.
 ///
-/// A web identity token is the body's whole bulk, and a Keycloak access token carrying a
-/// realm's worth of role claims is routinely 4–8 KiB, so this is generous where the
-/// internal endpoint's 16 KiB is not. It is still a bound, and it is the *only* one on
-/// this socket: the listener is unauthenticated by design, so what an anonymous caller
-/// can make this process allocate is decided here and nowhere else.
+/// A web identity token is the body's whole bulk, and an access token carrying a realm's
+/// worth of role claims is routinely 4–8 KiB, so this is deliberately generous. It is
+/// still the only bound on what an anonymous caller can make this process allocate.
 const MAX_MINT_BODY_BYTES: usize = 64 * 1024;
 
 impl Mint {
@@ -561,9 +510,8 @@ impl Mint {
             sts,
             ttl,
             web_identity: None,
-            // Defaulted rather than required, so a caller that predates F13 — every
-            // test harness, and anyone embedding this crate — is bounded rather than
-            // unbounded. "No limits configured" must never mean "no limits".
+            // Defaulted rather than required: for a test harness or anyone embedding
+            // this crate, "no limits configured" must never mean "no limits".
             limits: MintLimits::default(),
             metrics: Arc::new(MintMetrics::default()),
         }
@@ -576,7 +524,7 @@ impl Mint {
         self
     }
 
-    /// Override the listener's hardening bounds (F13). Omitted ⇒
+    /// Override the listener's hardening bounds. Omitted ⇒
     /// [`MintLimits::default`], never "unbounded".
     #[must_use]
     pub fn with_limits(mut self, limits: MintLimits) -> Self {
@@ -767,9 +715,7 @@ fn json_ok(body: Vec<u8>) -> Response<Full<Bytes>> {
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/json")
-        // A credential must not be cached by anything on the way to the client. The
-        // internal endpoint has always said so; this one did not, and the body is the
-        // same kind of thing.
+        // A credential must not be cached by anything on the way to the client.
         .header("cache-control", "no-store")
         .body(Full::new(Bytes::from(body)))
         .expect("response")
@@ -790,32 +736,18 @@ const MINT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Ceiling on one HTTP/1 message head, and on an HTTP/2 header list.
 ///
-/// **hyper does bound this already**, and the bound is real but sized for a general
-/// server: h1 refuses a head larger than `DEFAULT_MAX_BUFFER_SIZE` (8 KiB + 100 × 4 KiB
-/// ≈ **408 KiB**) or carrying more than `DEFAULT_MAX_HEADERS` (**100**) fields, with a
-/// `431 Request Header Fields Too Large`; h2 advertises
-/// `DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE` = **16 KiB**. So the failure mode is bounded
-/// either way and nothing here is load-bearing for correctness.
-///
-/// It is tightened to 64 KiB because on *this* socket the multiplier is
+/// hyper bounds both already (h1 ~408 KiB, h2 16 KiB), so this is not load-bearing for
+/// correctness. It is tightened because on this socket the multiplier is
 /// `max_connections` × an anonymous caller's discretion: 408 KiB × 256 is ~100 MiB of
-/// header buffer an unauthenticated client can ask this process to hold, to serve a
-/// request whose real headers are a `Host`, a `Content-Type` and a `Content-Length`.
-/// 64 KiB is the same number as [`MAX_MINT_BODY_BYTES`] and eight times the largest
-/// thing that legitimately appears in a mint header — a Keycloak access token on the
-/// bearer door's `Authorization` line, routinely 4–8 KiB.
-///
-/// The header-count default (100) is left alone: it is already far below anything a
-/// mint request carries, and re-stating it here would be a second place to keep in
-/// sync with hyper for no gain.
+/// header buffer, to serve a request whose real headers are a `Host`, a `Content-Type`
+/// and a `Content-Length`. hyper's header *count* default is left alone.
 const MINT_MAX_HEADER_BYTES: usize = 64 * 1024;
 
 /// Concurrent HTTP/2 streams per mint connection.
 ///
-/// Without a bound of the right order the connection cap means nothing over h2: hyper
-/// defaults to 200 streams per connection, so `max_connections` × 200 = 51 200
-/// concurrent in-flight mints behind a bound that says 256. A mint client opens a
-/// connection, POSTs once, and reads one XML document; 32 is already 32× that.
+/// Without it the connection cap means nothing over h2: hyper's default of 200 streams
+/// makes `max_connections` × 200 = 51 200 in-flight mints behind a bound that says 256.
+/// A mint client opens a connection, POSTs once, and reads one XML document.
 const MINT_MAX_CONCURRENT_STREAMS: u32 = 32;
 
 /// How often the two "a bound is biting" lines may speak. See [`LogThrottle`].
@@ -829,10 +761,8 @@ pub async fn serve(mint: Arc<Mint>, listen: SocketAddr) -> Result<()> {
 
 /// As [`serve`], with a caller-supplied shutdown trigger.
 ///
-/// The mint gets the same treatment as the S3 listener, and for the same reason: it
-/// used to be an infinite accept loop with no signal handling, so on every rolling
-/// update its task was aborted mid-request when the runtime dropped. The visible
-/// symptom is sporadic credential-issuing failures on each deploy — indistinguishable
+/// An accept loop without signal handling is aborted mid-request when the runtime drops,
+/// so every rolling update yields sporadic credential-issuing failures — indistinguishable
 /// from an IdP problem, and retried by clients into a thundering herd.
 pub async fn serve_with_shutdown(
     mint: Arc<Mint>,
@@ -842,51 +772,18 @@ pub async fn serve_with_shutdown(
     serve_on(mint, TcpListener::bind(listen).await?, shutdown).await
 }
 
-/// As [`serve_with_shutdown`], on an already-bound listener.
+/// As [`serve_with_shutdown`], on an already-bound listener, so a test that needs the
+/// port can bind `127.0.0.1:0` itself rather than racing bind-drop-rebind.
 ///
-/// Split out for the same reason `internal::serve_on` is: a test that must know the
-/// port has to bind `127.0.0.1:0` itself, and the alternative — bind, read the port,
-/// drop, hand the address to `serve_with_shutdown` — is a race that another test in
-/// the same run can win. Everything below is what production runs.
-///
-/// # What bounds this listener (F13)
-///
-/// The mint is the one socket that is **both internet-facing and unauthenticated by
-/// design**: the web identity token *is* the credential, exactly as at
-/// `sts.amazonaws.com`, so there is nothing to check before serving a request, and the
-/// Ingress in front of it applies no rate limiting (Cilium's Ingress has no rate-limit
-/// annotation, and an nginx-shaped key would be silently ignored — protection that
-/// confers nothing). Every bound therefore lives here:
-///
-/// | bound | where | default |
-/// |---|---|---|
-/// | concurrent connections | `Semaphore`, permit taken **before** `accept` | 256 |
-/// | connection lifetime | `tokio::time::timeout` around the watched connection | 30 s |
-/// | request body | [`MAX_MINT_BODY_BYTES`] via `Limited`, in [`Mint::route`] | 64 KiB |
-/// | header block / h2 header list | [`MINT_MAX_HEADER_BYTES`] | 64 KiB |
-/// | h2 streams per connection | [`MINT_MAX_CONCURRENT_STREAMS`] | 32 |
-///
-/// The connection bound is deliberately the **same mechanism** the S3 data plane
-/// already uses (`server::serve_with_shutdown`), down to taking the permit before the
-/// accept and putting both inside the shutdown `select!`, so there is one idiom in this
-/// repository rather than two. Taking the permit first is what makes the bound a
-/// *queue*: excess connections wait in the kernel's accept backlog instead of being
-/// answered with an error, so no legitimate mint is ever refused by it. What an
-/// operator sees instead is [`MintMetrics::connection_limit_saturated`] and a throttled
-/// `warn`.
-///
-/// The lifetime bound is **not** hyper's `header_read_timeout`, and that is not an
-/// oversight: that knob needs a timer on the h1 builder that does not survive
-/// `into_owned()`, so it panics once per connection. This project added it once and
-/// removed it (see the NOTE in `server::serve_with_shutdown`); reintroducing that shape
-/// on the credential path would turn a hardening change into an outage. A plain
-/// `timeout` around the connection future has no such coupling and bounds strictly
-/// more: the whole connection, not only its header read.
-///
-/// Graceful draining is unchanged and still wraps the connection *inside* the timeout,
-/// so a bound that fires during a drain releases the `GracefulShutdown` guard rather
-/// than holding the drain open — a bound that broke clean draining would trade F13 for
-/// the problem `serve_with_shutdown` was written to fix.
+/// This is the one socket that is both internet-facing and unauthenticated by design —
+/// the web identity token *is* the credential — and nothing in front of it rate-limits,
+/// so every bound lives here: [`MintLimits`], [`MAX_MINT_BODY_BYTES`],
+/// [`MINT_MAX_HEADER_BYTES`], [`MINT_MAX_CONCURRENT_STREAMS`]. The permit is taken
+/// **before** `accept`, so excess connections queue in the kernel backlog instead of
+/// being refused, and saturation surfaces as
+/// [`MintMetrics::connection_limit_saturated`] plus a throttled `warn`. The lifetime
+/// bound is a plain `timeout` around the *watched* connection, so it releases the
+/// `GracefulShutdown` guard rather than holding a drain open.
 pub async fn serve_on(
     mint: Arc<Mint>,
     listener: TcpListener,
@@ -922,11 +819,9 @@ pub async fn serve_on(
     tokio::pin!(shutdown);
 
     loop {
-        // The permit comes before the accept, exactly as on the data plane. Trying
-        // first rather than awaiting straight away is not an optimisation: the failed
-        // try IS the moment the bound bites, and it is the only moment at which an
-        // operator can be told. A silently queued mint is indistinguishable from a
-        // broken IdP.
+        // Trying first rather than awaiting straight away is not an optimisation: the
+        // failed try IS the moment the bound bites, and the only moment an operator can
+        // be told. A silently queued mint is indistinguishable from a broken IdP.
         let permit = match conn_limit.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
@@ -1105,17 +1000,16 @@ mod tests {
 
     /// **The check that decides whether a service account can use this gateway.**
     ///
-    /// A Keycloak `grant_type=client_credentials` token carries `aud: "account"` and
-    /// names its client only in `azp`. A strict `aud` check — which is exactly what the
-    /// bearer door does, correctly, for itself — refuses every one of them, i.e. the
-    /// primary consumer of the whole product.
+    /// A `grant_type=client_credentials` token carries `aud: "account"` and names its
+    /// client only in `azp`, so the strict `aud` check the bearer door correctly uses
+    /// for itself would refuse every one of them.
     #[test]
     fn the_web_identity_door_accepts_a_service_account_token_on_azp() {
         let v = verifier_with_web_identity_audiences(vec![
             "acme-storage".into(),
             "control-plane-sa".into(),
         ]);
-        // The real shape Keycloak issues for a service account.
+        // The shape an IdP issues for a service account.
         assert!(v.audience_is_accepted(&serde_json::json!({
             "aud": "account", "azp": "acme-storage"
         })));
@@ -1151,13 +1045,10 @@ mod tests {
     }
 
     /// The saturation and timeout lines are triggerable by an anonymous caller at will,
-    /// so the throttle in front of them is load-bearing: without it, the observability
-    /// added to make a flood visible would itself be the second half of the flood
-    /// (these logs are shipped off the node).
-    ///
-    /// What must NOT be throttled is the counting — `MintMetrics` stays exact — and the
-    /// suppressed tally has to reach the line that does get emitted, or an operator
-    /// reads "this happened once" for something that happened ten thousand times.
+    /// so the throttle in front of them is load-bearing. What must NOT be throttled is
+    /// the counting, and the suppressed tally has to reach the line that is emitted, or
+    /// an operator reads "this happened once" for something that happened ten thousand
+    /// times.
     #[test]
     fn the_pressure_log_speaks_once_per_interval_and_reports_what_it_swallowed() {
         let throttle = LogThrottle::new(Duration::from_secs(3600));

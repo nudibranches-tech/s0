@@ -7,8 +7,9 @@ name: e2e
 # client and a real S3-compatible backend, not mocks.
 
 on:
+  # See ci.yml: `main` plus pull requests, so a PR from a topic branch runs once.
   push:
-    branches: ["main", "master", "feat/**", "fix/**"]
+    branches: ["main"]
   pull_request:
 
 concurrency:
@@ -19,6 +20,13 @@ jobs:
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      # The same scenarios against both engines. The sidecar is the shipping default;
+      # the embedded engine is the gated fast path. A divergence shows up here as well
+      # as in the parity gate.
+      matrix:
+        pdp: [embedded, sidecar]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -27,7 +35,8 @@ jobs:
       - name: Build gateway
         run: cargo build --bin s0
 
-      - name: Run end-to-end suite
+      - name: Run end-to-end suite (PDP=${{ matrix.pdp }})
         run: bash tests/e2e/run.sh
         env:
           GW_BIN: ${{ github.workspace }}/target/debug/s0
+          PDP_MODE: ${{ matrix.pdp }}

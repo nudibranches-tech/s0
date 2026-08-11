@@ -1,14 +1,12 @@
-//! `OP_TABLE` well-formedness: the table is a security artifact, so these are the
-//! checks that hold it to reality rather than to itself.
+//! `OP_TABLE` well-formedness: the table is a security artifact, so these checks hold it
+//! to reality rather than to itself — it covers exactly the operation set s3s can route,
+//! it is internally consistent, and the enforced set is the reviewed one. Whether a
+//! `DangerTier` is *right* is what two reviewers on every `Denied → Enforced` diff are
+//! for.
 //!
-//! What these prove: the table covers exactly the operation set s3s can route, it is
-//! internally consistent, and the enforced set is the reviewed one. What they cannot
-//! prove is that a `DangerTier` is *right* — that is what two reviewers on every
-//! `Denied → Enforced` diff are for.
-//!
-//! The companion file `tests/gate_invariants.rs` proves the other half: that every
-//! `Enforced` entry really has a hook and a dispatch arm, and that a hook which does
-//! not authorize cannot forward.
+//! `tests/gate_invariants.rs` proves the other half: that every `Enforced` entry really
+//! has a hook and a dispatch arm, and that a hook which does not authorize cannot
+//! forward.
 
 use std::collections::BTreeSet;
 
@@ -26,17 +24,14 @@ const S3S_OPS: &str = include_str!("data/s3s-0.14.1-ops.txt");
 /// s0's own manifest, so a s3s bump cannot silently leave the reference list behind.
 const CARGO_TOML: &str = include_str!("../Cargo.toml");
 
-/// The reviewed enforced scope: 23 operations, after the 2026-08-08 re-scoping.
+/// The reviewed enforced scope: 23 operations.
 ///
 /// Checked in so the target is a diff against a written-down set rather than a number
-/// someone remembers — and so that flipping an op to `Enforced` that is NOT in this list
-/// is a visible, deliberate act.
-///
-/// It was 29 from M4 until 2026-08-08. The six that left are named below rather than
-/// silently deleted, because "we removed these on purpose" and "somebody dropped a line"
-/// look identical in a shrinking array.
+/// someone remembers, and so that flipping an op to `Enforced` that is NOT in this list
+/// is a visible, deliberate act. The ops deliberately kept out are named in
+/// `RE_DENIED_2026_08_08` rather than silently absent.
 const TARGET_ENFORCED: [&str; 23] = [
-    // the 15 enforced at the end of M1
+    // the object data plane
     "AbortMultipartUpload",
     "CompleteMultipartUpload",
     "CopyObject",
@@ -52,9 +47,8 @@ const TARGET_ENFORCED: [&str; 23] = [
     "PutObject",
     "UploadPart",
     "UploadPartCopy",
-    // the 8 M4 added that survived the 2026-08-08 re-scoping: object tagging, object
-    // attributes, the form upload, and the three bucket-EXISTENCE probes every S3
-    // client makes on connect.
+    // object tagging, object attributes, the form upload, and the three
+    // bucket-EXISTENCE probes every S3 client makes on connect
     "DeleteObjectTagging",
     "GetBucketLocation",
     "GetObjectAttributes",
@@ -65,13 +59,12 @@ const TARGET_ENFORCED: [&str; 23] = [
     "PutObjectTagging",
 ];
 
-/// The six M4 enforced and 2026-08-08 sent back to `Denied`, with the reason each is
-/// out of scope **permanently** rather than pending work.
+/// The six control-plane operations that are `Denied` **permanently** rather than
+/// pending work, each with its reason.
 ///
-/// This is the other half of `TARGET_ENFORCED`: that array says what may be enforced,
-/// this one says what may not, and `the_re_denied_ops_are_not_quietly_re_enforced` holds
-/// both. Without it, re-adding `CreateBucket` to `TARGET_ENFORCED` would read as
-/// restoring something that had been dropped by accident.
+/// The other half of `TARGET_ENFORCED`: that array says what may be enforced, this one
+/// says what may not. Without it, adding `CreateBucket` to `TARGET_ENFORCED` would read
+/// as restoring something dropped by accident.
 const RE_DENIED_2026_08_08: [(&str, &str); 6] = [
     (
         "CreateBucket",
@@ -90,7 +83,7 @@ const RE_DENIED_2026_08_08: [(&str, &str); 6] = [
     (
         "PutBucketPolicy",
         "a bucket policy IS a second PDP this gateway does not evaluate, so an Allow \
-         written here widens access to a principal no hyperfluid grant named",
+         written here widens access to a principal no projected grant named",
     ),
     (
         "GetBucketCors",
@@ -113,19 +106,17 @@ fn s3s_op_names() -> Vec<&'static str> {
 
 #[test]
 fn the_reference_op_list_matches_the_pinned_s3s_version() {
-    // If s3s moves, `data/s3s-0.14.1-ops.txt` is stale and every check below is
-    // measuring the table against the wrong reality.
+    // If s3s moves, `data/s3s-0.14.1-ops.txt` is stale and every check below measures
+    // the table against the wrong reality.
     assert!(
         CARGO_TOML.contains("s3s = \"=0.14.1\""),
         "s3s is no longer pinned to =0.14.1; regenerate tests/data/s3s-0.14.1-ops.txt \
          (command is on OP_TABLE), rename it, and re-classify any new operations"
     );
-    // s3s-aws is pinned just as hard, and this is the test that says why. The whole
-    // "a denied op falls through to NotImplemented" argument rests on which `S3` methods
-    // s3s-aws's generated `Proxy` impl overrides — a property of s3s-aws, not of s3s,
-    // and one no test in this repo can observe directly. A patch bump that started
-    // overriding one more method would turn a denial into a forward with every test
-    // still green, so the version is the guard.
+    // s3s-aws is pinned just as hard: "a denied op falls through to NotImplemented"
+    // rests on which `S3` methods s3s-aws's generated `Proxy` impl overrides, which no
+    // test here can observe. A patch bump that overrode one more method would turn a
+    // denial into a forward with every test still green, so the pin is the guard.
     assert!(
         CARGO_TOML.contains("s3s-aws = \"=0.14.1\""),
         "s3s-aws is no longer pinned to =0.14.1; re-read its generated Proxy impl and \
@@ -160,9 +151,8 @@ fn op_table_covers_every_s3s_operation_and_nothing_else() {
 
 #[test]
 fn exactly_23_enforced_76_denied() {
-    // 15 at the end of M1, +14 for the M4 op scope (29), −6 for the 2026-08-08
-    // re-scoping that made the gateway data-plane only. The other 76 are refused at the
-    // gate, before deserialization.
+    // The gateway is data-plane only. The other 76 ops are refused at the gate, before
+    // deserialization.
     let enforced = enforced_ops();
     let denied = OP_TABLE.len() - enforced.len();
     assert_eq!(
@@ -177,10 +167,8 @@ fn exactly_23_enforced_76_denied() {
 #[test]
 fn the_re_denied_ops_are_not_quietly_re_enforced() {
     // The count above is the weak form of this claim: an edit could re-enforce
-    // `PutBucketPolicy` and deny something else to keep 23/76 true. These six are named,
-    // and each is refused at the gate with the ordinary `NotEnforced` refusal — which is
-    // also the assertion that they are refused by the TABLE rather than by a hook that
-    // happens to return an error.
+    // `PutBucketPolicy` and deny something else to keep 23/76 true. Naming the six also
+    // asserts they are refused by the TABLE rather than by a hook that returns an error.
     let target: BTreeSet<&str> = TARGET_ENFORCED.into_iter().collect();
     for (op, why) in RE_DENIED_2026_08_08 {
         assert!(
@@ -266,10 +254,10 @@ fn the_two_structural_denials_are_never_implement() {
 
 #[test]
 fn op_table_verbs_are_grantable_or_explicitly_control_plane() {
-    // Every row's verb is one of exactly two things, and which one is the whole
-    // classification: a verb a grant can carry, or a label saying the authority is the
-    // console's. There is no third category — "not classified yet" is how an op ends up
-    // Enforced under a verb nobody argued for.
+    // Every row's verb is one of exactly two things: a verb a grant can carry, or a
+    // label saying the authority belongs to the control plane. There is no third
+    // category — "not classified yet" is how an op ends up Enforced under a verb nobody
+    // argued for.
     for s in OP_TABLE {
         match s.verb {
             None => assert_eq!(
@@ -300,10 +288,9 @@ fn op_table_verbs_are_grantable_or_explicitly_control_plane() {
 }
 
 #[test]
-fn the_gateway_vocabulary_is_the_six_verbs_hyperfluid_projects() {
-    // The local half of the cross-repo pin. `tests/cross_repo_contract.rs` holds this
-    // same set against hyperfluid's real projection code; this one runs everywhere and
-    // catches the drift s0's own commits can introduce.
+fn the_gateway_vocabulary_is_the_six_projected_verbs() {
+    // The vocabulary a control plane projects grants into. Changing it is a cross-repo
+    // contract change, not a local edit.
     let mut verbs = GATEWAY_VERBS.to_vec();
     verbs.sort_unstable();
     assert_eq!(
@@ -317,7 +304,7 @@ fn the_gateway_vocabulary_is_the_six_verbs_hyperfluid_projects() {
             "write_objects",
         ],
         "the projected vocabulary changed; that is a cross-repo contract change, not a \
-         local edit — see hyperfluid s3_gateway_projection::verbs"
+         local edit — the control plane's projection must agree"
     );
     let mut removed = NON_GATEWAY_VERBS.to_vec();
     removed.sort_unstable();
@@ -352,11 +339,9 @@ fn enforced_verbs_are_expressible_as_actions() {
 
 #[test]
 fn the_write_set_matches_the_shipped_rego() {
-    // `freeze_writes` is the only kill switch the live bundle carries, and it is
-    // implemented twice: `Action::is_write` on the PEP side (which decides nothing
-    // today but is what a future write-side guard reads) and `write_actions` in the
-    // rego, which is what actually freezes. A verb one side calls a write and the other
-    // does not is a freeze that silently does not cover it.
+    // `freeze_writes` is implemented twice: `Action::is_write` on the PEP side and
+    // `write_actions` in the rego, which is what actually freezes. A verb one side calls
+    // a write and the other does not is a freeze that silently does not cover it.
     let rego: &str = include_str!("../policy/gateway/authz.rego");
     let start = rego
         .find("write_actions := {")
@@ -384,7 +369,7 @@ fn the_write_set_matches_the_shipped_rego() {
     assert_eq!(
         from_rust.len(),
         3,
-        "the write set is 3 verbs since 2026-08-08: create_bucket, delete_bucket and \
+        "the write set is 3 verbs: create_bucket, delete_bucket and \
          write_bucket_config left the vocabulary, and write_object_acl with them"
     );
 }
@@ -392,9 +377,8 @@ fn the_write_set_matches_the_shipped_rego() {
 #[test]
 fn every_bucket_scoped_verb_is_keyless_in_the_rego_too() {
     // The bucket verbs ignore grant prefixes (there is no key to test one against).
-    // That is only sound while they are their own verbs — the moment an object verb
-    // joined this set, a `read_objects` grant scoped to `2024/` would confer
-    // whole-bucket access, which is precisely why `manage_lifecycle` was deleted.
+    // That is only sound while they are their own verbs: if an object verb joined this
+    // set, a `read_objects` grant scoped to `2024/` would confer whole-bucket access.
     let rego: &str = include_str!("../policy/gateway/authz.rego");
     let start = rego
         .find("bucket_actions := {")
@@ -425,13 +409,11 @@ fn every_bucket_scoped_verb_is_keyless_in_the_rego_too() {
 
 #[test]
 fn the_account_scope_reads_the_same_verb_the_bucket_scope_does() {
-    // The 2026-08-08 merge in one assertion. `read` answers "does this bucket exist, for
-    // me?" in both request shapes, and the two sets sharing it is the *point* — it is
-    // what stops `aws s3 ls` from coming back empty for a principal whose next
-    // `head-bucket` succeeds.
-    //
-    // The sharing is also what makes the rego's shape gates load-bearing, so this test
-    // asserts both halves: the sets agree with `Action`, and they overlap.
+    // `read` answers "does this bucket exist, for me?" in both request shapes, and the
+    // two sets sharing it is what stops `aws s3 ls` from coming back empty for a
+    // principal whose next `head-bucket` succeeds. The sharing is also what makes the
+    // rego's shape gates load-bearing, so both halves are asserted: the sets agree with
+    // `Action`, and they overlap.
     let rego: &str = include_str!("../policy/gateway/authz.rego");
     let set = |name: &str| -> Vec<String> {
         let start = rego
@@ -546,24 +528,18 @@ fn only_enforced_ops_carry_blind_spots() {
 
 #[test]
 fn the_acl_and_retention_blind_spots_are_closed_not_merely_unrecorded() {
-    // The inverse of the guard this replaces. Until the M4 retrofit, `PutObject`,
-    // `CopyObject`, `CreateMultipartUpload`, `CreateBucket` and `PostObject` were
-    // *required* to declare that they did not inspect `x-amz-acl` / `x-amz-grant-*`, and
-    // the two delete ops that they did not inspect `x-amz-bypass-governance-retention`.
-    // They do now (`s0::access::headers`, `s0::access::tagging`), so the entries had to
-    // go — and a stale claim of blindness is worse than none, because the blind-spot list
-    // is the document a reviewer reads before flipping an op on.
-    //
-    // This assertion is about the *table*. The behaviour it corresponds to is proved in
-    // `tests/request_riders.rs`, hook by hook and against a wildcard-granted principal.
+    // The ACL headers and the governance-bypass header ARE inspected
+    // (`s0::access::headers`, `s0::access::tagging`), so no row may still claim
+    // blindness to them: a stale claim is worse than none, because the blind-spot list
+    // is the document a reviewer reads before flipping an op on. This is a check on the
+    // *table*; the behaviour is proved in `tests/request_riders.rs`.
     for s in OP_TABLE {
         if s.coverage != Coverage::Enforced {
             continue;
         }
         for b in s.blind_spots {
             let claim = b.to_ascii_lowercase();
-            // "x-amz-acl / x-amz-grant-* are not inspected" is now false. A blind spot
-            // may still *mention* ACLs to explain a residual (CreateBucket's
+            // A blind spot may still *mention* ACLs to explain a residual (CreateBucket's
             // object_ownership does), so the guard is on the header names themselves.
             assert!(
                 !claim.contains("x-amz-acl") && !claim.contains("x-amz-grant-"),
@@ -581,8 +557,8 @@ fn the_acl_and_retention_blind_spots_are_closed_not_merely_unrecorded() {
         }
     }
 
-    // The two claims that must NOT have been deleted along with them: the retrofit
-    // closed the ACL and the bypass, not object lock or the copy-inherited tag set.
+    // The two residuals that must stay on the record: object lock, and the tag set a
+    // COPY-directive copy inherits.
     assert!(
         spec("PutObject")
             .unwrap()

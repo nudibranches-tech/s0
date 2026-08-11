@@ -1,29 +1,13 @@
 //! `Secret<T>` — a value that cannot be printed.
 //!
-//! Every plaintext credential this process holds arrives through configuration:
-//! the STS master-key ring and token signing key, each tenant's backend owner secret,
-//! and every long-lived static access key's secret. All of them live in structs that
-//! `derive(Debug)`, and this deployment logs JSON into a shared pipeline. One
-//! `tracing::debug!(?cfg)`, one `unwrap()` on a config-carrying `Result`, one
-//! `#[derive(Debug)]` on an enclosing error type, and the whole key ring is in
-//! VictoriaLogs — which in a hospital or government tenancy is an incident, not a
-//! papercut. That is the same defect class the master plan records as M0 issue 2
-//! ("live session tokens and decoded JWT claims logged at `info!`") and M0 issue 3.
-//!
-//! A hand-written `Debug` on each config struct would fix today's structs and nothing
-//! else: the next field someone adds is plaintext again unless they remember. So the
-//! redaction lives on the *type*. A `Secret<String>` prints as `Secret(<redacted>)`
-//! wherever it appears — inside a config, inside an error, inside a tuple, at any
-//! nesting depth — and the only way to the plaintext is to write [`Secret::expose`],
-//! which is greppable and reviewable.
-//!
-//! Deliberately absent:
-//!
-//! - **`Display`** — so a secret cannot be interpolated with `{}`. `expose()` is the
-//!   only exit.
-//! - **`Serialize`** — a config is deserialized, never written back. Adding it would
-//!   put the plaintext into any JSON the struct lands in, which is the same pipeline
-//!   this type exists to keep it out of.
+//! Every plaintext credential this process holds arrives through configuration — the STS
+//! key ring, each tenant's backend owner secret, every static access key — and lives in a
+//! struct that `derive(Debug)`. One `tracing::debug!(?cfg)` or one `#[derive(Debug)]` on
+//! an enclosing error type would put the whole key ring in the log aggregator. A
+//! hand-written `Debug` per struct only fixes today's fields, so the redaction lives on
+//! the *type*: [`Secret::expose`] is the one greppable exit. Deliberately absent are
+//! `Display`, so a secret cannot be interpolated with `{}`, and `Serialize`, which would
+//! put the plaintext into any JSON the enclosing struct lands in.
 
 use std::fmt;
 
@@ -66,8 +50,8 @@ impl<T> From<T> for Secret<T> {
 }
 
 /// So `"…".into()` still reaches a `Secret<String>` field, as it does for the `String`
-/// fields beside it. Adopting the type must not make constructing a config awkward, or
-/// the next struct will quietly go back to `String`.
+/// fields beside it: if the type makes constructing a config awkward, the next struct
+/// quietly goes back to `String`.
 impl From<&str> for Secret<String> {
     fn from(value: &str) -> Self {
         Secret(value.to_string())
@@ -99,9 +83,8 @@ mod tests {
 
     #[test]
     fn a_secret_deserializes_from_the_bare_scalar() {
-        // The wire form is unchanged: every shipped config, ConfigMap and Secret keeps
-        // working. A `{"v": {"secret": "..."}}` wrapper would have been a breaking
-        // config change for no benefit.
+        // The wire form is the bare scalar: a `{"v": {"secret": "..."}}` wrapper would be
+        // a breaking config change for no benefit.
         #[derive(Deserialize)]
         struct Holder {
             key: Secret<String>,

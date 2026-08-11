@@ -1,17 +1,13 @@
-//! Shared fixtures for the integration suite.
+//! Shared fixtures for the integration suite. One definition of each, because a suite
+//! that builds them per file drifts into testing a gateway nobody ships:
 //!
-//! Three things live here because getting any of them subtly different per file is how
-//! a suite drifts into testing a gateway nobody ships:
+//! - one gateway builder, running the real `Gateway` over the real shipped rego;
+//! - one request seeder mirroring exactly what `S3Access::check` stashes, so a hook
+//!   under test sees what it sees in production;
+//! - one raw SigV4 signer ([`sigv4`]), so black-box tests exercise the real signature
+//!   path rather than an SDK's idea of it.
 //!
-//! - one gateway builder, so every test runs the real `Gateway` with the real embedded
-//!   regorus engine over the real shipped rego;
-//! - one request seeder that mirrors exactly what `S3Access::check` stashes, so a hook
-//!   under test sees what it sees in production (and fails closed if it does not);
-//! - one raw SigV4 signer ([`sigv4`]), so the black-box tests exercise the real
-//!   signature path rather than an SDK's idea of it.
-//!
-//! Every gateway built here has the golden-capture tap installed, so any test that
-//! drives a hook contributes to the corpus for free.
+//! Every gateway built here has the golden-capture tap installed.
 
 #![allow(dead_code)] // each test binary uses a different subset
 
@@ -51,33 +47,23 @@ pub fn scratch(tag: &str) -> PathBuf {
 
 /// The grant fixture most tests run against: `alice` may read/list/write/delete objects
 /// (and write their tags) under `reports/2024/`, and may see that the `reports` bucket
-/// exists — including enumerating her buckets, of which `reports` is the only visible
-/// one. Nothing anywhere else.
+/// exists. Nothing anywhere else.
 ///
-/// Two grants, not one, because the two halves of the vocabulary scope differently: the
-/// object verbs are narrowed by `prefixes`, while `read` has no key to test a prefix
-/// against and is therefore emitted with `"prefixes": []` — the shape the projection is
-/// required to produce (ADR-006), so the fixture models the contract rather than a
-/// convenient approximation of it.
-///
-/// The second grant carries **one** verb since 2026-08-08. It used to carry six; the
-/// other five (`create_bucket`, `delete_bucket`, `{read,write}_bucket_config`,
-/// `list_buckets`) were removed from the vocabulary, four because they bypassed the
-/// managed path and one because it merged into `read`. `read` is what `HeadBucket`,
-/// `GetBucketLocation` and `ListBuckets` all decide against now.
+/// Two grants, not one: object verbs are narrowed by `prefixes`, while `read` has no key
+/// to test a prefix against and is emitted with `"prefixes": []` — the shape the
+/// projection is required to produce (ADR-006). `read` is what `HeadBucket`,
+/// `GetBucketLocation` and `ListBuckets` all decide against.
 ///
 /// `org_settings.reserved_tag_keys` is **published** here, because the shipped default
-/// for an absent list is to refuse every tag write (`access::tagging`). A fixture without
-/// it would exercise the inert path on every tagging op and hide the live one; the
-/// inert path has its own bundle, [`bundle_without_reserved_tag_keys`], and its own named
-/// tests.
+/// for an absent list is to refuse every tag write (`access::tagging`); the inert path
+/// has its own bundle, [`bundle_without_reserved_tag_keys`].
 pub fn alice_bundle() -> serde_json::Value {
     serde_json::json!({
         "org_settings": {
             "freeze_writes": false,
-            // A platform-owned namespace, the shape a real control plane emits: policy
+            // A control-plane-owned namespace, the shape a real one emits: policy
             // conditions live under it, so no S3 caller may write into it.
-            "reserved_tag_keys": ["hyperfluid/*"]
+            "reserved_tag_keys": ["acme/*"]
         },
         "tenants": { "acme": {
             "user_attributes": { "alice": { "groups": [], "attributes": [] } },
@@ -96,14 +82,13 @@ pub fn alice_bundle() -> serde_json::Value {
     })
 }
 
-/// [`alice_bundle`] with the reserved-key list **removed** — the state every deployment
-/// is in until hyperfluid publishes one.
+/// [`alice_bundle`] with the reserved-key list **removed** — the state a deployment is
+/// in until the control plane publishes one.
 ///
-/// Tag writes are inert under it: `PutObjectTagging`, `DeleteObjectTagging` and an inline
-/// `x-amz-tagging` on a write are all refused. That is the plan's stated default
-/// (open question 5, resolved to `["*"]`), and it needs its own fixture precisely because
-/// it is a *default*: a test that only ever ran against a published list would not notice
-/// if absence started meaning "reserve nothing".
+/// Tag writes are inert under it: `PutObjectTagging`, `DeleteObjectTagging` and an
+/// inline `x-amz-tagging` on a write are all refused. It needs its own fixture precisely
+/// because that is a *default*: a test that only ever ran against a published list would
+/// not notice if absence started meaning "reserve nothing".
 pub fn bundle_without_reserved_tag_keys() -> serde_json::Value {
     let mut bundle = alice_bundle();
     bundle["org_settings"]
@@ -141,9 +126,8 @@ pub fn config_json(dir: &std::path::Path, backend_endpoint: &str) -> String {
 
 /// Counts every `decide` the enforce path issues, from **outside** the decision cache.
 ///
-/// This is what turns "`GatewayAccess::decide` is the only PDP call site" from a claim
-/// in a doc comment into a checkable invariant: a hook that called `gw.pdp.decide`
-/// directly would bump this counter without producing a capture, and
+/// Makes "`GatewayAccess::decide` is the only PDP call site" checkable: a hook calling
+/// `gw.pdp.decide` directly bumps this counter without producing a capture, and
 /// `tests/golden_capture.rs` compares the two.
 struct CountingPdp {
     inner: Arc<dyn Pdp>,
@@ -168,11 +152,9 @@ impl Pdp for CountingPdp {
 
 /// Everything the gateway actually recorded, in order.
 ///
-/// The audit trail is a security artifact, so a test has to be able to read it — "the
-/// request was denied" and "the denial is on the record" are different claims, and the
-/// second one is the one a regulator asks about. This is an [`AuditBackend`] rather
-/// than a tap on the sink so it sees exactly what a real destination would: post-batch,
-/// post-worker, after the record has round-tripped through the queue.
+/// An [`AuditBackend`] rather than a tap on the sink, so it sees exactly what a real
+/// destination would: post-batch, post-worker, after the record has round-tripped
+/// through the queue.
 #[derive(Default)]
 pub struct RecordedAudit(std::sync::Mutex<Vec<AuditRecord>>);
 
@@ -296,12 +278,9 @@ pub fn principal(sub: &str) -> ResolvedPrincipal {
 
 /// Seed a request exactly as `S3Access::check` does: the resolved principal, the
 /// secret-free route snapshot, and the s3s op name. A hook that runs without all three
-/// fails closed with an internal error, so a test that skipped this would be measuring
-/// the backstop rather than the policy.
-///
-/// The route snapshot comes from a real `BackendRegistry` built from the same config
-/// the gateway uses, not from a hand-built struct — otherwise the fixture can drift
-/// from the routing it claims to model.
+/// fails closed, so a test that skipped this would measure the backstop, not the policy.
+/// The route snapshot comes from a real `BackendRegistry` over the same config the
+/// gateway uses, so the fixture cannot drift from the routing it claims to model.
 pub fn seeded_request<T>(
     cfg: &GatewayConfig,
     principal: ResolvedPrincipal,
@@ -363,11 +342,9 @@ impl Fixture {
     }
 
     /// Wait until at least `n` records have reached the audit backend, then hold still
-    /// for a grace period and return everything.
-    ///
-    /// The grace period is the point: "exactly one record" is only checkable if a
-    /// second one had a chance to arrive. Shipping is asynchronous by design (audit
-    /// must never block the data path), so a bare read races the worker.
+    /// for a grace period and return everything. The grace period is the point:
+    /// "exactly one record" is only checkable if a second one had a chance to arrive,
+    /// and shipping is asynchronous by design.
     pub async fn await_audit_records(&self, n: usize) -> Vec<AuditRecord> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while self.audit_log.all().len() < n && std::time::Instant::now() < deadline {

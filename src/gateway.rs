@@ -27,29 +27,26 @@ pub struct Gateway {
     pub audit: AuditSink,
     pub registry: Arc<BackendRegistry>,
     /// The concrete static credential store, kept alongside the `Arc<dyn
-    /// CredentialStore>` inside `identity` so a config apply can reach it (plan defect
-    /// A-8: `Identity::new` erases the handle immediately).
+    /// CredentialStore>` inside `identity` so a config apply can reach it — `Identity::new`
+    /// erases the handle immediately.
     pub credentials: Arc<StaticCredentialStore>,
-    /// Behind an [`ArcSwap`] so the gateway's own semantic caps can be re-applied
-    /// without a restart. `Arc<ArcSwap<_>>` rather than a bare `ArcSwap<_>` so the
-    /// *handle* can be shared with layers that must not hold the whole `Gateway` —
-    /// `crate::proxy::S3GatewayState` is the one that does. Load it at the point of
-    /// use; a reader that clones the `LimitsConfig` out into a long-lived field has
-    /// silently opted out of the reload.
+    /// Behind an [`ArcSwap`] so the semantic caps can be re-applied without a restart, and
+    /// `Arc<ArcSwap<_>>` so the *handle* can be shared with layers that must not hold the
+    /// whole `Gateway`. Load it at the point of use: a reader that clones the
+    /// `LimitsConfig` into a long-lived field has silently opted out of the reload.
     pub limits: Arc<ArcSwap<LimitsConfig>>,
     /// Kept so a bundle-refresh loop can swap revisions (cache stays coherent).
     pub bundles: Arc<BundleStore>,
-    /// Golden-capture tap. `None` in every deployed binary: [`Gateway::build`] is the
-    /// only production construction path and it hard-codes `None`, there is no setter
-    /// and no config knob. Enabling capture therefore requires building a `Gateway`
-    /// literally — which only tests do. See [`crate::authz::capture`].
+    /// Golden-capture tap. `None` in every deployed binary: [`Gateway::build`] is the only
+    /// production construction path and hard-codes `None`, with no setter and no config
+    /// knob, so only a test that builds a `Gateway` literally can enable it.
     pub capture: Option<Arc<CaptureSink>>,
 }
 
 impl Gateway {
     /// Build the full gateway from config. Must run inside a tokio runtime (spawns
     /// the audit worker). Returns the shared gateway plus the audit drain handle, which
-    /// the caller must `drain()` on shutdown so buffered records are not lost (§9.2).
+    /// the caller must `drain()` on shutdown so buffered records are not lost.
     pub fn build(cfg: &GatewayConfig) -> Result<(Arc<Gateway>, AuditHandle)> {
         let sts = Arc::new(build_sts(cfg)?);
         let credentials = Arc::new(StaticCredentialStore::from_config(cfg));
@@ -72,6 +69,10 @@ impl Gateway {
             sink_url: cfg.audit.sink_url.clone(),
             spill_path: cfg.audit.spill_path.clone(),
             backend: cfg.audit.backend,
+            labels: crate::audit::LabelPolicy::new(
+                cfg.audit.organization_label_key.clone(),
+                cfg.audit.extra_labels.clone(),
+            ),
             ..AuditConfig::default()
         });
 
@@ -96,43 +97,20 @@ impl Gateway {
         self.limits.load()
     }
 
-    /// Re-apply an operator-rendered config to the running gateway (plan task 10).
+    /// Re-apply a rendered config to the running gateway. There is deliberately no producer
+    /// for this in-tree; it exists so the swap *is possible* and so the state it swaps is
+    /// provably reachable rather than erased into a trait object at construction.
     ///
-    /// There is deliberately **no producer for this in-tree**. Plan §1.1 cut the polled
-    /// `/gateway-config` document: configuration comes from a ConfigMap + Secret, and
-    /// E-6's `checksum/credentials` annotation rolls the pods when either changes. This
-    /// exists so that swapping *is possible* — the mechanism, not a channel — and so
-    /// that the state it swaps is provably reachable rather than erased into a trait
-    /// object at construction.
+    /// Reloaded: the backend routing table (and with it every tenant→org binding and owner
+    /// credential), the static credential list, and the semantic caps. Everything consumed
+    /// once at assembly needs a restart instead — listen addresses, s3s protocol limits,
+    /// the STS and derived-key rings, the PDP mode, the audit backend.
     ///
-    /// ## What this does and does not reload
-    ///
-    /// Applied: the backend routing table (and with it every tenant→Org binding and
-    /// owner credential), the static credential list, and the gateway's own semantic
-    /// caps (`max_delete_keys`, `max_list_fanout`, the backend timeouts consulted on
-    /// the next pool build).
-    ///
-    /// **Not** applied, because they are consumed once at assembly and re-reading them
-    /// would report a change that did not happen: the listen addresses, the s3s
-    /// protocol limits and connection cap (baked into the `S3Service` and the accept
-    /// loop by `crate::server`), the STS key ring, the **derived-key ring**, the PDP
-    /// mode, and the audit backend. Changing any of those still needs a restart, which is
-    /// what a pod roll does.
-    ///
-    /// Note the derived-key *ring* is baked while its two inputs are not: revocation
-    /// follows the bundle store and attribution follows the routing table, both of which
-    /// this method (and the bundle poller) do swap. So the half that has to be live is
-    /// live, and the half that is key material is not.
-    ///
-    /// ## Ordering
-    ///
-    /// Each half is built before anything is stored, so an unusable config leaves the
-    /// running one entirely intact. The three stores are then swapped in sequence, so a
-    /// request in flight can observe new routes with old limits — deliberate and
-    /// harmless: limits are resource bounds, not authorization inputs, and no decision
-    /// reads both. What must *not* tear is a single request's view of its own route,
-    /// and that is guaranteed one level up by the `RouteSnapshot` in
-    /// `req.extensions` rather than by anything here.
+    /// Ordering: each half is built before anything is stored, so an unusable config leaves
+    /// the running one intact. The stores are then swapped in sequence, so a request can
+    /// observe new routes with old limits — harmless, since limits are resource bounds and
+    /// no decision reads both. A single request's view of its own route must not tear, and
+    /// that is guaranteed one level up by the `RouteSnapshot` in `req.extensions`.
     pub fn apply_config(&self, cfg: &GatewayConfig) -> Result<()> {
         let credentials = crate::auth::credentials_from_config(cfg);
         self.registry.apply_config(cfg)?;
@@ -150,12 +128,10 @@ impl Gateway {
 /// Assemble the credential authority: STS, the static store, and — when the deployment
 /// configured a ring — derived long-lived per-principal keys.
 ///
-/// The derived half is wired to the **live** bundle store and the **live** routing table,
-/// not to snapshots of them: revocation has to follow the bundle the PDP is deciding
-/// against, and a tenant re-bound to another organization has to re-attribute on the next
-/// request. Handing either a clone of the current contents would produce a credential
-/// class that could not be revoked without a pod roll, which is the failure this design
-/// exists to avoid.
+/// The derived half is wired to the **live** bundle store and routing table, not to
+/// snapshots: revocation has to follow the bundle the PDP is deciding against, and a
+/// tenant re-bound to another organization has to re-attribute on the next request.
+/// Snapshots would produce a credential class that could not be revoked without a restart.
 fn build_identity(
     cfg: &GatewayConfig,
     sts: Arc<StsAuthority>,
@@ -220,11 +196,10 @@ fn build_pdp(cfg: &GatewayConfig) -> Result<(Arc<BundleStore>, Arc<dyn Pdp>)> {
 
     let pdp: Arc<dyn Pdp> = match &cfg.pdp {
         PdpConfig::Embedded { cache_capacity } => {
-            // Cache is sound for the embedded engine: the gateway reloads the engine
-            // and bumps the revision atomically, so a stale entry misses by
-            // construction.
-            // The platform's pushed module is authoritative; the compiled-in default is
-            // the fallback when the bundle carries data only.
+            // Cache is sound for the embedded engine: the gateway reloads the engine and
+            // bumps the revision atomically, so a stale entry misses by construction.
+            // The pushed module is authoritative; the compiled-in default is the fallback
+            // when the bundle carries data only.
             let policy = parsed.policy.as_deref().unwrap_or(GATEWAY_REGO);
             let engine: Arc<dyn Pdp> = Arc::new(RegorusPdp::new(policy, &parsed.data)?);
             Arc::new(CachingPdp::new(engine, bundles.clone(), *cache_capacity))
@@ -234,12 +209,10 @@ fn build_pdp(cfg: &GatewayConfig) -> Result<(Arc<BundleStore>, Arc<dyn Pdp>)> {
             timeout_ms,
             ..
         } => {
-            // NO decision cache for the sidecar: OPA polls its own bundle
-            // independently, so the gateway's BundleStore revision is not bound to the
-            // data OPA actually evaluates. A revision-keyed cache would serve stale
-            // allows across the skew window (a live-revocation bypass). Every
-            // request hits OPA, which holds the current bundle. Caching returns once
-            // the gateway is authoritative for OPA's revision (ADR-005 follow-up).
+            // NO decision cache for the sidecar: OPA polls its own bundle independently,
+            // so the gateway's BundleStore revision is not bound to the data OPA
+            // evaluates. A revision-keyed cache would serve stale allows across the skew
+            // window — a live-revocation bypass (ADR-005).
             Arc::new(SidecarPdp::new(
                 base_url,
                 Duration::from_millis(*timeout_ms),
@@ -332,14 +305,10 @@ mod tests {
         (gw, handle)
     }
 
-    /// Plan defect A-8, as a runtime property rather than a claim.
-    ///
-    /// `Identity::new` erases the store into `Arc<dyn CredentialStore>` at
-    /// construction. If the swap lived *around* the store — an `ArcSwap` the caller
-    /// holds — replacing it would leave `Identity` reading the original forever, and
-    /// every test that checked the concrete handle instead of the erased one would
-    /// still pass. So this asserts through `Identity::resolve`, which is the path a
-    /// real request takes.
+    /// `Identity::new` erases the store into `Arc<dyn CredentialStore>` at construction.
+    /// If the swap lived *around* the store, replacing it would leave `Identity` reading
+    /// the original forever while a test checking the concrete handle still passed. So
+    /// this asserts through `Identity::resolve`, the path a real request takes.
     #[tokio::test]
     async fn a_credential_swap_reaches_the_handle_identity_erased_at_construction() {
         let (gw, _audit) = gateway(&cfg_with(
@@ -394,13 +363,11 @@ mod tests {
 
     #[tokio::test]
     async fn the_sts_key_ring_is_deliberately_not_hot_reloaded() {
-        // Not an oversight, and worth a test so it stays a decision: the mint holds a
-        // SECOND `Arc<StsAuthority>` clone (`Identity::sts()`, handed to `Mint::new` in
-        // `main` and captured into a detached task), so swapping the authority behind
-        // `Identity` would leave the badge desk minting under the old ring. Rotation is
-        // therefore a config edit plus a pod roll — which is what the key ring's `kid`
-        // exists to make survivable (see `crate::auth::sts`). Making it live requires
-        // the swap to live INSIDE `StsAuthority`, not around it.
+        // A decision, not an oversight: the mint holds a SECOND `Arc<StsAuthority>` clone
+        // (`Identity::sts()`, captured into a detached task), so swapping the authority
+        // behind `Identity` would leave the mint issuing under the old ring. Rotation is
+        // a config edit plus a restart, which the key ring's `kid` makes survivable.
+        // Making it live requires the swap to live INSIDE `StsAuthority`.
         let (gw, _audit) = gateway(&cfg_with(serde_json::json!([]), 1000));
         let held_by_the_mint = gw.identity.sts();
         gw.apply_config(&cfg_with(serde_json::json!([]), 1000))

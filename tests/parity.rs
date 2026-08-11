@@ -1,24 +1,14 @@
-//! Dual-engine parity gate. Replays the golden decision corpus through
-//! BOTH the embedded regorus engine and a real OPA (`opa eval`) and requires
-//! identical decisions. The regorus fast path is only allowed to serve traffic
-//! behind this gate.
+//! Dual-engine parity gate. Replays the golden decision corpus through BOTH the embedded
+//! regorus engine and a real OPA (`opa eval`) and requires identical decisions — the
+//! regorus fast path may only serve traffic behind this gate, so the gate must not be able
+//! to pass by accident:
 //!
-//! ## The gate must not be able to pass by accident
-//!
-//! This file used to `return` green whenever `opa` was not on `PATH`. On a machine
-//! without `opa` — which was every developer machine — the single check licensing the
-//! embedded engine reported success without ever running. So:
-//!
-//! - a missing oracle is a **hard failure**, not a skip. Opting out is explicit and
-//!   loud ([`ALLOW_NO_OPA`]), and the opt-out is never set in CI;
+//! - a missing oracle is a **hard failure**, not a skip; opting out is explicit and loud
+//!   ([`ALLOW_NO_OPA`]), and CI never sets it;
 //! - the oracle's **version** is pinned to the one production runs
-//!   ([`EXPECTED_OPA_VERSION`]) and cross-checked against every file that installs it,
-//!   by [`the_opa_oracle_is_pinned_to_the_production_version_everywhere`], which needs
-//!   no `opa` and therefore always runs.
-//!
-//! The version is not cosmetic. OPA ≥ 1.0 parses rego **v1**; 0.x parses **v0**. The
-//! previous CI pin (`0.70.0`) was answering v0 questions about a policy production
-//! evaluates as v1 — a different oracle, not a weaker one (plan §0.1 C-6).
+//!   ([`EXPECTED_OPA_VERSION`]) and cross-checked against every file that installs it by
+//!   [`the_opa_oracle_is_pinned_to_the_production_version_everywhere`], which needs no
+//!   `opa` and therefore always runs.
 
 use std::io::Write;
 use std::process::Command;
@@ -32,15 +22,13 @@ const CORPUS: &str = include_str!(concat!(
 ));
 const REGO_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/policy/gateway/authz.rego");
 
-/// The `opa` build this gate is allowed to trust as an oracle: the version the
-/// platform actually deploys (`openpolicyagent/opa:1.13.1`). Changing it means
-/// changing `.github/workflows/ci.yml` and `e2e/docker-compose.yml` in the same
-/// commit — enforced below.
+/// The `opa` build this gate is allowed to trust as an oracle: the version deployed in
+/// production. Changing it means changing `.github/workflows/ci.yml` and
+/// `e2e/docker-compose.yml` in the same commit — enforced below.
 const EXPECTED_OPA_VERSION: &str = "1.13.1";
 
-/// Explicit, documented opt-out for a machine with no `opa`. Set it to `1` and the
-/// gate degrades to "regorus alone", which is exactly the state this milestone is
-/// meant to abolish — so it prints why on the way past, and CI never sets it.
+/// Explicit opt-out for a machine with no `opa`. Set it to `1` and the gate degrades to
+/// "regorus alone", so it prints why on the way past. CI never sets it.
 const ALLOW_NO_OPA: &str = "S0_ALLOW_NO_OPA";
 
 /// The oracle's version string (`Version: x.y.z` on the first line of `opa version`),
@@ -75,9 +63,9 @@ fn require_opa() -> Option<String> {
         return None;
     };
 
-    // The dialect is the load-bearing half of the pin. A 0.x oracle parses rego v0 and
-    // would happily agree with regorus about a policy neither is reading the way
-    // production does.
+    // The dialect is the load-bearing half of the pin: a 0.x oracle parses rego v0 and
+    // would happily agree with regorus about a policy neither reads the way production
+    // does.
     let major: u32 = version
         .split('.')
         .next()
@@ -86,7 +74,7 @@ fn require_opa() -> Option<String> {
     assert!(
         major >= 1,
         "opa {version} parses rego v0; production runs opa {EXPECTED_OPA_VERSION} \
-         (rego v1). A v0 oracle is a different gate, not a weaker one — plan §0.1 C-6."
+         (rego v1). A v0 oracle is a different gate, not a weaker one."
     );
     if version != EXPECTED_OPA_VERSION {
         eprintln!(
@@ -102,9 +90,9 @@ fn require_opa() -> Option<String> {
 /// (order-insensitive on the two set-valued ones, which the PEP sorts anyway). Reason
 /// strings are engine-formatted and excluded.
 ///
-/// Every obligation has to be in here. An obligation the two engines could disagree
-/// about without this gate noticing is an obligation the gate does not cover — and for
-/// `visible_buckets` a disagreement is a difference in which buckets a principal is shown.
+/// Every obligation has to be in here: one the two engines could disagree about without
+/// this gate noticing is one the gate does not cover — and for `visible_buckets` a
+/// disagreement is a difference in which buckets a principal is shown.
 fn core(d: &Decision) -> (bool, Option<String>, Vec<String>, Vec<String>, bool) {
     let mut prefixes = d.obligations.allowed_prefixes.clone();
     prefixes.sort();
@@ -163,11 +151,10 @@ async fn regorus_matches_opa_over_corpus() {
         let raw_input = &case["input"];
         let input: OpaInput = serde_json::from_value(raw_input.clone())
             .unwrap_or_else(|e| panic!("[{name}] corpus input is not an OpaInput: {e}"));
-        // Feed BOTH engines the same bytes. Previously regorus got the typed value and
-        // OPA got the raw JSON, so a field the type silently dropped or renamed would
-        // change what one engine saw and not the other — a parity gate that is not
-        // comparing engines. `tests/fixture_drift.rs` is the rename guard that this
-        // symmetry gives up; the two must land together.
+        // Feed BOTH engines the same bytes. Handing one the typed value and the other the
+        // raw JSON would let a field the type silently drops or renames change what one
+        // engine sees and not the other — a parity gate that is not comparing engines.
+        // `tests/fixture_drift.rs` is the rename guard this symmetry gives up.
         let normalized = serde_json::to_value(&input).expect("serialize OpaInput");
 
         let regorus = RegorusPdp::new(GATEWAY_REGO, bundle).unwrap();
@@ -189,13 +176,10 @@ async fn regorus_matches_opa_over_corpus() {
         mismatches.len(),
         mismatches.join("\n  ")
     );
-    // The oracle must have *evaluated* something. `opa_decision` degrades an
-    // undefined result to a deny, so if the entrypoint path ever stops resolving —
-    // `data.s3.authz.decision` moves, or the module's `package` line does — every case
-    // would answer deny and parity would hold trivially against a regorus that is
-    // denying for real reasons. That failure is invisible without this line.
-    // `cross_repo_contract.rs` is the other half: it holds this name equal to the one
-    // the platform actually ships.
+    // The oracle must have *evaluated* something. `opa_decision` degrades an undefined
+    // result to a deny, so if `data.s3.authz.decision` ever stops resolving, every case
+    // answers deny and parity holds trivially against a regorus denying for real reasons.
+    // That failure is invisible without this line.
     assert!(
         opa_allowed > 0,
         "opa allowed 0 of {} corpus cases: the oracle is answering `undefined`, most \
@@ -206,20 +190,16 @@ async fn regorus_matches_opa_over_corpus() {
 
 /// Every place that installs the oracle names [`EXPECTED_OPA_VERSION`].
 ///
-/// This is the half of the fix that runs without `opa` and therefore runs everywhere.
-/// The original defect was not that the pin was wrong — it was that nothing related
-/// the pin to anything, so `0.70.0` sat next to a production `1.13.1` for as long as
-/// nobody happened to look.
+/// This half runs without `opa`, and therefore runs everywhere. Nothing else relates the
+/// installed pin to the one this gate expects, so without it a stale CI pin can sit next
+/// to a different production version for as long as nobody happens to look.
 #[test]
 fn the_opa_oracle_is_pinned_to_the_production_version_everywhere() {
     let ci = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/.github/workflows/ci.yml"
     ));
-    let compose = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/e2e/docker-compose.yml"
-    ));
+    let e2e = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/e2e/run.sh"));
 
     // CI: the `version:` belonging to the setup-opa step, not any other `version:`.
     let lines: Vec<&str> = ci.lines().collect();
@@ -237,16 +217,18 @@ fn the_opa_oracle_is_pinned_to_the_production_version_everywhere() {
         "ci.yml installs a different OPA than the parity gate expects"
     );
 
-    // The e2e stack's sidecar OPA is the same oracle in a different costume; a v0
-    // image there means the real-stack suite is exercising a dialect production does
-    // not run.
-    let image = compose
+    // The e2e suite's sidecar OPA is the same oracle in a different costume: a v0 image
+    // there means the real-stack suite exercises a dialect production does not run.
+    let image = e2e
         .lines()
-        .find_map(|l| l.trim().strip_prefix("image: openpolicyagent/opa:"))
-        .expect("e2e/docker-compose.yml no longer runs an OPA sidecar");
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix("OPA_IMAGE=\"${OPA_IMAGE:-openpolicyagent/opa:")
+        })
+        .expect("tests/e2e/run.sh no longer pins a sidecar OPA image");
     assert!(
         image.starts_with(EXPECTED_OPA_VERSION),
-        "e2e docker-compose runs openpolicyagent/opa:{image}, but the pinned oracle is \
+        "tests/e2e/run.sh runs openpolicyagent/opa:{image}, but the pinned oracle is \
          {EXPECTED_OPA_VERSION}"
     );
 }

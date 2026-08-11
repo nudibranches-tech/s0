@@ -2,8 +2,8 @@
 //! This is the executable specification of `policy/gateway/authz.rego`: every branch
 //! of the grant/prefix/deny logic has a case in `policy/testdata/corpus.json`.
 //!
-//! The same corpus is the seed of the dual-engine parity gate — once the sidecar
-//! test harness exists, OPA replays these and must produce identical decisions.
+//! `tests/parity.rs` replays the same corpus through a real OPA and requires identical
+//! decisions.
 
 use std::collections::HashMap;
 

@@ -1,17 +1,12 @@
 //! The three fail-closed layers, probed at runtime rather than asserted on paper.
 //!
-//! `tests/op_coverage.rs` proves `OP_TABLE` is well-formed. That is not the same as
-//! proving the code matches it, and the two ways it can fail to are both silent:
-//!
-//! 1. **A missing hook fails OPEN.** All 99 `S3Access` hooks default to `Ok(())`, so
-//!    an op marked `Enforced` whose hook was never written is *allowed*, with no audit
-//!    record and no decision. Probed by calling every enforced hook on a request with
-//!    no `check` context: the real hooks fail closed, the s3s default returns `Ok(())`.
-//! 2. **A hook that does not authorize still forwards.** Probed through the
-//!    `AuthzProof`: dispatch refuses a request the enforce path never allowed.
-//!
-//! Both probes are cross-checked against `enforced_ops()`, so adding an op to the
-//! table without adding it here fails the build rather than quietly losing coverage.
+//! `tests/op_coverage.rs` proves `OP_TABLE` is well-formed, which is not the same as
+//! proving the code matches it, and both ways it can fail to are silent: a missing
+//! `S3Access` hook defaults to `Ok(())`, so an op marked `Enforced` is *allowed* with no
+//! decision and no audit record; and a hook that does not authorize still forwards unless
+//! dispatch demands an `AuthzProof`. Both probes are cross-checked against
+//! `enforced_ops()`, so adding an op to the table without adding it here fails the build
+//! rather than quietly losing coverage.
 
 mod common;
 
@@ -90,12 +85,10 @@ async fn every_enforced_op_has_an_s3access_hook() {
 /// The request is seeded **exactly as `check` seeds it** — principal, route snapshot,
 /// operation name — and carries everything except an [`AuthzProof`].
 ///
-/// That is the whole point of using `fx.request` here rather than `bare_request`. With
-/// a bare request the arm fails on the missing route snapshot, so the assertion below
-/// held whether or not `proxy_for_req` demanded the proof: the M1 review deleted
-/// `proof::require(req)?` from `src/proxy/mod.rs` and this test stayed green. Seeding
-/// the route removes that alternative cause, and the message assertion pins the
-/// remaining one, so the test now measures what its name says.
+/// That is the whole point of using `fx.request` here rather than `bare_request`: with a
+/// bare request the arm fails on the missing route snapshot, so the assertion below holds
+/// whether or not the forward path demands the proof. Seeding the route removes that
+/// alternative cause, and the message assertion pins the remaining one.
 #[tokio::test]
 async fn every_enforced_op_has_a_gateway_s3_dispatch_arm() {
     let fx = common::fixture("gate-arms", common::alice_bundle());
@@ -195,12 +188,10 @@ async fn denied_ops_have_no_dispatch_arm() {
 #[tokio::test]
 async fn post_object_forwards_only_with_a_proof() {
     // `post_object` is the one S3 method whose s3s default is not NotImplemented: it
-    // re-dispatches through `put_object`. For every other denied op, deleting its
-    // dispatch arm produces a 501; for this one it produces a silent *forward*. Now
-    // that PostObject is enforced, the M1 `NotImplemented` override that stood in the
-    // way is gone — so the only thing between a hook that did not authorize and the
-    // backend is the AuthzProof. The generic probe above walks every enforced op; this
-    // one exists by name because the failure mode here is unique and unobvious.
+    // re-dispatches through `put_object`. For every other denied op a missing dispatch
+    // arm produces a 501; for this one it produces a silent *forward*, so the only thing
+    // between a hook that did not authorize and the backend is the AuthzProof. Called
+    // out by name because that failure mode is unique and unobvious.
     let fx = common::fixture("gate-postobject", common::alice_bundle());
     let s3 = gateway_s3(&fx.gw);
     let mut req = fx.request("PostObject", PostObjectInput::default(), Method::POST);

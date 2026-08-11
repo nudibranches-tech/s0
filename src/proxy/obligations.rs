@@ -1,34 +1,14 @@
-//! The obligation channel between the access layer and the dispatcher.
+//! The obligation channel between the access layer and the dispatcher, for obligations
+//! that cannot be applied at decision time: what is to be restricted is whatever the
+//! backend is about to answer, so the verdict rides across the forward and is applied in
+//! `GatewayS3` on the way back. (A *request* obligation — `narrow_prefix`, or dropping
+//! refused keys from a multi-delete — is applied by the typed hook and needs no channel.)
 //!
-//! Obligations come in two kinds, and until now only one of them had a home.
-//!
-//! - A **request** obligation is applied by the typed hook itself, on the parsed input,
-//!   before anything is forwarded: `narrow_prefix` rewrites `req.input.prefix`, and a
-//!   multi-delete drops the keys the PDP refused. Nothing downstream needs to know.
-//! - A **response** obligation cannot be applied there at all. The thing to be
-//!   restricted does not exist yet when the decision is made — it is whatever the
-//!   backend is about to answer. It has to be carried across the forward and applied in
-//!   `GatewayS3` on the way back.
-//!
-//! The second kind arrives with `ListBuckets`, and it is the first time this gateway
-//! *withholds* information the backend already returned. It has to: every request is
-//! re-signed with the per-`(backend, tenant)` **owner** credential
-//! (`super::build_proxy`), so `ListBuckets` against RGW answers with the tenant's entire
-//! bucket namespace no matter who asked. Forwarding that verbatim would publish the
-//! whole namespace to anyone holding a single grant.
-//!
-//! One extension type carries both, rather than one bare type per obligation
-//! (`Arc<ListFanout>` was the first of those, and a second would have made "did the hook
-//! impose anything on this response?" a question with N places to look). The dispatcher
-//! reads exactly one value and matches on it.
-//!
-//! ## Absence is not permission
-//!
-//! [`ResponseObligations`] is only ever installed by an access hook. Its **absence**
-//! therefore means the hook did not run, which for a response-filtered op must fail
-//! closed — see [`GatewayS3::list_buckets`](super::GatewayS3::list_buckets), whose only
-//! path without one is the ordinary forward, which demands the
-//! [`AuthzProof`](crate::access::AuthzProof) first and so cannot proceed either.
+//! `ListBuckets` is why: every request is re-signed with the per-`(backend, tenant)`
+//! **owner** credential, so the backend answers with the tenant's entire bucket namespace
+//! no matter who asked. [`ResponseObligations`] is only ever installed by an access hook,
+//! so its **absence** means the hook did not run and must fail closed — see
+//! [`GatewayS3::list_buckets`](super::GatewayS3::list_buckets).
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -45,15 +25,14 @@ use super::fanout::ListFanout;
 /// meant a type error rather than a review question.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BucketVisibility {
-    /// Nothing is visible. Answered as an **empty listing**, and — this is the load
-    /// bearing part — *without contacting the backend*.
+    /// Nothing is visible. Answered as an **empty listing**, *without contacting the
+    /// backend*.
     ///
-    /// It is the verdict for both "the PDP denied the enumeration" and "the PDP allowed
-    /// it and the principal holds no bucket grants". Those two must be indistinguishable
-    /// to the caller: a 403 for one and an empty 200 for the other is an oracle that
-    /// reports whether a principal holds `list_buckets` in this tenant, and skipping the
-    /// backend for one but not the other is the same oracle measured with a stopwatch.
-    /// One branch, one shape, one cost.
+    /// The verdict for both "the PDP denied the enumeration" and "the PDP allowed it and
+    /// the principal holds no bucket grants". Those must be indistinguishable: a 403 for
+    /// one and an empty 200 for the other reports whether a principal holds `list_buckets`
+    /// in this tenant, and contacting the backend for only one is the same oracle measured
+    /// with a stopwatch.
     Nothing,
     /// Exactly these bucket names, and nothing else. May not be empty — that is
     /// [`Self::Nothing`], which is a different code path.

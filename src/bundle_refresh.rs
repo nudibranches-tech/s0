@@ -1,11 +1,10 @@
-//! Live bundle refresh. Polls the projected policy data and, on a
-//! content change, reloads the engine and bumps the [`BundleStore`] revision — so a
-//! revoked grant takes effect without a restart, and every stale decision-cache entry
-//! misses by construction.
+//! Live bundle refresh. Polls the projected policy data and, on a content change,
+//! reloads the engine and bumps the [`BundleStore`] revision — so a revoked grant takes
+//! effect without a restart, and every stale decision-cache entry misses.
 //!
-//! Source is the control-plane bundle endpoint when configured, else the local bundle
-//! file (dev). The engine is reloaded *before* the revision is advertised, so no request
-//! ever sees a new revision backed by the old policy.
+//! Source is the control-plane bundle endpoint when configured, else a local bundle
+//! file. The engine is reloaded *before* the revision is advertised, so no request ever
+//! sees a new revision backed by the old policy.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,24 +27,15 @@ pub enum BundleSource {
 }
 
 impl BundleSource {
-    /// Build the polling HTTP source. The timeout is not optional: it bounds the
-    /// *whole* request, so a control plane that accepts the connection and never
-    /// answers cannot wedge the single refresh task and silently stop revocation
-    /// from landing.
+    /// Build the polling HTTP source. The timeout bounds the *whole* request, so a
+    /// control plane that accepts the connection and never answers cannot wedge the
+    /// single refresh task and silently stop revocation from landing.
     ///
-    /// `shared_secret` is the platform `X-Shared-Secret`
-    /// ([`crate::internal::SHARED_SECRET_HEADER`] — the same header, the same value,
-    /// the same idiom as every other console↔component internal call). It is
-    /// **optional**: s0 must stay runnable against a plain file or an unauthenticated
-    /// URL, and refusing to poll without a credential would break every deployment
-    /// that does not have one. But it is not *conditionally* sent — when it is
-    /// configured it rides on every request this source ever makes, including the
-    /// retries after a failure, because a poller that drops the credential on some
-    /// path is a poller that silently stops receiving revocations.
-    ///
-    /// Why a header and not a query parameter or basic auth: a query parameter lands
-    /// in the control plane's access log and in every proxy in between, which is the
-    /// same class of leak `Secret<T>` exists to prevent on this side.
+    /// `shared_secret` ([`crate::internal::SHARED_SECRET_HEADER`]) is optional so s0
+    /// stays runnable against a plain file or an unauthenticated URL, but it is never
+    /// sent conditionally: once configured it rides on every request this source makes,
+    /// retries included. It is a header rather than a query parameter because a query
+    /// parameter lands in access logs and in every proxy in between.
     pub fn http(
         url: String,
         timeout: Duration,
@@ -131,12 +121,10 @@ impl BundleSource {
 
 /// Observed state of the polling loop, and the basis for readiness.
 ///
-/// Readiness deliberately gates on **≥1 successful poll**, not on the gateway holding
-/// a non-empty bundle revision: `Gateway::build` seeds a revision from the local
-/// bundle file before any listener exists, so a revision check would be vacuously true
-/// on a pod that has never reached the control plane at all. Such a pod would join the
-/// Service and start deciding on a bundle that could be arbitrarily old — including
-/// one predating a revocation.
+/// Readiness gates on **≥1 successful poll**, not on holding a non-empty bundle
+/// revision: `Gateway::build` seeds a revision from the local bundle file, so a revision
+/// check would pass on an instance that has never reached the control plane and is
+/// deciding on an arbitrarily old bundle — possibly one predating a revocation.
 #[derive(Debug)]
 pub struct BundleHealth {
     /// Whether the source is the control plane rather than a local file. A file
@@ -177,7 +165,7 @@ impl BundleHealth {
 
     /// Unix seconds of the last successful poll, or `None` if there has never been
     /// one. Exported so staleness is alertable even though it does not (yet) fail
-    /// readiness — see the open question in the plan §6.2.
+    /// readiness.
     pub fn last_success_unix(&self) -> Option<u64> {
         match self.last_success_unix.load(Ordering::Relaxed) {
             0 => None,
@@ -303,8 +291,8 @@ mod tests {
         (format!("http://{addr}/bundle"), handle)
     }
 
-    /// P2's s0 half: the bundle endpoint is authenticated, and this poller presents
-    /// the credential. Asserted on the bytes that reach the socket.
+    /// The poller presents its credential to an authenticated bundle endpoint,
+    /// asserted on the bytes that reach the socket.
     #[tokio::test]
     async fn a_configured_bundle_credential_is_sent_on_the_wire() {
         let (url, seen) = capture_one_request(r#"{"data":{}}"#).await;

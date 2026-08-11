@@ -1,23 +1,13 @@
-//! Derived long-lived per-principal keys, end to end.
+//! Derived long-lived per-principal keys, end to end: an off-the-shelf S3 client holding
+//! two static fields signs a real SigV4 request over TCP, the gateway authorizes it against
+//! the bundle's grants, and stops doing so one bundle poll after the key is revoked.
 //!
-//! The unit tests in `src/auth/derived.rs` and `src/auth/mod.rs` prove the derivation and
-//! the admission rules. This file proves the thing that actually matters to the five
-//! consumers F18 has to migrate: **an off-the-shelf S3 client, holding two static fields
-//! and nothing else, signs a real SigV4 request over TCP and the gateway authorizes it
-//! against the bundle's grants** — and stops doing so one bundle poll after the key is
-//! revoked.
-//!
-//! Everything here goes through `Gateway::build`, the one production assembly path, over
-//! a real config file and a real bundle file. Nothing is hand-wired: if the config schema,
-//! the ring loading, the bundle plumbing or the `S3Auth` dispatch were wrong, these tests
-//! could not pass.
-//!
-//! The backend endpoint is a **closed port**, deliberately. An *allowed* request therefore
-//! fails at the forward with a `500`-class error, which is the unambiguous signal that the
-//! decision was allow and the request really left the policy engine — exactly the role the
-//! `404 NoSuchKey` plays in the cluster measurements in the migration notes. A denial never
-//! gets that far and answers `403`, and an unknown or forged credential is refused by s3s
-//! before the gate with `InvalidAccessKeyId`.
+//! Everything goes through `Gateway::build`, the one production assembly path, over a real
+//! config file and a real bundle file — nothing is hand-wired. The backend endpoint is a
+//! **closed port**, deliberately: an *allowed* request fails at the forward with a
+//! `500`-class error, the unambiguous signal that the decision was allow and the request
+//! really left the policy engine. A denial answers `403`, and an unknown or forged
+//! credential is refused by s3s before the gate with `InvalidAccessKeyId`.
 
 mod common;
 
@@ -35,23 +25,20 @@ use s0::pdp::{Bundle, content_revision};
 /// The master key the gateway is configured with, in the two spellings the test needs.
 const DERIVED_KEY_HEX: &str = "abababababababababababababababababababababababababababababababab";
 
-/// The subject F18 migrates first: Trino's background compaction identity. Held as a
-/// service account, granted one prefix of one bucket — where today it holds the
-/// tenant-owner key and reaches every bucket in the tenant.
+/// A service-account subject granted one prefix of one bucket — the shape a consumer gets
+/// instead of the tenant-owner key, which reaches every bucket in the tenant.
 const SUBJECT: &str = "trino-background";
 
 /// The bundle the gateway decides against.
 ///
-/// `s3_key_epoch` is the field this whole feature's revocation hangs off, and it is here
-/// rather than in a helper so that the two states a test moves between — floor 1 and
-/// floor 2 — are visible side by side.
+/// `s3_key_epoch` is the field revocation hangs off, kept here rather than in a helper so
+/// the two states a test moves between are visible side by side.
 fn bundle(key_epoch: u32) -> serde_json::Value {
     serde_json::json!({
-        "org_settings": { "freeze_writes": false, "reserved_tag_keys": ["hyperfluid/*"] },
+        "org_settings": { "freeze_writes": false, "reserved_tag_keys": ["acme/*"] },
         "tenants": { "acme": {
-            // The gateway's compiled-in default module keys on the RAW sub (the pushed
-            // platform module keys `sa:<client id>`); this fixture uses the default, so
-            // the raw spelling is correct here.
+            // The compiled-in default module keys on the RAW sub; an external policy
+            // source may key on a decorated spelling instead.
             "user_attributes": { SUBJECT: { "groups": [], "attributes": [] } },
             "bucket_attributes": { "reports": { "denylist": {} } },
             "s3_grants": { SUBJECT: [
@@ -60,7 +47,7 @@ fn bundle(key_epoch: u32) -> serde_json::Value {
                 { "bucket": "reports", "actions": ["read"], "prefixes": [] }
             ] },
             "group_grants": {},
-            // ── F17: the revocation floor ──────────────────────────────────────────
+            // ── the revocation floor ───────────────────────────────────────────────
             "s3_key_epoch": key_epoch
         }}
     })
@@ -172,8 +159,8 @@ impl Harness {
     }
 }
 
-/// The credential a consumer would be handed, minted through the same helper the
-/// platform half (F17b) will call.
+/// The credential a consumer would be handed, minted through the same helper an issuer
+/// calls.
 fn mint(epoch: u32, tenant: &str) -> DerivedKeyCredential {
     let authority =
         DerivedKeyAuthority::new(hex::decode(DERIVED_KEY_HEX).unwrap()).expect("authority");
@@ -230,8 +217,7 @@ async fn a_derived_key_signs_a_real_request_and_is_authorized_by_the_bundle() {
     assert_reached_the_backend(status, &body, "a granted prefix");
 
     // …and the grant is what bounds it, not the credential: the same key, one prefix
-    // over, is denied. That is the whole point of F17 — the tenant-owner key this
-    // replaces reaches every bucket in the tenant.
+    // over, is denied — unlike the tenant-owner key it replaces.
     let (status, body) = hx
         .get(
             "2023/q1.csv",
@@ -367,7 +353,7 @@ async fn a_revoked_key_stops_working_within_one_bundle_refresh() {
     assert_credential_not_honoured(status, &body, "a bundle with no epoch published");
 }
 
-/// **The multi-replica property (F8), as two processes rather than as an argument.**
+/// **The multi-replica property, as two processes rather than as an argument.**
 ///
 /// A key minted against one gateway is presented to a second one that has never seen it,
 /// shares no store with it, and was built from config alone — which is also what a pod
@@ -401,13 +387,11 @@ async fn a_key_minted_against_one_gateway_works_against_a_second_instance() {
     );
 }
 
-/// **An STS session is untouched by the new class**, on a gateway that has it switched
-/// on: minted under the config's own key ring, presented with its session token, and
-/// authorized against the same grants — allow inside the prefix, deny outside it.
-///
-/// `tests/web_identity_e2e.rs` and `tests/internal_session.rs` cover the STS door itself
-/// and run unchanged; what they do not cover is the STS path *coexisting* with derived
-/// keys, which is the only thing this stage could have broken.
+/// **An STS session is untouched by the derived-key class**: minted under the config's own
+/// key ring, presented with its session token, and authorized against the same grants —
+/// allow inside the prefix, deny outside it. `tests/web_identity_e2e.rs` and
+/// `tests/internal_session.rs` cover the STS door itself; what they do not cover is the two
+/// credential classes coexisting.
 #[tokio::test]
 async fn an_sts_session_still_works_on_a_gateway_with_derived_keys_switched_on() {
     use s0::auth::sts::{SessionClaims, StsAuthority};

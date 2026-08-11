@@ -25,29 +25,22 @@ const MAX_SPILL_BYTES: u64 = 64 * 1024 * 1024;
 /// Gate-denial audit budget: burst, then a sustained refill rate, per replica.
 ///
 /// Check-level denials are the one audit stream an **unauthenticated** caller controls
-/// the rate of: an unsigned request, or any request naming an operation this build does
-/// not enforce, produces one. Emitting them unconditionally hands a scanner a way to
-/// fill the bounded queue and make the gateway drop *decision* records — an attacker
-/// suppressing the audit trail of real access is far worse than an attacker being
-/// under-logged. So they are rate-limited, and the suppression is loud: every dropped
-/// one increments `s0_audit_gate_suppressed_total`, and the count since the last
-/// emitted gate record rides on the next one (`gate.suppressed_since_last`). The fact
-/// of a flood, and its size, are never lost — only the per-request detail is.
-///
-/// 64 absorbs a misconfigured client's retry storm and a full `OP_TABLE` sweep (84 ops)
-/// nearly whole; 8/s sustained is two orders of magnitude below the queue's drain rate,
-/// so a scan cannot displace decision records no matter how long it runs.
+/// the rate of, so emitting them unconditionally would let a scanner fill the bounded
+/// queue and displace *decision* records. Suppression is loud rather than silent: it
+/// increments `s0_audit_gate_suppressed_total` and the count rides on the next emitted
+/// gate record, so the fact and size of a flood are never lost — only the per-request
+/// detail. 8/s sustained is far below the queue's drain rate.
 const GATE_BURST: u64 = 64;
 const GATE_REFILL_PER_SEC: f64 = 8.0;
 
 /// Counters for everything that can happen to a record between the data path and the
 /// control plane.
 ///
-/// These exist because the failure mode they describe is **silent**: a dropped audit
-/// record produces no client-visible error and no failed request, and in a regulated
-/// deployment "we cannot prove this access was logged" is itself the incident.
-/// `tracing::error!` alone is not alertable in the way a counter is; every one of
-/// these is exported by the admin listener's `/metrics`.
+/// The failure mode they describe is **silent**: a dropped audit record produces no
+/// client-visible error and no failed request, and in a regulated deployment "we cannot
+/// prove this access was logged" is itself the incident. All of these are exported by
+/// the admin listener's `/metrics`, because a log line is not alertable the way a
+/// counter is.
 #[derive(Debug, Default)]
 pub struct AuditMetrics {
     /// Records never handed to the worker: the bounded queue was full, or the worker
@@ -64,17 +57,12 @@ pub struct AuditMetrics {
     pub spill_dropped: AtomicU64,
     /// Records recovered from the spill file and shipped.
     pub spill_replayed: AtomicU64,
-    /// Records still in the spill file when the worker exited. **Lost.** The spill
-    /// lives on node-local scratch (`emptyDir`), which kubernetes deletes with the pod,
-    /// so a record left there at shutdown is not "pending" — it is gone, and counting
-    /// it as pending is how `dropped_total` came to under-report on precisely the event
-    /// (a rolling update with the sink down) where audit loss is most likely.
-    ///
-    /// Deliberately a conservative **upper bound**: a bare container restart keeps the
-    /// `emptyDir`, and [`claim_spill_path`] lets the same instance re-claim and replay
-    /// its own file, so those records do survive and are counted here anyway. Erring
-    /// toward "we may have lost audit records" is the right direction to be wrong in;
-    /// the opposite bias is what this counter exists to end.
+    /// Records still in the spill file when the worker exited. **Lost.** The spill lives
+    /// on node-local scratch (`emptyDir`), deleted with the pod, so a record left there
+    /// at shutdown is gone rather than pending. Deliberately a conservative upper bound:
+    /// a bare container restart keeps the `emptyDir` and [`claim_spill_path`] lets the
+    /// same instance replay its own file, but over-counting loss is the right direction
+    /// to be wrong in.
     pub spill_abandoned: AtomicU64,
     /// Gate-denial records deliberately not emitted because an unauthenticated caller
     /// was producing them faster than the budget (see `GATE_BURST`). **Not** counted as
@@ -172,6 +160,8 @@ pub struct AuditConfig {
     /// one process, and so an operator can pin it if the pod name is not the right
     /// identity.
     pub instance: String,
+    /// How records are labelled for the consumer that ingests them.
+    pub labels: crate::audit::LabelPolicy,
 }
 
 impl Default for AuditConfig {
@@ -185,6 +175,7 @@ impl Default for AuditConfig {
             http_timeout: Duration::from_secs(5),
             spill_path: PathBuf::from("/var/lib/s0/audit-spill.ndjson"),
             instance: crate::config::instance_id(),
+            labels: crate::audit::LabelPolicy::default(),
         }
     }
 }
@@ -195,15 +186,22 @@ pub struct AuditSink {
     tx: mpsc::Sender<AuditRecord>,
     metrics: Arc<AuditMetrics>,
     gate: Arc<GateBudget>,
+    labels: crate::audit::LabelPolicy,
 }
 
 impl AuditSink {
+    /// How this deployment labels records. Every record builder takes it, so a
+    /// misconfigured key is one value in one place rather than a constant in the binary.
+    pub fn labels(&self) -> &crate::audit::LabelPolicy {
+        &self.labels
+    }
+
     /// Emit a **gate** record — a denial from before the policy question existed.
     ///
     /// Separate from [`Self::emit`] because this is the one audit stream whose rate an
-    /// unauthenticated caller controls; see `GATE_BURST`. The record is mutated in
-    /// place to carry the number of gate records suppressed since the last emitted one,
-    /// so a reader of the trail sees the flood even though it does not see every event.
+    /// unauthenticated caller controls; see `GATE_BURST`. The record carries the number
+    /// suppressed since the last emitted one, so a reader sees the flood even though it
+    /// does not see every event.
     pub fn emit_gate_denial(&self, mut record: AuditRecord) {
         let Some(suppressed) = self.gate.take() else {
             let n = self.metrics.gate_suppressed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -248,7 +246,7 @@ impl AuditSink {
 }
 
 /// Awaitable handle for draining the worker on shutdown, so buffered + queued records
-/// are shipped instead of aborted when the runtime drops (§9.2: on shutdown, no silent
+/// are shipped instead of aborted when the runtime drops (on shutdown, no silent
 /// loss). Held by `main`, awaited after the HTTP server drains.
 pub struct AuditHandle {
     join: tokio::task::JoinHandle<()>,
@@ -297,6 +295,7 @@ pub fn spawn_with_backend(
     cfg: AuditConfig,
     backend: Arc<dyn AuditBackend>,
 ) -> (AuditSink, AuditHandle) {
+    let labels = cfg.labels.clone();
     let (tx, rx) = mpsc::channel(cfg.queue_capacity);
     let metrics = Arc::new(AuditMetrics::default());
     let shutdown = Arc::new(tokio::sync::Notify::new());
@@ -322,6 +321,7 @@ pub fn spawn_with_backend(
             tx,
             metrics,
             gate: Arc::new(GateBudget::new()),
+            labels,
         },
         AuditHandle { join, shutdown },
     )
@@ -329,20 +329,13 @@ pub fn spawn_with_backend(
 
 /// Resolve the configured spill path to one **this process alone** writes.
 ///
-/// Two replicas sharing a spill file destroy each other's records: replay reads the
-/// whole file, POSTs it and `remove_file`s it — including records another pod appended
-/// but this pod never read. The loss is silent and permanent, which in a regulated
-/// deployment is the worst class of bug this component can have.
-///
-/// A shared RWX volume is therefore **unsupported**; the spill belongs on node-local
-/// scratch (`emptyDir`), and the configured path should carry a pod-unique component
-/// (`"spill_path": "/var/lib/s0/audit-spill-${POD_NAME}.ndjson"` — see
-/// [`crate::config::GatewayConfig::load`]). Documentation alone is not enforcement,
-/// so ownership is also claimed here: an `<path>.owner` marker naming this instance.
-/// If the marker names *another* instance we do not fight over the file and we do not
-/// delete it — we take a distinct, instance-unique path and say so, loudly. That turns
-/// a misconfiguration from "records silently destroyed" into "records preserved for
-/// their owner, plus an error in the log".
+/// Two replicas sharing a spill file destroy each other's records silently: replay reads
+/// the whole file, POSTs it and `remove_file`s it, including records another pod appended
+/// but this one never read. A shared RWX volume is therefore unsupported; the spill
+/// belongs on node-local scratch with a pod-unique path component. Ownership is claimed
+/// here rather than merely documented, via an `<path>.owner` marker: if it names another
+/// instance we neither fight over the file nor delete it, but take an instance-unique
+/// path and log loudly.
 fn claim_spill_path(configured: &Path, instance: &str) -> PathBuf {
     if let Some(parent) = configured.parent()
         && !parent.as_os_str().is_empty()
@@ -477,17 +470,12 @@ impl Worker {
         }
     }
 
-    /// The last thing the worker does, on either exit path.
+    /// The last thing the worker does, on either exit path: one final replay attempt,
+    /// then count whatever is still on disk as lost.
     ///
-    /// The shutdown branch used to flush and `break`, and a flush that fails **spills**
-    /// — so the records most likely to be spilled were the ones spilled last, at
-    /// shutdown, and nothing ever replayed them. The spill file is node-local scratch
-    /// (`emptyDir`), deleted with the pod, so those records were counted as `spilled`
-    /// ("pending, not lost") and were in fact gone. That made `s0_audit_dropped_total`
-    /// under-report on exactly the deployment — a rolling update with the sink down —
-    /// where it is most likely to matter.
-    ///
-    /// So: one last replay attempt, then count whatever is still on disk as lost.
+    /// A flush that fails spills, so without this the records spilled last — at shutdown
+    /// — would never be replayed and would still be reported as pending, on exactly the
+    /// event (a rolling update with the sink down) where audit loss matters most.
     async fn finish(&self) {
         self.replay_spill().await;
         let abandoned = self.count_spill_lines().await;
@@ -602,10 +590,8 @@ impl Worker {
         for line in contents.lines().filter(|l| !l.trim().is_empty()) {
             match serde_json::from_str(line) {
                 Ok(rec) => batch.push(rec),
-                // Was `filter_map(...ok())`: an unparseable line vanished with no log
-                // and no counter, so a truncated write looked exactly like a clean
-                // replay. Losing the record is unavoidable here; losing the *fact* is
-                // not.
+                // Losing the record is unavoidable here; losing the *fact* is not —
+                // silently skipping makes a truncated write look like a clean replay.
                 Err(e) => {
                     unparseable += 1;
                     tracing::error!(%e, "audit spill line unparseable; record lost");
@@ -756,17 +742,16 @@ mod tests {
                 backend: BackendOutcome::NotAttempted,
                 backend_status: None,
             },
+            &crate::audit::LabelPolicy::default(),
         )
     }
 
     #[tokio::test]
     async fn records_still_spilled_when_the_worker_exits_are_counted_lost_not_pending() {
-        // The shutdown branch used to flush — which spills on failure — and `break`,
-        // with no replay and no accounting. The spill lives on node-local `emptyDir`,
-        // deleted with the pod, so those records were reported as `spilled` ("pending,
-        // not lost") and were in fact gone. `s0_audit_dropped_total` therefore read 0
-        // on exactly the event (a rolling update with the sink down) it exists to
-        // catch.
+        // The spill lives on node-local `emptyDir`, deleted with the pod, so a record
+        // still there at worker exit is gone. Reporting it as `spilled` ("pending, not
+        // lost") would leave `s0_audit_dropped_total` at 0 on exactly the event (a
+        // rolling update with the sink down) it exists to catch.
         let dir = tmpdir("abandoned");
         let backend = Arc::new(Flaky {
             fail: std::sync::atomic::AtomicBool::new(true),
@@ -833,9 +818,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_spill_that_replays_at_shutdown_is_not_counted_as_lost() {
-        // The other half of the fix: the shutdown branch now *tries* a replay before it
-        // gives up. A sink that came back just before the pod went away must get its
-        // records, and nothing may be reported as lost.
+        // The shutdown path tries a replay before it gives up: a sink that came back
+        // just before the pod went away must get its records, and nothing may be
+        // reported as lost.
         let dir = tmpdir("shutdown-replay");
         let backend = Arc::new(Flaky {
             fail: std::sync::atomic::AtomicBool::new(true),
@@ -856,12 +841,10 @@ mod tests {
         for i in 0..4 {
             sink.emit(a_record(&format!("rec-{i}")));
         }
-        // Wait for the *condition*, not for a duration. A fixed sleep here was a real
-        // flake: shipping is asynchronous and the whole suite runs in parallel, so
-        // 50 ms is sometimes not enough for the worker to have drained four emits, and
-        // the failure looked like "the sink lost records" rather than "the test was
-        // early". The deadline still fails the test if the spill genuinely never
-        // happens.
+        // Wait for the *condition*, not for a duration: shipping is asynchronous and the
+        // suite runs in parallel, so a fixed sleep flakes as "the sink lost records"
+        // when the truth is "the test was early". The deadline still fails the test if
+        // the spill genuinely never happens.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while sink.metrics().spilled.load(Ordering::Relaxed) < 4
             && tokio::time::Instant::now() < deadline
@@ -904,9 +887,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(120)).await;
         handle.drain(Duration::from_secs(2)).await;
 
-        // The records are unrecoverable either way; what must not happen is losing
-        // the FACT that they were lost. `filter_map(..ok())` made a torn spill file
-        // indistinguishable from a clean replay.
+        // The records are unrecoverable either way; what must not happen is losing the
+        // FACT that they were lost — a torn spill file must not look like a clean replay.
         let m = sink.metrics();
         assert_eq!(
             m.spill_dropped.load(Ordering::Relaxed),

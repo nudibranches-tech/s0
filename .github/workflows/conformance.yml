@@ -9,10 +9,12 @@
 
 name: conformance
 
+# Manual trigger only. The harness step below is unimplemented and exits 1 by design,
+# so a schedule here would be a guaranteed weekly failure that trains everyone to
+# ignore a red conformance badge — the opposite of what the gate is for. Restore the
+# `schedule:` in the same commit that wires the suite.
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 6 * * 1" # weekly
 
 jobs:
   minio:
