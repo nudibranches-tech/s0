@@ -409,6 +409,74 @@ async fn a_service_account_token_mints_a_credential_that_works_against_s3() {
     );
 }
 
+/// **Two replicas behind one Service.** A credential minted by replica A is presented to
+/// replica B, which has never seen the session — the ordinary case the moment the
+/// deployment is scaled past one pod or a rolling update replaces the minting pod
+/// mid-session.
+///
+/// The design makes this hold without shared state: the secret is
+/// `HMAC(master_key, kid ‖ sid)` and the session is a signed token, so any replica
+/// holding the configured key ring re-derives both. That is a *claim about a
+/// deployment*, and it is the kind that stays true right up until someone adds a cache,
+/// a nonce table or a per-process salt to the session path — at which point it fails
+/// under load balancing and nowhere else. Asserted here rather than argued from the
+/// design, because the failure is a 403 on a valid credential in production.
+#[tokio::test]
+async fn a_credential_minted_on_one_replica_is_honoured_by_another() {
+    // Two independent gateways: separate sockets, PDP, bundle store, capture tap, audit
+    // sink and spill directory. All they have in common is the config — including the
+    // STS key ring, which is the only thing a real pair of replicas shares.
+    let a = harness("ha-replica-a").await;
+    let b = harness("ha-replica-b").await;
+
+    let session = assume_role_ok(&a, &service_account_token(SA_CLIENT_ID)).await;
+
+    // The credential crosses to the replica that did not mint it.
+    let (status, body) = get_object(&b, &session, "sa/q1.csv").await;
+    assert_ne!(
+        status, 403,
+        "replica B refused a credential replica A minted — with a shared key ring this \
+         is the load-balanced request failing, not a policy denial: {body}"
+    );
+
+    // B resolved the principal from the token itself, to the same subject A would have.
+    // A session that only works where it was minted is not visible as a signature
+    // failure; it surfaces as an identity that resolves to nothing and a denial the
+    // policy appears to have made.
+    let input = last_opa_input(&b);
+    assert_eq!(input["principal"]["sub"], serde_json::json!(SA_CLIENT_ID));
+    assert_eq!(
+        input["principal"]["type"],
+        serde_json::json!("service_account")
+    );
+    assert_eq!(input["tenant"], serde_json::json!(TENANT));
+
+    // And the minting replica was not in the path: no decision reached A, so B is not
+    // quietly relying on state that only exists because A is still alive in this process.
+    assert!(
+        a.fx.capture.snapshot().is_empty(),
+        "replica A evaluated a request that was sent to replica B"
+    );
+
+    // Control. Everything above would also hold on a data plane that accepted any
+    // signature at all, which is the more alarming way to pass: the same request to the
+    // same replica, signed with a secret one hex digit off, must be refused.
+    let mut wrong: Vec<char> = session.secret_access_key.chars().collect();
+    wrong[0] = if wrong[0] == '0' { '1' } else { '0' };
+    let forged = Session {
+        access_key_id: session.access_key_id.clone(),
+        secret_access_key: wrong.into_iter().collect(),
+        session_token: session.session_token.clone(),
+        expiration: session.expiration.clone(),
+    };
+    let (status, _) = get_object(&b, &forged, "sa/q1.csv").await;
+    assert_eq!(
+        status, 403,
+        "replica B accepted a request signed with the wrong secret, so its acceptance \
+         of the real one proves nothing"
+    );
+}
+
 /// The other half of the same claim: a human's token mints a **user** session, keyed by
 /// `sub`, and is refused on the service account's prefix. Without this, the test above
 /// would pass on a surface that hard-coded `ServiceAccount` — which is precisely the bug

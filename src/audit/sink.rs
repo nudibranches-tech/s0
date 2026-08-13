@@ -845,13 +845,22 @@ mod tests {
         // suite runs in parallel, so a fixed sleep flakes as "the sink lost records"
         // when the truth is "the test was early". The deadline still fails the test if
         // the spill genuinely never happens.
+        //
+        // The condition is "something reached the disk", not a record count: the flush
+        // ticker's first tick is immediate, so it can flush a half-full buffer and leave
+        // the remainder batched until a tick 30s away. How the four records divide
+        // between spill and buffer is timing, not behaviour — what must hold is that the
+        // shutdown path recovers *both* halves, which is what the asserts below check.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while sink.metrics().spilled.load(Ordering::Relaxed) < 4
+        while sink.metrics().spilled.load(Ordering::Relaxed) == 0
             && tokio::time::Instant::now() < deadline
         {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        assert_eq!(sink.metrics().spilled.load(Ordering::Relaxed), 4);
+        assert!(
+            sink.metrics().spilled.load(Ordering::Relaxed) > 0,
+            "records must reach the spill file while the sink is down"
+        );
 
         backend.fail.store(false, Ordering::Relaxed);
         handle.drain(Duration::from_secs(2)).await;
@@ -860,6 +869,23 @@ mod tests {
         ids.sort();
         assert_eq!(ids, vec!["rec-0", "rec-1", "rec-2", "rec-3"]);
         assert_eq!(sink.dropped_total(), 0);
+        // Counters are read only now: `drain` awaited the worker, so nothing is still in
+        // flight and the two below cannot be sampled from different instants — read
+        // before the drain, `spilled` can miss a batch the worker was mid-spill on while
+        // the sink came back, and this would compare a stale count against a final one.
+        //
+        // The subject of this test is the replay that ran on the shutdown path, not a
+        // ticker replay (none can have fired — the interval is 30s) and not the drain's
+        // flush of still-buffered records. Without this, a run that shipped everything
+        // straight from the buffer would pass and leave the spill path unexercised.
+        let m = sink.metrics();
+        let spilled = m.spilled.load(Ordering::Relaxed);
+        assert!(spilled > 0);
+        assert_eq!(
+            m.spill_replayed.load(Ordering::Relaxed),
+            spilled,
+            "every spilled record must be replayed by the shutdown path"
+        );
         assert!(
             !dir.join("audit-spill.ndjson").exists(),
             "a fully replayed spill file is removed"

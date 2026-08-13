@@ -178,6 +178,208 @@ mod tests {
         )
     }
 
+    /// What the control plane actually received.
+    #[derive(Debug)]
+    struct Received {
+        method: String,
+        path: String,
+        content_type: String,
+        body: String,
+    }
+
+    /// A stand-in for the decision-log endpoint that records every request and answers
+    /// with `status`. Returns its URL and the shared log.
+    ///
+    /// On a real socket rather than against a mocked client: the thing under test is what
+    /// goes on the wire, and a fake that agrees with the code by construction cannot
+    /// catch a shape the ingest side will reject.
+    async fn recording_control_plane(
+        status: u16,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<Received>>>) {
+        use std::sync::{Arc, Mutex};
+
+        let seen: Arc<Mutex<Vec<Received>>> = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let served = served.clone();
+                tokio::spawn(async move {
+                    let svc = hyper::service::service_fn(
+                        move |req: hyper::Request<hyper::body::Incoming>| {
+                            let served = served.clone();
+                            async move {
+                                let method = req.method().to_string();
+                                let path = req.uri().path().to_string();
+                                let content_type = req
+                                    .headers()
+                                    .get(hyper::header::CONTENT_TYPE)
+                                    .and_then(|v| v.to_str().ok())
+                                    .unwrap_or_default()
+                                    .to_string();
+                                let body = http_body_util::BodyExt::collect(req.into_body())
+                                    .await
+                                    .map(|b| String::from_utf8_lossy(&b.to_bytes()).into_owned())
+                                    .unwrap_or_default();
+                                served.lock().unwrap().push(Received {
+                                    method,
+                                    path,
+                                    content_type,
+                                    body,
+                                });
+                                Ok::<_, std::convert::Infallible>(
+                                    hyper::Response::builder()
+                                        .status(status)
+                                        .body(http_body_util::Full::new(bytes::Bytes::new()))
+                                        .unwrap(),
+                                )
+                            }
+                        },
+                    );
+                    let _ = hyper_util::server::conn::auto::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(hyper_util::rt::TokioIo::new(stream), svc)
+                    .await;
+                });
+            }
+        });
+        (format!("http://{addr}/api/v1/decision-logs"), seen)
+    }
+
+    #[tokio::test]
+    async fn a_batch_reaches_the_control_plane_as_one_flat_json_array() {
+        let (url, seen) = recording_control_plane(200).await;
+        ControlPlaneBackend::new(reqwest::Client::new(), url)
+            .ship(&[record("a"), record("b")])
+            .await
+            .expect("a 2xx is success");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            1,
+            "a batch is ONE request; one POST per record would multiply ingest load by \
+             the batch size"
+        );
+        let req = &seen[0];
+        assert_eq!(req.method, "POST");
+        assert_eq!(
+            req.path, "/api/v1/decision-logs",
+            "the configured URL is used verbatim — no path is appended or rewritten"
+        );
+        assert!(
+            req.content_type.starts_with("application/json"),
+            "content-type was {:?}",
+            req.content_type
+        );
+
+        // The consumer contract. Every assertion below is something the ingest side
+        // parses by, so a change here is a change to a published wire format, not an
+        // implementation detail: a batch is a bare JSON array whose elements are the
+        // records themselves, with their fields at the top level rather than nested
+        // under a wrapper key.
+        let body: serde_json::Value = serde_json::from_str(&req.body).expect("a JSON body");
+        let batch = body.as_array().expect("a batch is a JSON array");
+        assert_eq!(batch.len(), 2, "one element per record, in order");
+        assert_eq!(batch[0]["decision_id"], "a");
+        assert_eq!(batch[1]["decision_id"], "b");
+        assert_eq!(batch[0]["requested_by"], "alice");
+        assert_eq!(batch[0]["gateway"]["outcome"], "allowed");
+        // Unlike the NDJSON line, the POST carries no `event` discriminator: the endpoint
+        // is dedicated, so there is no combined firehose to select out of. Asserted so
+        // the asymmetry with `EVENT_KIND` is deliberate and visible rather than a
+        // difference someone discovers from an ingest-side parse failure.
+        assert!(batch[0].get("event").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_control_plane_error_status_is_a_failure_not_a_silent_success() {
+        // `ship` returning Ok means the worker counts the batch shipped and forgets it.
+        // For any answer that is not a success the records are NOT durable at the
+        // destination, so Ok would turn a control-plane outage — or a rejected payload,
+        // or a revoked credential — into audit records that no one holds and no counter
+        // reports. Err spills them instead.
+        for status in [400u16, 403, 429, 500, 503] {
+            let (url, seen) = recording_control_plane(status).await;
+            let err = ControlPlaneBackend::new(reqwest::Client::new(), url)
+                .ship(&[record("a")])
+                .await
+                .expect_err(&format!("HTTP {status} must not be reported as shipped"));
+            assert!(
+                err.contains(&status.to_string()),
+                "the failure must name the status an operator has to act on; got {err:?}"
+            );
+            assert_eq!(seen.lock().unwrap().len(), 1, "the batch was actually sent");
+        }
+    }
+
+    /// The whole default path, as configured rather than as injected: `spawn` picks the
+    /// backend from [`AuditBackendKind`], builds the HTTP client, and the records land at
+    /// a real endpoint. Every other sink test substitutes its own backend or an
+    /// unroutable URL, so without this the selection itself — the one step a deployment
+    /// cannot override — is never exercised against a server that answers.
+    #[tokio::test]
+    async fn the_config_selected_default_backend_ships_to_the_endpoint() {
+        use crate::audit::{AuditBackendKind, AuditConfig, spawn};
+
+        let (url, seen) = recording_control_plane(200).await;
+        let dir = std::env::temp_dir().join(format!("s0-cp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+
+        let (sink, handle) = spawn(AuditConfig {
+            sink_url: url,
+            backend: AuditBackendKind::ControlPlane,
+            spill_path: dir.join("audit-spill.ndjson"),
+            instance: "pod-cp".into(),
+            batch_max: 2,
+            flush_interval: std::time::Duration::from_millis(20),
+            ..AuditConfig::default()
+        });
+        sink.emit(record("a"));
+        sink.emit(record("b"));
+        handle.drain(std::time::Duration::from_secs(5)).await;
+
+        let m = sink.metrics();
+        assert_eq!(
+            m.shipped.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "both records must be accounted shipped by the default backend"
+        );
+        assert_eq!(
+            m.spilled.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a healthy endpoint must not spill"
+        );
+        assert_eq!(sink.dropped_total(), 0);
+
+        // How the two records divide between POSTs is batching timing; that they all
+        // arrived, once each, is not.
+        let ids: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|r| {
+                serde_json::from_str::<serde_json::Value>(&r.body)
+                    .expect("a JSON body")
+                    .as_array()
+                    .expect("a batch is a JSON array")
+                    .iter()
+                    .map(|rec| rec["decision_id"].as_str().unwrap_or_default().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let mut ids = ids;
+        ids.sort();
+        assert_eq!(ids, vec!["a", "b"]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn ndjson_is_one_flat_line_per_record_with_the_discriminator() {
         let rendered = StdoutNdjsonBackend::render(&[record("a"), record("b")]).unwrap();

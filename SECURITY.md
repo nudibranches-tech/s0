@@ -1,6 +1,6 @@
 # Security Policy
 
-s0-gas sits directly on the authorization path for S3 traffic and holds the
+s0 sits directly on the authorization path for S3 traffic and holds the
 per-tenant backend credentials it re-signs with, so we take security reports
 seriously and appreciate responsible disclosure.
 
@@ -37,7 +37,7 @@ prefer to remain anonymous.
 
 ## Supported versions
 
-s0-gas is pre-1.0; only the latest released minor series receives security
+s0 is pre-1.0; only the latest released minor series receives security
 fixes.
 
 | Version | Supported          |

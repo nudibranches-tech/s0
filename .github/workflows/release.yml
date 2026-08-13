@@ -133,7 +133,7 @@ jobs:
   # else's registry would be a standing key to the artifact that authorizes S3 traffic.
   #
   # PUBLICATION point, not necessarily the pull point: a consumer pins
-  # `ghcr.io/<owner>/s0-gas:<version>` or copies that exact tag into its own registry
+  # `ghcr.io/<owner>/s0:<version>` or copies that exact tag into its own registry
   # (`skopeo copy` / `crane copy` — never a rebuild). GHCR publishes a new package
   # PRIVATE: mark it public once, or give the pulling cluster a pull secret. See
   # "Releasing" in README.md.

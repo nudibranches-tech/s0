@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Real-stack end-to-end: real S3 clients (aws-cli) -> s0-gas gateway -> MinIO backend,
+# Real-stack end-to-end: real S3 clients (aws-cli) -> s0 gateway -> MinIO backend,
 # with a pushed policy bundle. Proves the security properties against a real S3 stack
 # rather than mocks — most importantly that a server-side copy whose SOURCE is denied is
 # blocked, enforced through an off-the-shelf client.
@@ -19,7 +19,7 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 E2E="$ROOT/tests/e2e"
-STATE="/tmp/s0-gas-e2e"
+STATE="/tmp/s0-e2e"
 
 GW_ENDPOINT="${GW_ENDPOINT:-http://127.0.0.1:8014}"
 MINIO_ENDPOINT="${MINIO_ENDPOINT:-http://127.0.0.1:9000}"
@@ -112,7 +112,7 @@ expect_code() {
 }
 
 echo "============================================================"
-echo " s0-gas end-to-end: aws-cli -> gateway -> MinIO (PDP: $PDP_MODE)"
+echo " s0 end-to-end: aws-cli -> gateway -> MinIO (PDP: $PDP_MODE)"
 echo "============================================================"
 
 # --- 1. backend ------------------------------------------------------------

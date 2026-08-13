@@ -1,6 +1,6 @@
-# Contributing to s0-gas
+# Contributing to s0
 
-Thanks for your interest in improving **s0-gas**, an OPA/ABAC-enforcing,
+Thanks for your interest in improving **s0**, an OPA/ABAC-enforcing,
 S3-compatible authorization gateway. This document explains how to build, test,
 and submit changes.
 

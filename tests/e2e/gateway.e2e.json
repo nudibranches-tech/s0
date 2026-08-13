@@ -1,5 +1,5 @@
 {
-  "_note": "e2e gateway config. One tenant (acme) fronts a MinIO backend as a remote_s3 bay; the owner_* keys are the MinIO root creds the gateway re-signs with (never the caller's). Two long-lived virtual credentials stand in for platform-issued identities. Embedded regorus PDP; the policy bundle is pushed via bundle_path and re-read every 2s so the live-revocation scenario works. State (bundle + audit spill) lives under /tmp/s0-gas-e2e, seeded by run.sh.",
+  "_note": "e2e gateway config. One tenant (acme) fronts a MinIO backend as a remote_s3 bay; the owner_* keys are the MinIO root creds the gateway re-signs with (never the caller's). Two long-lived virtual credentials stand in for platform-issued identities. Embedded regorus PDP; the policy bundle is pushed via bundle_path and re-read every 2s so the live-revocation scenario works. State (bundle + audit spill) lives under /tmp/s0-e2e, seeded by run.sh.",
   "listen": "0.0.0.0:8014",
   "sts": {
     "master_key_hex": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
@@ -9,7 +9,7 @@
   "pdp": { "mode": "embedded", "cache_capacity": 10000 },
   "audit": {
     "sink_url": "http://127.0.0.1:9099/api/v1/decision-logs",
-    "spill_path": "/tmp/s0-gas-e2e/audit-spill.ndjson"
+    "spill_path": "/tmp/s0-e2e/audit-spill.ndjson"
   },
   "backends": [
     {
@@ -47,6 +47,6 @@
       "groups": []
     }
   ],
-  "bundle_path": "/tmp/s0-gas-e2e/bundle.json",
+  "bundle_path": "/tmp/s0-e2e/bundle.json",
   "bundle_poll_secs": 2
 }

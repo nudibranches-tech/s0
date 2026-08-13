@@ -7,6 +7,11 @@
 //! - a readiness probe that passes before the pod has reached the control plane puts
 //!   a stale-policy replica into the Service;
 //! - two replicas sharing a spill file destroy each other's audit records.
+//!
+//! One more property belongs to this list and is asserted where the machinery for it
+//! already lives: a credential minted by one replica must be honoured by another
+//! (`web_identity_e2e::a_credential_minted_on_one_replica_is_honoured_by_another`), which
+//! needs the production STS door and S3 front on real sockets, twice over.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -358,9 +363,24 @@ async fn two_workers_do_not_destroy_each_others_spill() {
         sink_a.emit(record(&format!("a-{i}")));
         sink_b.emit(record(&format!("b-{i}")));
     }
-    // Long enough for both workers to flush, fail to POST, spill, and run several
-    // replay passes against each other.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Both workers must actually flush, fail to POST, spill, and run several replay
+    // passes *against each other* before the drain — that contention is the thing under
+    // test. Wait for the condition rather than for a wall clock: a fixed sleep is either
+    // too short on a loaded machine (the replicas never contend, and the test passes
+    // having checked nothing) or wasted time on an idle one. Every failed POST bumps
+    // `post_failures`, so three means the initial flush plus at least two replay passes.
+    let contended = |sink: &audit::AuditSink| sink.metrics().post_failures.load(Ordering::Relaxed);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while (contended(&sink_a) < 3 || contended(&sink_b) < 3)
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        contended(&sink_a) >= 3 && contended(&sink_b) >= 3,
+        "both replicas must have spilled and replayed against the shared path before \
+         shutdown, or this test asserts nothing about contention"
+    );
     handle_a.drain(Duration::from_secs(2)).await;
     handle_b.drain(Duration::from_secs(2)).await;
 
