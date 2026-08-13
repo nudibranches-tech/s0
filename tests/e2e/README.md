@@ -1,7 +1,7 @@
 # Real-stack end-to-end tests
 
 `run.sh` exercises the gateway the way a real deployment does: an off-the-shelf
-S3 client (aws-cli) talks to **s0-gas**, which authorizes each request against a
+S3 client (aws-cli) talks to **s0**, which authorizes each request against a
 pushed policy bundle and re-signs to a real **MinIO** backend. Nothing here is
 mocked — it is the client, the gateway binary, and a real S3 server.
 
@@ -32,7 +32,7 @@ The script starts MinIO in a container (`--network host`), seeds buckets and
 objects with the backend credentials, builds and launches the gateway with
 [`gateway.e2e.json`](gateway.e2e.json) + [`bundle.e2e.json`](bundle.e2e.json),
 then runs every scenario and prints a pass/fail tally. It cleans up the
-container, the gateway process, and its scratch state under `/tmp/s0-gas-e2e`
+container, the gateway process, and its scratch state under `/tmp/s0-e2e`
 on exit.
 
 Useful overrides: `GW_BIN` (skip the build and use a prebuilt binary),

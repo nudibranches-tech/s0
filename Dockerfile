@@ -46,7 +46,7 @@ EXPOSE 8016
 EXPOSE 8017
 
 # The gateway reads its JSON config from $GATEWAY_CONFIG; mount it at runtime,
-# e.g. `-v /etc/s0-gas:/etc/s0-gas -e GATEWAY_CONFIG=/etc/s0-gas/gateway.json`.
+# e.g. `-v /etc/s0:/etc/s0 -e GATEWAY_CONFIG=/etc/s0/gateway.json`.
 # The config may reference ${VAR} / ${VAR:-default} from the environment. The audit
 # spill path MUST be pod-unique (`audit-spill-${POD_NAME}.ndjson`, POD_NAME from the
 # downward API) on node-local scratch: a spill volume shared between replicas is

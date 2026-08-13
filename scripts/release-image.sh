@@ -29,7 +29,7 @@ cd "$repo_root"
 registry="${REGISTRY:-ghcr.io}"
 # Lower-cased on the way in: CI passes `github.repository`, which preserves the org/repo
 # capitalisation, and GHCR rejects an upper-case path.
-repository="$(printf '%s' "${IMAGE_REPOSITORY:-nudibranches-tech/s0-gas}" | tr '[:upper:]' '[:lower:]')"
+repository="$(printf '%s' "${IMAGE_REPOSITORY:-nudibranches-tech/s0-gateway}" | tr '[:upper:]' '[:lower:]')"
 platforms="${PLATFORMS:-linux/amd64}"
 push="${PUSH:-0}"
 
@@ -110,7 +110,7 @@ docker buildx build \
   --label "org.opencontainers.image.version=${version}" \
   --label "org.opencontainers.image.revision=${revision}" \
   --label "org.opencontainers.image.created=${created}" \
-  --label "org.opencontainers.image.source=https://github.com/nudibranches-tech/s0-gas" \
+  --label "org.opencontainers.image.source=https://github.com/nudibranches-tech/s0-gateway" \
   --label "org.opencontainers.image.licenses=BUSL-1.1" \
   --metadata-file "$metadata_file" \
   "${output_args[@]}" \
@@ -157,5 +157,5 @@ normal way. A cluster that pulls from its own registry mirrors this exact tag in
 first — a registry-to-registry copy of these bytes, never a rebuild:
 
   skopeo copy docker://$image \\
-              docker://<your-registry>/s0-gas:$version
+              docker://<your-registry>/s0:$version
 EOF

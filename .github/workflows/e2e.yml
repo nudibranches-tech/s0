@@ -1,6 +1,6 @@
 name: e2e
 
-# Real-stack end-to-end: aws-cli -> s0-gas gateway -> MinIO backend, embedded
+# Real-stack end-to-end: aws-cli -> s0 gateway -> MinIO backend, embedded
 # OPA (regorus). Proves the security properties (including the copy-source
 # authorization that closes the Ceph RGW-OPA gap, per-key multi-delete
 # filtering, list narrowing, and live revocation) against an off-the-shelf S3
