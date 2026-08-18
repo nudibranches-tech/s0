@@ -407,6 +407,6 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md). Security reports: [`SECURITY.md`](SECU
 
 ## License
 
-Business Source License 1.1, converting to AGPL-3.0-or-later on the change date. See
-[`LICENSE`](LICENSE); the future AGPL text is in
-[`LICENSE-AGPL-3.0.txt`](LICENSE-AGPL-3.0.txt).
+Business Source License 1.1, converting to Apache-2.0 on the change date
+(`2030-07-15`, four years after first publication). See [`LICENSE`](LICENSE); the future
+Apache text is in [`LICENSE-APACHE-2.0.txt`](LICENSE-APACHE-2.0.txt).

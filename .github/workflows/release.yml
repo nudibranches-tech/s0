@@ -114,7 +114,7 @@ jobs:
           staging="${BINARY}-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir -p "$staging"
           cp "target/${{ matrix.target }}/release/${BINARY}" "$staging/"
-          cp README.md LICENSE "$staging/" 2>/dev/null || true
+          cp README.md LICENSE LICENSE-APACHE-2.0.txt "$staging/" 2>/dev/null || true
           tar czf "${staging}.tar.gz" "$staging"
           sha256sum "${staging}.tar.gz" > "${staging}.tar.gz.sha256"
 
@@ -128,15 +128,11 @@ jobs:
 
   # ── the container image consumers pin ───────────────────────────────────────
   #
-  # REGISTRY: ghcr.io, derived from `github.repository` — the only registry this workflow
-  # can authenticate to without a long-lived credential. A deploy secret for somebody
-  # else's registry would be a standing key to the artifact that authorizes S3 traffic.
+  # Consumers pin `registry.hyperfluid.cloud/hyperfluid/s0:<version>`, or copy that exact
+  # tag onward (`skopeo copy` / `crane copy` — never a rebuild). See docs/releasing.md.
   #
-  # PUBLICATION point, not necessarily the pull point: a consumer pins
-  # `ghcr.io/<owner>/s0:<version>` or copies that exact tag into its own registry
-  # (`skopeo copy` / `crane copy` — never a rebuild). GHCR publishes a new package
-  # PRIVATE: mark it public once, or give the pulling cluster a pull secret. See
-  # "Releasing" in README.md.
+  # REGISTRY_TOKEN is a long-lived credential to exactly the artifact that authorizes S3
+  # traffic — scope it to push on `hyperfluid/s0` and nothing else.
   #
   # TAGS: exactly one, the crate version. No `latest`, no floating `0.2`, no branch tag —
   # a pinned tag must name one immutable set of bytes forever.
@@ -150,32 +146,54 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write # push to ghcr.io
+    env:
+      REGISTRY: registry.hyperfluid.cloud
+      IMAGE_REPOSITORY: hyperfluid/s0
     steps:
       - uses: actions/checkout@v4
 
-      - uses: docker/setup-buildx-action@v3
+      # Names the missing secret; `docker login` with an empty password does not.
+      - name: Require the registry credentials
+        env:
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [ -n "${REGISTRY_USERNAME:-}" ] || missing+=(REGISTRY_USERNAME)
+          [ -n "${REGISTRY_TOKEN:-}" ]    || missing+=(REGISTRY_TOKEN)
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "::error::missing repository secret(s): ${missing[*]}"
+            echo "s0 publishes to ${REGISTRY}; set these under Settings → Secrets → Actions." >&2
+            exit 1
+          fi
+          echo "credentials for ${REGISTRY} present"
 
-      - name: Log in to ghcr.io
+      # Before buildx: the builder image below is pulled through this registry.
+      - name: Log in to the container registry
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          registry: registry.hyperfluid.cloud
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_TOKEN }}
 
-      # A registry tag is only "immutable" because nothing overwrites it. GHCR would let a
-      # re-run, or a deleted-and-recreated git tag, push different bytes under a version
-      # somebody has already pinned and deployed. If the tag is already there, this is not
-      # a release, it is an overwrite — bump the version instead.
+      # buildkit via the registry's pull-through cache, not an anonymous Docker Hub pull.
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=registry.hyperfluid.cloud/proxy_cache/moby/buildkit:master
+
+      # A registry tag is only "immutable" because nothing overwrites it. A re-run, or a
+      # deleted-and-recreated git tag, would otherwise push different bytes under a version
+      # somebody has already pinned and deployed. That is not a release, it is an overwrite.
       #
-      # A successful inspect is the only signal treated as "exists"; any failure (absent
-      # package on the first ever release, transient registry error) falls through to the
-      # build, which cannot succeed without a working registry anyway.
+      # Only a successful inspect counts as "exists"; any failure (absent repository on the
+      # first release, transient registry error) falls through to the build, which cannot
+      # succeed without a working registry anyway.
       - name: Refuse to overwrite a published version
         run: |
           set -euo pipefail
-          repo="$(printf '%s' "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')"
-          image="ghcr.io/${repo}:${{ needs.version.outputs.version }}"
+          image="${REGISTRY}/${IMAGE_REPOSITORY}:${{ needs.version.outputs.version }}"
           if docker buildx imagetools inspect "$image" >/dev/null 2>&1; then
             echo "::error::${image} already exists — a published version is never rebuilt."
             echo "Bump package.version, commit, and tag the new version." >&2
@@ -189,8 +207,6 @@ jobs:
       - name: Build and push
         env:
           PUSH: "1"
-          REGISTRY: ghcr.io
-          IMAGE_REPOSITORY: ${{ github.repository }}
           PLATFORMS: linux/amd64
           S0_DIGEST_OUT: ${{ github.workspace }}/${{ env.BINARY }}-${{ needs.version.outputs.version }}.image-digest.txt
         run: bash scripts/release-image.sh
@@ -203,8 +219,7 @@ jobs:
           set -euo pipefail
           file="${BINARY}-${{ needs.version.outputs.version }}.image-digest.txt"
           digest="$(cat "$file")"
-          repo="$(printf '%s' "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')"
-          image="ghcr.io/${repo}:${{ needs.version.outputs.version }}"
+          image="${REGISTRY}/${IMAGE_REPOSITORY}:${{ needs.version.outputs.version }}"
           printf '%s@%s\n' "$image" "$digest" > "$file"
           {
             echo "### s0 container image"

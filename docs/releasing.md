@@ -26,7 +26,7 @@ git push && git push --tags
 ```
 
 On that one tag event CI re-runs the full [`ci`](../.github/workflows/ci.yml) suite on the
-tagged commit, builds and publishes `ghcr.io/<owner>/s0:0.3.0`, and attaches the binary
+tagged commit, builds and publishes `registry.hyperfluid.cloud/hyperfluid/s0:0.3.0`, and attaches the binary
 tarballs and the image digest to a GitHub Release. It **refuses to overwrite** a version
 already in the registry — a published tag names one immutable set of bytes, forever.
 Re-releasing means bumping the version.
@@ -63,7 +63,7 @@ experiment. It is simply not how a release happens.
 
 | | | |
 |---|---|---|
-| **Registry** | `ghcr.io/<owner>/s0` | The only registry the workflow reaches with a job-scoped `GITHUB_TOKEN`. Holding a long-lived deploy key to somebody else's registry, as a secret in this repo, would be a standing key to exactly the artifact this care is about. GHCR makes a new package **private** — mark it public once, or give the pulling cluster a pull secret. An air-gapped consumer copies the tag into its own registry (`skopeo copy` / `crane copy`): a byte-for-byte move, never a rebuild. |
+| **Registry** | `registry.hyperfluid.cloud/hyperfluid/s0` | The organisation's own registry. CI authenticates with the `REGISTRY_USERNAME` / `REGISTRY_TOKEN` repository secrets; that token is a standing key to exactly the artifact this care is about, so it is scoped to push on `hyperfluid/s0` alone. The registry is private — give the pulling cluster a pull secret. An air-gapped consumer copies the tag onward (`skopeo copy` / `crane copy`): a byte-for-byte move, never a rebuild. |
 | **Tag** | the crate version, and only that | No `latest`, no floating `0.3`, no branch tag. A second, moving name for the same image is something a consumer can pin by accident, which is the failure this whole page exists to prevent. |
 | **Source of truth** | `Cargo.toml` → [`../scripts/crate-version.sh`](../scripts/crate-version.sh) | No step in the pipeline accepts a hand-typed version; the git tag is *checked against* the crate rather than being an input. The same script fails when `Cargo.lock` disagrees — the classic half-done bump, which otherwise surfaces as a `--locked` failure ten minutes into a release. |
 | **Trigger** | a `v*` git tag | Not a published GitHub Release: the tag is what the release commit already creates and what `git describe` reports from a checkout, and it needs no click at the moment the artifact's identity is fixed. The Release object is an *output* of the workflow. |

@@ -15,8 +15,8 @@
 # `Cargo.toml` via `scripts/crate-version.sh`.
 #
 # Environment (CI sets these; a local run needs none of them):
-#   REGISTRY          default ghcr.io
-#   IMAGE_REPOSITORY  default: this project's GitHub org/repo path
+#   REGISTRY          default registry.hyperfluid.cloud
+#   IMAGE_REPOSITORY  default hyperfluid/s0
 #   PLATFORMS         default linux/amd64  (see "Releasing" in the README for why)
 #   PUSH              1 to publish — honoured ONLY under GitHub Actions
 #   S0_DIGEST_OUT     file to write the pushed digest to (CI records it on the release)
@@ -26,10 +26,9 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-registry="${REGISTRY:-ghcr.io}"
-# Lower-cased on the way in: CI passes `github.repository`, which preserves the org/repo
-# capitalisation, and GHCR rejects an upper-case path.
-repository="$(printf '%s' "${IMAGE_REPOSITORY:-nudibranches-tech/s0-gateway}" | tr '[:upper:]' '[:lower:]')"
+registry="${REGISTRY:-registry.hyperfluid.cloud}"
+# Lower-cased: registries reject an upper-case path.
+repository="$(printf '%s' "${IMAGE_REPOSITORY:-hyperfluid/s0}" | tr '[:upper:]' '[:lower:]')"
 platforms="${PLATFORMS:-linux/amd64}"
 push="${PUSH:-0}"
 
@@ -110,7 +109,7 @@ docker buildx build \
   --label "org.opencontainers.image.version=${version}" \
   --label "org.opencontainers.image.revision=${revision}" \
   --label "org.opencontainers.image.created=${created}" \
-  --label "org.opencontainers.image.source=https://github.com/nudibranches-tech/s0-gateway" \
+  --label "org.opencontainers.image.source=https://github.com/nudibranches-tech/s0" \
   --label "org.opencontainers.image.licenses=BUSL-1.1" \
   --metadata-file "$metadata_file" \
   "${output_args[@]}" \
