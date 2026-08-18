@@ -43,7 +43,7 @@ jobs:
     outputs:
       version: ${{ steps.crate.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Read the crate version
         id: crate
@@ -90,7 +90,7 @@ jobs:
           - target: x86_64-unknown-linux-gnu
           - target: x86_64-unknown-linux-musl
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -150,7 +150,7 @@ jobs:
       REGISTRY: registry.hyperfluid.cloud
       IMAGE_REPOSITORY: hyperfluid/s0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Names the missing secret; `docker login` with an empty password does not.
       - name: Require the registry credentials

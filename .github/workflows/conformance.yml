@@ -30,7 +30,7 @@ jobs:
           --health-cmd "curl -f http://localhost:9000/minio/health/live || exit 1"
           --health-interval 5s --health-timeout 3s --health-retries 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
