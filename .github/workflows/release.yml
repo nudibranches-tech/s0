@@ -1,0 +1,261 @@
+name: Release
+
+# One git tag produces the whole release: the binary tarballs AND the container image
+# consumers pin. One workflow, because an image without its matching release (or a release
+# with no image behind its tag) is what makes a consumer's pinned tag `ImagePullBackOff`.
+# The GitHub Release object is an OUTPUT of this workflow, not its trigger.
+#
+# THIS WORKFLOW IS THE ONLY THING THAT PUBLISHES THE s0 IMAGE — `scripts/release-image.sh`
+# refuses to push anywhere else. The binary that decides who may read what is built from a
+# tagged commit, by a job whose inputs are all in git, or it is not shipped.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+# Two runs for the same tag would race to publish the same name. One at a time, and never
+# cancel a half-published release in flight.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  BINARY: s0
+
+jobs:
+  # ── the gate that makes a mistyped version unshippable ──────────────────────
+  #
+  # `Cargo.toml` is the source of truth for the version; the git tag must agree with it,
+  # and every downstream job takes the version from HERE rather than from the triggering
+  # ref. A tag that disagrees with the crate fails in seconds instead of publishing a
+  # `v0.3.0` release full of `0.2.0` artifacts.
+  version:
+    name: version guard
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.crate.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the crate version
+        id: crate
+        run: |
+          set -euo pipefail
+          version="$(bash scripts/crate-version.sh)"   # also fails if Cargo.lock disagrees
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "crate version: $version"
+
+      - name: The git tag must be v<crate version>
+        run: |
+          set -euo pipefail
+          expected="v${{ steps.crate.outputs.version }}"
+          if [ "$GITHUB_REF_NAME" != "$expected" ]; then
+            echo "::error::tag '$GITHUB_REF_NAME' does not match Cargo.toml ($expected)."
+            echo "Bump package.version and Cargo.lock in the same commit you tag, or tag $expected." >&2
+            exit 1
+          fi
+          echo "tag $GITHUB_REF_NAME matches Cargo.toml"
+
+  # ── the tagged commit's own test run ────────────────────────────────────────
+  #
+  # `ci.yml` triggers on branches and pull requests, and a tag can be pointed at any
+  # commit, so without this a tag could publish a commit that never ran the suite. It is
+  # CALLED rather than copied: one definition of "s0 passes", so the release gate cannot
+  # drift from the merge gate.
+  test:
+    name: gate
+    needs: version
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: [version, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build release binary
+        run: cargo build --release --locked --bin "$BINARY" --target ${{ matrix.target }}
+
+      - name: Package artifact
+        run: |
+          set -euo pipefail
+          staging="${BINARY}-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "$staging"
+          cp "target/${{ matrix.target }}/release/${BINARY}" "$staging/"
+          cp README.md LICENSE LICENSE-APACHE-2.0.txt "$staging/" 2>/dev/null || true
+          tar czf "${staging}.tar.gz" "$staging"
+          sha256sum "${staging}.tar.gz" > "${staging}.tar.gz.sha256"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY }}-${{ matrix.target }}
+          path: |
+            ${{ env.BINARY }}-*.tar.gz
+            ${{ env.BINARY }}-*.tar.gz.sha256
+
+  # ── the container image consumers pin ───────────────────────────────────────
+  #
+  # Consumers pin `registry.hyperfluid.cloud/hyperfluid/s0:<version>`, or copy that exact
+  # tag onward (`skopeo copy` / `crane copy` — never a rebuild). See docs/releasing.md.
+  #
+  # REGISTRY_TOKEN is a long-lived credential to exactly the artifact that authorizes S3
+  # traffic — scope it to push on `hyperfluid/s0` and nothing else.
+  #
+  # TAGS: exactly one, the crate version. No `latest`, no floating `0.2`, no branch tag —
+  # a pinned tag must name one immutable set of bytes forever.
+  #
+  # PLATFORMS: linux/amd64 only. arm64 would need QEMU cross-compilation or a second
+  # runner, and the resulting OCI index mirrors into private registries worse than a plain
+  # manifest. Adding it is one line in PLATFORMS below.
+  image:
+    name: publish container image
+    needs: [version, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      REGISTRY: registry.hyperfluid.cloud
+      IMAGE_REPOSITORY: hyperfluid/s0
+    steps:
+      - uses: actions/checkout@v4
+
+      # Names the missing secret; `docker login` with an empty password does not.
+      - name: Require the registry credentials
+        env:
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [ -n "${REGISTRY_USERNAME:-}" ] || missing+=(REGISTRY_USERNAME)
+          [ -n "${REGISTRY_TOKEN:-}" ]    || missing+=(REGISTRY_TOKEN)
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "::error::missing repository secret(s): ${missing[*]}"
+            echo "s0 publishes to ${REGISTRY}; set these under Settings → Secrets → Actions." >&2
+            exit 1
+          fi
+          echo "credentials for ${REGISTRY} present"
+
+      # Before buildx: the builder image below is pulled through this registry.
+      - name: Log in to the container registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.hyperfluid.cloud
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_TOKEN }}
+
+      # buildkit via the registry's pull-through cache, not an anonymous Docker Hub pull.
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=registry.hyperfluid.cloud/proxy_cache/moby/buildkit:master
+
+      # A registry tag is only "immutable" because nothing overwrites it. A re-run, or a
+      # deleted-and-recreated git tag, would otherwise push different bytes under a version
+      # somebody has already pinned and deployed. That is not a release, it is an overwrite.
+      #
+      # Only a successful inspect counts as "exists"; any failure (absent repository on the
+      # first release, transient registry error) falls through to the build, which cannot
+      # succeed without a working registry anyway.
+      - name: Refuse to overwrite a published version
+        run: |
+          set -euo pipefail
+          image="${REGISTRY}/${IMAGE_REPOSITORY}:${{ needs.version.outputs.version }}"
+          if docker buildx imagetools inspect "$image" >/dev/null 2>&1; then
+            echo "::error::${image} already exists — a published version is never rebuilt."
+            echo "Bump package.version, commit, and tag the new version." >&2
+            exit 1
+          fi
+          echo "$image is unpublished; proceeding"
+
+      # The same script anyone can run locally to check that the image still builds. PUSH=1
+      # is honoured only under GitHub Actions: one build recipe, one place it can publish
+      # from.
+      - name: Build and push
+        env:
+          PUSH: "1"
+          PLATFORMS: linux/amd64
+          S0_DIGEST_OUT: ${{ github.workspace }}/${{ env.BINARY }}-${{ needs.version.outputs.version }}.image-digest.txt
+        run: bash scripts/release-image.sh
+
+      # The digest travels with the release for the record — mirror verification, incident
+      # forensics — while the deployable reference stays the tag. Nothing in the deploy
+      # path reads this file; it is evidence, not configuration.
+      - name: Record the digest
+        run: |
+          set -euo pipefail
+          file="${BINARY}-${{ needs.version.outputs.version }}.image-digest.txt"
+          digest="$(cat "$file")"
+          image="${REGISTRY}/${IMAGE_REPOSITORY}:${{ needs.version.outputs.version }}"
+          printf '%s@%s\n' "$image" "$digest" > "$file"
+          {
+            echo "### s0 container image"
+            echo
+            echo '```'
+            echo "$image"
+            echo "$digest"
+            echo '```'
+            echo
+            echo "Consumers pin: \`${{ needs.version.outputs.version }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY }}-image-digest
+          path: ${{ env.BINARY }}-*.image-digest.txt
+
+  release:
+    name: publish release
+    needs: [build, image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub Release
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/*.image-digest.txt
+          generate_release_notes: true

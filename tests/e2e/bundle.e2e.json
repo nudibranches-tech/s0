@@ -1,0 +1,29 @@
+{
+  "_note": "e2e policy bundle (the pushed policy data). open-user is scoped to the pub/ prefix of the 'open' bucket and holds the existence verb `read`, so `aws s3 ls` shows it 'open' and NOT 'secret'; admin-user has the whole tenant and so sees both. This is what the platform would project and push in production; here it is a static fixture the gateway loads from bundle_path.",
+  "org_settings": { "freeze_writes": false, "reserved_tag_keys": [] },
+  "tenants": {
+    "acme": {
+      "user_attributes": {
+        "open-user": { "groups": [], "attributes": [] },
+        "admin-user": { "groups": [], "attributes": [] }
+      },
+      "bucket_attributes": {
+        "open": { "denylist": {}, "sensitivity": "low" },
+        "secret": { "denylist": {}, "sensitivity": "high" }
+      },
+      "s3_grants": {
+        "open-user": [
+          {
+            "bucket": "open",
+            "actions": ["read_objects", "list_objects", "write_objects", "delete_objects", "read"],
+            "prefixes": ["pub/"]
+          }
+        ],
+        "admin-user": [
+          { "bucket": "*", "actions": ["*"], "prefixes": [] }
+        ]
+      },
+      "group_grants": {}
+    }
+  }
+}
