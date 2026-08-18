@@ -178,7 +178,7 @@ jobs:
           password: ${{ secrets.REGISTRY_TOKEN }}
 
       # buildkit via the registry's pull-through cache, not an anonymous Docker Hub pull.
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
         with:
           driver-opts: |
             image=registry.hyperfluid.cloud/proxy_cache/moby/buildkit:master
