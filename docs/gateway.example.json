@@ -1,0 +1,92 @@
+{
+  "listen": "0.0.0.0:8014",
+  "admin_listen": "0.0.0.0:8016",
+  "sts": {
+    "master_keys": {
+      "k0": "REPLACE_ME_openssl_rand_hex_32_0000000000000000000000000000"
+    },
+    "current_kid": "k0",
+    "signing_key_hex": "REPLACE_ME_openssl_rand_hex_32_1111111111111111111111111111",
+    "session_ttl_secs": 3600
+  },
+  "_derived_keys_note": "Long-lived per-principal S3 keys (`HFSA<kid>.<payload>.<mac>` \u2014 see src/auth/derived.rs). Same two forms as `sts`: `master_key_hex`, or `master_keys` + `current_kid`. It must NOT share key material with `sts`, and the gateway refuses to load if it does. Present here because the section switching the FEATURE on is only half the opt-in: the policy bundle must also publish `tenants.<tenant>.s3_key_epoch`, whose ABSENCE denies every derived key for that tenant. Omit the whole section to answer the HFSA namespace with nothing \u2014 it stays reserved either way, so a static_credentials entry inside it is refused at load.",
+  "derived_keys": {
+    "master_keys": {
+      "k0": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    "current_kid": "k0"
+  },
+  "pdp": {
+    "mode": "embedded",
+    "cache_capacity": 100000
+  },
+  "audit": {
+    "backend": "control_plane",
+    "sink_url": "http://controlplane.example.com/api/v1/decision-logs",
+    "spill_path": "/var/lib/s0/audit-spill-${POD_NAME}.ndjson"
+  },
+  "limits": {
+    "xml_max_body_size": 20971520,
+    "post_object_max_file_size": 67108864,
+    "presigned_url_max_skew_time_secs": 900,
+    "max_delete_keys": 1000,
+    "max_tag_count": 10,
+    "max_list_fanout": 16,
+    "max_buckets_per_page": 1000,
+    "max_bucket_list_pages": 64,
+    "max_connections": 1024,
+    "header_read_timeout_secs": 15,
+    "backend_connect_timeout_secs": 5,
+    "backend_read_timeout_secs": 0
+  },
+  "backends": [
+    {
+      "id": "backend-eu-1",
+      "kind": "ceph",
+      "endpoint_url": "https://s3-backend.example.com:7480",
+      "region": "us-east-1",
+      "force_path_style": true
+    }
+  ],
+  "tenants": [
+    {
+      "tenant": "acme",
+      "organization_id": "org-acme",
+      "backend_id": "backend-eu-1",
+      "owner_access_key": "REPLACE_WITH_PER_TENANT_BACKEND_KEY",
+      "owner_secret_key": "REPLACE_WITH_PER_TENANT_BACKEND_SECRET"
+    }
+  ],
+  "static_credentials": [],
+  "bundle_path": "/etc/s0/bundle.json",
+  "bundle_url": "http://controlplane.example.com/api/v1/organizations/org-acme/bundle",
+  "bundle_poll_secs": 30,
+  "bundle_timeout_secs": 10,
+  "bundle_shared_secret": "REPLACE_WITH_PLATFORM_SHARED_SECRET",
+  "internal": {
+    "listen": "0.0.0.0:8017",
+    "shared_secret": "REPLACE_WITH_PLATFORM_SHARED_SECRET",
+    "max_session_ttl_secs": 3600
+  },
+  "sts_mint": {
+    "listen": "0.0.0.0:8015",
+    "issuer": "https://idp.example.com/realms/acme",
+    "audience": "s0",
+    "jwks_uri": "https://idp.example.com/realms/acme/protocol/openid-connect/certs",
+    "tenant_claim": "tenant",
+    "org_claim": "org",
+    "groups_claim": "groups",
+    "jwks_timeout_secs": 5,
+    "jwks_refresh_secs": 300,
+    "web_identity_enabled": true,
+    "web_identity_audiences": [
+      "acme-storage",
+      "hf-console",
+      "control-plane-sa"
+    ],
+    "role_name_template": "{tenant}-sts-role",
+    "max_duration_secs": 3600,
+    "max_connections": 256,
+    "connection_timeout_secs": 30
+  }
+}

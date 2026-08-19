@@ -1,0 +1,102 @@
+# Operation	method	path	query	headers
+# Generated from the pinned s3s 0.14.1 `resolve_route`; see the header of
+# tests/gate_blackbox.rs for the regeneration command and what it is for.
+AbortMultipartUpload	DELETE	/reports/2024/q1.csv	uploadId=upload-1	
+CompleteMultipartUpload	POST	/reports/2024/q1.csv	uploadId=upload-1	
+CopyObject	PUT	/reports/2024/q1.csv		x-amz-copy-source=/reports/2024/src.csv
+CreateBucket	PUT	/reports		
+CreateBucketMetadataTableConfiguration	POST	/reports	metadataTable=	
+CreateMultipartUpload	POST	/reports/2024/q1.csv	uploads=	
+CreateSession	GET	/reports	session=	
+DeleteBucket	DELETE	/reports		
+DeleteBucketAnalyticsConfiguration	DELETE	/reports	analytics=	
+DeleteBucketCors	DELETE	/reports	cors=	
+DeleteBucketEncryption	DELETE	/reports	encryption=	
+DeleteBucketIntelligentTieringConfiguration	DELETE	/reports	intelligent-tiering=	
+DeleteBucketInventoryConfiguration	DELETE	/reports	inventory=	
+DeleteBucketLifecycle	DELETE	/reports	lifecycle=	
+DeleteBucketMetadataTableConfiguration	DELETE	/reports	metadataTable=	
+DeleteBucketMetricsConfiguration	DELETE	/reports	metrics=	
+DeleteBucketOwnershipControls	DELETE	/reports	ownershipControls=	
+DeleteBucketPolicy	DELETE	/reports	policy=	
+DeleteBucketReplication	DELETE	/reports	replication=	
+DeleteBucketTagging	DELETE	/reports	tagging=	
+DeleteBucketWebsite	DELETE	/reports	website=	
+DeleteObject	DELETE	/reports/2024/q1.csv		
+DeleteObjectTagging	DELETE	/reports/2024/q1.csv	tagging=	
+DeleteObjects	POST	/reports	delete=	
+DeletePublicAccessBlock	DELETE	/reports	publicAccessBlock=	
+GetBucketAccelerateConfiguration	GET	/reports	accelerate=	
+GetBucketAcl	GET	/reports	acl=	
+GetBucketAnalyticsConfiguration	GET	/reports	analytics=&id=cfg-1	
+GetBucketCors	GET	/reports	cors=	
+GetBucketEncryption	GET	/reports	encryption=	
+GetBucketIntelligentTieringConfiguration	GET	/reports	intelligent-tiering=&id=cfg-1	
+GetBucketInventoryConfiguration	GET	/reports	inventory=&id=cfg-1	
+GetBucketLifecycleConfiguration	GET	/reports	lifecycle=	
+GetBucketLocation	GET	/reports	location=	
+GetBucketLogging	GET	/reports	logging=	
+GetBucketMetadataTableConfiguration	GET	/reports	metadataTable=	
+GetBucketMetricsConfiguration	GET	/reports	metrics=&id=cfg-1	
+GetBucketNotificationConfiguration	GET	/reports	notification=	
+GetBucketOwnershipControls	GET	/reports	ownershipControls=	
+GetBucketPolicy	GET	/reports	policy=	
+GetBucketPolicyStatus	GET	/reports	policyStatus=	
+GetBucketReplication	GET	/reports	replication=	
+GetBucketRequestPayment	GET	/reports	requestPayment=	
+GetBucketTagging	GET	/reports	tagging=	
+GetBucketVersioning	GET	/reports	versioning=	
+GetBucketWebsite	GET	/reports	website=	
+GetObject	GET	/reports/2024/q1.csv		
+GetObjectAcl	GET	/reports/2024/q1.csv	acl=	
+GetObjectAttributes	GET	/reports/2024/q1.csv	attributes=	
+GetObjectLegalHold	GET	/reports/2024/q1.csv	legal-hold=	
+GetObjectLockConfiguration	GET	/reports	object-lock=	
+GetObjectRetention	GET	/reports/2024/q1.csv	retention=	
+GetObjectTagging	GET	/reports/2024/q1.csv	tagging=	
+GetObjectTorrent	GET	/reports/2024/q1.csv	torrent=	
+GetPublicAccessBlock	GET	/reports	publicAccessBlock=	
+HeadBucket	HEAD	/reports		
+HeadObject	HEAD	/reports/2024/q1.csv		
+ListBucketAnalyticsConfigurations	GET	/reports	analytics=	
+ListBucketIntelligentTieringConfigurations	GET	/reports	intelligent-tiering=	
+ListBucketInventoryConfigurations	GET	/reports	inventory=	
+ListBucketMetricsConfigurations	GET	/reports	metrics=	
+ListBuckets	GET	/		
+ListDirectoryBuckets	GET	/	x-id=ListDirectoryBuckets	
+ListMultipartUploads	GET	/reports	uploads=	
+ListObjectVersions	GET	/reports	versions=	
+ListObjects	GET	/reports		
+ListObjectsV2	GET	/reports	list-type=2	
+ListParts	GET	/reports/2024/q1.csv	uploadId=upload-1	
+PostObject	POST	/reports		@multipart
+PutBucketAccelerateConfiguration	PUT	/reports	accelerate=	
+PutBucketAcl	PUT	/reports	acl=	
+PutBucketAnalyticsConfiguration	PUT	/reports	analytics=	
+PutBucketCors	PUT	/reports	cors=	
+PutBucketEncryption	PUT	/reports	encryption=	
+PutBucketIntelligentTieringConfiguration	PUT	/reports	intelligent-tiering=	
+PutBucketInventoryConfiguration	PUT	/reports	inventory=	
+PutBucketLifecycleConfiguration	PUT	/reports	lifecycle=	
+PutBucketLogging	PUT	/reports	logging=	
+PutBucketMetricsConfiguration	PUT	/reports	metrics=	
+PutBucketNotificationConfiguration	PUT	/reports	notification=	
+PutBucketOwnershipControls	PUT	/reports	ownershipControls=	
+PutBucketPolicy	PUT	/reports	policy=	
+PutBucketReplication	PUT	/reports	replication=	
+PutBucketRequestPayment	PUT	/reports	requestPayment=	
+PutBucketTagging	PUT	/reports	tagging=	
+PutBucketVersioning	PUT	/reports	versioning=	
+PutBucketWebsite	PUT	/reports	website=	
+PutObject	PUT	/reports/2024/q1.csv		
+PutObjectAcl	PUT	/reports/2024/q1.csv	acl=	
+PutObjectLegalHold	PUT	/reports/2024/q1.csv	legal-hold=	
+PutObjectLockConfiguration	PUT	/reports	object-lock=	
+PutObjectRetention	PUT	/reports/2024/q1.csv	retention=	
+PutObjectTagging	PUT	/reports/2024/q1.csv	tagging=	
+PutPublicAccessBlock	PUT	/reports	publicAccessBlock=	
+RestoreObject	POST	/reports/2024/q1.csv	restore=	
+SelectObjectContent	POST	/reports/2024/q1.csv	select=&select-type=2	
+UploadPart	PUT	/reports/2024/q1.csv	partNumber=1&uploadId=upload-1	
+UploadPartCopy	PUT	/reports/2024/q1.csv	partNumber=1&uploadId=upload-1	x-amz-copy-source=/reports/2024/src.csv
+WriteGetObjectResponse	POST	/reports		x-amz-request-route=route-1,x-amz-request-token=token-1

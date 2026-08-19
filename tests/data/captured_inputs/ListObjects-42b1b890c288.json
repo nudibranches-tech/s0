@@ -1,0 +1,23 @@
+{
+  "acl_grants": [],
+  "action": "list_objects",
+  "backend": {
+    "id": "bay-1",
+    "kind": "ceph"
+  },
+  "bucket": "reports",
+  "bypass_governance": false,
+  "organization_id": "org-acme",
+  "prefix": "2024/",
+  "principal": {
+    "attributes": {
+      "groups": []
+    },
+    "sub": "alice",
+    "type": "user"
+  },
+  "request": {
+    "method": "GET"
+  },
+  "tenant": "acme"
+}
