@@ -417,7 +417,9 @@ Until that date, in short:
   and demonstration, for everyone, companies included; plus production use by
   individuals, non-profits, educational institutions and public research bodies.
 - **Paid** — any production use by or for a commercial entity, including a purely
-  internal deployment securing your own object storage. Write to
-  <contact@nudibranches.tech> for a commercial license.
+  internal deployment securing your own object storage. That needs a commercial
+  license, granted against payment of a fee and obtained before the use starts:
+  see [`COMMERCIAL.md`](COMMERCIAL.md), or write to <contact@nudibranches.tech>
+  for terms and pricing.
 
 That summary is a convenience; [`LICENSE`](LICENSE) is what governs.

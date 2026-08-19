@@ -33,6 +33,22 @@ Re-releasing means bumping the version.
 
 The consuming platform then bumps its pin and deploys normally.
 
+## The Change Date travels with the version
+
+[`../LICENSE`](../LICENSE) carries a fixed `Change Date`, and the BSL applies it
+*per version*: a version converts to Apache-2.0 on that date **or** on its own
+fourth anniversary, whichever comes first. Freeze the date and every later release
+inherits a shorter and shorter BSL window — a version cut in 2029 would go
+Apache-2.0 after a year. So move it with the version bump, in step 1:
+
+```bash
+$EDITOR LICENSE     # Change Date: <release date + 4 years>
+$EDITOR README.md   # the same date in the License section, and in COMMERCIAL.md
+```
+
+What is already published is unaffected: releasing 0.4.0 with a later Change Date
+does not move 0.3.2's. Each version keeps the terms it shipped under.
+
 ## Why there is no shortcut, and why the tag has to move
 
 A consumer pins a tag with `imagePullPolicy: IfNotPresent`. Push different bytes under a
