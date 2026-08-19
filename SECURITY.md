@@ -10,7 +10,7 @@ seriously and appreciate responsible disclosure.
 
 Instead, report privately to:
 
-- **Email:** roch@nudibranches.tech
+- **Email:** contact@nudibranches.tech
 - Optionally use GitHub's
   [private vulnerability reporting](https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing-information-about-vulnerabilities/privately-reporting-a-security-vulnerability)
   ("Report a vulnerability" under the repository's **Security** tab).

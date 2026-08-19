@@ -80,6 +80,20 @@ The gateway is on the security path, so a few conventions are non-negotiable:
 Please do **not** open public issues for vulnerabilities. See
 [`SECURITY.md`](SECURITY.md) for the private disclosure process.
 
+## Licensing of contributions
+
+s0 is distributed under the Business Source License 1.1 ([`LICENSE`](LICENSE)),
+which converts to Apache-2.0 on the change date and is also offered under
+separate commercial licenses. So that both paths stay possible, by submitting a
+contribution you agree that it is licensed under the terms of [`LICENSE`](LICENSE),
+and you grant Nudibranches a perpetual, worldwide, non-exclusive, royalty-free,
+irrevocable license to use, reproduce, modify, sublicense and distribute your
+contribution, including under the Change License and under commercial license
+terms. You keep the copyright on what you write.
+
+Sign off your commits (`git commit -s`) to certify the
+[Developer Certificate of Origin](https://developercertificate.org/).
+
 ## Code of Conduct
 
 Participation is governed by our [Code of Conduct](CODE_OF_CONDUCT.md).

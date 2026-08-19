@@ -6,7 +6,7 @@ rust-version = "1.85"
 license = "BUSL-1.1"
 description = "An OPA/ABAC-enforcing, S3-compatible authorization gateway."
 repository = "https://github.com/nudibranches-tech/s0"
-authors = ["Nudibranches <roch@nudibranches.tech>"]
+authors = ["Nudibranches <contact@nudibranches.tech>"]
 keywords = ["s3", "abac", "opa", "gateway", "authorization"]
 
 [dependencies]

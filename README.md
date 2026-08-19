@@ -407,6 +407,17 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md). Security reports: [`SECURITY.md`](SECU
 
 ## License
 
-Business Source License 1.1, converting to Apache-2.0 on the change date
-(`2030-07-15`, four years after first publication). See [`LICENSE`](LICENSE); the future
-Apache text is in [`LICENSE-APACHE-2.0.txt`](LICENSE-APACHE-2.0.txt).
+Business Source License 1.1 (`BUSL-1.1`), converting to Apache-2.0 on the change
+date (`2030-08-18`, four years after first publication). See [`LICENSE`](LICENSE);
+the future Apache text is in [`LICENSE-APACHE-2.0.txt`](LICENSE-APACHE-2.0.txt).
+
+Until that date, in short:
+
+- **Free** — evaluation, development, testing, CI, benchmarking, security research
+  and demonstration, for everyone, companies included; plus production use by
+  individuals, non-profits, educational institutions and public research bodies.
+- **Paid** — any production use by or for a commercial entity, including a purely
+  internal deployment securing your own object storage. Write to
+  <contact@nudibranches.tech> for a commercial license.
+
+That summary is a convenience; [`LICENSE`](LICENSE) is what governs.

@@ -7,23 +7,43 @@ License text copyright (c) 2023 MariaDB plc, All Rights Reserved.
 
 Parameters
 
-Licensor:             Nudibranches (roch@nudibranches.tech)
+Licensor:             Nudibranches (contact@nudibranches.tech)
 
 Licensed Work:        s0 — an OPA/ABAC-enforcing, S3-compatible
                       authorization gateway. The Licensed Work is
                       (c) 2026 Nudibranches.
 
-Additional Use Grant: You may make production use of the Licensed Work,
-                      provided that you do not offer the Licensed Work to third
-                      parties as a hosted or managed service where the service
-                      provides users with access to a substantial set of the
-                      features or functionality of the Licensed Work (i.e. a
-                      "Gateway-as-a-Service" competing offering). Using the
-                      Licensed Work internally to secure your own object storage,
-                      or bundling it inside a product whose primary value is not
-                      the gateway itself, is permitted.
+Additional Use Grant: You may make production use of the Licensed Work, free of
+                      charge, for Non-Commercial Use.
 
-Change Date:          2030-07-15
+                      Whether or not you are a Commercial Entity, you may also
+                      use the Licensed Work free of charge for evaluation,
+                      development, testing, continuous integration,
+                      benchmarking, security research, and demonstration,
+                      including against copies of production data. Such use is
+                      non-production use: the Licensed Work is not, in that
+                      case, relied upon to authorize access to a system that
+                      serves your users or customers.
+
+                      "Non-Commercial Use" means use by a natural person acting
+                      on their own behalf, or by a non-profit organization, an
+                      educational institution, or a public research body, in
+                      each case where the Licensed Work is not used to operate,
+                      secure, or deliver a product or service that is sold,
+                      licensed, or otherwise commercially exploited, and is not
+                      offered to third parties as a hosted or managed service.
+
+                      "Commercial Entity" means any person or legal entity
+                      whose use is not Non-Commercial Use, including any entity
+                      that operates for profit and its affiliates.
+
+                      Production use by or for a Commercial Entity — including
+                      use that is purely internal to that entity, such as
+                      securing its own object storage — falls outside this
+                      grant and requires a commercial license from the
+                      Licensor. Write to contact@nudibranches.tech.
+
+Change Date:          2030-08-18
 
 Change License:       Apache License, Version 2.0 (Apache-2.0), the full text of
                       which is provided in the file LICENSE-APACHE-2.0.txt in
