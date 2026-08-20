@@ -15,7 +15,7 @@
 # `Cargo.toml` via `scripts/crate-version.sh`.
 #
 # Environment (CI sets these; a local run needs none of them):
-#   REGISTRY          default registry.hyperfluid.cloud
+#   REGISTRY          default 90o7448p.c1.gra9.container-registry.ovh.net
 #   IMAGE_REPOSITORY  default s0/s0
 #   PLATFORMS         default linux/amd64  (see "Releasing" in the README for why)
 #   PUSH              1 to publish — honoured ONLY under GitHub Actions
@@ -26,7 +26,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-registry="${REGISTRY:-registry.hyperfluid.cloud}"
+registry="${REGISTRY:-90o7448p.c1.gra9.container-registry.ovh.net}"
 # Lower-cased: registries reject an upper-case path.
 repository="$(printf '%s' "${IMAGE_REPOSITORY:-s0/s0}" | tr '[:upper:]' '[:lower:]')"
 platforms="${PLATFORMS:-linux/amd64}"

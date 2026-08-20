@@ -128,7 +128,7 @@ jobs:
 
   # ── the container image consumers pin ───────────────────────────────────────
   #
-  # Consumers pin `registry.hyperfluid.cloud/s0/s0:<version>`, or copy that exact
+  # Consumers pin `90o7448p.c1.gra9.container-registry.ovh.net/s0/s0:<version>`, or copy that exact
   # tag onward (`skopeo copy` / `crane copy` — never a rebuild). See docs/releasing.md.
   #
   # REGISTRY_TOKEN is a long-lived credential to exactly the artifact that authorizes S3
@@ -147,7 +147,7 @@ jobs:
     permissions:
       contents: read
     env:
-      REGISTRY: registry.hyperfluid.cloud
+      REGISTRY: ${{ secrets.REGISTRY_URL }}
       IMAGE_REPOSITORY: s0/s0
     steps:
       - uses: actions/checkout@v4
@@ -173,7 +173,7 @@ jobs:
       - name: Log in to the container registry
         uses: docker/login-action@v3
         with:
-          registry: registry.hyperfluid.cloud
+          registry: ${{ env.REGISTRY }}
           username: ${{ secrets.REGISTRY_USERNAME }}
           password: ${{ secrets.REGISTRY_TOKEN }}
 
@@ -181,7 +181,7 @@ jobs:
       - uses: docker/setup-buildx-action@v3
         with:
           driver-opts: |
-            image=registry.hyperfluid.cloud/proxy_cache/moby/buildkit:master
+            image=${{ env.REGISTRY }}/proxy_cache/moby/buildkit:master
 
       # A registry tag is only "immutable" because nothing overwrites it. A re-run, or a
       # deleted-and-recreated git tag, would otherwise push different bytes under a version
