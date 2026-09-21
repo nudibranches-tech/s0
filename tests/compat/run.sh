@@ -27,7 +27,9 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 STATE="${STATE:-/tmp/s0-compat}"
 GW_BIN="${GW_BIN:-$ROOT/target/release/s0}"
-BACKEND_IMAGE="${BACKEND_IMAGE:-minio/minio:latest}"
+# quay.io, not Docker Hub: docker.io/minio/minio no longer serves anonymous pulls
+# ("pull access denied"), which kills the job before a single scenario runs.
+BACKEND_IMAGE="${BACKEND_IMAGE:-quay.io/minio/minio:latest}"
 BACKEND_NAME=s0compat-backend
 GW_PORT=8114
 PROXY_PORT=8113

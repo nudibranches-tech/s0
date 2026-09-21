@@ -23,7 +23,9 @@ STATE="/tmp/s0-e2e"
 
 GW_ENDPOINT="${GW_ENDPOINT:-http://127.0.0.1:8014}"
 MINIO_ENDPOINT="${MINIO_ENDPOINT:-http://127.0.0.1:9000}"
-MINIO_IMAGE="${MINIO_IMAGE:-minio/minio:latest}"
+# quay.io, not Docker Hub: docker.io/minio/minio no longer serves anonymous pulls
+# ("pull access denied"), which kills the job before a single scenario runs.
+MINIO_IMAGE="${MINIO_IMAGE:-quay.io/minio/minio:latest}"
 # Pinned to the parity gate's oracle: the OPA major version selects the rego dialect
 # (>=1.0 parses v1, 0.x parses v0), so a sidecar on the wrong side of that line answers
 # different questions than the embedded engine. Held equal to `EXPECTED_OPA_VERSION` in
