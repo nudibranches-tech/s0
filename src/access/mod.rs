@@ -711,6 +711,7 @@ impl S3Access for GatewayAccess {
     /// behind an audit record that said "allowed write". See [`headers`] for the
     /// classification and for why the answer is a denial rather than a silent strip.
     async fn put_object(&self, req: &mut S3Request<PutObjectInput>) -> S3Result<()> {
+        headers::strip_aws_chunked(&mut req.input.content_encoding);
         let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
         let max_tags = self.gw.limits().max_tag_count;
         let riders = RequestRiders::parse(
@@ -943,6 +944,7 @@ impl S3Access for GatewayAccess {
         &self,
         req: &mut S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<()> {
+        headers::strip_aws_chunked(&mut req.input.content_encoding);
         let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
         let max_tags = self.gw.limits().max_tag_count;
         let riders = RequestRiders::parse(
