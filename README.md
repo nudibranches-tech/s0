@@ -408,7 +408,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md). Security reports: [`SECURITY.md`](SECU
 ## License
 
 Business Source License 1.1 (`BUSL-1.1`), converting to Apache-2.0 on the change
-date (`2030-08-18`, four years after first publication). See [`LICENSE`](LICENSE);
+date (`2030-09-28`, four years after this release). See [`LICENSE`](LICENSE);
 the future Apache text is in [`LICENSE-APACHE-2.0.txt`](LICENSE-APACHE-2.0.txt).
 
 Until that date, in short:

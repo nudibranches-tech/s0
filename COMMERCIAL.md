@@ -1,7 +1,7 @@
 # Commercial license
 
 s0 is **source-available, not open source**. Until the change date
-(`2030-08-18`), running it in production inside a company requires a paid
+(`2030-09-28`), running it in production inside a company requires a paid
 commercial license from Nudibranches. Everything else — reading the code,
 modifying it, redistributing it, and using it outside production — is free
 under the [Business Source License 1.1](LICENSE).
@@ -54,7 +54,7 @@ missed license is a conversation, not an ambush.
 
 ## After the change date
 
-On `2030-08-18` the versions covered by the current [`LICENSE`](LICENSE) become
+On `2030-09-28` the versions covered by the current [`LICENSE`](LICENSE) become
 available under Apache-2.0 and the commercial license stops being necessary for
 them. Versions released later carry their own change date and remain under BSL
 until it passes. See [`docs/releasing.md`](docs/releasing.md).
