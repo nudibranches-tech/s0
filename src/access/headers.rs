@@ -306,6 +306,23 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Drop the `aws-chunked` coding from a parsed `Content-Encoding`, keeping any other.
+///
+/// It describes how the client framed the request body, which s3s has already decoded,
+/// not the object. Forwarded, the backend SDK appends its own for its checksum trailer and
+/// signs two values the backend canonicalizes as one, so the write fails SigV4 upstream.
+pub fn strip_aws_chunked(encoding: &mut Option<String>) {
+    let Some(value) = encoding.as_deref() else {
+        return;
+    };
+    let kept: Vec<&str> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("aws-chunked"))
+        .collect();
+    *encoding = (!kept.is_empty()).then(|| kept.join(","));
+}
+
 fn hex_val(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
@@ -558,5 +575,22 @@ mod tests {
         // fact about the request and the record should say so.
         assert!(!r.is_empty());
         assert_eq!(classify(&r.acl), AclDisposition::NoGrant);
+    }
+
+    #[test]
+    fn aws_chunked_is_stripped_and_real_codings_are_kept() {
+        let strip = |v: Option<&str>| {
+            let mut e = v.map(str::to_string);
+            strip_aws_chunked(&mut e);
+            e
+        };
+        assert_eq!(strip(Some("aws-chunked")), None);
+        assert_eq!(strip(Some("AWS-Chunked")), None);
+        assert_eq!(strip(Some("gzip,aws-chunked")), Some("gzip".into()));
+        assert_eq!(strip(Some("aws-chunked, gzip")), Some("gzip".into()));
+        assert_eq!(strip(Some("gzip, br")), Some("gzip,br".into()));
+        assert_eq!(strip(Some("gzip")), Some("gzip".into()));
+        assert_eq!(strip(Some("")), None);
+        assert_eq!(strip(None), None);
     }
 }
