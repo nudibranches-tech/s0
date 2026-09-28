@@ -21,8 +21,9 @@ jobs:
     runs-on: ubuntu-latest
     services:
       minio:
-        # quay.io: docker.io/minio/minio no longer serves anonymous pulls.
-        image: quay.io/minio/minio:latest
+        # pgsty/silo, a maintained MinIO fork: MinIO no longer publishes public images.
+        # Keep in step with MINIO_IMAGE in tests/e2e/run.sh.
+        image: pgsty/silo:RELEASE.2026-09-16T00-00-00Z
         ports: ["9000:9000"]
         env:
           MINIO_ROOT_USER: minioadmin
