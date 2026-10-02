@@ -125,11 +125,17 @@ allow if {
 # pushed module can be checked against it. `tests/policy_corpus.rs` holds the two to the
 # same answer over the corpus.
 #
-# The version gate is the gateway's: an integer below 3, a string, or no version at all
-# places nothing, and every rule below is inert.
+# The version gate is the gateway's: a number below 3, or no version at all, places
+# nothing, and every rule below is inert. A version that is present but not a number
+# (`"3"`, `null`) is a projection defect, refused rather than read as an old document.
 places_buckets if {
 	is_number(data.grant_schema_version)
 	data.grant_schema_version >= 3
+}
+
+placement_version_unreadable if {
+	version := data.grant_schema_version
+	not is_number(version)
 }
 
 # Account scope included: a bundle projected for another backend (or naming none) describes
@@ -168,6 +174,8 @@ bucket_not_placed if {
 	some bucket in screened_bucket
 	not claims_bucket(input.tenant, bucket)
 }
+
+placement_refused if placement_version_unreadable
 
 placement_refused if placement_backend_mismatch
 
@@ -537,6 +545,8 @@ default reason := "deny: no grant matches action/scope"
 
 # Placement first: it says the question was about the wrong bucket or the wrong backend,
 # which no grant, membership or freeze could change.
+reason := "deny: bundle grant_schema_version is not a number" if placement_version_unreadable
+
 reason := "deny: bundle projected for another backend" if placement_backend_mismatch
 
 reason := "deny: bucket belongs to another tenant" if {

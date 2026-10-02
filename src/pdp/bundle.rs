@@ -308,6 +308,13 @@ impl BucketPlacement {
                     "data.{GRANT_SCHEMA_VERSION_FIELD} is {version}, not an integer"
                 ));
             }
+            // No version was ever anything but a number, so one that is not (`"3"`, `null`)
+            // is a projection defect. Read as "old", it would switch the placement gate off.
+            None if !version.is_number() => {
+                return BucketPlacement::Unusable(format!(
+                    "data.{GRANT_SCHEMA_VERSION_FIELD} is {version}, not a number"
+                ));
+            }
             None => return BucketPlacement::Unplaced,
         };
 
@@ -1100,7 +1107,6 @@ mod tests {
             ("v1", with(serde_json::json!(1))),
             ("v2", with(serde_json::json!(2))),
             ("negative", with(serde_json::json!(-3))),
-            ("a string", with(serde_json::json!("3"))),
             ("below 3, fractional", with(serde_json::json!(2.5))),
         ] {
             assert!(
@@ -1125,6 +1131,33 @@ mod tests {
             matches!(&fractional, BucketPlacement::Unusable(why) if why.contains("not an integer")),
             "{fractional:?}"
         );
+        // Present but not a number at all: a projection defect, never an old document.
+        for (label, version) in [
+            ("a string", serde_json::json!("3")),
+            ("a string below 3", serde_json::json!("2")),
+            ("null", serde_json::Value::Null),
+            ("a boolean", serde_json::json!(true)),
+            ("an object", serde_json::json!({ "version": 3 })),
+        ] {
+            let placement = with(version);
+            assert!(
+                matches!(&placement, BucketPlacement::Unusable(why) if why.contains("not a number")),
+                "{label}: {placement:?}"
+            );
+            assert!(placement.places_buckets(), "{label}");
+            assert!(
+                matches!(
+                    placement.refusal("archive", "acme", "reports"),
+                    Some(PlacementRefusal::Unusable(_))
+                ),
+                "{label}"
+            );
+            assert_eq!(
+                placement.listing("archive", "acme"),
+                Some(Vec::new()),
+                "{label}"
+            );
+        }
         assert_eq!(PLACEMENT_SCHEMA_VERSION, 3);
     }
 
