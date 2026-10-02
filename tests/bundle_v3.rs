@@ -254,6 +254,86 @@ async fn a_bucket_of_another_tenant_is_refused_before_any_policy_is_asked() {
     assert_eq!(rec.result.reason, BUCKET_OF_ANOTHER_TENANT);
     assert_eq!(rec.gateway.outcome, Outcome::Denied);
     assert_eq!(rec.gateway.backend_id, BACKEND);
+    assert_eq!(
+        rec.gateway.object_name.as_deref(),
+        Some("ledger.bay-1"),
+        "the record names the resource that was reached for"
+    );
+}
+
+/// Every record names the bundle's object name for each bucket it is about, so a
+/// consumer can join it to the bucket without re-deriving one name from the other — and
+/// names nothing the bundle did not publish.
+#[tokio::test]
+async fn the_record_carries_the_bundles_object_name_for_each_bucket() {
+    let fx = common::fixture("v3-object-names", v3());
+    let access = GatewayAccess::new(fx.gw.clone());
+
+    // Allowed: the record is held for the forward leg and emitted when the request ends.
+    let mut req = fx.request("GetObject", get("reports", "2024/q1.csv"), Method::GET);
+    access.get_object(&mut req).await.expect("allowed");
+    drop(req);
+    // A copy out of another tenant's bucket: both names, on the refusal.
+    let mut copy = common::ops::copy_object_input();
+    copy.copy_source = CopySource::Bucket {
+        bucket: "ledger".into(),
+        key: "src.csv".into(),
+        version_id: None,
+    };
+    let mut req = fx.request_as("wild", "CopyObject", copy, Method::PUT);
+    access.copy_object(&mut req).await.expect_err("refused");
+    // A bucket the bundle does not place has no object name to give.
+    let mut req = fx.request_as("wild", "GetObject", get("elsewhere", "k"), Method::GET);
+    access.get_object(&mut req).await.expect_err("refused");
+
+    let records = fx.await_audit_records(3).await;
+    let by_bucket = |bucket: &str| {
+        records
+            .iter()
+            .find(|r| r.input.as_ref().is_some_and(|i| i.bucket == bucket))
+            .unwrap_or_else(|| panic!("no record for {bucket}: {records:?}"))
+            .gateway
+            .clone()
+    };
+    let read = by_bucket("reports");
+    assert_eq!(read.outcome, Outcome::Allowed);
+    assert_eq!(read.object_name.as_deref(), Some("reports.bay-1"));
+    assert_eq!(read.copy_source_object_name, None);
+    // The copy's record is the destination's (`reports`, the copy's own bucket).
+    let copy = records
+        .iter()
+        .find(|r| r.input.as_ref().is_some_and(|i| i.copy_source.is_some()))
+        .expect("the copy's record")
+        .gateway
+        .clone();
+    assert_eq!(copy.object_name.as_deref(), Some("reports.bay-1"));
+    assert_eq!(
+        copy.copy_source_object_name.as_deref(),
+        Some("ledger.bay-1")
+    );
+    let elsewhere = by_bucket("elsewhere");
+    assert_eq!(elsewhere.object_name, None);
+}
+
+/// Below v3 there is nothing to name, and the record is the one it always was: the
+/// fields are not even serialized.
+#[tokio::test]
+async fn a_v2_record_carries_no_object_name() {
+    let fx = common::fixture("v3-v2-record", placed_bundle(2, BACKEND));
+    let mut req = fx.request("GetObject", get("reports", "2024/q1.csv"), Method::GET);
+    GatewayAccess::new(fx.gw.clone())
+        .get_object(&mut req)
+        .await
+        .expect("allowed");
+    drop(req);
+    let records = fx.await_audit_records(1).await;
+    let rec = decision_records(&records)[0];
+    let json = serde_json::to_value(rec).expect("serialize");
+    assert!(
+        json["gateway"].get("object_name").is_none()
+            && json["gateway"].get("copy_source_object_name").is_none(),
+        "{json}"
+    );
 }
 
 #[tokio::test]

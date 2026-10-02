@@ -235,6 +235,10 @@ impl GatewayAccess {
         outcome: Outcome,
         denied_keys: Vec<String>,
     ) -> AuditRecord {
+        // The live revision rather than the request's pinned one: this names, it never
+        // decides, and a bucket keeps its object name for as long as it exists.
+        let bundle = self.gw.bundles.current();
+        let object_name = |bucket: &str| bundle.placement().object_name(bucket).map(str::to_string);
         let meta = GatewayMeta {
             backend_id: input.backend.id.clone(),
             backend_kind: input.backend.kind.as_str().to_string(),
@@ -242,6 +246,11 @@ impl GatewayAccess {
             denied_keys,
             backend: BackendOutcome::NotAttempted,
             backend_status: None,
+            object_name: object_name(&input.bucket),
+            copy_source_object_name: input
+                .copy_source
+                .as_ref()
+                .and_then(|source| object_name(&source.bucket)),
         };
         AuditRecord::new(
             new_decision_id(),
