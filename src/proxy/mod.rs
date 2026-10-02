@@ -40,6 +40,8 @@ struct TenantRoute {
     /// intermediate struct can print it — see `src/secret.rs`.
     owner_secret_key: Secret<String>,
     organization_id: String,
+    /// See [`RouteSnapshot::shares_upstream_identity`].
+    shares_upstream_identity: bool,
 }
 
 /// The secret-free half of a [`TenantRoute`]. `S3Access::check` resolves one per request
@@ -54,6 +56,11 @@ pub struct RouteSnapshot {
     /// The gateway's AUTHORITATIVE tenant→org binding — never the credential's
     /// self-declared org, so audit attribution is not drift-able.
     pub organization_id: String,
+    /// Another tenant of this config is re-signed with the same upstream credential on the
+    /// same backend, so the backend would serve either tenant's buckets to the other. Only
+    /// a placing bundle keeps them apart, and without one this tenant is refused
+    /// ([`crate::pdp::BucketPlacement::shared_identity_refusal`]). A flag, never the key.
+    pub shares_upstream_identity: bool,
 }
 
 /// The routing table: one immutable snapshot, swapped wholesale.
@@ -96,8 +103,10 @@ impl crate::auth::TenantDirectory for BackendRegistry {
 
 impl BackendRegistry {
     pub fn from_config(cfg: &GatewayConfig) -> Result<Self> {
+        let routes = build_routes(cfg)?;
+        log_shared_upstream_identities(&routes);
         Ok(BackendRegistry {
-            routes: ArcSwap::from_pointee(build_routes(cfg)?),
+            routes: ArcSwap::from_pointee(routes),
             pool: Mutex::new(HashMap::new()),
             timeouts: backend_timeouts(&cfg.limits),
         })
@@ -113,6 +122,7 @@ impl BackendRegistry {
     pub fn apply_config(&self, cfg: &GatewayConfig) -> Result<()> {
         let routes = build_routes(cfg)?;
         let tenants = routes.len();
+        log_shared_upstream_identities(&routes);
         self.routes.store(Arc::new(routes));
         let dropped = {
             let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
@@ -137,6 +147,7 @@ impl BackendRegistry {
             backend_id: BackendId(route.backend.id.clone()),
             backend_kind: route.backend.kind,
             organization_id: route.organization_id.clone(),
+            shares_upstream_identity: route.shares_upstream_identity,
         })
     }
 
@@ -157,6 +168,20 @@ impl BackendRegistry {
                 "tenant {} was authorized against backend {} but now routes to {}; \
                  refusing to forward across a routing change",
                 snapshot.tenant, snapshot.backend_id.0, route.backend.id
+            )));
+        }
+        // The placement screen was chosen by this flag: a tenant that started sharing its
+        // upstream identity since `check` was screened as one that did not.
+        if route.shares_upstream_identity != snapshot.shares_upstream_identity {
+            return Err(GatewayError::Backend(format!(
+                "tenant {} was authorized under a routing table where it {} its upstream \
+                 identity; refusing to forward across a routing change",
+                snapshot.tenant,
+                if snapshot.shares_upstream_identity {
+                    "shared"
+                } else {
+                    "did not share"
+                }
             )));
         }
         let key: PoolKey = (route.backend.id.clone(), snapshot.tenant.clone());
@@ -183,12 +208,24 @@ fn build_routes(cfg: &GatewayConfig) -> Result<Routes> {
         .iter()
         .map(|b| (b.id.as_str(), Arc::new(b.clone())))
         .collect();
+    // How many tenants each upstream identity re-signs for. One identity is one
+    // `(backend, access key)`: the same key on two backends is two accounts.
+    let mut identities: HashMap<(&str, &str), usize> = HashMap::new();
+    for t in &cfg.tenants {
+        *identities
+            .entry((t.backend_id.as_str(), t.owner_access_key.as_str()))
+            .or_default() += 1;
+    }
     let mut routes = Routes::new();
     for t in &cfg.tenants {
         let backend = backends
             .get(t.backend_id.as_str())
             .ok_or_else(|| GatewayError::Config(format!("unknown backend {}", t.backend_id)))?
             .clone();
+        let sharers = identities
+            .get(&(t.backend_id.as_str(), t.owner_access_key.as_str()))
+            .copied()
+            .unwrap_or(0);
         routes.insert(
             t.tenant.clone(),
             TenantRoute {
@@ -196,10 +233,31 @@ fn build_routes(cfg: &GatewayConfig) -> Result<Routes> {
                 owner_access_key: t.owner_access_key.clone(),
                 owner_secret_key: t.owner_secret_key.clone(),
                 organization_id: t.organization_id.clone(),
+                shares_upstream_identity: sharers > 1,
             },
         );
     }
     Ok(routes)
+}
+
+/// Say, once per installed table, which tenants share an upstream identity: each of them
+/// is refused while the bundle in force places no buckets, and a refusal whose cause is in
+/// the config rather than the bundle is otherwise hard to find.
+fn log_shared_upstream_identities(routes: &Routes) {
+    let mut sharing: Vec<&str> = routes
+        .iter()
+        .filter(|(_, r)| r.shares_upstream_identity)
+        .map(|(tenant, _)| tenant.as_str())
+        .collect();
+    if sharing.is_empty() {
+        return;
+    }
+    sharing.sort_unstable();
+    tracing::info!(
+        tenants = ?sharing,
+        "these tenants share an upstream identity with another tenant; each is refused \
+         while the bundle in force places no buckets (grant_schema_version >= 3)"
+    );
 }
 
 /// Connection bounds for the backend client.
@@ -940,11 +998,83 @@ mod tests {
             backend_id,
             backend_kind,
             organization_id,
+            // A flag derived from the credentials, never one of them.
+            shares_upstream_identity,
         } = registry().route_snapshot("acme").expect("acme is routable");
         assert_eq!(tenant, "acme");
         assert_eq!(backend_id, BackendId("bay-1".into()));
         assert_eq!(backend_kind, BackendKind::Ceph);
         assert_eq!(organization_id, "org-acme");
+        assert!(!shares_upstream_identity);
+    }
+
+    /// Two tenants re-signed with one key on one backend share an upstream identity; the
+    /// same key on another backend, or another key on the same backend, does not.
+    #[test]
+    fn tenants_re_signed_with_one_key_on_one_backend_share_an_upstream_identity() {
+        let reg = BackendRegistry::from_config(&config(
+            two_backends(),
+            serde_json::json!([
+                { "tenant": "acme", "organization_id": "org-one", "backend_id": "bay-2",
+                  "owner_access_key": "ORG-ONE", "owner_secret_key": "S" },
+                { "tenant": "globex", "organization_id": "org-one", "backend_id": "bay-2",
+                  "owner_access_key": "ORG-ONE", "owner_secret_key": "S" },
+                { "tenant": "initech", "organization_id": "org-one", "backend_id": "bay-1",
+                  "owner_access_key": "ORG-ONE", "owner_secret_key": "S" },
+                { "tenant": "hooli", "organization_id": "org-two", "backend_id": "bay-2",
+                  "owner_access_key": "ORG-TWO", "owner_secret_key": "S" },
+            ]),
+        ))
+        .expect("registry");
+        let shares = |t: &str| {
+            reg.route_snapshot(t)
+                .expect("routable")
+                .shares_upstream_identity
+        };
+        assert!(shares("acme"));
+        assert!(shares("globex"));
+        assert!(!shares("initech"), "the same key on another backend");
+        assert!(!shares("hooli"), "another key on the same backend");
+
+        // Re-derived on every apply, in both directions.
+        reg.apply_config(&config(
+            two_backends(),
+            serde_json::json!([
+                { "tenant": "acme", "organization_id": "org-one", "backend_id": "bay-2",
+                  "owner_access_key": "ORG-ONE", "owner_secret_key": "S" },
+                { "tenant": "hooli", "organization_id": "org-two", "backend_id": "bay-2",
+                  "owner_access_key": "ORG-ONE", "owner_secret_key": "S" },
+            ]),
+        ))
+        .expect("apply");
+        assert!(shares("acme"));
+        assert!(shares("hooli"));
+        reg.apply_config(&config(two_backends(), acme_on("bay-2", "S")))
+            .expect("apply");
+        assert!(!shares("acme"));
+    }
+
+    /// A request screened as a tenant with its own identity is not forwarded once the
+    /// tenant shares one: the screen it passed is not the one that now applies.
+    #[test]
+    fn a_forward_cannot_cross_a_change_in_identity_sharing() {
+        let reg = registry();
+        let authorized_against = reg.route_snapshot("acme").expect("routable");
+        reg.apply_config(&config(
+            two_backends(),
+            serde_json::json!([
+                { "tenant": "acme", "organization_id": "org-acme", "backend_id": "bay-1",
+                  "owner_access_key": "OWNER", "owner_secret_key": "S" },
+                { "tenant": "globex", "organization_id": "org-acme", "backend_id": "bay-1",
+                  "owner_access_key": "OWNER", "owner_secret_key": "S" },
+            ]),
+        ))
+        .expect("apply");
+        assert!(reg.proxy_for(&authorized_against).is_err());
+        assert!(
+            reg.proxy_for(&reg.route_snapshot("acme").expect("routable"))
+                .is_ok()
+        );
     }
 
     #[test]

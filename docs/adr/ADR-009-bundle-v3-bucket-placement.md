@@ -54,6 +54,17 @@ question passes through — refuses before asking any engine:
 | the bucket is placed under several tenants | the first reason, naming the defect |
 | `data.backend.id` is not the backend the request routes to | every request refused, naming both ids |
 | a placing document that cannot be read | every request refused, naming the defect |
+| below v3, the tenant shares its upstream identity with another tenant | every request of that tenant refused |
+
+**Tenants sharing an upstream identity need a placing bundle.** Below v3 the pre-v3 path is
+only safe because each tenant has its own credential, which the backend keeps apart by
+itself. When two or more tenants of the gateway config are re-signed with the same
+`(backend_id, owner_access_key)`, the placement is the only barrier between them, so for
+those tenants an unplaced bundle (v2, the seed, an unversioned document) is not "today's
+behaviour": every request of theirs is refused, `ListBuckets` lists nothing, and nothing is
+forwarded. The sharing is derived from the config on load and on every config apply, carried
+on the request's route snapshot as a flag (never the key), and a forward refuses to cross a
+config change that flipped it. Tenants with their own credential keep the v2 path unchanged.
 
 A copy's source bucket is screened on the same terms as its destination. The hooks whose
 single record summarizes several decisions (copy, multi-delete, a write with riders) screen
@@ -93,6 +104,10 @@ bundle publishes none.
   tenant reaching across.
 - **Treat an unreadable placing bundle as unplaced.** That switches the gate off for exactly
   the bundles that need it.
+- **Let tenants sharing an upstream identity fall back to the v2 path.** A rollout that puts
+  a shared-identity config live before the placing bundle, a control-plane rollback or the
+  boot seed would then remove the only cross-tenant barrier, and a wildcard grant of one
+  tenant would match the other's buckets. It is the same hole as the previous alternative.
 
 ## Consequences
 
@@ -104,5 +119,8 @@ bundle publishes none.
   `error` once per revision and recorded on every refused request. Failing open would serve
   buckets the bundle was never about.
 - `ListBuckets` at v3 costs no backend round trip and no drain bound.
+- A config whose tenants share an upstream identity must not go live before their placing
+  bundle does. If it does, those tenants are refused until it arrives; nothing is served
+  across tenants in the meantime.
 - Bucket names in a v3 bundle are S3 names; grants must be projected to them, or they match
   nothing the gate lets through.

@@ -225,6 +225,24 @@ pub fn fixture_with_backend(tag: &str, bundle: serde_json::Value, endpoint: &str
     fixture_from_config(tag, dir.clone(), bundle, &config_json(&dir, endpoint))
 }
 
+/// [`fixture_with_backend`] with a second tenant, `globex` of the same organization,
+/// re-signed with **acme's own** upstream credential: one identity shared by two tenants,
+/// the shape of a backend that only has one identity per organization.
+pub fn fixture_with_shared_identity(
+    tag: &str,
+    bundle: serde_json::Value,
+    endpoint: &str,
+) -> Fixture {
+    let dir = scratch(tag);
+    let mut config: serde_json::Value =
+        serde_json::from_str(&config_json(&dir, endpoint)).expect("config json");
+    let acme = config["tenants"][0].clone();
+    let mut globex = acme.clone();
+    globex["tenant"] = serde_json::json!("globex");
+    config["tenants"] = serde_json::json!([acme, globex]);
+    fixture_from_config(tag, dir, bundle, &config.to_string())
+}
+
 /// [`fixture_with_backend`] with the backend `kind` and signing `region` spelled out —
 /// for a test that must observe the *upstream* re-signing, not just the inbound gate.
 pub fn fixture_with_backend_kind_region(
