@@ -29,7 +29,7 @@ use s0::authz::{Decision, OpaInput};
 use s0::config::GatewayConfig;
 use s0::gateway::Gateway;
 use s0::identity::ResolvedPrincipal;
-use s0::model::PrincipalType;
+use s0::model::{BackendKind, PrincipalType};
 use s0::pdp::{Bundle, BundleStore, CachingPdp, GATEWAY_REGO, Pdp, RegorusPdp};
 use s0::proxy::BackendRegistry;
 use s3s::S3Request;
@@ -102,6 +102,19 @@ pub fn bundle_without_reserved_tag_keys() -> serde_json::Value {
 /// *allowed* request gets: point it at a closed port and the forward fails loudly
 /// instead of silently succeeding against something real.
 pub fn config_json(dir: &std::path::Path, backend_endpoint: &str) -> String {
+    config_json_for_backend(dir, backend_endpoint, BackendKind::Ceph, "us-east-1")
+}
+
+/// [`config_json`] with the backend `kind` and signing `region` spelled out — for a test
+/// proving upstream re-signing uses `BackendConfig.region` regardless of what the
+/// *client* signed with (the Garage leg of S0.1: a backend pinned to `region: "garage"`
+/// must re-sign every forwarded request in that scope, never the inbound one).
+pub fn config_json_for_backend(
+    dir: &std::path::Path,
+    backend_endpoint: &str,
+    kind: BackendKind,
+    region: &str,
+) -> String {
     serde_json::json!({
         "listen": "127.0.0.1:0",
         "sts": { "master_key_hex": "00".repeat(32), "signing_key_hex": "11".repeat(32) },
@@ -109,7 +122,8 @@ pub fn config_json(dir: &std::path::Path, backend_endpoint: &str) -> String {
         "audit": { "sink_url": "http://127.0.0.1:59999/none",
                    "spill_path": dir.join("audit.ndjson") },
         "backends": [
-            { "id": "bay-1", "kind": "ceph", "endpoint_url": backend_endpoint }
+            { "id": "bay-1", "kind": kind.as_str(), "endpoint_url": backend_endpoint,
+              "region": region }
         ],
         "tenants": [
             { "tenant": "acme", "organization_id": "org-acme", "backend_id": "bay-1",
@@ -208,7 +222,34 @@ pub fn fixture(tag: &str, bundle: serde_json::Value) -> Fixture {
 /// the gateway does to a *response*.
 pub fn fixture_with_backend(tag: &str, bundle: serde_json::Value, endpoint: &str) -> Fixture {
     let dir = scratch(tag);
-    let cfg = GatewayConfig::from_json(&config_json(&dir, endpoint)).expect("config");
+    fixture_from_config(tag, dir.clone(), bundle, &config_json(&dir, endpoint))
+}
+
+/// [`fixture_with_backend`] with the backend `kind` and signing `region` spelled out —
+/// for a test that must observe the *upstream* re-signing, not just the inbound gate.
+pub fn fixture_with_backend_kind_region(
+    tag: &str,
+    bundle: serde_json::Value,
+    endpoint: &str,
+    kind: BackendKind,
+    region: &str,
+) -> Fixture {
+    let dir = scratch(tag);
+    fixture_from_config(
+        tag,
+        dir.clone(),
+        bundle,
+        &config_json_for_backend(&dir, endpoint, kind, region),
+    )
+}
+
+fn fixture_from_config(
+    tag: &str,
+    dir: PathBuf,
+    bundle: serde_json::Value,
+    config: &str,
+) -> Fixture {
+    let cfg = GatewayConfig::from_json(config).expect("config");
     let bundles = Arc::new(BundleStore::new(Bundle::new("rev-1", bundle.clone())));
     let engine = RegorusPdp::new(GATEWAY_REGO, &bundle).expect("regorus");
     let pdp_calls = Arc::new(AtomicUsize::new(0));
