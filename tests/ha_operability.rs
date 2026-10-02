@@ -128,6 +128,8 @@ fn record(id: &str) -> AuditRecord {
             denied_keys: vec![],
             backend: BackendOutcome::NotAttempted,
             backend_status: None,
+            object_name: None,
+            copy_source_object_name: None,
         },
         &LabelPolicy::default(),
     )
