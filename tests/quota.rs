@@ -372,7 +372,8 @@ async fn the_tenant_and_the_backend_ceilings_refuse_with_their_own_message() {
         None,
     );
     let fx = common::fixture("quota-tenant", tenant);
-    admit_put(&fx, "alice", put("2024/a", 10))
+    // Held in flight: a write dropped before it was sent would give its bytes back.
+    let _in_flight = admit_put(&fx, "alice", put("2024/a", 10))
         .await
         .expect("90 + 10 fits the tenant");
     assert_quota_exceeded(
@@ -763,12 +764,73 @@ async fn a_write_the_backend_refused_gives_its_bytes_back_and_an_unknown_outcome
         "after a 5xx the write may have landed, so it stays counted"
     );
 
-    // A write admitted and then dropped before any forward stays counted too.
+    // A write admitted and then dropped before any forward (s3s refusing it after the
+    // access hook, a client gone before dispatch) stored nothing, and gives its bytes back.
     let req = admit_put(&fx, "alice", put("2024/lost", 30))
         .await
         .expect("fits");
-    drop(req);
     assert_eq!(fx.gw.quota.counted(&reports()), Some(90));
+    drop(req);
+    assert_eq!(fx.gw.quota.counted(&reports()), Some(60));
+}
+
+/// A client that declares the remaining quota and then fails its body is charged nothing:
+/// the backend cannot store an object without its whole body, so the failed upload must not
+/// block the level until the next collection.
+#[tokio::test]
+async fn a_write_whose_client_body_failed_gives_its_bytes_back() {
+    let backend = backend().await;
+    let fx =
+        common::fixture_with_backend("quota-body-failed", bucket_limited(100, 0), &backend.url);
+    let input = PutObjectInput {
+        body: Some(StreamingBlob::from(Body::http_body(HangUp { sent: false }))),
+        ..put("2024/hangup", 100)
+    };
+    let req = admit_put(&fx, "alice", input).await.expect("100 bytes fit");
+    assert_eq!(fx.gw.quota.counted(&reports()), Some(100));
+    gateway_s3(&fx)
+        .put_object(req)
+        .await
+        .expect_err("the body never arrives");
+    assert_eq!(
+        fx.gw.quota.counted(&reports()),
+        Some(0),
+        "a body that failed stored nothing"
+    );
+    put_through(&fx, "2024/after", 100)
+        .await
+        .expect("the full quota is available again");
+}
+
+/// A body that declares 100 bytes, yields ten, then fails the way a client hanging up
+/// mid-upload does.
+struct HangUp {
+    sent: bool,
+}
+
+impl hyper::body::Body for HangUp {
+    type Data = bytes::Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<bytes::Bytes>, std::io::Error>>> {
+        if self.sent {
+            return std::task::Poll::Ready(Some(Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "the client hung up",
+            ))));
+        }
+        self.sent = true;
+        std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(
+            bytes::Bytes::from_static(b"0123456789"),
+        ))))
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        hyper::body::SizeHint::with_exact(100)
+    }
 }
 
 /// A write admitted and then refused before any backend call (here, its tenant was
