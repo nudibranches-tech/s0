@@ -35,8 +35,11 @@ shape) enforces and counts nothing, and below v3 the key is not read at all.
 is refused with `QuotaExceeded` (HTTP 403, RGW's convention) when, at any level,
 `used_bytes + counted + this write > limit_bytes`. `counted` is what this replica accepted
 since that level's `collected_at`. The refusal is an ordinary decision record whose reason
-carries the figures; the client is told only which level is full. A caller the policy
-refuses is refused as before and learns nothing about any quota.
+carries the figures; the client is told only which level is full. A quota the bundle states
+but the gateway cannot read refuses the writes it covers (`AccessDenied`), and a write of
+unstated size under a quota is refused `MissingContentLength`; both answer a fixed sentence,
+since the record's reason names the tenant or backend and the bundle's defect. A caller the
+policy refuses is refused as before and learns nothing about any quota.
 
 What a write is charged:
 

@@ -268,7 +268,8 @@ impl QuotaRefusal {
 
     /// What the client is answered: `QuotaExceeded` (403) over a limit, `AccessDenied` for
     /// a quota the bundle cannot state, `MissingContentLength` (411) for a write of
-    /// unstated size.
+    /// unstated size. Fixed messages: the audit reason names the tenant or backend the
+    /// quota is on and the bundle's defect, which the client is not told.
     #[must_use]
     pub fn to_s3_error(&self) -> S3Error {
         match self {
@@ -280,13 +281,21 @@ impl QuotaRefusal {
                 err.set_status_code(http::StatusCode::FORBIDDEN);
                 err
             }
-            QuotaRefusal::Unreadable { .. } => s3_error!(AccessDenied, "{}", self.reason()),
+            QuotaRefusal::Unreadable { .. } => s3_error!(AccessDenied, "{QUOTA_UNREADABLE}"),
             QuotaRefusal::UnknownSize { .. } => {
-                s3_error!(MissingContentLength, "{}", self.reason())
+                s3_error!(MissingContentLength, "{QUOTA_NEEDS_A_SIZE}")
             }
         }
     }
 }
+
+/// What a client is told when a quota applies to its write and the bundle cannot state it.
+pub const QUOTA_UNREADABLE: &str = "deny (gateway): a storage quota applies to this write, \
+     and the policy bundle in force cannot state it";
+
+/// What a client is told when a quota applies to its write and the write states no size.
+pub const QUOTA_NEEDS_A_SIZE: &str = "deny (gateway): a storage quota applies to this write, \
+     which must state its size (Content-Length)";
 
 /// The ledger's answer to one write.
 #[derive(Debug)]
@@ -708,7 +717,11 @@ mod tests {
         ]);
         let refusal = refused(ledger.admit(&broken, &TARGET, Some(1)));
         assert!(matches!(&refusal, QuotaRefusal::Unreadable { scope, .. } if *scope == tenant()));
-        assert_eq!(*refusal.to_s3_error().code(), S3ErrorCode::AccessDenied);
+        let err = refusal.to_s3_error();
+        assert_eq!(*err.code(), S3ErrorCode::AccessDenied);
+        // The audit reason names the tenant and the defect; the client hears neither.
+        assert!(refusal.reason().contains("\"acme\"") && refusal.reason().contains("negative"));
+        assert_eq!(err.message(), Some(QUOTA_UNREADABLE));
 
         let quotas = table(&[(bucket(), quota(100, 0, 0))]);
         let refusal = refused(ledger.admit(&quotas, &TARGET, None));
@@ -717,6 +730,7 @@ mod tests {
             *refusal.to_s3_error().code(),
             S3ErrorCode::MissingContentLength
         );
+        assert_eq!(refusal.to_s3_error().message(), Some(QUOTA_NEEDS_A_SIZE));
         assert_eq!(
             ledger.counted(&bucket()),
             None,

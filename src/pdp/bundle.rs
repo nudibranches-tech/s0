@@ -243,10 +243,9 @@ pub enum PlacementRefusal {
 }
 
 impl PlacementRefusal {
-    /// The audit-facing reason, which is also what the client is told: like every other
-    /// gateway refusal it names the layer that refused. Telling "another tenant" from "not
-    /// here" discloses that the name is taken on this backend, which a bucket creation
-    /// refused as "name already used" discloses anyway.
+    /// The audit-facing reason, which also goes to the error log: like every other gateway
+    /// refusal it names the layer that refused. A bundle-wide refusal names the defect, a
+    /// backend id or a tenant, which the client is not told ([`Self::client_message`]).
     #[must_use]
     pub fn reason(&self) -> String {
         match self {
@@ -269,6 +268,31 @@ impl PlacementRefusal {
         }
     }
 }
+
+impl PlacementRefusal {
+    /// What the client is told. A bundle-wide refusal is one fixed sentence: its detail can
+    /// name another tenant (an unreadable `bucket_attributes`), both backend ids, or the
+    /// fact that the tenant shares its upstream identity, and stays on the audit record.
+    /// The per-bucket refusals are the audit reason verbatim: telling "another tenant" from
+    /// "not here" discloses that the name is taken on this backend, which a bucket creation
+    /// refused as "name already used" discloses anyway.
+    #[must_use]
+    pub fn client_message(&self) -> String {
+        match self {
+            PlacementRefusal::Unusable(_)
+            | PlacementRefusal::BackendMismatch { .. }
+            | PlacementRefusal::UnplacedSharedIdentity => BUNDLE_UNUSABLE.to_string(),
+            PlacementRefusal::AnotherTenant
+            | PlacementRefusal::Contested
+            | PlacementRefusal::NotOnBackend => self.reason(),
+        }
+    }
+}
+
+/// What the client is told when the bundle in force cannot be used for its request,
+/// whatever the detail on the audit record.
+pub const BUNDLE_UNUSABLE: &str = "deny (gateway): the policy bundle in force cannot be used \
+     for this request; it is refused until the control plane serves a usable one";
 
 /// The refusal reason for a tenant sharing an upstream identity under a bundle that places
 /// no buckets.

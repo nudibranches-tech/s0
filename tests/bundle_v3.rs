@@ -24,7 +24,8 @@ use http::Method;
 use s0::access::GatewayAccess;
 use s0::audit::{AuditRecord, Outcome};
 use s0::pdp::{
-    BUCKET_NOT_ON_THIS_BACKEND, BUCKET_OF_ANOTHER_TENANT, Bundle, UNPLACED_SHARED_IDENTITY,
+    BUCKET_NOT_ON_THIS_BACKEND, BUCKET_OF_ANOTHER_TENANT, BUNDLE_UNUSABLE, Bundle,
+    UNPLACED_SHARED_IDENTITY,
 };
 use s0::proxy::{GatewayS3, S3GatewayState};
 use s3s::access::S3Access;
@@ -254,10 +255,11 @@ async fn below_v3_tenants_sharing_an_upstream_identity_are_refused() {
 
         // The cross-tenant GET the wildcard grant would otherwise allow.
         let mut req = fx.request_as("wild", "GetObject", get("ledger", "k"), Method::GET);
+        // The client hears the fixed sentence; why is the audit record's.
         assert_refused(
             &format!("{label}: GetObject on globex's bucket"),
             access.get_object(&mut req).await,
-            UNPLACED_SHARED_IDENTITY,
+            BUNDLE_UNUSABLE,
         );
         assert!(req.extensions.get::<s0::access::AuthzProof>().is_none());
         // The tenant's own bucket too: the backend cannot tell it apart either.
@@ -265,7 +267,7 @@ async fn below_v3_tenants_sharing_an_upstream_identity_are_refused() {
         assert_refused(
             &format!("{label}: GetObject on acme's own bucket"),
             access.get_object(&mut req).await,
-            UNPLACED_SHARED_IDENTITY,
+            BUNDLE_UNUSABLE,
         );
         // The backend's listing would be both tenants' buckets.
         let out = list_buckets(&fx, "wild", ListBucketsInput::default())
@@ -691,17 +693,10 @@ async fn a_bundle_projected_for_another_backend_fails_closed() {
     );
     let access = GatewayAccess::new(fx.gw.clone());
     let mut req = fx.request("GetObject", get("reports", "2024/q1.csv"), Method::GET);
-    let err = access
-        .get_object(&mut req)
-        .await
-        .expect_err("a request alice holds a grant for, on her own bucket, is refused");
-    assert_eq!(*err.code(), S3ErrorCode::AccessDenied);
-    let message = err.message().unwrap_or_default().to_string();
-    assert!(
-        message.starts_with("deny (gateway):")
-            && message.contains("\"archive\"")
-            && message.contains("\"bay-1\""),
-        "{message}"
+    assert_refused(
+        "a request alice holds a grant for, on her own bucket",
+        access.get_object(&mut req).await,
+        BUNDLE_UNUSABLE,
     );
 
     let out = list_buckets(&fx, "wild", ListBucketsInput::default())
@@ -711,12 +706,57 @@ async fn a_bundle_projected_for_another_backend_fails_closed() {
     assert_eq!(backend.requests.load(Ordering::Relaxed), 0);
     assert_eq!(fx.pdp_calls(), 0);
 
+    // Both backend ids are the audit record's, never the client's.
     let records = fx.await_audit_records(2).await;
     let records = decision_records(&records);
     assert_eq!(records.len(), 2);
     for rec in records {
-        assert_eq!(rec.result.reason, message, "{rec:?}");
+        let reason = &rec.result.reason;
+        assert!(
+            reason.starts_with("deny (gateway):")
+                && reason.contains("\"archive\"")
+                && reason.contains("\"bay-1\""),
+            "{rec:?}"
+        );
         assert_eq!(rec.gateway.outcome, Outcome::Denied);
+    }
+}
+
+/// An unusable bundle's detail can name another tenant; the client is told only that the
+/// bundle cannot be used, and the record keeps the detail.
+#[tokio::test]
+async fn a_bundle_wide_refusal_names_no_other_tenant_to_the_client() {
+    let mut bundle = v3();
+    bundle["tenants"]["globex"]["bucket_attributes"] = serde_json::json!(["ledger"]);
+    let fx = common::fixture("v3-unusable-names-nobody", bundle);
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request("GetObject", get("reports", "2024/q1.csv"), Method::GET);
+    let err = access.get_object(&mut req).await.expect_err("refused");
+    assert_eq!(err.message(), Some(BUNDLE_UNUSABLE));
+    assert!(!err.message().unwrap_or_default().contains("globex"));
+
+    let mut req = fx.request(
+        "ListObjectsV2",
+        ListObjectsV2Input {
+            bucket: "reports".into(),
+            prefix: Some("2024/".into()),
+            ..Default::default()
+        },
+        Method::GET,
+    );
+    let err = access.list_objects_v2(&mut req).await.expect_err("refused");
+    assert_eq!(err.message(), Some(BUNDLE_UNUSABLE));
+
+    let records = fx.await_audit_records(2).await;
+    let records = decision_records(&records);
+    assert_eq!(records.len(), 2);
+    for rec in records {
+        assert!(
+            rec.result
+                .reason
+                .contains("data.tenants.globex.bucket_attributes"),
+            "{rec:?}"
+        );
     }
 }
 
@@ -729,12 +769,7 @@ async fn an_unreadable_v3_bundle_fails_closed() {
     let access = GatewayAccess::new(fx.gw.clone());
     let mut req = fx.request("GetObject", get("reports", "2024/q1.csv"), Method::GET);
     let err = access.get_object(&mut req).await.expect_err("refused");
-    assert!(
-        err.message().is_some_and(
-            |m| m.starts_with("deny (gateway): the policy bundle in force cannot be used")
-        ),
-        "{err}"
-    );
+    assert_eq!(err.message(), Some(BUNDLE_UNUSABLE), "{err}");
     let out = list_buckets(&fx, "wild", ListBucketsInput::default())
         .await
         .expect("empty listing");

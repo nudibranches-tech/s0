@@ -713,10 +713,14 @@ async fn an_unreadable_quota_refuses_writes_and_leaves_reads_alone() {
         .await
         .expect_err("a limit half-read is not enforced by allowing");
     assert_eq!(*err.code(), S3ErrorCode::AccessDenied);
+    assert_eq!(err.message(), Some(s0::quota::QUOTA_UNREADABLE), "{err}");
+    let records = fx.await_audit_records(1).await;
     assert!(
-        err.message()
-            .is_some_and(|m| m.contains("storage quota for bucket \"reports\" cannot be read")),
-        "{err}"
+        records.iter().any(|r| r
+            .result
+            .reason
+            .contains("storage quota for bucket \"reports\" cannot be read")),
+        "the record keeps the detail: {records:?}"
     );
     let mut req = fx.request(
         "GetObject",

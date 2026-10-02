@@ -11,9 +11,9 @@ mod sidecar;
 
 pub use bundle::{
     BACKEND_FIELD, BUCKET_ATTRIBUTES_FIELD, BUCKET_NOT_ON_THIS_BACKEND, BUCKET_OF_ANOTHER_TENANT,
-    BucketPlacement, Bundle, BundleStore, CREATED_AT_FIELD, DECISION_RULE, GATEWAY_REGO,
-    GRANT_SCHEMA_VERSION_FIELD, KEY_EPOCH_FIELD, KEY_EPOCHS_FIELD, ListedBucket, OBJECT_NAME_FIELD,
-    PLACEMENT_SCHEMA_VERSION, ParsedBundle, PlacementIndex, PlacementRefusal,
+    BUNDLE_UNUSABLE, BucketPlacement, Bundle, BundleStore, CREATED_AT_FIELD, DECISION_RULE,
+    GATEWAY_REGO, GRANT_SCHEMA_VERSION_FIELD, KEY_EPOCH_FIELD, KEY_EPOCHS_FIELD, ListedBucket,
+    OBJECT_NAME_FIELD, PLACEMENT_SCHEMA_VERSION, ParsedBundle, PlacementIndex, PlacementRefusal,
     UNPLACED_SHARED_IDENTITY, bundle_key_epoch_floor, bundle_knows_service_account,
     content_revision, decision_rule_path, parse_bundle, principal_subject_key,
     service_account_subject_key,
