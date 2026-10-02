@@ -318,12 +318,14 @@ pub fn principal(sub: &str) -> ResolvedPrincipal {
 }
 
 /// Seed a request exactly as `S3Access::check` does: the resolved principal, the
-/// secret-free route snapshot, and the s3s op name. A hook that runs without all three
-/// fails closed, so a test that skipped this would measure the backstop, not the policy.
-/// The route snapshot comes from a real `BackendRegistry` over the same config the
-/// gateway uses, so the fixture cannot drift from the routing it claims to model.
+/// secret-free route snapshot, the bundle's bucket placement, and the s3s op name. A hook
+/// that runs without all four fails closed, so a test that skipped this would measure the
+/// backstop, not the policy. The route snapshot comes from a real `BackendRegistry` over
+/// the same config the gateway uses, and the placement from the bundle store the gateway
+/// decides against, so the fixture cannot drift from what it claims to model.
 pub fn seeded_request<T>(
     cfg: &GatewayConfig,
+    bundles: &BundleStore,
     principal: ResolvedPrincipal,
     op: &str,
     input: T,
@@ -337,6 +339,7 @@ pub fn seeded_request<T>(
     let mut extensions = Extensions::new();
     extensions.insert(Arc::new(route));
     extensions.insert(Arc::new(principal));
+    extensions.insert(bundles.current().placement().clone());
     extensions.insert(OperationName(op.into()));
     S3Request {
         input,
@@ -354,11 +357,19 @@ pub fn seeded_request<T>(
 impl Fixture {
     /// [`seeded_request`] bound to this fixture's config and to `alice`.
     pub fn request<T>(&self, op: &str, input: T, method: Method) -> S3Request<T> {
-        seeded_request(&self.cfg, principal("alice"), op, input, method, "/")
+        self.request_as("alice", op, input, method)
     }
 
     pub fn request_as<T>(&self, sub: &str, op: &str, input: T, method: Method) -> S3Request<T> {
-        seeded_request(&self.cfg, principal(sub), op, input, method, "/")
+        seeded_request(
+            &self.cfg,
+            &self.gw.bundles,
+            principal(sub),
+            op,
+            input,
+            method,
+            "/",
+        )
     }
 
     /// A request carrying the real method and URI this operation arrives with, taken
@@ -369,6 +380,7 @@ impl Fixture {
         let route = routes::route(op);
         seeded_request(
             &self.cfg,
+            &self.gw.bundles,
             principal("alice"),
             op,
             input,

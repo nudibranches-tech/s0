@@ -8,13 +8,16 @@
 //! **owner** credential, so the backend answers with the tenant's entire bucket namespace
 //! no matter who asked. [`ResponseObligations`] is only ever installed by an access hook,
 //! so its **absence** means the hook did not run and must fail closed — see
-//! [`GatewayS3::list_buckets`](super::GatewayS3::list_buckets).
+//! [`GatewayS3::list_buckets`](super::GatewayS3::list_buckets). A bundle that places
+//! buckets also supplies the list itself ([`BucketSource::Bundle`]), and the backend is
+//! not asked at all.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use http::Extensions;
 use s3s::S3Request;
+use s3s::dto::Bucket;
 
 use super::fanout::ListFanout;
 
@@ -81,6 +84,18 @@ impl BucketVisibility {
     }
 }
 
+/// Where a `ListBuckets` answer comes from — chosen by the access hook from the bundle
+/// revision it decided under, never by the dispatcher.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BucketSource {
+    /// The backend's own listing, drained and filtered: a bundle that places no buckets.
+    Backend,
+    /// The tenant's buckets as the bundle places them. The backend is never asked: an
+    /// upstream identity shared by an organization's tenants lists them all, and may not
+    /// be allowed to list at all.
+    Bundle(Vec<Bucket>),
+}
+
 /// Everything an access hook asks the dispatcher to do to a response.
 ///
 /// `Default` is deliberately *not* implemented: an empty `ResponseObligations` reads as
@@ -93,6 +108,9 @@ pub struct ResponseObligations {
     pub list_fanout: Option<ListFanout>,
     /// `ListBuckets`: which of the tenant's buckets this principal may see.
     pub visible_buckets: Option<BucketVisibility>,
+    /// `ListBuckets`: what the visibility is applied to. Only [`Self::buckets`] sets it,
+    /// together with `visible_buckets`, so a listing never has one without the other.
+    pub bucket_source: Option<BucketSource>,
 }
 
 impl ResponseObligations {
@@ -101,14 +119,16 @@ impl ResponseObligations {
         ResponseObligations {
             list_fanout: Some(ListFanout { prefixes }),
             visible_buckets: None,
+            bucket_source: None,
         }
     }
 
     #[must_use]
-    pub fn buckets(visibility: BucketVisibility) -> Self {
+    pub fn buckets(visibility: BucketVisibility, source: BucketSource) -> Self {
         ResponseObligations {
             list_fanout: None,
             visible_buckets: Some(visibility),
+            bucket_source: Some(source),
         }
     }
 
