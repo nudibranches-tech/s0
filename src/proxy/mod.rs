@@ -872,7 +872,10 @@ mod tests {
 
         let acme = reg.route_snapshot("acme").unwrap();
         assert_eq!(acme.backend_id, BackendId("bay-2".into()));
-        assert_eq!(acme.backend_kind, BackendKind::RemoteS3);
+        // The fixture spells this backend `remote_s3` (the 0.3.x wire value) precisely so
+        // this assertion also proves the deserialization alias still resolves to the
+        // canonical `S3` variant.
+        assert_eq!(acme.backend_kind, BackendKind::S3);
         assert_eq!(
             reg.route_snapshot("globex").unwrap().organization_id,
             "org-globex"
