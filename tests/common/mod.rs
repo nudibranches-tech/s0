@@ -294,6 +294,7 @@ fn fixture_from_config(
         credentials,
         limits: Arc::new(arc_swap::ArcSwap::from_pointee(cfg.limits.clone())),
         bundles,
+        quota: Arc::new(s0::quota::QuotaLedger::new()),
         capture: Some(capture.clone()),
     });
     Fixture {

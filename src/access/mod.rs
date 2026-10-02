@@ -9,7 +9,9 @@
 //! `write_object_tags`. [`proof`] is the third fail-closed layer: a hook that forgot to
 //! authorize cannot reach the backend. A bundle that places buckets
 //! ([`crate::pdp::BucketPlacement`]) adds one more, ahead of the PDP: a bucket of another
-//! tenant, or of no tenant on this backend, is refused whatever the policy says.
+//! tenant, or of no tenant on this backend, is refused whatever the policy says. A write
+//! the policy allowed is then charged to the byte quotas that bundle states, if any
+//! ([`crate::quota`]).
 
 pub mod headers;
 pub mod optable;
@@ -23,7 +25,7 @@ use std::time::SystemTime;
 use http::Extensions;
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::dto::*;
-use s3s::{S3Error, S3Request, S3Result, s3_error};
+use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Result, s3_error};
 
 use crate::access::headers::RequestRiders;
 use crate::access::tagging::ReservedTagKeys;
@@ -32,12 +34,14 @@ use crate::audit::{
 };
 use crate::auth::SECURITY_TOKEN_HEADER;
 use crate::authz::{Backend, CopySource as AuthzCopySource, Decision, OpaInput, RequestMeta};
+use crate::error::{is_backend_error, remint_backend_error};
 use crate::gateway::Gateway;
 use crate::identity::ResolvedPrincipal;
 use crate::model::Action;
 use crate::pdp::{BucketPlacement, PlacementRefusal};
 use crate::proxy::RouteSnapshot;
 use crate::proxy::obligations::{BucketSource, BucketVisibility, ResponseObligations};
+use crate::quota::{Admission, QuotaRefusal, WriteTarget};
 
 pub use optable::{Coverage, DangerTier, GateDenial, OP_TABLE, OpSpec, ResourceShape};
 pub use proof::AuthzProof;
@@ -134,6 +138,15 @@ impl<'a> ReqCtx<'a> {
                 self.placement
                     .refusal(backend, &input.tenant, &source.bucket)
             })
+    }
+
+    /// Where a write decided against `input` lands, for the quota check.
+    fn write_target<'b>(&'b self, input: &'b OpaInput) -> WriteTarget<'b> {
+        WriteTarget {
+            backend: &self.route.backend_id.0,
+            tenant: &input.tenant,
+            bucket: &input.bucket,
+        }
     }
 
     /// The request-invariant half of the OPA input. A pure projection of the route
@@ -263,10 +276,17 @@ impl GatewayAccess {
     }
 
     /// Emit now: the request is refused here and there is no forward leg to wait for.
-    fn audit_denied(&self, input: OpaInput, decision: &Decision, denied_keys: Vec<String>) {
-        self.gw
-            .audit
-            .emit(self.record(input, decision, Outcome::Denied, denied_keys));
+    /// Returns the record's decision id.
+    fn audit_denied(
+        &self,
+        input: OpaInput,
+        decision: &Decision,
+        denied_keys: Vec<String>,
+    ) -> String {
+        let record = self.record(input, decision, Outcome::Denied, denied_keys);
+        let decision_id = record.decision_id.clone();
+        self.gw.audit.emit(record);
+        decision_id
     }
 
     /// Hold the record until the forward leg reports back.
@@ -322,6 +342,17 @@ impl GatewayAccess {
     /// hook funnels through here, so "audited exactly once, and a proof exists only on the
     /// allow side" is one branch to read rather than one per op.
     async fn enforce(&self, cx: &mut ReqCtx<'_>, input: OpaInput) -> S3Result<()> {
+        self.enforce_charged(cx, input, Charge::Nothing).await
+    }
+
+    /// [`Self::enforce`] for a write that adds bytes: once the policy allowed it, it is
+    /// charged to the bundle's quotas, and refused (still one record) if it does not fit.
+    async fn enforce_charged(
+        &self,
+        cx: &mut ReqCtx<'_>,
+        input: OpaInput,
+        charge: Charge,
+    ) -> S3Result<()> {
         let decision = self.decide(cx, &input).await;
         // An obligation the policy declared mandatory and this binary cannot apply is a
         // denial, not a warning: a restriction that silently did not happen is the
@@ -336,6 +367,9 @@ impl GatewayAccess {
         }
         let (allow, reason) = (decision.allow, decision.reason.clone());
         if allow {
+            if let Err(denial) = self.hold_quota(cx, &input, &charge).await {
+                return Err(self.deny_quota(input, denial));
+            }
             self.audit_pending(cx, input, &decision, vec![]);
             cx.prove();
             Ok(())
@@ -343,6 +377,100 @@ impl GatewayAccess {
             self.audit_denied(input, &decision, vec![]);
             Err(s3_error!(AccessDenied, "{reason}"))
         }
+    }
+
+    /// Charge a write the policy allowed to the byte quotas of the bundle it was admitted
+    /// under, and stash the reservation for the forward path to settle with the backend's
+    /// answer (ADR-010). Asked only after an allow, so a caller holding no grant learns
+    /// nothing about anyone's quota.
+    async fn hold_quota(
+        &self,
+        cx: &mut ReqCtx<'_>,
+        input: &OpaInput,
+        charge: &Charge,
+    ) -> Result<(), QuotaDenial> {
+        let Some(quotas) = cx.placement.quotas() else {
+            return Ok(());
+        };
+        let target = cx.write_target(input);
+        if !quotas.applies_to(&target) {
+            return Ok(());
+        }
+        let bytes = match charge {
+            Charge::Nothing => return Ok(()),
+            Charge::Body(length) => length.and_then(|l| u64::try_from(l).ok()),
+            Charge::Copy(copy) => Some(self.copy_size(cx, copy).await?),
+        };
+        match self.gw.quota.admit(quotas, &target, bytes) {
+            Admission::Unlimited => Ok(()),
+            Admission::Reserved(reservation) => {
+                cx.extensions.insert(reservation);
+                Ok(())
+            }
+            Admission::Refused(refusal) => Err(QuotaDenial::Refused(refusal)),
+        }
+    }
+
+    /// What a copy adds: its range's length, or the source object's size as the backend
+    /// reports it. Asked only where a quota applies, so a backend with native quotas never
+    /// sees the extra `HeadObject`, and only once both halves of the copy were allowed, so
+    /// the read is one the caller holds a grant for.
+    async fn copy_size(&self, cx: &ReqCtx<'_>, copy: &CopyCharge) -> Result<u64, QuotaDenial> {
+        if let Some(length) = copy.range.as_deref().and_then(copy_range_len) {
+            return Ok(length);
+        }
+        let proxy = self.gw.registry.proxy_for(&cx.route).map_err(|e| {
+            tracing::warn!(error = %e, "no backend client to size a copy source");
+            QuotaDenial::SourceUnsized {
+                reason: format!("{COPY_SOURCE_UNSIZED}: no backend client"),
+                answer: Some(s3_error!(ServiceUnavailable, "backend unavailable")),
+            }
+        })?;
+        let head = HeadObjectInput {
+            bucket: copy.bucket.clone(),
+            key: copy.key.clone(),
+            version_id: copy.version_id.clone(),
+            sse_customer_algorithm: copy.sse_customer_algorithm.clone(),
+            sse_customer_key: copy.sse_customer_key.clone(),
+            sse_customer_key_md5: copy.sse_customer_key_md5.clone(),
+            ..Default::default()
+        };
+        let request = S3Request {
+            input: head,
+            method: http::Method::HEAD,
+            uri: http::Uri::from_static("/"),
+            headers: http::HeaderMap::new(),
+            extensions: Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        match proxy.head_object(request).await {
+            Ok(response) => response
+                .output
+                .content_length
+                .and_then(|l| u64::try_from(l).ok())
+                .ok_or_else(|| QuotaDenial::SourceUnsized {
+                    reason: format!("{COPY_SOURCE_UNSIZED}: the backend reported no length"),
+                    answer: None,
+                }),
+            Err(e) => Err(QuotaDenial::SourceUnsized {
+                reason: format!(
+                    "{COPY_SOURCE_UNSIZED}: the backend answered {} ({})",
+                    e.code().as_str(),
+                    e.status_code().map_or(0, |s| s.as_u16())
+                ),
+                answer: Some(e),
+            }),
+        }
+    }
+
+    /// Refuse a write the policy allowed, on quota grounds: one denial record, carrying the
+    /// figures the client is not told.
+    fn deny_quota(&self, input: OpaInput, denial: QuotaDenial) -> S3Error {
+        let decision_id = self.audit_denied(input, &Decision::deny(denial.reason()), vec![]);
+        denial.into_error(&decision_id)
     }
 
     /// A refusal the **gateway** decided rather than the PDP: a semantic cap, a body it
@@ -451,6 +579,7 @@ impl GatewayAccess {
         bucket: String,
         object: String,
         riders: Result<RequestRiders, String>,
+        charge: Charge,
     ) -> S3Result<()> {
         // The riders are parsed from `&req.input` *before* the `ReqCtx` takes its mutable
         // borrow, so a malformed one arrives here as an `Err` rather than as an early
@@ -475,7 +604,7 @@ impl GatewayAccess {
         if let Some(why) = self.authorize_riders(cx, &input, &riders).await {
             return Err(self.deny(input, why));
         }
-        self.enforce(cx, input).await
+        self.enforce_charged(cx, input, charge).await
     }
 
     /// The single-object path (get/head/put/delete-one/post-form/tagging). One
@@ -487,9 +616,22 @@ impl GatewayAccess {
         bucket: String,
         object: String,
     ) -> S3Result<()> {
+        self.enforce_object_charged(cx, action, bucket, object, Charge::Nothing)
+            .await
+    }
+
+    /// [`Self::enforce_object`] for a write that adds bytes (a multipart part).
+    async fn enforce_object_charged(
+        &self,
+        cx: &mut ReqCtx<'_>,
+        action: Action,
+        bucket: String,
+        object: String,
+        charge: Charge,
+    ) -> S3Result<()> {
         let mut input = cx.base_input(action, bucket);
         input.object = Some(object);
-        self.enforce(cx, input).await
+        self.enforce_charged(cx, input, charge).await
     }
 
     /// The keyless bucket path (head/location). No object and no prefix, so grant
@@ -557,9 +699,18 @@ impl GatewayAccess {
         dest_bucket: String,
         dest_key: String,
         riders: RequestRiders,
+        sizing: CopySizing,
     ) -> S3Result<()> {
-        let (src_bucket, src_key) = match source {
-            CopySource::Bucket { bucket, key, .. } => (bucket.to_string(), key.to_string()),
+        let (src_bucket, src_key, src_version) = match source {
+            CopySource::Bucket {
+                bucket,
+                key,
+                version_id,
+            } => (
+                bucket.to_string(),
+                key.to_string(),
+                version_id.as_deref().map(str::to_string),
+            ),
             _ => {
                 return Err(s3_error!(
                     AccessDenied,
@@ -584,6 +735,15 @@ impl GatewayAccess {
             return Err(self.refuse(dst_input, why));
         }
 
+        let charge = Charge::Copy(CopyCharge {
+            bucket: src_bucket.clone(),
+            key: src_key.clone(),
+            version_id: src_version,
+            range: sizing.range,
+            sse_customer_algorithm: sizing.sse_customer_algorithm,
+            sse_customer_key: sizing.sse_customer_key,
+            sse_customer_key_md5: sizing.sse_customer_key_md5,
+        });
         let mut src_input = cx.base_input(Action::ReadObjects, src_bucket);
         src_input.object = Some(src_key);
         let src_allow = self.decide(cx, &src_input).await.allow;
@@ -606,6 +766,9 @@ impl GatewayAccess {
             ))
         };
         if allow {
+            if let Err(denial) = self.hold_quota(cx, &dst_input, &charge).await {
+                return Err(self.deny_quota(dst_input, denial));
+            }
             self.audit_pending(cx, dst_input, &decision, vec![]);
             cx.prove();
             Ok(())
@@ -777,8 +940,10 @@ impl S3Access for GatewayAccess {
             false,
             max_tags,
         );
+        // The length forwarded, which s3s sets to the decoded length of an aws-chunked body.
+        let charge = Charge::Body(req.input.content_length);
         let mut cx = ReqCtx::new(req)?;
-        self.enforce_object_write(&mut cx, Action::WriteObjects, bucket, key, riders)
+        self.enforce_object_write(&mut cx, Action::WriteObjects, bucket, key, riders, charge)
             .await
     }
 
@@ -802,8 +967,11 @@ impl S3Access for GatewayAccess {
             false,
             max_tags,
         );
+        // s3s sizes the form's file from the body it already aggregated, and leaves the
+        // length unset only for an empty one.
+        let charge = Charge::Body(Some(req.input.content_length.unwrap_or(0)));
         let mut cx = ReqCtx::new(req)?;
-        self.enforce_object_write(&mut cx, Action::WriteObjects, bucket, key, riders)
+        self.enforce_object_write(&mut cx, Action::WriteObjects, bucket, key, riders, charge)
             .await
     }
 
@@ -819,8 +987,15 @@ impl S3Access for GatewayAccess {
             ..RequestRiders::default()
         });
         let mut cx = ReqCtx::new(req)?;
-        self.enforce_object_write(&mut cx, Action::DeleteObjects, bucket, key, riders)
-            .await
+        self.enforce_object_write(
+            &mut cx,
+            Action::DeleteObjects,
+            bucket,
+            key,
+            riders,
+            Charge::Nothing,
+        )
+        .await
     }
 
     async fn delete_objects(&self, req: &mut S3Request<DeleteObjectsInput>) -> S3Result<()> {
@@ -931,6 +1106,12 @@ impl S3Access for GatewayAccess {
             (false, t) => t,
         };
         let riders = RequestRiders::parse(object_acl_fields!(req.input), tagging, false, max_tags);
+        let sizing = CopySizing {
+            range: None,
+            sse_customer_algorithm: req.input.copy_source_sse_customer_algorithm.clone(),
+            sse_customer_key: req.input.copy_source_sse_customer_key.clone(),
+            sse_customer_key_md5: req.input.copy_source_sse_customer_key_md5.clone(),
+        };
         let mut cx = ReqCtx::new(req)?;
         let riders = match riders {
             Ok(r) => r,
@@ -940,7 +1121,7 @@ impl S3Access for GatewayAccess {
                 return Err(self.refuse(input, why));
             }
         };
-        self.enforce_copy(&mut cx, &source, bucket, key, riders)
+        self.enforce_copy(&mut cx, &source, bucket, key, riders, sizing)
             .await
     }
 
@@ -1017,25 +1198,43 @@ impl S3Access for GatewayAccess {
             max_tags,
         );
         let mut cx = ReqCtx::new(req)?;
-        self.enforce_object_write(&mut cx, Action::WriteObjects, bucket, key, riders)
-            .await
+        // No bytes yet: a multipart upload is charged part by part.
+        self.enforce_object_write(
+            &mut cx,
+            Action::WriteObjects,
+            bucket,
+            key,
+            riders,
+            Charge::Nothing,
+        )
+        .await
     }
 
+    /// A part is where a multipart upload's bytes arrive, so it is what the quota charges.
     async fn upload_part(&self, req: &mut S3Request<UploadPartInput>) -> S3Result<()> {
         let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
+        let charge = Charge::Body(req.input.content_length);
         let mut cx = ReqCtx::new(req)?;
-        self.enforce_object(&mut cx, Action::WriteObjects, bucket, key)
+        self.enforce_object_charged(&mut cx, Action::WriteObjects, bucket, key, charge)
             .await
     }
 
+    /// Completing adds no bytes (its parts were charged as they arrived), but it is still a
+    /// write: charged at zero, it is refused only once a level is already over its limit.
     async fn complete_multipart_upload(
         &self,
         req: &mut S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<()> {
         let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
         let mut cx = ReqCtx::new(req)?;
-        self.enforce_object(&mut cx, Action::WriteObjects, bucket, key)
-            .await
+        self.enforce_object_charged(
+            &mut cx,
+            Action::WriteObjects,
+            bucket,
+            key,
+            Charge::Body(Some(0)),
+        )
+        .await
     }
 
     async fn abort_multipart_upload(
@@ -1059,11 +1258,24 @@ impl S3Access for GatewayAccess {
         // Authorize the copy source read + the dest part write.
         let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
         let source = req.input.copy_source.clone();
+        let sizing = CopySizing {
+            range: req.input.copy_source_range.clone(),
+            sse_customer_algorithm: req.input.copy_source_sse_customer_algorithm.clone(),
+            sse_customer_key: req.input.copy_source_sse_customer_key.clone(),
+            sse_customer_key_md5: req.input.copy_source_sse_customer_key_md5.clone(),
+        };
         let mut cx = ReqCtx::new(req)?;
         // No riders: `UploadPartCopy` carries no ACL, tag or retention fields — the part's
         // destination object was created (and its ACL fixed) by `CreateMultipartUpload`.
-        self.enforce_copy(&mut cx, &source, bucket, key, RequestRiders::default())
-            .await
+        self.enforce_copy(
+            &mut cx,
+            &source,
+            bucket,
+            key,
+            RequestRiders::default(),
+            sizing,
+        )
+        .await
     }
 
     async fn list_multipart_uploads(
@@ -1314,6 +1526,110 @@ const NO_FANOUT_ON_THIS_OP: &str =
     "multi-prefix listing is not supported for this operation; list a single prefix";
 const NO_FANOUT_WITH_DELIMITER: &str =
     "delimiter listing across multiple granted prefixes is unsupported; list a single prefix";
+
+/// What an allowed write adds to the bytes stored on the backend, for the quota check.
+enum Charge {
+    /// Not a data write.
+    Nothing,
+    /// The request's own length; `None` when it states none.
+    Body(Option<i64>),
+    /// A copy adds its source's bytes, or its range's.
+    Copy(CopyCharge),
+}
+
+/// What sizes a copy. No `Debug`: it can carry an SSE-C key.
+struct CopyCharge {
+    bucket: String,
+    key: String,
+    version_id: Option<String>,
+    range: Option<String>,
+    sse_customer_algorithm: Option<String>,
+    sse_customer_key: Option<String>,
+    sse_customer_key_md5: Option<String>,
+}
+
+/// The request half of a [`CopyCharge`], read before the hook borrows the request.
+struct CopySizing {
+    range: Option<String>,
+    sse_customer_algorithm: Option<String>,
+    sse_customer_key: Option<String>,
+    sse_customer_key_md5: Option<String>,
+}
+
+const COPY_SOURCE_UNSIZED: &str = "deny (gateway): a storage quota applies to this copy, and \
+                                   the copy source's size could not be read to charge it";
+
+/// Why a write the policy allowed is refused on quota grounds.
+enum QuotaDenial {
+    Refused(QuotaRefusal),
+    /// The copy source could not be sized, so the copy cannot be charged. `answer` is what
+    /// the client gets: the backend's error re-minted, a gateway error, or (`None`) the
+    /// reason as an `AccessDenied`.
+    SourceUnsized {
+        reason: String,
+        answer: Option<S3Error>,
+    },
+}
+
+impl QuotaDenial {
+    fn reason(&self) -> String {
+        match self {
+            QuotaDenial::Refused(refusal) => refusal.reason(),
+            QuotaDenial::SourceUnsized { reason, .. } => reason.clone(),
+        }
+    }
+
+    /// The error the client is answered with. A backend's error from sizing a copy source
+    /// is re-minted like any forwarded one, under the denial record's decision id.
+    fn into_error(self, decision_id: &str) -> S3Error {
+        match self {
+            QuotaDenial::Refused(refusal) => refusal.to_s3_error(),
+            QuotaDenial::SourceUnsized {
+                reason,
+                answer: None,
+            } => s3_error!(AccessDenied, "{reason}"),
+            QuotaDenial::SourceUnsized {
+                answer: Some(err), ..
+            } if is_backend_error(&err) => {
+                remint_backend_error(as_copy_source_error(err), decision_id)
+            }
+            QuotaDenial::SourceUnsized {
+                answer: Some(mut err),
+                ..
+            } => {
+                err.set_request_id(decision_id);
+                err
+            }
+        }
+    }
+}
+
+/// A `HeadObject` error answered as the copy it sized. A HEAD response has no body, so the
+/// SDK names its error after the status (`NotFound`, `Forbidden`); the copy would have
+/// answered `NoSuchKey` or `AccessDenied` for the same source.
+fn as_copy_source_error(err: S3Error) -> S3Error {
+    let code = match err.status_code().map(|s| s.as_u16()) {
+        Some(404) => S3ErrorCode::NoSuchKey,
+        Some(403) => S3ErrorCode::AccessDenied,
+        _ => return err,
+    };
+    let status = err.status_code();
+    let mut named = S3Error::new(code);
+    if let Some(status) = status {
+        named.set_status_code(status);
+    }
+    named.set_source(Box::new(err));
+    named
+}
+
+/// The length of an `x-amz-copy-source-range` (`bytes=first-last`, both inclusive), or
+/// `None` when it is not that form, in which case the whole source is charged.
+fn copy_range_len(range: &str) -> Option<u64> {
+    let (first, last) = range.strip_prefix("bytes=")?.split_once('-')?;
+    let first = first.trim().parse::<u64>().ok()?;
+    let last = last.trim().parse::<u64>().ok()?;
+    last.checked_sub(first)?.checked_add(1)
+}
 
 /// Classify the PDP obligation into a list verdict. Multi-prefix within the fan-out
 /// bound becomes `FanOut`; above the bound, or on an op that cannot fan out, it fails
@@ -1816,6 +2132,28 @@ mod tests {
         });
         assert_eq!(shown(&ok), BucketVisibility::All);
         assert!(unimplemented_obligations(&ok).is_none());
+    }
+
+    #[test]
+    fn a_copy_range_is_charged_its_inclusive_length_and_anything_else_the_whole_source() {
+        assert_eq!(copy_range_len("bytes=0-29"), Some(30));
+        assert_eq!(copy_range_len("bytes=7-7"), Some(1));
+        assert_eq!(
+            copy_range_len("bytes=0-18446744073709551614"),
+            Some(u64::MAX)
+        );
+        // Not the one form S3 accepts here: charged as the whole source instead.
+        for other in [
+            "bytes=5-4",
+            "bytes=0-",
+            "bytes=-10",
+            "0-29",
+            "bytes=a-b",
+            "bytes=0-18446744073709551615",
+            "",
+        ] {
+            assert_eq!(copy_range_len(other), None, "{other:?}");
+        }
     }
 
     #[test]

@@ -88,6 +88,7 @@ async fn test_gateway(dir: &std::path::Path) -> Arc<Gateway> {
         credentials,
         limits: Arc::new(arc_swap::ArcSwap::from_pointee(cfg.limits.clone())),
         bundles,
+        quota: Arc::new(s0::quota::QuotaLedger::new()),
         capture: None,
     })
 }

@@ -18,6 +18,7 @@ use crate::pdp::{
     parse_bundle,
 };
 use crate::proxy::BackendRegistry;
+use crate::quota::QuotaLedger;
 
 /// Shared, cheaply-cloneable state. `Arc<Gateway>` is held by the auth, access, and
 /// proxy layers.
@@ -37,6 +38,9 @@ pub struct Gateway {
     pub limits: Arc<ArcSwap<LimitsConfig>>,
     /// Kept so a bundle-refresh loop can swap revisions (cache stays coherent).
     pub bundles: Arc<BundleStore>,
+    /// What this replica has written against the bundle's byte quotas since their last
+    /// collection. Outlives every revision: a new one resets what its collection covers.
+    pub quota: Arc<QuotaLedger>,
     /// Golden-capture tap. `None` in every deployed binary: [`Gateway::build`] is the only
     /// production construction path and hard-codes `None`, with no setter and no config
     /// knob, so only a test that builds a `Gateway` literally can enable it.
@@ -84,6 +88,7 @@ impl Gateway {
             credentials,
             limits: Arc::new(ArcSwap::from_pointee(cfg.limits.clone())),
             bundles,
+            quota: Arc::new(QuotaLedger::new()),
             // Never enabled from config: a capture sink retains principal identifiers
             // and object keys in memory, and nothing an operator can set should be able
             // to turn that on.
@@ -300,6 +305,7 @@ mod tests {
             credentials,
             limits: Arc::new(ArcSwap::from_pointee(cfg.limits.clone())),
             bundles,
+            quota: Arc::new(QuotaLedger::new()),
             capture: None,
         };
         (gw, handle)

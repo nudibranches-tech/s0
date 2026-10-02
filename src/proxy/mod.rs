@@ -29,6 +29,7 @@ use crate::config::{BackendConfig, GatewayConfig, LimitsConfig};
 use crate::error::{GatewayError, Result, is_backend_error, remint_backend_error};
 use crate::model::{BackendId, BackendKind};
 use crate::proxy::obligations::{BucketSource, BucketVisibility, ResponseObligations};
+use crate::quota::QuotaReservation;
 use crate::secret::Secret;
 
 /// One tenant's routing: which backend, which per-tenant credential, which Org.
@@ -317,12 +318,26 @@ impl GatewayS3 {
     /// is re-minted ([`remint_backend_error`]) and the backend's request and host ids are
     /// replaced by the gateway's own, on success and failure alike. The id is the decision
     /// id of the request's audit record, so a client's report leads to that record.
+    ///
+    /// And it settles a write's quota reservation with what the backend answered: kept on
+    /// success, given back when the backend refused the write (a 4xx), kept when the
+    /// outcome is unknown. Taken out first, so a request refused before any backend call
+    /// gives its bytes back too.
     async fn forward<T, O, F, Fut>(&self, req: S3Request<T>, call: F) -> S3Result<S3Response<O>>
     where
         F: FnOnce(Arc<Proxy>, S3Request<T>) -> Fut + Send,
         Fut: std::future::Future<Output = S3Result<S3Response<O>>> + Send,
     {
-        let proxy = self.proxy_for_req(&req)?;
+        let reservation = req.extensions.get::<Arc<QuotaReservation>>().cloned();
+        let proxy = match self.proxy_for_req(&req) {
+            Ok(proxy) => proxy,
+            Err(e) => {
+                if let Some(reservation) = &reservation {
+                    reservation.release();
+                }
+                return Err(e);
+            }
+        };
         let pending = req.extensions.get::<Arc<PendingAudit>>().cloned();
         // Read before the settle below takes the record with it.
         let request_id = pending
@@ -330,6 +345,14 @@ impl GatewayS3 {
             .and_then(|p| p.decision_id())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let result = call(proxy, req).await;
+        if let Some(reservation) = &reservation {
+            match &result {
+                Err(e) if backend_status(e).is_some_and(|s| (400..500).contains(&s)) => {
+                    reservation.release();
+                }
+                _ => reservation.commit(),
+            }
+        }
         if let Some(pending) = pending {
             match &result {
                 Ok(_) => pending.settle(BackendOutcome::SucceededStatusUnknown, None),
