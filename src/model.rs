@@ -12,8 +12,11 @@ use serde::{Deserialize, Serialize};
 /// which maps to two. The set is a contract with whatever control plane projects grants.
 ///
 /// **The gateway is data-plane only**, so there is no verb for acting on a bucket as a
-/// *managed resource*: existence, policy, CORS and quota are control-plane concerns, and
-/// `write_object_acl` is refused in code ([`crate::access::headers`]).
+/// *managed resource*: existence, policy, CORS and quota *settings* are control-plane
+/// concerns, and `write_object_acl` is refused in code ([`crate::access::headers`]). The one
+/// quota the gateway enforces is the byte quota a v3 bundle states for a backend without
+/// native ones ([`crate::quota`]): a limit the control plane set, applied to writes, and
+/// never a verb.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Action {

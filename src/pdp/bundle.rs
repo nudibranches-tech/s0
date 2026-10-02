@@ -10,7 +10,9 @@
 //!
 //! From `grant_schema_version` 3 a bundle also **places** buckets: it is filtered to one
 //! backend, names that backend, and lists each of its buckets under exactly one tenant.
-//! [`BucketPlacement`] is that index, built once per revision on load.
+//! [`BucketPlacement`] is that index, built once per revision on load, together with the
+//! byte quotas the document states for those buckets, their tenants and the backend
+//! ([`crate::quota`]).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -18,6 +20,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
+
+use crate::quota::{BACKEND_QUOTA_FIELD, BundleQuotas, QUOTA_FIELD, QuotaScope, QuotaSpec};
 
 /// The default gateway policy, compiled into the binary. In production the control plane
 /// pushes the authoritative module in the bundle; this is the fallback when a bundle
@@ -192,6 +196,8 @@ pub struct PlacementIndex {
     /// Set by the first request refused for a backend mismatch, so the error is logged
     /// once per revision rather than once per request.
     mismatch_logged: AtomicBool,
+    /// The byte quotas this revision states. Empty for a backend with native quotas.
+    quotas: BundleQuotas,
 }
 
 #[derive(Debug)]
@@ -326,10 +332,17 @@ impl BucketPlacement {
                 return BucketPlacement::Unusable("data.tenants is not an object".to_string());
             }
         };
+        let mut quotas: HashMap<QuotaScope, QuotaSpec> = HashMap::new();
+        if let Some(spec) = QuotaSpec::read(data.get(BACKEND_QUOTA_FIELD)) {
+            quotas.insert(QuotaScope::Backend(backend_id.clone()), spec);
+        }
         // Every tenant claiming each bucket, so a bucket listed twice is seen as such
         // rather than silently won by whichever tenant iterates last.
         let mut claims: BTreeMap<&str, Vec<(&str, &serde_json::Value)>> = BTreeMap::new();
         for (tenant, tenant_data) in tenants.into_iter().flatten() {
+            if let Some(spec) = QuotaSpec::read(tenant_data.get(QUOTA_FIELD)) {
+                quotas.insert(QuotaScope::Tenant(tenant.clone()), spec);
+            }
             let attributes = match tenant_data.get(BUCKET_ATTRIBUTES_FIELD) {
                 None => continue,
                 Some(serde_json::Value::Object(attributes)) => attributes,
@@ -356,6 +369,10 @@ impl BucketPlacement {
                         .entry((*tenant).to_string())
                         .or_default()
                         .push(bucket.to_string());
+                    // Only a placed bucket's: a contested one is refused before any write.
+                    if let Some(spec) = QuotaSpec::read(attrs.get(QUOTA_FIELD)) {
+                        quotas.insert(QuotaScope::Bucket(bucket.to_string()), spec);
+                    }
                     PlacedBucket {
                         owner: BucketOwner::Tenant((*tenant).to_string()),
                         object_name: attrs
@@ -382,6 +399,7 @@ impl BucketPlacement {
             buckets,
             listings,
             mismatch_logged: AtomicBool::new(false),
+            quotas: BundleQuotas::new(quotas),
         })
     }
 
@@ -436,6 +454,16 @@ impl BucketPlacement {
     pub fn object_name(&self, bucket: &str) -> Option<&str> {
         match self {
             BucketPlacement::Placed(index) => index.buckets.get(bucket)?.object_name.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// The byte quotas this revision states, or `None` when it states none: below v3, or a
+    /// placing document with no `quota` anywhere (a backend with native quotas).
+    #[must_use]
+    pub fn quotas(&self) -> Option<&BundleQuotas> {
+        match self {
+            BucketPlacement::Placed(index) if !index.quotas.is_empty() => Some(&index.quotas),
             _ => None,
         }
     }
@@ -495,6 +523,19 @@ impl PlacementIndex {
                 count = undated,
                 "buckets without a readable {CREATED_AT_FIELD}; they are listed without a \
                  creation date"
+            );
+        }
+        let unreadable: Vec<String> = self
+            .quotas
+            .unreadable()
+            .map(|(scope, why)| format!("{scope:?}: {why}"))
+            .collect();
+        if !unreadable.is_empty() {
+            tracing::error!(
+                count = unreadable.len(),
+                quotas = ?unreadable,
+                "the policy bundle states storage quotas that cannot be read; every write \
+                 they cover is refused"
             );
         }
     }
@@ -1309,6 +1350,97 @@ mod tests {
             pinned.refusal("archive", "acme", "ledger"),
             Some(PlacementRefusal::AnotherTenant)
         );
+    }
+
+    // ── byte quotas (ADR-010) ───────────────────────────────────────────────────
+
+    fn quota_json(limit: u64, used: u64) -> serde_json::Value {
+        serde_json::json!({
+            "limit_bytes": limit, "used_bytes": used, "collected_at": "2026-10-01T12:00:00Z"
+        })
+    }
+
+    fn limit_of(placement: &BucketPlacement, scope: QuotaScope) -> Option<u64> {
+        match placement.quotas()?.get(&scope)? {
+            QuotaSpec::Limit(quota) => Some(quota.limit_bytes),
+            QuotaSpec::Unreadable(why) => panic!("{scope:?} is unreadable: {why}"),
+        }
+    }
+
+    /// Each of the three levels is read from where the contract puts it, keyed the way a
+    /// write names it: the S3 name, the tenant, and the backend the bundle names.
+    #[test]
+    fn quotas_are_read_from_the_bucket_the_tenant_and_the_backend() {
+        let mut doc = v3();
+        doc["backend_quota"] = quota_json(1_000, 10);
+        doc["tenants"]["acme"]["quota"] = quota_json(500, 10);
+        doc["tenants"]["acme"]["bucket_attributes"]["reports"]["quota"] = quota_json(100, 10);
+        // A tenant with no bucket here can still carry its ceiling.
+        doc["tenants"]["quiet"]["quota"] = quota_json(50, 0);
+        // A contested bucket's quota is never consulted: it is refused before any write.
+        doc["tenants"]["acme"]["bucket_attributes"]["shared"]["quota"] = quota_json(1, 0);
+        let placement = placed(&doc);
+        assert_eq!(
+            limit_of(&placement, QuotaScope::Backend("archive".into())),
+            Some(1_000)
+        );
+        assert_eq!(
+            limit_of(&placement, QuotaScope::Tenant("acme".into())),
+            Some(500)
+        );
+        assert_eq!(
+            limit_of(&placement, QuotaScope::Tenant("quiet".into())),
+            Some(50)
+        );
+        assert_eq!(
+            limit_of(&placement, QuotaScope::Bucket("reports".into())),
+            Some(100)
+        );
+        assert_eq!(
+            limit_of(&placement, QuotaScope::Bucket("logs".into())),
+            None
+        );
+        assert_eq!(
+            limit_of(&placement, QuotaScope::Bucket("shared".into())),
+            None
+        );
+        assert_eq!(
+            limit_of(&placement, QuotaScope::Tenant("globex".into())),
+            None
+        );
+    }
+
+    /// No `quota` anywhere is no enforcement at all — the Ceph shape, where the backend
+    /// keeps its native quotas — and below v3 a `quota` key means nothing.
+    #[test]
+    fn a_document_without_quotas_or_below_v3_states_none() {
+        assert!(placed(&v3()).quotas().is_none());
+        let mut nulls = v3();
+        nulls["backend_quota"] = serde_json::Value::Null;
+        nulls["tenants"]["acme"]["quota"] = serde_json::Value::Null;
+        assert!(placed(&nulls).quotas().is_none(), "null is no quota");
+
+        let mut v2 = v3();
+        v2["grant_schema_version"] = serde_json::json!(2);
+        v2["backend_quota"] = quota_json(0, 0);
+        v2["tenants"]["acme"]["bucket_attributes"]["reports"]["quota"] = quota_json(0, 0);
+        assert!(BucketPlacement::from_data(&v2).quotas().is_none());
+    }
+
+    /// A quota the document states but the gateway cannot read is kept as unreadable, so
+    /// the writes it covers are refused rather than left unlimited.
+    #[test]
+    fn an_unreadable_quota_is_kept_as_such_never_dropped() {
+        let mut doc = v3();
+        doc["tenants"]["acme"]["bucket_attributes"]["reports"]["quota"] = serde_json::json!({ "limit_bytes": "100", "used_bytes": 0,
+                                "collected_at": "2026-10-01T12:00:00Z" });
+        let placement = placed(&doc);
+        let quotas = placement.quotas().expect("a stated quota");
+        assert!(matches!(
+            quotas.get(&QuotaScope::Bucket("reports".into())),
+            Some(QuotaSpec::Unreadable(why)) if why.contains("limit_bytes")
+        ));
+        assert_eq!(quotas.unreadable().count(), 1);
     }
 
     /// The two bucket-level reasons are the audited contract the control plane reads.

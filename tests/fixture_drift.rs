@@ -12,8 +12,8 @@
 //! The same argument runs the other way for the **bundle**, whose producer is the control
 //! plane: the v3 fixture must carry every field the gateway reads from a placing bundle,
 //! in the shape it reads it, and be the v2 capture plus exactly those fields — so the
-//! placement is tested against the document the projection is pinned to, not against one
-//! written to suit the reader.
+//! placement and the byte quotas are tested against the document the projection is pinned
+//! to, not against one written to suit the reader.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -24,6 +24,10 @@ use s0::model::BackendKind;
 use s0::pdp::{
     BACKEND_FIELD, BUCKET_ATTRIBUTES_FIELD, BucketPlacement, CREATED_AT_FIELD,
     GRANT_SCHEMA_VERSION_FIELD, OBJECT_NAME_FIELD, PLACEMENT_SCHEMA_VERSION, parse_bundle,
+};
+use s0::quota::{
+    BACKEND_QUOTA_FIELD, COLLECTED_AT_FIELD, LIMIT_BYTES_FIELD, QUOTA_FIELD, Quota, QuotaScope,
+    QuotaSpec, USED_BYTES_FIELD,
 };
 
 const REGO: &str = include_str!(concat!(
@@ -273,21 +277,39 @@ fn assert_rfc3339(label: &str, v: &serde_json::Value) {
         .unwrap_or_else(|e| panic!("{label} = {s:?} is not RFC 3339: {e}"));
 }
 
-/// `{ limit_bytes: u64, used_bytes: u64, collected_at: RFC 3339 }`, and nothing else.
-fn assert_quota_shape(label: &str, quota: &serde_json::Value) {
+/// `{ limit_bytes: u64, used_bytes: u64, collected_at: RFC 3339 }`, and nothing else —
+/// and the placement reads it, under the level a write names it by.
+fn assert_quota_shape(
+    label: &str,
+    quota: &serde_json::Value,
+    placement: &BucketPlacement,
+    scope: QuotaScope,
+) {
     assert_eq!(
         keys(quota),
-        set(&["limit_bytes", "used_bytes", "collected_at"]),
+        set(&[LIMIT_BYTES_FIELD, USED_BYTES_FIELD, COLLECTED_AT_FIELD]),
         "{label}"
     );
-    for field in ["limit_bytes", "used_bytes"] {
+    for field in [LIMIT_BYTES_FIELD, USED_BYTES_FIELD] {
         assert!(
             quota[field].as_u64().is_some(),
             "{label}.{field} must be an unsigned integer, got {}",
             quota[field]
         );
     }
-    assert_rfc3339(&format!("{label}.collected_at"), &quota["collected_at"]);
+    assert_rfc3339(
+        &format!("{label}.{COLLECTED_AT_FIELD}"),
+        &quota[COLLECTED_AT_FIELD],
+    );
+    let read = placement
+        .quotas()
+        .and_then(|quotas| quotas.get(&scope))
+        .unwrap_or_else(|| panic!("{label}: the placement does not read it as {scope:?}"));
+    assert_eq!(
+        *read,
+        QuotaSpec::Limit(Quota::from_value(quota).expect("the fixture's quota parses")),
+        "{label}"
+    );
 }
 
 /// Every field the gateway reads from a placing bundle is present, in the shape it reads
@@ -342,8 +364,13 @@ fn the_v3_fixture_carries_every_field_the_placement_reads() {
                 &format!("{label}.{CREATED_AT_FIELD}"),
                 &attrs[CREATED_AT_FIELD],
             );
-            if let Some(quota) = attrs.get("quota") {
-                assert_quota_shape(&format!("{label}.quota"), quota);
+            if let Some(quota) = attrs.get(QUOTA_FIELD) {
+                assert_quota_shape(
+                    &format!("{label}.{QUOTA_FIELD}"),
+                    quota,
+                    &placement,
+                    QuotaScope::Bucket(bucket.clone()),
+                );
             }
             assert_eq!(
                 placement.refusal(backend_id, tenant, bucket),
@@ -367,17 +394,33 @@ fn the_v3_fixture_carries_every_field_the_placement_reads() {
             keys(&tenant_data[BUCKET_ATTRIBUTES_FIELD]),
             "{tenant}"
         );
-        if let Some(quota) = tenant_data.get("quota") {
-            assert_quota_shape(&format!("tenants.{tenant}.quota"), quota);
+        if let Some(quota) = tenant_data.get(QUOTA_FIELD) {
+            assert_quota_shape(
+                &format!("tenants.{tenant}.{QUOTA_FIELD}"),
+                quota,
+                &placement,
+                QuotaScope::Tenant(tenant.clone()),
+            );
         }
     }
     assert!(
         total >= 2,
         "the fixture must place buckets under more than one tenant"
     );
-    if let Some(quota) = data.get("backend_quota") {
-        assert_quota_shape("backend_quota", quota);
+    if let Some(quota) = data.get(BACKEND_QUOTA_FIELD) {
+        assert_quota_shape(
+            BACKEND_QUOTA_FIELD,
+            quota,
+            &placement,
+            QuotaScope::Backend(backend_id.to_string()),
+        );
     }
+    let quotas = placement.quotas().expect("the fixture states quotas");
+    assert_eq!(
+        quotas.unreadable().count(),
+        0,
+        "every quota in the fixture is readable"
+    );
 
     // The data half only, so it is recognized as a platform document missing its module.
     assert!(
@@ -395,7 +438,7 @@ fn the_v3_fixture_is_the_v2_capture_plus_the_v3_fields() {
     let v3 = bundle_data(V3_BUNDLE);
 
     let mut expected = keys(&v2);
-    expected.extend(set(&[BACKEND_FIELD, "backend_quota"]));
+    expected.extend(set(&[BACKEND_FIELD, BACKEND_QUOTA_FIELD]));
     assert_eq!(keys(&v3), expected, "top-level data keys");
     assert_eq!(keys(&v2["org_settings"]), keys(&v3["org_settings"]));
     assert_eq!(
@@ -412,14 +455,14 @@ fn the_v3_fixture_is_the_v2_capture_plus_the_v3_fields() {
         .flat_map(|(_, attrs)| keys(attrs))
         .collect();
     let mut allowed_bucket_keys = v2_bucket_keys.clone();
-    allowed_bucket_keys.extend(set(&[OBJECT_NAME_FIELD, CREATED_AT_FIELD, "quota"]));
+    allowed_bucket_keys.extend(set(&[OBJECT_NAME_FIELD, CREATED_AT_FIELD, QUOTA_FIELD]));
 
     for (tenant, t3) in v3["tenants"].as_object().expect("tenants") {
         let t2 = &v2["tenants"][tenant];
         let mut tenant_keys = keys(t2);
         let v3_only: BTreeSet<String> = keys(t3).difference(&tenant_keys).cloned().collect();
         assert!(
-            v3_only.is_subset(&set(&["quota"])),
+            v3_only.is_subset(&set(&[QUOTA_FIELD])),
             "{tenant} gained {v3_only:?}, which the contract does not pin"
         );
         tenant_keys.extend(v3_only);
