@@ -1,6 +1,6 @@
 # ADR-007: Response obligations — bucket visibility, gateway-owned listing order, and the empty answer
 
-- **Status**: Accepted — implemented (src/proxy/obligations.rs)
+- **Status**: Accepted — implemented (src/proxy/obligations.rs); amended by ADR-009: from bundle v3 the listing comes from the bundle, not the backend
 - **Date**: 2026-07-28
 - **Owners**: gateway team (this repository); the `visible_buckets` derivation in the projected bundle is control-plane integration (out of scope here)
 - **Related**: `src/proxy/obligations.rs`, `src/proxy/bucketfilter.rs`, `src/access/mod.rs` (`list_buckets`), `src/authz/decision.rs`; ADR-004 (list narrowing and the fan-out cursor), ADR-002 (audit record shape), ADR-006 (grant projection)
