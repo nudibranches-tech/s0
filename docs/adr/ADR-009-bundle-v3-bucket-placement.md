@@ -66,6 +66,14 @@ forwarded. The sharing is derived from the config on load and on every config ap
 on the request's route snapshot as a flag (never the key), and a forward refuses to cross a
 config change that flipped it. Tenants with their own credential keep the v2 path unchanged.
 
+**What the client is told.** The three per-bucket refusals answer `AccessDenied` with the
+reason above, verbatim. The bundle-wide ones (another backend, an unreadable placing
+document, a shared identity below v3) answer one fixed sentence, `deny (gateway): the policy
+bundle in force cannot be used for this request; …`: their detail can name another tenant
+(`data.tenants.<tenant>.bucket_attributes is not an object`), both backend ids, or the
+fact that the tenant shares an upstream identity. The detail stays on the audit record and
+in the error log.
+
 A copy's source bucket is screened on the same terms as its destination. The hooks whose
 single record summarizes several decisions (copy, multi-delete, a write with riders) screen
 up front, so the record names the placement rather than the summary. A refusal is an

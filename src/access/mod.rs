@@ -359,6 +359,11 @@ impl GatewayAccess {
         input: OpaInput,
         charge: Charge,
     ) -> S3Result<()> {
+        // Screened here as well as in `decide`, so the client gets the placement's client
+        // message rather than the decision's reason, which is the audit's.
+        if let Some(refusal) = cx.placement_refusal(&input) {
+            return Err(self.deny_placement(input, &refusal));
+        }
         let decision = self.decide(cx, &input).await;
         // An obligation the policy declared mandatory and this binary cannot apply is a
         // denial, not a warning: a restriction that silently did not happen is the
@@ -505,6 +510,13 @@ impl GatewayAccess {
         s3_error!(AccessDenied, "{reason}")
     }
 
+    /// Record a placement refusal with its full reason, and answer 403 with the client's
+    /// version of it ([`PlacementRefusal::client_message`]).
+    fn deny_placement(&self, input: OpaInput, refusal: &PlacementRefusal) -> S3Error {
+        self.audit_denied(input, &Decision::deny(refusal.reason()), vec![]);
+        s3_error!(AccessDenied, "{}", refusal.client_message())
+    }
+
     /// The reserved-key list currently published by the control plane.
     ///
     /// Read from the live bundle on each tag write rather than cached: the bundle is the
@@ -602,7 +614,7 @@ impl GatewayAccess {
         let input = cx.write_input(action, bucket, object, &riders);
         // Ahead of the riders, whose own decision would otherwise be the one recorded.
         if let Some(refusal) = cx.placement_refusal(&input) {
-            return Err(self.deny(input, refusal.reason()));
+            return Err(self.deny_placement(input, &refusal));
         }
         if let Err(why) = self.screen_riders(&riders) {
             return Err(self.refuse(input, why));
@@ -732,7 +744,7 @@ impl GatewayAccess {
         // Both buckets, before either half: the record below would only say which half
         // was refused, not that the bucket is not this tenant's.
         if let Some(refusal) = cx.placement_refusal(&dst_input) {
-            return Err(self.deny(dst_input, refusal.reason()));
+            return Err(self.deny_placement(dst_input, &refusal));
         }
         // Screened before either half is asked about: a conferring ACL on the destination
         // is refused whatever the answers would have been, and refusing early keeps the
@@ -802,6 +814,11 @@ impl GatewayAccess {
     ) -> ListVerdict {
         let mut input = cx.base_input(Action::ListObjects, bucket);
         input.prefix = prefix;
+        // Ahead of `decide`, for the client message; see `enforce_charged`.
+        if let Some(refusal) = cx.placement_refusal(&input) {
+            self.audit_denied(input, &Decision::deny(refusal.reason()), vec![]);
+            return ListVerdict::Deny(refusal.client_message());
+        }
         let decision = self.decide(cx, &input).await;
         let verdict = classify_list(&decision, self.gw.limits().max_list_fanout, fanout);
         match &verdict {
@@ -1025,7 +1042,7 @@ impl S3Access for GatewayAccess {
         // reason, and the record would then say only "all delete keys denied".
         let placement_input = cx.base_input(Action::DeleteObjects, bucket.clone());
         if let Some(refusal) = cx.placement_refusal(&placement_input) {
-            return Err(self.deny(placement_input, refusal.reason()));
+            return Err(self.deny_placement(placement_input, &refusal));
         }
         // Refused through the audit path like every other cap, rather than with an early
         // `Err` above `ReqCtx` that would leave no record. `delete_keys` is deliberately
