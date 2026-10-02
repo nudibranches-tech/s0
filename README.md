@@ -118,6 +118,15 @@ table, so no pushed policy can enable them:
 - **Live policy and live revocation**: OPA holds the policy; a revoked grant denies on the
   next request. No policy is ever baked into a credential.
 - **`freeze_writes`** org kill-switch, per-bucket denylist, and the grant superset.
+- **Bucket placement on a shared upstream identity**: from `grant_schema_version` 3 the
+  bundle names the backend it was projected for and, per bucket, the one tenant that owns
+  it. A request naming a bucket owned by another tenant, or one no tenant lists, or a
+  bundle projected for a different backend, is refused by the gateway itself — before the
+  policy is even asked — with `ListBuckets` answered straight from the bundle instead of
+  forwarded, since the shared upstream identity generally cannot list at all. This is what
+  makes a backend profile such as `garage`, where every tenant of an organization shares
+  one upstream key scoped only by bucket grant, safe to front
+  ([ADR-009](docs/adr/ADR-009-bundle-v3-bucket-placement.md)).
 - **Byte quotas where the backend has none**: a v3 bundle may state a quota on a bucket,
   a tenant or the backend, and a write that would pass one is refused `QuotaExceeded`
   (403) before it is forwarded, counting what was written since the last collection rather
@@ -296,7 +305,7 @@ read bucket CORS. The implementation is [`src/cors`](src/cors).
 | Module | Role |
 |---|---|
 | [`authz`](src/authz) | the OPA input contract and the decision type — the core seam |
-| [`pdp`](src/pdp) | `Pdp` trait; embedded regorus + sidecar OPA; revision-keyed decision cache |
+| [`pdp`](src/pdp) | `Pdp` trait; embedded regorus + sidecar OPA; revision-keyed decision cache; v3 bundle bucket placement (`BucketPlacement`) |
 | [`auth`](src/auth) | identity authority, own STS, long-lived derived keys |
 | [`access`](src/access) | the OPA gate: deny-by-default `check` + typed per-op hooks |
 | [`cors`](src/cors) | preflights and response headers for browsers, from the bucket's own CORS rule |

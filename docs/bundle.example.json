@@ -1,18 +1,34 @@
 {
   "_note": "Projected per-tenant policy data: user_attributes / bucket_attributes / org_settings.freeze_writes, plus the s3_grants / group_grants grant superset the control plane projects. The gateway's rego reads these by name. This object is the 'data'. To push the policy module alongside it, wrap it as { \"policy\": \"<rego source>\", \"data\": { ... } }; a bare object (this file) uses the gateway's compiled-in default policy.",
+  "_v3_note": "From grant_schema_version 3 (src/pdp/bundle.rs, ADR-009) the bundle also PLACES buckets: data.backend.id names the backend this bundle was projected for, and bucket_attributes is keyed by S3 name with exactly one owning tenant per bucket. A request for a bucket not listed here, listed under another tenant, or routed to a backend_id that does not match data.backend.id, is refused by the gateway itself, before the policy is asked; ListBuckets is answered straight from this index. object_name is the control plane's own name for the bucket (carried into audit records); created_at (RFC 3339) backs ListBuckets' reported creation date. Below version 3 none of this is read: grant_schema_version, data.backend and quota are all ignored by an older gateway or an unversioned bundle (the shape this file shipped before 0.4.0).",
+  "_quota_note": "Byte quotas (ADR-010, src/quota.rs) are also v3-only and optional at every level: data.backend.quota, tenants.<t>.quota, and tenants.<t>.bucket_attributes.<bucket>.quota. Each is { limit_bytes, used_bytes, collected_at }; used_bytes is the control plane's last collection and the gateway counts what each replica has accepted since collected_at on top of it, refusing a write that would cross limit_bytes at any level with QuotaExceeded (403). Omit quota at a level to enforce nothing there (e.g. a backend with its own native per-bucket quota, such as Garage).",
+  "grant_schema_version": 3,
+  "backend": { "id": "backend-eu-1", "kind": "ceph" },
   "org_settings": { "freeze_writes": false },
   "tenants": {
     "acme": {
       "_s3_key_epoch_note": "Revocation for long-lived derived per-principal keys (src/auth/derived.rs). `s3_key_epoch` is the lowest epoch such a key may carry and still be honoured; raising it revokes every outstanding key for the tenant at the next bundle poll. `s3_key_epochs` optionally raises the floor for ONE subject (keyed `sa:<client id>` / `user:<sub>`), so one compromised consumer can be cut off without touching the others; it can only ever tighten. ABSENCE OF `s3_key_epoch` DENIES every derived key for this tenant — so publishing it is the opt-in, and losing it fails closed.",
       "s3_key_epoch": 1,
       "s3_key_epochs": {},
+      "quota": { "limit_bytes": 536870912000, "used_bytes": 107374182400, "collected_at": "2026-10-01T00:00:00Z" },
       "user_attributes": {
         "5f3a...oidc-sub-alice": { "groups": ["analysts"], "attributes": [] },
         "9c21...oidc-sub-bob": { "groups": [], "attributes": [] }
       },
       "bucket_attributes": {
-        "reports": { "denylist": { "9c21...oidc-sub-bob": true }, "sensitivity": "high" },
-        "public": { "denylist": {}, "sensitivity": "low" }
+        "reports": {
+          "denylist": { "9c21...oidc-sub-bob": true },
+          "sensitivity": "high",
+          "object_name": "acme-reports",
+          "created_at": "2026-01-15T09:30:00Z",
+          "quota": { "limit_bytes": 107374182400, "used_bytes": 21474836480, "collected_at": "2026-10-01T00:00:00Z" }
+        },
+        "public": {
+          "denylist": {},
+          "sensitivity": "low",
+          "object_name": "acme-public",
+          "created_at": "2026-01-15T09:30:00Z"
+        }
       },
       "s3_grants": {
         "5f3a...oidc-sub-alice": [
