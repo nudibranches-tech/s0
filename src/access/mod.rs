@@ -130,6 +130,12 @@ impl<'a> ReqCtx<'a> {
     /// Why the bundle's placement refuses `input` — its bucket, and a copy's source
     /// bucket — before any policy is asked, or `None` when it does not.
     fn placement_refusal(&self, input: &OpaInput) -> Option<PlacementRefusal> {
+        if let Some(refusal) = self
+            .placement
+            .shared_identity_refusal(self.route.shares_upstream_identity)
+        {
+            return Some(refusal);
+        }
         let backend = self.route.backend_id.0.as_str();
         self.placement
             .refusal(backend, &input.tenant, &input.bucket)
@@ -1718,6 +1724,13 @@ fn classify_bucket_listing(decision: &Decision) -> BucketListing {
 /// What a `ListBuckets` on `route` lists: the tenant's buckets as `placement` places them,
 /// or the backend's own listing when it places none.
 fn bucket_source(placement: &BucketPlacement, route: &RouteSnapshot) -> BucketSource {
+    // The backend's listing for a shared identity is every sharing tenant's buckets.
+    if placement
+        .shared_identity_refusal(route.shares_upstream_identity)
+        .is_some()
+    {
+        return BucketSource::Bundle(Vec::new());
+    }
     match placement.listing(&route.backend_id.0, &route.tenant) {
         None => BucketSource::Backend,
         Some(listed) => BucketSource::Bundle(

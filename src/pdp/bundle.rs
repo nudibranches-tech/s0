@@ -237,6 +237,9 @@ pub enum PlacementRefusal {
     Contested,
     /// No tenant has the bucket on this backend.
     NotOnBackend,
+    /// The requester's tenant shares its upstream identity with another tenant, and the
+    /// bundle in force places no buckets: nothing would keep the two apart.
+    UnplacedSharedIdentity,
 }
 
 impl PlacementRefusal {
@@ -262,9 +265,16 @@ impl PlacementRefusal {
                  one tenant"
             ),
             PlacementRefusal::NotOnBackend => BUCKET_NOT_ON_THIS_BACKEND.to_string(),
+            PlacementRefusal::UnplacedSharedIdentity => UNPLACED_SHARED_IDENTITY.to_string(),
         }
     }
 }
+
+/// The refusal reason for a tenant sharing an upstream identity under a bundle that places
+/// no buckets.
+pub const UNPLACED_SHARED_IDENTITY: &str = "deny (gateway): tenants sharing an upstream \
+     identity need a placing bundle (grant_schema_version >= 3); every request of this \
+     tenant is refused until the control plane serves one";
 
 /// The refusal reason for a bucket the bundle places under another tenant.
 pub const BUCKET_OF_ANOTHER_TENANT: &str = "deny (gateway): bucket belongs to another tenant";
@@ -414,6 +424,22 @@ impl BucketPlacement {
     #[must_use]
     pub fn places_buckets(&self) -> bool {
         !matches!(self, BucketPlacement::Unplaced)
+    }
+
+    /// The refusal for a route whose upstream identity other tenants share
+    /// ([`crate::proxy::RouteSnapshot::shares_upstream_identity`]), whatever the request.
+    ///
+    /// The pre-v3 path is today's only for a tenant with its own credential, which the
+    /// backend keeps apart by itself. For tenants sharing one, the placement is the only
+    /// barrier: an unplaced bundle (a v2 or seed document in force during a rollout, a
+    /// rollback) would let a wildcard grant of one reach the other's buckets.
+    #[must_use]
+    pub fn shared_identity_refusal(
+        &self,
+        shares_upstream_identity: bool,
+    ) -> Option<PlacementRefusal> {
+        (shares_upstream_identity && !self.places_buckets())
+            .then_some(PlacementRefusal::UnplacedSharedIdentity)
     }
 
     /// Why a decision about `bucket` (`""` for the account scope) by `tenant`, on a
@@ -1159,6 +1185,32 @@ mod tests {
             );
         }
         assert_eq!(PLACEMENT_SCHEMA_VERSION, 3);
+    }
+
+    /// A tenant sharing its upstream identity is refused by any bundle that places no
+    /// buckets, and screened by the placement itself by one that does.
+    #[test]
+    fn a_shared_upstream_identity_needs_a_placing_bundle() {
+        let mut v2 = v3();
+        v2["grant_schema_version"] = serde_json::json!(2);
+        let unplaced = BucketPlacement::from_data(&v2);
+        assert_eq!(
+            unplaced.shared_identity_refusal(true),
+            Some(PlacementRefusal::UnplacedSharedIdentity)
+        );
+        assert_eq!(unplaced.shared_identity_refusal(false), None);
+        assert_eq!(
+            PlacementRefusal::UnplacedSharedIdentity.reason(),
+            UNPLACED_SHARED_IDENTITY
+        );
+        // A placing document, readable or not, screens on its own terms.
+        assert_eq!(placed(&v3()).shared_identity_refusal(true), None);
+        let mut unusable = v3();
+        unusable["grant_schema_version"] = serde_json::json!("3");
+        assert_eq!(
+            BucketPlacement::from_data(&unusable).shared_identity_refusal(true),
+            None
+        );
     }
 
     /// The owning-tenant index: a bucket is usable by its owner only, and a bucket no

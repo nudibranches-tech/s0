@@ -123,7 +123,9 @@ table, so no pushed policy can enable them:
   policy is even asked — with `ListBuckets` answered straight from the bundle instead of
   forwarded, since the shared upstream identity generally cannot list at all. This is what
   makes a backend profile such as `garage`, where every tenant of an organization shares
-  one upstream key scoped only by bucket grant, safe to front
+  one upstream key scoped only by bucket grant, safe to front. Tenants that share an
+  upstream key are refused outright while the bundle in force places nothing (a v2 or seed
+  bundle), since the backend alone would not keep them apart
   ([ADR-009](docs/adr/ADR-009-bundle-v3-bucket-placement.md)).
 - **Byte quotas where the backend has none**: a v3 bundle may state a quota on a bucket,
   a tenant or the backend, and a write that would pass one is refused `QuotaExceeded`

@@ -23,7 +23,9 @@ use common::sigv4::RawRequest;
 use http::Method;
 use s0::access::GatewayAccess;
 use s0::audit::{AuditRecord, Outcome};
-use s0::pdp::{BUCKET_NOT_ON_THIS_BACKEND, BUCKET_OF_ANOTHER_TENANT, Bundle};
+use s0::pdp::{
+    BUCKET_NOT_ON_THIS_BACKEND, BUCKET_OF_ANOTHER_TENANT, Bundle, UNPLACED_SHARED_IDENTITY,
+};
 use s0::proxy::{GatewayS3, S3GatewayState};
 use s3s::access::S3Access;
 use s3s::dto::*;
@@ -220,6 +222,95 @@ async fn a_v2_bundle_keeps_todays_path_policy_decided_and_forwarded() {
     );
     // The backend's whole namespace survives the wildcard: v2's behaviour, unchanged.
     assert_eq!(names(&out), ["ledger", "logs", "reports", "zeta"]);
+}
+
+// ── below v3, tenants sharing an upstream identity ──────────────────────────────
+
+/// Two tenants re-signed with one upstream key: the backend serves either tenant's buckets
+/// to the other, so below v3 nothing would keep them apart, and `wild`'s wildcard grant
+/// would reach `globex`'s `ledger`. Every request of a sharing tenant is refused until a
+/// placing bundle is in force — v2, the seed and an unversioned document alike — and
+/// nothing reaches the PDP or the backend.
+#[tokio::test]
+async fn below_v3_tenants_sharing_an_upstream_identity_are_refused() {
+    let mut unversioned = placed_bundle(3, BACKEND);
+    unversioned
+        .as_object_mut()
+        .expect("object")
+        .remove("grant_schema_version");
+    for (label, bundle) in [
+        ("v2", placed_bundle(2, BACKEND)),
+        ("v0 seed", placed_bundle(0, BACKEND)),
+        ("unversioned", unversioned),
+    ] {
+        let backend = fake_backend().await;
+        let fx = common::fixture_with_shared_identity(
+            &format!("v3-shared-identity-{}", label.replace(' ', "-")),
+            bundle,
+            &backend.url,
+        );
+        assert!(!fx.gw.bundles.current().placement().places_buckets());
+        let access = GatewayAccess::new(fx.gw.clone());
+
+        // The cross-tenant GET the wildcard grant would otherwise allow.
+        let mut req = fx.request_as("wild", "GetObject", get("ledger", "k"), Method::GET);
+        assert_refused(
+            &format!("{label}: GetObject on globex's bucket"),
+            access.get_object(&mut req).await,
+            UNPLACED_SHARED_IDENTITY,
+        );
+        assert!(req.extensions.get::<s0::access::AuthzProof>().is_none());
+        // The tenant's own bucket too: the backend cannot tell it apart either.
+        let mut req = fx.request_as("wild", "GetObject", get("reports", "k"), Method::GET);
+        assert_refused(
+            &format!("{label}: GetObject on acme's own bucket"),
+            access.get_object(&mut req).await,
+            UNPLACED_SHARED_IDENTITY,
+        );
+        // The backend's listing would be both tenants' buckets.
+        let out = list_buckets(&fx, "wild", ListBucketsInput::default())
+            .await
+            .expect("a refused enumeration is an empty listing");
+        assert!(names(&out).is_empty(), "{label}: {:?}", names(&out));
+
+        assert_eq!(fx.pdp_calls(), 0, "{label}: the PDP is never asked");
+        assert_eq!(
+            backend.requests.load(Ordering::Relaxed),
+            0,
+            "{label}: nothing reaches the backend"
+        );
+        let records = fx.await_audit_records(3).await;
+        let records = decision_records(&records);
+        assert_eq!(records.len(), 3, "{label}: {records:?}");
+        for rec in records {
+            assert_eq!(rec.result.reason, UNPLACED_SHARED_IDENTITY, "{label}");
+            assert_eq!(rec.gateway.outcome, Outcome::Denied, "{label}");
+        }
+    }
+}
+
+/// The same two tenants under a placing bundle: the placement keeps them apart, so the
+/// owner reaches its bucket (the policy decides) and the other tenant's is refused.
+#[tokio::test]
+async fn at_v3_tenants_sharing_an_upstream_identity_are_kept_apart_by_the_placement() {
+    let fx = common::fixture_with_shared_identity(
+        "v3-shared-identity-placed",
+        v3(),
+        "http://127.0.0.1:1",
+    );
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request_as("wild", "GetObject", get("ledger", "k"), Method::GET);
+    assert_refused(
+        "GetObject on globex's bucket",
+        access.get_object(&mut req).await,
+        BUCKET_OF_ANOTHER_TENANT,
+    );
+    let mut req = fx.request_as("wild", "GetObject", get("reports", "k"), Method::GET);
+    access
+        .get_object(&mut req)
+        .await
+        .expect("the owner's own bucket is the policy's to decide");
+    assert_eq!(fx.pdp_calls(), 1);
 }
 
 // ── v3: the owning-tenant gate ──────────────────────────────────────────────────
