@@ -14,6 +14,7 @@ use std::sync::Arc;
 use http::Method;
 use s0::access::{GatewayAccess, OperationName};
 use s0::identity::ResolvedPrincipal;
+use s0::pdp::BucketPlacement;
 use s0::proxy::RouteSnapshot;
 use s3s::access::S3Access;
 use s3s::dto::{
@@ -209,10 +210,11 @@ async fn multi_prefix_list_allows_and_stashes_fanout() {
 
 #[tokio::test]
 async fn a_hook_without_the_check_context_fails_closed() {
-    // The typed hooks read the principal, the route snapshot and the op name that
-    // `check` stashed. If any is missing, `check` did not run — the hook must error,
-    // never fall back to a default route or an empty org (which would silently
-    // mis-attribute, and in the route's case mis-target, the decision).
+    // The typed hooks read the principal, the route snapshot, the bucket placement and the
+    // op name that `check` stashed. If any is missing, `check` did not run — the hook must
+    // error, never fall back to a default route or an empty org (which would silently
+    // mis-attribute, and in the route's case mis-target, the decision), nor to "this
+    // bundle places nothing", which would switch the placement gate off.
     let fx = common::fixture("e2e-failclosed", bundle());
     let access = GatewayAccess::new(fx.gw.clone());
     let input = || GetObjectInput {
@@ -231,6 +233,10 @@ async fn a_hook_without_the_check_context_fails_closed() {
 
     let mut req = fx.request("GetObject", input(), Method::GET);
     req.extensions.remove::<Arc<ResolvedPrincipal>>();
+    assert!(access.get_object(&mut req).await.is_err());
+
+    let mut req = fx.request("GetObject", input(), Method::GET);
+    req.extensions.remove::<Arc<BucketPlacement>>();
     assert!(access.get_object(&mut req).await.is_err());
 
     // Control: with the full context the same request is allowed.

@@ -27,7 +27,7 @@ use crate::audit::{BackendOutcome, PendingAudit};
 use crate::config::{BackendConfig, GatewayConfig, LimitsConfig};
 use crate::error::{GatewayError, Result};
 use crate::model::{BackendId, BackendKind};
-use crate::proxy::obligations::{BucketVisibility, ResponseObligations};
+use crate::proxy::obligations::{BucketSource, BucketVisibility, ResponseObligations};
 use crate::secret::Secret;
 
 /// One tenant's routing: which backend, which per-tenant credential, which Org.
@@ -522,13 +522,16 @@ impl S3 for GatewayS3 {
     /// the access hook installed *is* the authorization, and its absence is refused rather
     /// than forwarded. [`BucketVisibility::Nothing`] serves both "denied" and "allowed with
     /// no grants", so the caller cannot tell them apart.
+    ///
+    /// When the bundle places buckets the list is the bundle's ([`BucketSource::Bundle`])
+    /// and nothing is forwarded; the same visibility and the same paging apply to it.
     async fn list_buckets(
         &self,
         req: S3Request<ListBucketsInput>,
     ) -> S3Result<S3Response<ListBucketsOutput>> {
-        let Some(visibility) =
-            ResponseObligations::of(&req).and_then(|o| o.visible_buckets.clone())
-        else {
+        let obligation = ResponseObligations::of(&req)
+            .and_then(|o| Some((o.visible_buckets.clone()?, o.bucket_source.clone()?)));
+        let Some((visibility, source)) = obligation else {
             return Err(s3_error!(
                 InternalError,
                 "list buckets reached the forward path with no bucket-visibility \
@@ -552,10 +555,17 @@ impl S3 for GatewayS3 {
             .input
             .max_buckets
             .map_or(max_page, |m| (m.max(1) as usize).min(max_page));
-        self.forward(req, move |proxy, req| async move {
-            filtered_bucket_listing(proxy, req, &visibility, page_size, max_pages).await
-        })
-        .await
+        match source {
+            BucketSource::Backend => {
+                self.forward(req, move |proxy, req| async move {
+                    filtered_bucket_listing(proxy, req, &visibility, page_size, max_pages).await
+                })
+                .await
+            }
+            BucketSource::Bundle(buckets) => {
+                bundle_bucket_listing(&req, buckets, &visibility, page_size)
+            }
+        }
     }
 
     /// PostObject: the ONE `S3` method whose s3s default is not `NotImplemented` — it
@@ -712,9 +722,6 @@ async fn fan_out_list_v2(
 /// drained, sorted gateway-side and paged from there, bounded by a page cap and a check
 /// that the backend's token advances — both fail loudly rather than truncating, because a
 /// listing that quietly omitted buckets looks exactly like a revoked grant.
-// ListBucketsOutput is constructed field-by-field: struct-update syntax on a
-// `#[non_exhaustive]`-adjacent generated DTO is unavailable, as in fan_out_list_v2.
-#[allow(clippy::field_reassign_with_default)]
 async fn filtered_bucket_listing(
     proxy: Arc<Proxy>,
     req: S3Request<ListBucketsInput>,
@@ -753,6 +760,43 @@ async fn filtered_bucket_listing(
         }
     }
 
+    bucket_listing_page(all, visibility, name_prefix, cursor, page_size)
+}
+
+/// One gateway-cut page of the tenant's buckets as the bundle places them. The backend
+/// is not asked, so nothing here can fail on its account; the page is cut exactly as a
+/// drained backend listing is.
+///
+/// The authorization proof is still required: the list is the tenant's, and only an
+/// allowed decision may hand it out.
+fn bundle_bucket_listing(
+    req: &S3Request<ListBucketsInput>,
+    buckets: Vec<Bucket>,
+    visibility: &BucketVisibility,
+    page_size: usize,
+) -> S3Result<S3Response<ListBucketsOutput>> {
+    proof::require(req)?;
+    let cursor = decode_cursor(req.input.continuation_token.as_deref())?;
+    bucket_listing_page(
+        buckets,
+        visibility,
+        req.input.prefix.clone(),
+        cursor,
+        page_size,
+    )
+}
+
+/// Filter, sort and cut one page of `all`, whichever source it came from.
+// ListBucketsOutput is constructed field-by-field: struct-update syntax on a
+// `#[non_exhaustive]`-adjacent generated DTO is unavailable, as in fan_out_list_v2.
+#[allow(clippy::field_reassign_with_default)]
+fn bucket_listing_page(
+    all: Vec<Bucket>,
+    visibility: &BucketVisibility,
+    name_prefix: Option<String>,
+    cursor: Option<fanout::Cursor>,
+    page_size: usize,
+) -> S3Result<S3Response<ListBucketsOutput>> {
     let page = bucketfilter::page(all, visibility, name_prefix.as_deref(), cursor, page_size)
         .map_err(|e| s3_error!(InvalidArgument, "{e}"))?;
 

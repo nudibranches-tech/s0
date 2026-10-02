@@ -7,7 +7,9 @@
 //! denied one emitted at once. Riders no grant may authorize are refused in code, never
 //! silently stripped ([`headers`], ADR-008); an inline tag set is decomposed onto
 //! `write_object_tags`. [`proof`] is the third fail-closed layer: a hook that forgot to
-//! authorize cannot reach the backend.
+//! authorize cannot reach the backend. A bundle that places buckets
+//! ([`crate::pdp::BucketPlacement`]) adds one more, ahead of the PDP: a bucket of another
+//! tenant, or of no tenant on this backend, is refused whatever the policy says.
 
 pub mod headers;
 pub mod optable;
@@ -16,6 +18,7 @@ pub mod tagging;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use http::Extensions;
 use s3s::access::{S3Access, S3AccessContext};
@@ -32,8 +35,9 @@ use crate::authz::{Backend, CopySource as AuthzCopySource, Decision, OpaInput, R
 use crate::gateway::Gateway;
 use crate::identity::ResolvedPrincipal;
 use crate::model::Action;
+use crate::pdp::{BucketPlacement, PlacementRefusal};
 use crate::proxy::RouteSnapshot;
-use crate::proxy::obligations::{BucketVisibility, ResponseObligations};
+use crate::proxy::obligations::{BucketSource, BucketVisibility, ResponseObligations};
 
 pub use optable::{Coverage, DangerTier, GateDenial, OP_TABLE, OpSpec, ResourceShape};
 pub use proof::AuthzProof;
@@ -72,6 +76,9 @@ struct ReqCtx<'a> {
     principal: Arc<ResolvedPrincipal>,
     /// Resolved once in `check`; carries no owner credentials by construction.
     route: Arc<RouteSnapshot>,
+    /// The bucket placement of the bundle revision `check` admitted the request under.
+    /// Every sub-decision of the request is screened against this one.
+    placement: Arc<BucketPlacement>,
     /// Consumed by `AuthzProof` and the audit record; stashed by `check`, the only place
     /// the name is available.
     operation: Arc<str>,
@@ -95,6 +102,11 @@ impl<'a> ReqCtx<'a> {
             .get::<Arc<RouteSnapshot>>()
             .cloned()
             .ok_or_else(|| s3_error!(InternalError, "route snapshot missing from request"))?;
+        let placement = req
+            .extensions
+            .get::<Arc<BucketPlacement>>()
+            .cloned()
+            .ok_or_else(|| s3_error!(InternalError, "bucket placement missing from request"))?;
         let operation = req
             .extensions
             .get::<OperationName>()
@@ -104,10 +116,24 @@ impl<'a> ReqCtx<'a> {
         Ok(ReqCtx {
             principal,
             route,
+            placement,
             operation,
             meta,
             extensions: &mut req.extensions,
         })
+    }
+
+    /// Why the bundle's placement refuses `input` — its bucket, and a copy's source
+    /// bucket — before any policy is asked, or `None` when it does not.
+    fn placement_refusal(&self, input: &OpaInput) -> Option<PlacementRefusal> {
+        let backend = self.route.backend_id.0.as_str();
+        self.placement
+            .refusal(backend, &input.tenant, &input.bucket)
+            .or_else(|| {
+                let source = input.copy_source.as_ref()?;
+                self.placement
+                    .refusal(backend, &input.tenant, &source.bucket)
+            })
     }
 
     /// The request-invariant half of the OPA input. A pure projection of the route
@@ -180,7 +206,16 @@ impl GatewayAccess {
     /// second call site would silently make the corpus incomplete;
     /// `tests/golden_capture.rs::decide_is_the_only_pdp_call_site_on_the_request_path`
     /// is the guard.
+    ///
+    /// It is also where the bundle's bucket placement is enforced, ahead of the PDP: a
+    /// bucket placed under another tenant, or on no tenant of this backend, is refused here
+    /// whatever any policy would say, so no question about it reaches an engine. Being
+    /// the funnel is what makes that total; the hooks that summarize several decisions in
+    /// one record also screen up front, so the record carries this reason.
     async fn decide(&self, cx: &ReqCtx<'_>, input: &OpaInput) -> Decision {
+        if let Some(refusal) = cx.placement_refusal(input) {
+            return Decision::deny(refusal.reason());
+        }
         if let Some(capture) = &self.gw.capture {
             capture.record(&cx.operation, input);
         }
@@ -421,6 +456,10 @@ impl GatewayAccess {
             }
         };
         let input = cx.write_input(action, bucket, object, &riders);
+        // Ahead of the riders, whose own decision would otherwise be the one recorded.
+        if let Some(refusal) = cx.placement_refusal(&input) {
+            return Err(self.deny(input, refusal.reason()));
+        }
         if let Err(why) = self.screen_riders(&riders) {
             return Err(self.refuse(input, why));
         }
@@ -524,6 +563,11 @@ impl GatewayAccess {
             bucket: src_bucket.clone(),
             key: src_key.clone(),
         });
+        // Both buckets, before either half: the record below would only say which half
+        // was refused, not that the bucket is not this tenant's.
+        if let Some(refusal) = cx.placement_refusal(&dst_input) {
+            return Err(self.deny(dst_input, refusal.reason()));
+        }
         // Screened before either half is asked about: a conferring ACL on the destination
         // is refused whatever the answers would have been, and refusing early keeps the
         // record's reason the one the client is given.
@@ -683,9 +727,13 @@ impl S3Access for GatewayAccess {
                 principal.tenant
             ));
         };
+        // The placement is pinned here for the same reason: a bundle swap mid-request must
+        // not let one sub-decision see a bucket where another did not.
+        let placement = self.gw.bundles.current().placement().clone();
         let ext = cx.extensions_mut();
         ext.insert(Arc::new(principal));
         ext.insert(Arc::new(route));
+        ext.insert(placement);
         ext.insert(OperationName(Arc::from(op.as_str())));
         Ok(())
     }
@@ -783,6 +831,12 @@ impl S3Access for GatewayAccess {
             .map(|o| o.key.clone())
             .collect();
         let mut cx = ReqCtx::new(req)?;
+        // Once for the batch, not per key: every key would be refused for the same
+        // reason, and the record would then say only "all delete keys denied".
+        let placement_input = cx.base_input(Action::DeleteObjects, bucket.clone());
+        if let Some(refusal) = cx.placement_refusal(&placement_input) {
+            return Err(self.deny(placement_input, refusal.reason()));
+        }
         // Refused through the audit path like every other cap, rather than with an early
         // `Err` above `ReqCtx` that would leave no record. `delete_keys` is deliberately
         // NOT recorded here: the request is over the bound precisely because it carries
@@ -1034,12 +1088,18 @@ impl S3Access for GatewayAccess {
     /// The hook returns `Ok(())` even on a refusal because a hook produces a verdict, not
     /// a response. The dispatcher builds the empty listing from the obligation installed
     /// here, and `GatewayS3::list_buckets` refuses outright if none is present.
+    ///
+    /// The list the visibility is applied to is chosen here too, from the placement this
+    /// request was admitted under: the bundle's own list when it places buckets, so the
+    /// backend is never asked, and the backend's otherwise.
     async fn list_buckets(&self, req: &mut S3Request<ListBucketsInput>) -> S3Result<()> {
-        let visibility = {
+        let (visibility, source) = {
             let mut cx = ReqCtx::new(req)?;
-            self.enforce_bucket_listing(&mut cx).await
+            let visibility = self.enforce_bucket_listing(&mut cx).await;
+            let source = bucket_source(&cx.placement, &cx.route);
+            (visibility, source)
         };
-        ResponseObligations::buckets(visibility).install(&mut req.extensions);
+        ResponseObligations::buckets(visibility, source).install(&mut req.extensions);
         Ok(())
     }
 
@@ -1328,6 +1388,24 @@ fn classify_bucket_listing(decision: &Decision) -> BucketListing {
     BucketListing::Show(BucketVisibility::only(
         obligations.visible_buckets.iter().cloned().collect(),
     ))
+}
+
+/// What a `ListBuckets` on `route` lists: the tenant's buckets as `placement` places them,
+/// or the backend's own listing when it places none.
+fn bucket_source(placement: &BucketPlacement, route: &RouteSnapshot) -> BucketSource {
+    match placement.listing(&route.backend_id.0, &route.tenant) {
+        None => BucketSource::Backend,
+        Some(listed) => BucketSource::Bundle(
+            listed
+                .into_iter()
+                .map(|b| Bucket {
+                    bucket_region: None,
+                    creation_date: b.created_at.map(|t| Timestamp::from(SystemTime::from(t))),
+                    name: Some(b.name),
+                })
+                .collect(),
+        ),
+    }
 }
 
 /// The deny reason for a decision carrying a `must_understand` this binary cannot

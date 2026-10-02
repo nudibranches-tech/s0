@@ -7,9 +7,17 @@
 //! Each fetch is content-hashed into a revision, the linchpin of cache correctness: a
 //! revocation lands as a new revision, so every decision cached under the old revision is
 //! unreachable by construction — there is no invalidation logic to get wrong.
+//!
+//! From `grant_schema_version` 3 a bundle also **places** buckets: it is filtered to one
+//! backend, names that backend, and lists each of its buckets under exactly one tenant.
+//! [`BucketPlacement`] is that index, built once per revision on load.
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use arc_swap::ArcSwap;
-use serde::{Deserialize, Serialize};
+use chrono::{DateTime, Utc};
 
 /// The default gateway policy, compiled into the binary. In production the control plane
 /// pushes the authoritative module in the bundle; this is the fallback when a bundle
@@ -113,19 +121,381 @@ impl ParsedBundle {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One installed revision: the policy data, and the bucket placement derived from it.
+///
+/// Not `Deserialize`, deliberately: [`Bundle::new`] is the only constructor, so the
+/// placement can never be absent from a v3 document — a decoded `Bundle` would carry
+/// [`BucketPlacement::Unplaced`] for one and silently switch the placement gate off.
+#[derive(Debug, Clone)]
 pub struct Bundle {
     /// Opaque monotonic revision from the control-plane bundle builder (an etag/version).
     pub revision: String,
     /// The projected policy data (`tenants`, `org_settings`, …).
     pub data: serde_json::Value,
+    placement: Arc<BucketPlacement>,
 }
 
 impl Bundle {
     pub fn new(revision: impl Into<String>, data: serde_json::Value) -> Self {
+        let placement = Arc::new(BucketPlacement::from_data(&data));
         Bundle {
             revision: revision.into(),
             data,
+            placement,
+        }
+    }
+
+    /// The placement this revision publishes. An `Arc` so a request can hold the one it
+    /// was admitted under for its whole life, the way it holds its route.
+    #[must_use]
+    pub fn placement(&self) -> &Arc<BucketPlacement> {
+        &self.placement
+    }
+}
+
+/// The `grant_schema_version` from which a bundle places buckets. Below it the request
+/// path is today's, byte for byte: no index, and `ListBuckets` is the backend's answer.
+pub const PLACEMENT_SCHEMA_VERSION: u64 = 3;
+
+/// Bundle field names the placement is read from. A contract with the control plane's
+/// projection, named once so the reader, the fixtures and the drift tests share them.
+pub const GRANT_SCHEMA_VERSION_FIELD: &str = "grant_schema_version";
+pub const BACKEND_FIELD: &str = "backend";
+pub const BUCKET_ATTRIBUTES_FIELD: &str = "bucket_attributes";
+pub const OBJECT_NAME_FIELD: &str = "object_name";
+pub const CREATED_AT_FIELD: &str = "created_at";
+
+/// How the bundle in force places buckets on this gateway's backend.
+///
+/// On a backend whose upstream identity is shared by every tenant of an organization,
+/// this is what keeps one tenant out of another's bucket: the backend would serve either.
+#[derive(Debug)]
+pub enum BucketPlacement {
+    /// A document below [`PLACEMENT_SCHEMA_VERSION`], or one with no version at all. No
+    /// placement is published and nothing about the request path changes.
+    Unplaced,
+    /// A placing document this gateway cannot read. Every request is refused with this
+    /// reason: a placement half-understood is a placement not enforced.
+    Unusable(String),
+    Placed(PlacementIndex),
+}
+
+/// A v3 bundle's placement: the backend it was projected for, and `S3 name → owning
+/// tenant` for every bucket on it.
+#[derive(Debug)]
+pub struct PlacementIndex {
+    backend_id: String,
+    buckets: HashMap<String, PlacedBucket>,
+    /// Each tenant's buckets, the `ListBuckets` answer before visibility is applied.
+    /// A contested bucket is in no tenant's list.
+    listings: HashMap<String, Vec<String>>,
+    /// Set by the first request refused for a backend mismatch, so the error is logged
+    /// once per revision rather than once per request.
+    mismatch_logged: AtomicBool,
+}
+
+#[derive(Debug)]
+struct PlacedBucket {
+    owner: BucketOwner,
+    object_name: Option<String>,
+    created_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug)]
+enum BucketOwner {
+    Tenant(String),
+    /// Listed under more than one tenant: the projection broke its own contract, and no
+    /// tenant may use the bucket until it says which one owns it.
+    Contested,
+}
+
+/// One bucket of a tenant's bundle listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedBucket {
+    pub name: String,
+    /// `created_at`, when the bundle carried a parseable one.
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+/// Why the placement refuses a decision. Asked before the PDP, so a refused question is
+/// never posed to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlacementRefusal {
+    /// The bundle in force places buckets but cannot be read.
+    Unusable(String),
+    /// The bundle was projected for another backend than the one this request routes to.
+    BackendMismatch { bundle: String, route: String },
+    /// The bucket is placed under a different tenant than the requester's.
+    AnotherTenant,
+    /// The bucket is placed under more than one tenant.
+    Contested,
+    /// No tenant has the bucket on this backend.
+    NotOnBackend,
+}
+
+impl PlacementRefusal {
+    /// The audit-facing reason, which is also what the client is told: like every other
+    /// gateway refusal it names the layer that refused. Telling "another tenant" from "not
+    /// here" discloses that the name is taken on this backend, which a bucket creation
+    /// refused as "name already used" discloses anyway.
+    #[must_use]
+    pub fn reason(&self) -> String {
+        match self {
+            PlacementRefusal::Unusable(why) => format!(
+                "deny (gateway): the policy bundle in force cannot be used ({why}); every \
+                 request is refused until the control plane serves a readable one"
+            ),
+            PlacementRefusal::BackendMismatch { bundle, route } => format!(
+                "deny (gateway): the policy bundle in force was projected for backend \
+                 {bundle:?}, but this request routes to backend {route:?}; every request \
+                 is refused until the control plane serves this backend's bundle"
+            ),
+            PlacementRefusal::AnotherTenant => BUCKET_OF_ANOTHER_TENANT.to_string(),
+            PlacementRefusal::Contested => format!(
+                "{BUCKET_OF_ANOTHER_TENANT}: the policy bundle places it under more than \
+                 one tenant"
+            ),
+            PlacementRefusal::NotOnBackend => BUCKET_NOT_ON_THIS_BACKEND.to_string(),
+        }
+    }
+}
+
+/// The refusal reason for a bucket the bundle places under another tenant.
+pub const BUCKET_OF_ANOTHER_TENANT: &str = "deny (gateway): bucket belongs to another tenant";
+
+/// The refusal reason for a bucket no tenant has on this backend.
+pub const BUCKET_NOT_ON_THIS_BACKEND: &str = "deny (gateway): bucket not on this backend";
+
+impl BucketPlacement {
+    /// Read the placement a document publishes. Logs at `error!` for a placing document
+    /// that cannot be used, or that lists a bucket under several tenants: each is a
+    /// control-plane defect that denies requests, and a denial with no log is undebuggable.
+    #[must_use]
+    pub fn from_data(data: &serde_json::Value) -> Self {
+        let placement = Self::read(data);
+        match &placement {
+            BucketPlacement::Unusable(why) => tracing::error!(
+                reason = %why,
+                "the policy bundle places buckets but cannot be read; EVERY request is \
+                 refused until the control plane serves a readable one"
+            ),
+            BucketPlacement::Placed(index) => index.log_load_defects(),
+            BucketPlacement::Unplaced => {}
+        }
+        placement
+    }
+
+    fn read(data: &serde_json::Value) -> Self {
+        let Some(version) = data.get(GRANT_SCHEMA_VERSION_FIELD) else {
+            return BucketPlacement::Unplaced;
+        };
+        let version = match version.as_u64() {
+            Some(v) if v < PLACEMENT_SCHEMA_VERSION => return BucketPlacement::Unplaced,
+            Some(v) => v,
+            // A version at or past the placing one that is not an integer cannot be told
+            // apart from a placing document, so it is refused rather than taken as old.
+            None if version
+                .as_f64()
+                .is_some_and(|v| v >= PLACEMENT_SCHEMA_VERSION as f64) =>
+            {
+                return BucketPlacement::Unusable(format!(
+                    "data.{GRANT_SCHEMA_VERSION_FIELD} is {version}, not an integer"
+                ));
+            }
+            None => return BucketPlacement::Unplaced,
+        };
+
+        let backend_id = match data
+            .get(BACKEND_FIELD)
+            .and_then(|b| b.get("id"))
+            .and_then(serde_json::Value::as_str)
+        {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => {
+                return BucketPlacement::Unusable(format!(
+                    "a version {version} bundle must name its backend in \
+                     data.{BACKEND_FIELD}.id"
+                ));
+            }
+        };
+
+        let tenants = match data.get("tenants") {
+            None => None,
+            Some(serde_json::Value::Object(tenants)) => Some(tenants),
+            Some(_) => {
+                return BucketPlacement::Unusable("data.tenants is not an object".to_string());
+            }
+        };
+        // Every tenant claiming each bucket, so a bucket listed twice is seen as such
+        // rather than silently won by whichever tenant iterates last.
+        let mut claims: BTreeMap<&str, Vec<(&str, &serde_json::Value)>> = BTreeMap::new();
+        for (tenant, tenant_data) in tenants.into_iter().flatten() {
+            let attributes = match tenant_data.get(BUCKET_ATTRIBUTES_FIELD) {
+                None => continue,
+                Some(serde_json::Value::Object(attributes)) => attributes,
+                Some(_) => {
+                    return BucketPlacement::Unusable(format!(
+                        "data.tenants.{tenant}.{BUCKET_ATTRIBUTES_FIELD} is not an object"
+                    ));
+                }
+            };
+            for (bucket, attrs) in attributes {
+                // The empty name is the account scope, never a bucket.
+                if !bucket.is_empty() {
+                    claims.entry(bucket).or_default().push((tenant, attrs));
+                }
+            }
+        }
+
+        let mut buckets = HashMap::with_capacity(claims.len());
+        let mut listings: HashMap<String, Vec<String>> = HashMap::new();
+        for (bucket, claimants) in claims {
+            let placed = match claimants.as_slice() {
+                [(tenant, attrs)] => {
+                    listings
+                        .entry((*tenant).to_string())
+                        .or_default()
+                        .push(bucket.to_string());
+                    PlacedBucket {
+                        owner: BucketOwner::Tenant((*tenant).to_string()),
+                        object_name: attrs
+                            .get(OBJECT_NAME_FIELD)
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string),
+                        created_at: attrs
+                            .get(CREATED_AT_FIELD)
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                            .map(|t| t.with_timezone(&Utc)),
+                    }
+                }
+                _ => PlacedBucket {
+                    owner: BucketOwner::Contested,
+                    object_name: None,
+                    created_at: None,
+                },
+            };
+            buckets.insert(bucket.to_string(), placed);
+        }
+        BucketPlacement::Placed(PlacementIndex {
+            backend_id,
+            buckets,
+            listings,
+            mismatch_logged: AtomicBool::new(false),
+        })
+    }
+
+    /// Whether this revision places buckets, readable or not. `false` is the pre-v3 path.
+    #[must_use]
+    pub fn places_buckets(&self) -> bool {
+        !matches!(self, BucketPlacement::Unplaced)
+    }
+
+    /// Why a decision about `bucket` (`""` for the account scope) by `tenant`, on a
+    /// request routed to `backend_id`, must be refused — or `None` to ask the PDP.
+    #[must_use]
+    pub fn refusal(
+        &self,
+        backend_id: &str,
+        tenant: &str,
+        bucket: &str,
+    ) -> Option<PlacementRefusal> {
+        match self {
+            BucketPlacement::Unplaced => None,
+            BucketPlacement::Unusable(why) => Some(PlacementRefusal::Unusable(why.clone())),
+            BucketPlacement::Placed(index) => index.refusal(backend_id, tenant, bucket),
+        }
+    }
+
+    /// `tenant`'s buckets, for a `ListBuckets` routed to `backend_id`: `None` when this
+    /// revision places nothing (the backend is asked, as before), empty when it cannot be
+    /// used for that backend.
+    #[must_use]
+    pub fn listing(&self, backend_id: &str, tenant: &str) -> Option<Vec<ListedBucket>> {
+        match self {
+            BucketPlacement::Unplaced => None,
+            BucketPlacement::Unusable(_) => Some(Vec::new()),
+            BucketPlacement::Placed(index) if index.backend_id != backend_id => Some(Vec::new()),
+            BucketPlacement::Placed(index) => Some(
+                index
+                    .listings
+                    .get(tenant)
+                    .into_iter()
+                    .flatten()
+                    .map(|name| ListedBucket {
+                        name: name.clone(),
+                        created_at: index.buckets.get(name).and_then(|b| b.created_at),
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    /// The `object_name` the bundle gives `bucket`, the control plane's own name for it.
+    #[must_use]
+    pub fn object_name(&self, bucket: &str) -> Option<&str> {
+        match self {
+            BucketPlacement::Placed(index) => index.buckets.get(bucket)?.object_name.as_deref(),
+            _ => None,
+        }
+    }
+}
+
+impl PlacementIndex {
+    fn refusal(&self, backend_id: &str, tenant: &str, bucket: &str) -> Option<PlacementRefusal> {
+        if self.backend_id != backend_id {
+            if !self.mismatch_logged.swap(true, Ordering::Relaxed) {
+                tracing::error!(
+                    bundle_backend = %self.backend_id,
+                    gateway_backend = %backend_id,
+                    "the policy bundle in force was projected for another backend; EVERY \
+                     request is refused until the control plane serves this backend's bundle"
+                );
+            }
+            return Some(PlacementRefusal::BackendMismatch {
+                bundle: self.backend_id.clone(),
+                route: backend_id.to_string(),
+            });
+        }
+        if bucket.is_empty() {
+            return None;
+        }
+        let Some(placed) = self.buckets.get(bucket) else {
+            return Some(PlacementRefusal::NotOnBackend);
+        };
+        match &placed.owner {
+            BucketOwner::Tenant(owner) if owner == tenant => None,
+            BucketOwner::Tenant(_) => Some(PlacementRefusal::AnotherTenant),
+            BucketOwner::Contested => Some(PlacementRefusal::Contested),
+        }
+    }
+
+    fn log_load_defects(&self) {
+        let contested: Vec<&str> = self
+            .buckets
+            .iter()
+            .filter(|(_, b)| matches!(b.owner, BucketOwner::Contested))
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if !contested.is_empty() {
+            tracing::error!(
+                count = contested.len(),
+                buckets = ?contested,
+                "the policy bundle places these buckets under more than one tenant; every \
+                 request naming one is refused"
+            );
+        }
+        let undated = self
+            .buckets
+            .values()
+            .filter(|b| matches!(b.owner, BucketOwner::Tenant(_)) && b.created_at.is_none())
+            .count();
+        if undated > 0 {
+            tracing::warn!(
+                count = undated,
+                "buckets without a readable {CREATED_AT_FIELD}; they are listed without a \
+                 creation date"
+            );
         }
     }
 }
@@ -630,5 +1000,348 @@ mod tests {
         // the compiled-in default.
         let dev = parse_bundle(r#"{ "org_settings": { "freeze_writes": false } }"#).unwrap();
         assert!(!dev.is_platform_data_missing_its_module());
+    }
+
+    // ── bucket placement (grant_schema_version ≥ 3) ─────────────────────────────
+
+    /// A v3 document on backend `archive`: `acme` owns `reports` and `logs`, `globex` owns
+    /// `ledger`, and `shared` is claimed by both — the projection defect.
+    fn v3() -> serde_json::Value {
+        serde_json::json!({
+            "grant_schema_version": 3,
+            "backend": { "id": "archive", "kind": "s3" },
+            "tenants": {
+                "acme": { "bucket_attributes": {
+                    "reports": { "denylist": {}, "object_name": "reports.archive",
+                                 "created_at": "2026-01-02T03:04:05Z" },
+                    "logs": { "denylist": {}, "object_name": "logs.archive",
+                              "created_at": "not a date" },
+                    "shared": { "denylist": {} }
+                } },
+                "globex": { "bucket_attributes": {
+                    "ledger": { "denylist": {}, "object_name": "ledger.archive",
+                                "created_at": "2026-02-03T04:05:06.789+02:00" },
+                    "shared": { "denylist": {} }
+                } },
+                // A tenant with no buckets on this backend.
+                "quiet": { "user_attributes": {} }
+            }
+        })
+    }
+
+    fn placed(data: &serde_json::Value) -> BucketPlacement {
+        let placement = BucketPlacement::from_data(data);
+        assert!(
+            matches!(placement, BucketPlacement::Placed(_)),
+            "expected a readable placement, got {placement:?}"
+        );
+        placement
+    }
+
+    /// The gate is version-driven, and below 3 it does not exist: today's documents — the
+    /// operator's seed (v0), the platform's v2 and s0's own unversioned dev bundles — must
+    /// keep today's request path exactly, forwarding included.
+    #[test]
+    fn placement_starts_at_version_3_and_nothing_older_is_placed() {
+        let with = |v: serde_json::Value| {
+            let mut doc = v3();
+            doc["grant_schema_version"] = v;
+            BucketPlacement::from_data(&doc)
+        };
+        let mut unversioned = v3();
+        unversioned
+            .as_object_mut()
+            .expect("object")
+            .remove("grant_schema_version");
+        for (label, placement) in [
+            ("no version", BucketPlacement::from_data(&unversioned)),
+            ("v0 seed", with(serde_json::json!(0))),
+            ("v1", with(serde_json::json!(1))),
+            ("v2", with(serde_json::json!(2))),
+            ("negative", with(serde_json::json!(-3))),
+            ("a string", with(serde_json::json!("3"))),
+            ("below 3, fractional", with(serde_json::json!(2.5))),
+        ] {
+            assert!(
+                matches!(placement, BucketPlacement::Unplaced),
+                "{label}: {placement:?}"
+            );
+            assert!(!placement.places_buckets());
+            // Unplaced refuses nothing and lists nothing: the backend is asked, as before.
+            assert_eq!(placement.refusal("archive", "acme", "ledger"), None);
+            assert_eq!(placement.listing("archive", "acme"), None);
+        }
+        for version in [3, 4, 99] {
+            let placement = with(serde_json::json!(version));
+            assert!(
+                matches!(placement, BucketPlacement::Placed(_)),
+                "v{version} must place: {placement:?}"
+            );
+        }
+        // Not an integer, yet not below the placing version: unreadable, not old.
+        let fractional = with(serde_json::json!(3.0));
+        assert!(
+            matches!(&fractional, BucketPlacement::Unusable(why) if why.contains("not an integer")),
+            "{fractional:?}"
+        );
+        assert_eq!(PLACEMENT_SCHEMA_VERSION, 3);
+    }
+
+    /// The owning-tenant index: a bucket is usable by its owner only, and a bucket no
+    /// tenant has is on no tenant of this backend.
+    #[test]
+    fn every_bucket_is_usable_by_its_owning_tenant_alone() {
+        let placement = placed(&v3());
+        assert_eq!(placement.refusal("archive", "acme", "reports"), None);
+        assert_eq!(placement.refusal("archive", "globex", "ledger"), None);
+        assert_eq!(
+            placement.refusal("archive", "acme", "ledger"),
+            Some(PlacementRefusal::AnotherTenant)
+        );
+        assert_eq!(
+            placement.refusal("archive", "globex", "reports"),
+            Some(PlacementRefusal::AnotherTenant)
+        );
+        // A tenant the bundle knows but that has nothing here, and one it does not know.
+        assert_eq!(
+            placement.refusal("archive", "quiet", "reports"),
+            Some(PlacementRefusal::AnotherTenant)
+        );
+        assert_eq!(
+            placement.refusal("archive", "nobody", "reports"),
+            Some(PlacementRefusal::AnotherTenant)
+        );
+        for bucket in ["elsewhere", "Reports", "reports.archive", "report"] {
+            assert_eq!(
+                placement.refusal("archive", "acme", bucket),
+                Some(PlacementRefusal::NotOnBackend),
+                "{bucket} is an S3 name no tenant has here (object names do not count)"
+            );
+        }
+        // The account scope names no bucket, so only a bundle-wide refusal applies.
+        assert_eq!(placement.refusal("archive", "acme", ""), None);
+        assert_eq!(placement.refusal("archive", "nobody", ""), None);
+    }
+
+    #[test]
+    fn a_bucket_placed_under_two_tenants_is_refused_to_both() {
+        let placement = placed(&v3());
+        for tenant in ["acme", "globex", "quiet"] {
+            assert_eq!(
+                placement.refusal("archive", tenant, "shared"),
+                Some(PlacementRefusal::Contested),
+                "{tenant}"
+            );
+        }
+        // …and it is listed for neither.
+        for tenant in ["acme", "globex"] {
+            let names: Vec<String> = placement
+                .listing("archive", tenant)
+                .expect("placed")
+                .into_iter()
+                .map(|b| b.name)
+                .collect();
+            assert!(
+                !names.contains(&"shared".to_string()),
+                "{tenant}: {names:?}"
+            );
+        }
+    }
+
+    /// `data.backend.id` must be the backend the request routes to. A bundle served to the
+    /// wrong instance places buckets that are not there, so it refuses everything —
+    /// including the account scope — and lists nothing.
+    #[test]
+    fn a_bundle_projected_for_another_backend_refuses_every_request() {
+        let placement = placed(&v3());
+        let mismatch = Some(PlacementRefusal::BackendMismatch {
+            bundle: "archive".into(),
+            route: "default".into(),
+        });
+        for bucket in ["reports", "ledger", "elsewhere", ""] {
+            assert_eq!(
+                placement.refusal("default", "acme", bucket),
+                mismatch,
+                "{bucket:?}"
+            );
+        }
+        assert_eq!(placement.listing("default", "acme"), Some(Vec::new()));
+        // A second refusal still refuses; only the log line is latched.
+        assert_eq!(placement.refusal("default", "acme", "reports"), mismatch);
+    }
+
+    /// A placing document that cannot be read refuses everything rather than falling back
+    /// to the unplaced path, which would switch the gate off for exactly the bundles that
+    /// need it.
+    #[test]
+    fn an_unreadable_placing_bundle_refuses_every_request() {
+        let mut no_backend = v3();
+        no_backend
+            .as_object_mut()
+            .expect("object")
+            .remove("backend");
+        let mut no_id = v3();
+        no_id["backend"] = serde_json::json!({ "kind": "s3" });
+        let mut empty_id = v3();
+        empty_id["backend"]["id"] = serde_json::json!("");
+        let mut numeric_id = v3();
+        numeric_id["backend"]["id"] = serde_json::json!(7);
+        let mut tenants_not_object = v3();
+        tenants_not_object["tenants"] = serde_json::json!(["acme"]);
+        let mut attributes_not_object = v3();
+        attributes_not_object["tenants"]["globex"]["bucket_attributes"] =
+            serde_json::json!(["ledger"]);
+
+        for (label, doc) in [
+            ("no data.backend", no_backend),
+            ("no backend id", no_id),
+            ("empty backend id", empty_id),
+            ("backend id not a string", numeric_id),
+            ("tenants not an object", tenants_not_object),
+            ("bucket_attributes not an object", attributes_not_object),
+        ] {
+            let placement = BucketPlacement::from_data(&doc);
+            assert!(
+                matches!(placement, BucketPlacement::Unusable(_)),
+                "{label}: {placement:?}"
+            );
+            assert!(placement.places_buckets(), "{label}");
+            for (tenant, bucket) in [("acme", "reports"), ("globex", "ledger"), ("acme", "")] {
+                assert!(
+                    matches!(
+                        placement.refusal("archive", tenant, bucket),
+                        Some(PlacementRefusal::Unusable(_))
+                    ),
+                    "{label}: {tenant}/{bucket:?} must be refused"
+                );
+            }
+            assert_eq!(
+                placement.listing("archive", "acme"),
+                Some(Vec::new()),
+                "{label}"
+            );
+        }
+
+        // An absent tenants map is not malformed: nothing is placed, so every bucket is
+        // simply not on this backend.
+        let mut no_tenants = v3();
+        no_tenants
+            .as_object_mut()
+            .expect("object")
+            .remove("tenants");
+        let placement = placed(&no_tenants);
+        assert_eq!(
+            placement.refusal("archive", "acme", "reports"),
+            Some(PlacementRefusal::NotOnBackend)
+        );
+        assert_eq!(placement.listing("archive", "acme"), Some(Vec::new()));
+    }
+
+    /// The `ListBuckets` source: the tenant's own uncontested buckets, with `created_at`
+    /// as the creation date when it parses — and nothing of any other tenant's.
+    #[test]
+    fn the_listing_is_the_tenants_own_buckets_with_their_creation_dates() {
+        let placement = placed(&v3());
+        let acme = placement.listing("archive", "acme").expect("placed");
+        assert_eq!(
+            acme,
+            vec![
+                ListedBucket {
+                    name: "logs".into(),
+                    // "not a date" is listed, undated, rather than dropped.
+                    created_at: None,
+                },
+                ListedBucket {
+                    name: "reports".into(),
+                    created_at: Some(
+                        DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+                            .expect("date")
+                            .with_timezone(&Utc)
+                    ),
+                },
+            ]
+        );
+        let globex = placement.listing("archive", "globex").expect("placed");
+        assert_eq!(globex.len(), 1);
+        assert_eq!(globex[0].name, "ledger");
+        assert_eq!(
+            globex[0].created_at.map(|t| t.to_rfc3339()),
+            Some("2026-02-03T02:05:06.789+00:00".to_string()),
+            "an offset timestamp is normalized to UTC, not misread"
+        );
+        assert_eq!(placement.listing("archive", "quiet"), Some(Vec::new()));
+        assert_eq!(placement.listing("archive", "nobody"), Some(Vec::new()));
+    }
+
+    #[test]
+    fn the_object_name_is_the_bundles_own_and_only_for_a_placed_bucket() {
+        let placement = placed(&v3());
+        assert_eq!(placement.object_name("reports"), Some("reports.archive"));
+        assert_eq!(placement.object_name("ledger"), Some("ledger.archive"));
+        assert_eq!(placement.object_name("shared"), None);
+        assert_eq!(placement.object_name("elsewhere"), None);
+        assert_eq!(BucketPlacement::Unplaced.object_name("reports"), None);
+    }
+
+    /// The placement is derived once, on load, and travels with its revision: swapping
+    /// the store swaps it, in both directions.
+    #[test]
+    fn the_placement_is_computed_on_load_and_follows_the_store() {
+        let store = BundleStore::new(Bundle::new(
+            "rev-v2",
+            serde_json::json!({
+                "grant_schema_version": 2, "tenants": {}
+            }),
+        ));
+        assert!(!store.current().placement().places_buckets());
+
+        store.store(Bundle::new("rev-v3", v3()));
+        let pinned = store.current().placement().clone();
+        assert_eq!(pinned.refusal("archive", "acme", "reports"), None);
+
+        store.store(Bundle::new(
+            "rev-v2b",
+            serde_json::json!({ "grant_schema_version": 2 }),
+        ));
+        assert!(!store.current().placement().places_buckets());
+        // A request that pinned the v3 placement keeps deciding under it.
+        assert_eq!(
+            pinned.refusal("archive", "acme", "ledger"),
+            Some(PlacementRefusal::AnotherTenant)
+        );
+    }
+
+    /// The two bucket-level reasons are the audited contract the control plane reads.
+    #[test]
+    fn the_placement_reasons_name_the_gateway_and_the_cause() {
+        assert_eq!(
+            PlacementRefusal::AnotherTenant.reason(),
+            "deny (gateway): bucket belongs to another tenant"
+        );
+        assert_eq!(
+            PlacementRefusal::NotOnBackend.reason(),
+            "deny (gateway): bucket not on this backend"
+        );
+        assert!(
+            PlacementRefusal::Contested
+                .reason()
+                .starts_with("deny (gateway): bucket belongs to another tenant")
+        );
+        let mismatch = PlacementRefusal::BackendMismatch {
+            bundle: "archive".into(),
+            route: "default".into(),
+        }
+        .reason();
+        assert!(
+            mismatch.starts_with("deny (gateway):")
+                && mismatch.contains("\"archive\"")
+                && mismatch.contains("\"default\""),
+            "{mismatch}"
+        );
+        assert!(
+            PlacementRefusal::Unusable("why".into())
+                .reason()
+                .starts_with("deny (gateway):")
+        );
     }
 }
