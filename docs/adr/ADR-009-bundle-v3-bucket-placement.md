@@ -1,6 +1,7 @@
 # ADR-009: Bundle v3 — bucket placement, enforced by the gateway
 
-- **Status**: Accepted — implemented (src/pdp/bundle.rs, src/access/mod.rs, src/proxy/mod.rs)
+- **Status**: Accepted — implemented (src/pdp/bundle.rs, src/access/mod.rs, src/proxy/mod.rs,
+  policy/gateway/authz.rego)
 - **Date**: 2026-10-02
 - **Owners**: gateway team (this repo); the per-backend projection is control-plane integration
 - **Related**: `src/pdp/bundle.rs` (`BucketPlacement`), `src/access/mod.rs` (`check`, `decide`),
@@ -55,6 +56,15 @@ single record summarizes several decisions (copy, multi-delete, a write with rid
 up front, so the record names the placement rather than the summary. A refusal is an
 ordinary decision record — attributed, carrying the full input, not rate-limited — because
 the caller is authenticated and its tenant is known.
+
+**The default policy agrees.** The compiled-in `policy/gateway/authz.rego` refuses the
+same cases from v3 on — a bucket-scoped decision (or a copy's source) whose bucket is not
+placed under `input.tenant` alone, and any decision when `data.backend.id` is not
+`input.backend.id` — with its own `deny: …` reasons, and leaves the account scope's
+visibility as it was. The corpus (`policy/testdata/corpus.json`) pins the cases on both
+engines, and `tests/policy_corpus.rs` checks that over every case the module refuses on
+placement exactly when the gateway's screen does. A module the control plane pushes is
+expected to carry the same rule; the gate does not depend on it.
 
 **`ListBuckets` from the bundle.** The hook picks the listing's source (`BucketSource`) from
 the pinned placement: at v3, the requester's tenant's buckets from the bundle, `created_at`

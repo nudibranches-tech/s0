@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use s0::authz::{Decision, OpaInput};
-use s0::pdp::{GATEWAY_REGO, Pdp, RegorusPdp};
+use s0::pdp::{BucketPlacement, GATEWAY_REGO, Pdp, RegorusPdp};
 use serde::Deserialize;
 
 const CORPUS: &str = include_str!(concat!(
@@ -79,6 +79,75 @@ async fn golden_corpus_matches_rego() {
         "{} corpus case(s) failed:\n  {}",
         failures.len(),
         failures.join("\n  ")
+    );
+}
+
+/// The reasons the default policy gives for refusing on placement. Each names the layer
+/// that refused, as the gateway's own refusal does.
+const PLACEMENT_REASONS: [&str; 3] = [
+    "deny: bucket belongs to another tenant",
+    "deny: bucket not on this backend",
+    "deny: bundle projected for another backend",
+];
+
+/// Default-policy parity with the gateway (ADR-009): for every corpus case, the default
+/// module refuses on placement exactly when the gateway's own pre-PDP screen would, so a
+/// data-only v3 bundle is safe whichever of the two looks first.
+///
+/// The gateway screen is asked the way `GatewayAccess::decide` asks it: the decision's
+/// bucket, then a copy's source, against the backend the decision names.
+#[tokio::test]
+async fn default_policy_refuses_on_placement_exactly_when_the_gateway_does() {
+    let corpus: Corpus = serde_json::from_str(CORPUS).expect("parse corpus.json");
+
+    let mut failures = Vec::new();
+    let mut gateway_refusals = 0usize;
+    for case in &corpus.cases {
+        let data = corpus
+            .bundles
+            .get(&case.bundle)
+            .expect("unknown bundle in case");
+        let placement = BucketPlacement::from_data(data);
+        let input = &case.input;
+        let refusal = placement
+            .refusal(&input.backend.id, &input.tenant, &input.bucket)
+            .or_else(|| {
+                let source = input.copy_source.as_ref()?;
+                placement.refusal(&input.backend.id, &input.tenant, &source.bucket)
+            });
+        let pdp = RegorusPdp::new(GATEWAY_REGO, data).expect("build regorus engine");
+        let decision = pdp.decide(input).await.expect("decision");
+        let rego_refused = PLACEMENT_REASONS.contains(&decision.reason.as_str());
+
+        match (&refusal, rego_refused) {
+            (Some(why), false) => failures.push(format!(
+                "[{}] the gateway refuses ({why:?}) but the default policy answers \
+                 allow={} reason={:?}",
+                case.name, decision.allow, decision.reason
+            )),
+            (None, true) => failures.push(format!(
+                "[{}] the default policy refuses on placement ({:?}) but the gateway does not",
+                case.name, decision.reason
+            )),
+            (Some(_), true) if decision.allow => {
+                failures.push(format!("[{}] a placement reason on an allow", case.name));
+            }
+            _ => {}
+        }
+        gateway_refusals += usize::from(refusal.is_some());
+    }
+
+    assert!(
+        failures.is_empty(),
+        "{} case(s) where the default policy and the gateway disagree on placement:\n  {}",
+        failures.len(),
+        failures.join("\n  ")
+    );
+    // Over a corpus with no placing bundle this would hold vacuously.
+    assert!(
+        gateway_refusals >= 5,
+        "only {gateway_refusals} corpus case(s) are refused on placement; the v3 cases are \
+         missing"
     );
 }
 
