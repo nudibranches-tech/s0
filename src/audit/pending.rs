@@ -46,6 +46,17 @@ impl PendingAudit {
         self.sink.emit(record);
     }
 
+    /// The id of the record this request is audited under, while it is still held. The
+    /// forward path hands it to the client as the request id, so a reported error leads
+    /// straight to its decision record.
+    pub fn decision_id(&self) -> Option<String> {
+        self.record
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|r| r.decision_id.clone())
+    }
+
     fn take(&self) -> Option<AuditRecord> {
         // A poisoned lock here would mean a panic while holding the record; recovering
         // is strictly better than dropping an audit record on the floor.
@@ -166,7 +177,13 @@ mod tests {
     async fn settling_emits_exactly_one_record_even_though_drop_also_runs() {
         let collector = Arc::new(Collector::default());
         let pending = Arc::new(PendingAudit::new(sink(collector.clone()), record()));
+        assert_eq!(pending.decision_id().as_deref(), Some("dec-1"));
         pending.settle(BackendOutcome::SucceededStatusUnknown, None);
+        assert_eq!(
+            pending.decision_id(),
+            None,
+            "the record left with the settle"
+        );
         // The Drop that follows must not produce a second record: a duplicated decision
         // record is as bad for an audit trail as a missing one.
         drop(pending);

@@ -116,6 +116,11 @@ table, so no pushed policy can enable them:
 - **Live policy and live revocation**: OPA holds the policy; a revoked grant denies on the
   next request. No policy is ever baked into a credential.
 - **`freeze_writes`** org kill-switch, per-bucket denylist, and the grant superset.
+- **No backend text in an answer**: an error the backend returns is re-minted with its
+  code and HTTP status and a message of the gateway's own, so the ARN, account id or Ceph
+  tenant an upstream error names never reaches the client. The request id is the
+  gateway's on every forwarded answer (the decision id of the request's audit record), and
+  the backend's host id is dropped.
 
 ### Fail-closed by construction
 
