@@ -134,9 +134,13 @@ table, so no pushed policy can enable them:
   ([ADR-010](docs/adr/ADR-010-byte-quotas-counted-per-replica.md)).
 - **No backend text in an answer**: an error the backend returns is re-minted with its
   code and HTTP status and a message of the gateway's own, so the ARN, account id or Ceph
-  tenant an upstream error names never reaches the client. The request id is the
-  gateway's on every forwarded answer (the decision id of the request's audit record), and
-  the backend's host id is dropped.
+  tenant an upstream error names never reaches the client. A successful answer loses the
+  backend identifiers it carries: the SSE-KMS key id (an ARN with the account id, on AWS)
+  and encryption context, and `CompleteMultipartUpload`'s `Location`, which is the
+  object's URL on the backend's own host. The request id is the gateway's on every
+  forwarded answer (the decision id of the request's audit record), and the backend's host
+  id is dropped. Other fields of a successful answer (object metadata, ETags, listing
+  entries) are the backend's.
 
 ### Fail-closed by construction
 

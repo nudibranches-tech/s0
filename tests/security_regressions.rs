@@ -1747,8 +1747,10 @@ const UPSTREAM_ACCOUNT: &str = "123456789012";
 const UPSTREAM_TENANT: &str = "tenant-owner-acme";
 const UPSTREAM_REQUEST_ID: &str = "tx00000UPSTREAMREQ4242-zone-a";
 const UPSTREAM_HOST_ID: &str = "upstreamhostid-zone-a-zonegroup-b";
+/// The backend's own host, which a `CompleteMultipartUpload` `Location` names.
+const UPSTREAM_ENDPOINT: &str = "garage-internal.storage.svc";
 
-fn leak_markers() -> [&'static str; 6] {
+fn leak_markers() -> [&'static str; 7] {
     [
         "arn:",
         UPSTREAM_ACCOUNT,
@@ -1756,6 +1758,7 @@ fn leak_markers() -> [&'static str; 6] {
         UPSTREAM_REQUEST_ID,
         UPSTREAM_HOST_ID,
         "Resource",
+        UPSTREAM_ENDPOINT,
     ]
 }
 
@@ -1801,11 +1804,23 @@ async fn leaky_backend() -> String {
                     }
                 }
                 let head = String::from_utf8_lossy(&head).to_string();
-                let path = head.split_whitespace().nth(1).unwrap_or_default();
-                let path = path.split('?').next().unwrap_or_default();
+                let method = head
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                let target = head.split_whitespace().nth(1).unwrap_or_default();
+                let completes = method == "POST" && target.contains("uploadId=");
+                let path = target.split('?').next().unwrap_or_default();
                 let key = path.trim_start_matches("/reports/");
+                // A success names the backend's KMS key, an ARN carrying the account.
                 let ids = format!(
-                    "x-amz-request-id: {UPSTREAM_REQUEST_ID}\r\nx-amz-id-2: {UPSTREAM_HOST_ID}\r\n"
+                    "x-amz-request-id: {UPSTREAM_REQUEST_ID}\r\nx-amz-id-2: {UPSTREAM_HOST_ID}\r\n\
+                     x-amz-server-side-encryption: aws:kms\r\n\
+                     x-amz-server-side-encryption-aws-kms-key-id: \
+                     arn:aws:kms:eu-west-1:{UPSTREAM_ACCOUNT}:key/{UPSTREAM_TENANT}\r\n\
+                     x-amz-server-side-encryption-context: \
+                     eyJhd3M6czM6YXJuIjoiYXJuOmF3czpzMzo6OnJlcG9ydHMifQ==\r\n"
                 );
                 let resp = match upstream_answer(key) {
                     Some((status, code)) => {
@@ -1820,6 +1835,20 @@ async fn leaky_backend() -> String {
                         );
                         format!(
                             "HTTP/1.1 {status} Upstream\r\ncontent-type: application/xml\r\n{ids}\
+                             content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    }
+                    None if completes => {
+                        let body = format!(
+                            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                             <CompleteMultipartUploadResult>\
+                             <Location>http://{UPSTREAM_ENDPOINT}:3900/reports/{key}</Location>\
+                             <Bucket>reports</Bucket><Key>{key}</Key><ETag>\"abc-2\"</ETag>\
+                             </CompleteMultipartUploadResult>"
+                        );
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/xml\r\n{ids}\
                              content-length: {}\r\nconnection: close\r\n\r\n{body}",
                             body.len()
                         )
@@ -2007,12 +2036,76 @@ async fn no_backend_arn_account_or_id_reaches_the_client_on_the_wire() {
         }
     }
 
-    // Positive control: a success is served, and still carries no backend id.
+    // Positive control: a success is served, and still carries no backend id — nor the
+    // backend's KMS key ARN, though it still says the object is encrypted.
     let (status, headers, body) = send_get(&base, "/reports/2024/ok").await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body, "hello");
     assert!(headers.contains("x-amz-request-id"), "{headers}");
-    for marker in [UPSTREAM_REQUEST_ID, UPSTREAM_HOST_ID] {
+    assert!(headers.contains("aws:kms"), "{headers}");
+    for marker in leak_markers().into_iter().chain(["kms-key-id"]) {
         assert!(!headers.contains(marker), "{marker:?} in {headers}");
+    }
+}
+
+/// A successful write names no backend identifier either: not the KMS key ARN (and its
+/// account id) or encryption context of a PutObject, and not the `Location` of a
+/// CompleteMultipartUpload, which is the object's URL on the backend's own host.
+#[tokio::test]
+async fn a_successful_answer_names_no_backend_key_or_endpoint() {
+    use s3s::S3;
+    let backend = leaky_backend().await;
+    let fx = common::fixture_with_backend("scrub-success", common::alice_bundle(), &backend);
+    let access = GatewayAccess::new(fx.gw.clone());
+    let s3 = s0::proxy::GatewayS3::new(Arc::new(s0::proxy::S3GatewayState::new(
+        fx.gw.registry.clone(),
+        fx.gw.limits.clone(),
+    )));
+
+    let mut req = fx.request(
+        "PutObject",
+        PutObjectInput {
+            bucket: "reports".into(),
+            key: "2024/ok".into(),
+            content_length: Some(5),
+            body: Some(StreamingBlob::from(s3s::Body::from(b"hello".to_vec()))),
+            ..Default::default()
+        },
+        Method::PUT,
+    );
+    access
+        .put_object(&mut req)
+        .await
+        .expect("alice writes under 2024/");
+    let out = s3.put_object(req).await.expect("stored").output;
+    assert!(out.server_side_encryption.is_some(), "{out:?}");
+    assert_eq!(out.ssekms_key_id, None, "{out:?}");
+    assert_eq!(out.ssekms_encryption_context, None, "{out:?}");
+
+    let mut req = fx.request(
+        "CompleteMultipartUpload",
+        CompleteMultipartUploadInput {
+            bucket: "reports".into(),
+            key: "2024/big".into(),
+            upload_id: "upload-1".into(),
+            ..Default::default()
+        },
+        Method::POST,
+    );
+    access
+        .complete_multipart_upload(&mut req)
+        .await
+        .expect("alice writes under 2024/");
+    let out = s3
+        .complete_multipart_upload(req)
+        .await
+        .expect("completed")
+        .output;
+    assert_eq!(out.key.as_deref(), Some("2024/big"), "{out:?}");
+    assert_eq!(out.location, None, "{out:?}");
+    assert_eq!(out.ssekms_key_id, None, "{out:?}");
+    let rendered = format!("{out:?}");
+    for marker in leak_markers() {
+        assert!(!rendered.contains(marker), "{marker:?} in {rendered}");
     }
 }
