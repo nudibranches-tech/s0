@@ -332,7 +332,8 @@ Two Garage v2.4.1 behaviours it found, neither s0's:
    trailer upload through s0 to an `http://` Garage endpoint therefore fails with
    `InvalidRequest` ("Invalid payload signature"); a correctly signed request sent straight
    to Garage fails the same way. Over TLS the SDK sends the unsigned trailer form, which
-   works. **A Garage backend's endpoint must be `https`.**
+   works. **A Garage backend's endpoint must be `https`**, and s0 refuses to load a
+   `profile: garage` backend whose `endpoint_url` is not (`BackendConfig::validate`).
 2. **A multipart object's checksum fails SDK validation.** A GET of a multipart object
    returns its composite CRC32 with no `-<parts>` suffix and no `COMPOSITE` type, so boto3
    validates it as a full-object checksum and raises `FlexibleChecksumError`, on Garage

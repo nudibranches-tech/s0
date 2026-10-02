@@ -127,12 +127,14 @@ impl BackendKind {
     }
 }
 
-/// Vendor hint for an `s3`-kind [`BackendConfig`] (D8, B2). Purely informational: s0
-/// records it (config, logs) but no code path branches on it — addressing style is
+/// Vendor hint for an `s3`-kind [`BackendConfig`] (D8, B2). s0 records it (config, logs)
+/// and the request path never branches on it — addressing style is
 /// `BackendConfig::force_path_style` and the SigV4 scope s0 re-signs with is
 /// `BackendConfig::region`, both already backend-agnostic. A `Garage` profile, for
 /// instance, still needs path-style addressing and its own region string set explicitly;
-/// the profile itself does not imply either.
+/// the profile itself does not imply either. Its one use is at load: a `Garage` backend's
+/// endpoint must be `https`, since Garage refuses the signed upload trailer an SDK sends
+/// over plain HTTP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendProfile {
