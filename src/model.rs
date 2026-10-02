@@ -99,18 +99,55 @@ impl Action {
 
 /// Which backend family a request is proxied to. Enforcement never depends on
 /// backend-native features; this only selects the proxy client + re-signing.
+///
+/// `S3` is D8's "`s3` with a profile": any S3-compatible endpoint that is not the
+/// platform's own Ceph RGW (Garage, AWS, OVH Object Storage, ObjectScale, PowerStore...).
+/// It serializes as `"s3"`; `#[serde(alias = "remote_s3")]` keeps 0.3.x `gateway.json`
+/// files and audit fixtures parsing unchanged, since s0 0.3.4 shipped the variant as
+/// `remote_s3`. Addressing style stays `BackendConfig::force_path_style` and the signing
+/// region stays `BackendConfig::region`; which vendor it is never gates behavior, it is
+/// recorded on `BackendConfig::profile` for operators only (see `BackendProfile`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendKind {
     Ceph,
-    RemoteS3,
+    #[serde(alias = "remote_s3")]
+    S3,
 }
 
 impl BackendKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             BackendKind::Ceph => "ceph",
-            BackendKind::RemoteS3 => "remote_s3",
+            BackendKind::S3 => "s3",
+        }
+    }
+}
+
+/// Vendor hint for an `s3`-kind [`BackendConfig`] (D8, B2). Purely informational: s0
+/// records it (config, logs) but no code path branches on it — addressing style is
+/// `BackendConfig::force_path_style` and the SigV4 scope s0 re-signs with is
+/// `BackendConfig::region`, both already backend-agnostic. A `Garage` profile, for
+/// instance, still needs path-style addressing and its own region string set explicitly;
+/// the profile itself does not imply either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendProfile {
+    Generic,
+    Garage,
+    Aws,
+    Objectscale,
+    Powerstore,
+}
+
+impl BackendProfile {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            BackendProfile::Generic => "generic",
+            BackendProfile::Garage => "garage",
+            BackendProfile::Aws => "aws",
+            BackendProfile::Objectscale => "objectscale",
+            BackendProfile::Powerstore => "powerstore",
         }
     }
 }
@@ -161,4 +198,60 @@ impl std::fmt::Display for OrgId {
 pub struct PoolKey {
     pub backend: BackendId,
     pub tenant: Tenant,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backend_kind_s3_is_the_wire_value_and_remote_s3_still_parses() {
+        assert_eq!(BackendKind::S3.as_str(), "s3");
+        assert_eq!(
+            serde_json::to_string(&BackendKind::S3).expect("serialize"),
+            "\"s3\""
+        );
+        // 0.3.x configs and audit fixtures spelled it `remote_s3`; the alias keeps them
+        // loading unchanged rather than forcing a flag-day rewrite.
+        assert_eq!(
+            serde_json::from_str::<BackendKind>("\"remote_s3\"").expect("alias parses"),
+            BackendKind::S3
+        );
+        assert_eq!(
+            serde_json::from_str::<BackendKind>("\"s3\"").expect("canonical parses"),
+            BackendKind::S3
+        );
+    }
+
+    #[test]
+    fn backend_kind_ceph_is_unchanged() {
+        assert_eq!(BackendKind::Ceph.as_str(), "ceph");
+        assert_eq!(
+            serde_json::from_str::<BackendKind>("\"ceph\"").expect("ceph parses"),
+            BackendKind::Ceph
+        );
+    }
+
+    #[test]
+    fn backend_profile_round_trips_every_variant() {
+        let all = [
+            (BackendProfile::Generic, "generic"),
+            (BackendProfile::Garage, "garage"),
+            (BackendProfile::Aws, "aws"),
+            (BackendProfile::Objectscale, "objectscale"),
+            (BackendProfile::Powerstore, "powerstore"),
+        ];
+        for (profile, wire) in all {
+            assert_eq!(profile.as_str(), wire);
+            assert_eq!(
+                serde_json::to_string(&profile).expect("serialize"),
+                format!("\"{wire}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<BackendProfile>(&format!("\"{wire}\""))
+                    .expect("deserialize"),
+                profile
+            );
+        }
+    }
 }

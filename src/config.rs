@@ -16,7 +16,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::error::{GatewayError, Result};
-use crate::model::BackendKind;
+use crate::model::{BackendKind, BackendProfile};
 use crate::secret::Secret;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -453,6 +453,12 @@ pub struct BackendConfig {
     pub region: String,
     #[serde(default = "default_true")]
     pub force_path_style: bool,
+    /// Vendor hint for an `s3`-kind backend (B2). s0 records it; nothing in this
+    /// process branches on it — addressing style stays `force_path_style` and the
+    /// SigV4 re-signing scope stays `region`, both set explicitly regardless of
+    /// profile. Absent for `ceph`, and optional for `s3` too.
+    #[serde(default)]
+    pub profile: Option<BackendProfile>,
 }
 
 /// Maps a tenant to its Org, its backend, and the per-tenant backend
@@ -1697,5 +1703,74 @@ mod tests {
         cfg.as_object_mut().unwrap().remove("admin_listen");
         let loaded = GatewayConfig::from_json(&cfg.to_string()).unwrap();
         assert_eq!(loaded.admin_listen.port(), 8016);
+    }
+
+    // ── B2: the `s3` backend kind + profile (S0.1) ──────────────────────────────
+
+    /// A backend with no `profile` key at all — today's shape, and every `ceph`
+    /// backend forever — must still load, with `profile` staying `None` rather than
+    /// some silently-materialized default. Mirrors the CRD "absent stays absent" rule.
+    #[test]
+    fn a_backend_without_profile_loads_with_profile_absent() {
+        let base = example();
+        assert!(base["backends"][0].get("profile").is_none());
+        let loaded = GatewayConfig::from_json(&base.to_string()).expect("loads");
+        assert_eq!(loaded.backends[0].kind, BackendKind::Ceph);
+        assert_eq!(loaded.backends[0].profile, None);
+    }
+
+    /// The canonical `s3` spelling, with every documented profile value.
+    #[test]
+    fn an_s3_backend_parses_every_profile_value() {
+        for (wire, profile) in [
+            ("generic", BackendProfile::Generic),
+            ("garage", BackendProfile::Garage),
+            ("aws", BackendProfile::Aws),
+            ("objectscale", BackendProfile::Objectscale),
+            ("powerstore", BackendProfile::Powerstore),
+        ] {
+            let mut cfg = example();
+            cfg["backends"][0]["kind"] = serde_json::json!("s3");
+            cfg["backends"][0]["profile"] = serde_json::json!(wire);
+            let loaded = GatewayConfig::from_json(&cfg.to_string())
+                .unwrap_or_else(|e| panic!("profile {wire}: {e}"));
+            assert_eq!(loaded.backends[0].kind, BackendKind::S3);
+            assert_eq!(loaded.backends[0].profile, Some(profile));
+        }
+    }
+
+    /// An `s3` backend with no `profile` is "some S3-compatible endpoint" — valid,
+    /// since the profile is informational only and never gates behavior.
+    #[test]
+    fn an_s3_backend_without_a_profile_still_loads() {
+        let mut cfg = example();
+        cfg["backends"][0]["kind"] = serde_json::json!("s3");
+        let loaded = GatewayConfig::from_json(&cfg.to_string()).expect("loads");
+        assert_eq!(loaded.backends[0].kind, BackendKind::S3);
+        assert_eq!(loaded.backends[0].profile, None);
+    }
+
+    /// 0.3.x configs spelled this backend `remote_s3`. The deserialization alias keeps
+    /// them loading on 0.4.0 unchanged — no flag day across a config bump.
+    #[test]
+    fn a_remote_s3_backend_still_loads_as_the_s3_kind() {
+        let mut cfg = example();
+        cfg["backends"][0]["kind"] = serde_json::json!("remote_s3");
+        let loaded = GatewayConfig::from_json(&cfg.to_string()).expect("alias loads");
+        assert_eq!(loaded.backends[0].kind, BackendKind::S3);
+    }
+
+    /// Profile never changes addressing or signing: both stay exactly what the config
+    /// says regardless of which profile (or none) is set.
+    #[test]
+    fn profile_does_not_change_addressing_style_or_region() {
+        let mut cfg = example();
+        cfg["backends"][0]["kind"] = serde_json::json!("s3");
+        cfg["backends"][0]["profile"] = serde_json::json!("garage");
+        cfg["backends"][0]["region"] = serde_json::json!("garage");
+        cfg["backends"][0]["force_path_style"] = serde_json::json!(true);
+        let loaded = GatewayConfig::from_json(&cfg.to_string()).expect("loads");
+        assert_eq!(loaded.backends[0].region, "garage");
+        assert!(loaded.backends[0].force_path_style);
     }
 }

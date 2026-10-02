@@ -39,12 +39,21 @@
     "backend_connect_timeout_secs": 5,
     "backend_read_timeout_secs": 0
   },
+  "_backends_note": "`kind` is `ceph` or `s3` (D8's \"`s3` with a profile\"; `remote_s3` still deserializes as `s3` — the 0.3.x wire spelling, kept as an alias). `profile` is an optional vendor hint (`generic`, `garage`, `aws`, `objectscale`, `powerstore`) on an `s3` backend: s0 records it but never branches on it — addressing style is `force_path_style` and the SigV4 re-signing scope is `region`, both set explicitly regardless of profile.",
   "backends": [
     {
       "id": "backend-eu-1",
       "kind": "ceph",
       "endpoint_url": "https://s3-backend.example.com:7480",
       "region": "us-east-1",
+      "force_path_style": true
+    },
+    {
+      "id": "backend-garage-1",
+      "kind": "s3",
+      "profile": "garage",
+      "endpoint_url": "https://garage.example.com:3900",
+      "region": "garage",
       "force_path_style": true
     }
   ],
