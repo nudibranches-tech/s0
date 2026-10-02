@@ -19,13 +19,14 @@ use aws_sdk_s3::config::timeout::TimeoutConfig;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::{Client, Config};
 use s3s::dto::*;
+use s3s::header::{X_AMZ_ID_2, X_AMZ_REQUEST_ID};
 use s3s::{S3, S3Error, S3Request, S3Response, S3Result, s3_error};
 use s3s_aws::Proxy;
 
 use crate::access::proof;
 use crate::audit::{BackendOutcome, PendingAudit};
 use crate::config::{BackendConfig, GatewayConfig, LimitsConfig};
-use crate::error::{GatewayError, Result};
+use crate::error::{GatewayError, Result, is_backend_error, remint_backend_error};
 use crate::model::{BackendId, BackendKind};
 use crate::proxy::obligations::{BucketSource, BucketVisibility, ResponseObligations};
 use crate::secret::Secret;
@@ -296,10 +297,11 @@ impl GatewayS3 {
             .extensions
             .get::<Arc<RouteSnapshot>>()
             .ok_or_else(|| s3_error!(InternalError, "route snapshot missing from request"))?;
-        self.state
-            .registry
-            .proxy_for(route)
-            .map_err(|e| s3_error!(ServiceUnavailable, "backend unavailable: {e}"))
+        self.state.registry.proxy_for(route).map_err(|e| {
+            // The detail names tenants and backends; the client gets the code alone.
+            tracing::warn!(error = %e, "no backend client for an authorized request");
+            s3_error!(ServiceUnavailable, "backend unavailable")
+        })
     }
 
     /// Resolve the proxy, run the backend call, and settle this request's audit record
@@ -310,6 +312,11 @@ impl GatewayS3 {
     /// otherwise the request's extensions — and the last reference to the record — would be
     /// dropped inside the backend call, and the record emitted unenriched a moment before
     /// the answer arrived.
+    ///
+    /// It is also the one place a backend answer turns into the gateway's: a backend error
+    /// is re-minted ([`remint_backend_error`]) and the backend's request and host ids are
+    /// replaced by the gateway's own, on success and failure alike. The id is the decision
+    /// id of the request's audit record, so a client's report leads to that record.
     async fn forward<T, O, F, Fut>(&self, req: S3Request<T>, call: F) -> S3Result<S3Response<O>>
     where
         F: FnOnce(Arc<Proxy>, S3Request<T>) -> Fut + Send,
@@ -317,6 +324,11 @@ impl GatewayS3 {
     {
         let proxy = self.proxy_for_req(&req)?;
         let pending = req.extensions.get::<Arc<PendingAudit>>().cloned();
+        // Read before the settle below takes the record with it.
+        let request_id = pending
+            .as_ref()
+            .and_then(|p| p.decision_id())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let result = call(proxy, req).await;
         if let Some(pending) = pending {
             match &result {
@@ -324,7 +336,32 @@ impl GatewayS3 {
                 Err(e) => pending.settle(BackendOutcome::Failed, backend_status(e)),
             }
         }
-        result
+        match result {
+            Ok(mut resp) => {
+                stamp_request_id(&mut resp.headers, &request_id);
+                Ok(resp)
+            }
+            Err(e) if is_backend_error(&e) => Err(remint_backend_error(e, &request_id)),
+            Err(mut e) => {
+                e.set_request_id(request_id);
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Put the gateway's request id where s3s-aws copied the backend's, and drop the backend's
+/// host id (`x-amz-id-2`): the gateway has no host id of its own to put in its place, and
+/// Ceph's names the zone and zonegroup that served the request.
+fn stamp_request_id(headers: &mut http::HeaderMap, request_id: &str) {
+    headers.remove(X_AMZ_ID_2);
+    match http::HeaderValue::from_str(request_id) {
+        Ok(value) => {
+            headers.insert(X_AMZ_REQUEST_ID, value);
+        }
+        Err(_) => {
+            headers.remove(X_AMZ_REQUEST_ID);
+        }
     }
 }
 

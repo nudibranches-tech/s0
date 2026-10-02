@@ -930,6 +930,7 @@ macro_rules! wrap_sdk_error {
 Propagation caveats for the gateway:
 - Non-`ServiceError` kinds (`ConstructionFailure`, `DispatchFailure`, `TimeoutError`, `ResponseError`) collapse to bare `InternalError` (500); only `.source` carries detail. Remap in your dispatch layer if you want e.g. RGW-unreachable → 503.
 - Success responses forward only `x-amz-request-id`/`x-amz-id-2` plus whatever the DTO carries; other upstream headers are dropped. Error responses forward no headers.
+- The upstream `Message` and `RequestId` above are backend-authored text. s0 does not let them through: its `GatewayS3::forward` re-mints every error carrying a `source` (code and status kept, message from a fixed table, s0's own request id) and replaces both success ids. That lives in s0's own `src/proxy/mod.rs` and `src/error.rs`, not in this crate.
 - Streaming: `GetObjectOutput.body` is lazy — `ByteStream` → `SdkBody` → `s3s::Body` → `StreamingBlob`, never buffered (`builtin.rs:111-124`). `select_object_content` event streams go through `src/event_stream.rs::from_aws` (per-event `try_from_aws`, errors yielded via `wrap_sdk_error!`).
 
 ### 6.5 aws-sdk-s3 client for a Ceph RGW endpoint (static creds + path-style)
