@@ -375,7 +375,9 @@ impl GatewayS3 {
     /// It is also the one place a backend answer turns into the gateway's: a backend error
     /// is re-minted ([`remint_backend_error`]) and the backend's request and host ids are
     /// replaced by the gateway's own, on success and failure alike. The id is the decision
-    /// id of the request's audit record, so a client's report leads to that record.
+    /// id of the request's audit record, so a client's report leads to that record. A
+    /// successful answer also loses the backend identifiers its body or headers name
+    /// ([`BackendAnswer`]).
     ///
     /// And it settles a write's quota reservation with what the backend answered: kept on
     /// success, given back when the backend refused the write (a 4xx), and on an unknown
@@ -385,6 +387,7 @@ impl GatewayS3 {
     /// dispatched right before the call, so a request dropped before it does as well.
     async fn forward<T, O, F, Fut>(&self, req: S3Request<T>, call: F) -> S3Result<S3Response<O>>
     where
+        O: BackendAnswer,
         F: FnOnce(Arc<Proxy>, S3Request<T>) -> Fut + Send,
         Fut: std::future::Future<Output = S3Result<S3Response<O>>> + Send,
     {
@@ -426,6 +429,7 @@ impl GatewayS3 {
         match result {
             Ok(mut resp) => {
                 stamp_request_id(&mut resp.headers, &request_id);
+                resp.output.scrub_backend_identifiers();
                 Ok(resp)
             }
             Err(e) if is_backend_error(&e) => Err(remint_backend_error(e, &request_id)),
@@ -436,6 +440,81 @@ impl GatewayS3 {
         }
     }
 }
+
+/// A successful backend answer, cleared of the identifiers the backend authored about
+/// itself before it reaches the client — the success-side half of re-minting errors.
+///
+/// - `x-amz-server-side-encryption-aws-kms-key-id` (and the encryption context next to it)
+///   names the backend's key: on AWS a KMS key ARN, which carries the account id; on Ceph
+///   or another store, the operator's key name. The client still learns that the object
+///   is encrypted (`x-amz-server-side-encryption`).
+/// - `CompleteMultipartUpload`'s `Location` is the object's URL on the backend endpoint,
+///   an internal host the client never addressed. It is dropped rather than rebuilt: the
+///   gateway's own URL is the one the client already used, and the field is optional.
+///
+/// Applied on every backend kind, like the error re-mint. A bound on [`GatewayS3::forward`],
+/// so an arm added for a new output type does not compile until it says what it carries.
+pub trait BackendAnswer {
+    fn scrub_backend_identifiers(&mut self) {}
+}
+
+macro_rules! answers_without_backend_identifiers {
+    ($($output:ty),* $(,)?) => { $(impl BackendAnswer for $output {})* };
+}
+
+answers_without_backend_identifiers!(
+    AbortMultipartUploadOutput,
+    DeleteObjectOutput,
+    DeleteObjectTaggingOutput,
+    DeleteObjectsOutput,
+    GetBucketLocationOutput,
+    GetObjectAttributesOutput,
+    GetObjectTaggingOutput,
+    HeadBucketOutput,
+    ListBucketsOutput,
+    ListMultipartUploadsOutput,
+    ListObjectsOutput,
+    ListObjectsV2Output,
+    ListPartsOutput,
+    PutObjectTaggingOutput,
+);
+
+macro_rules! answers_naming_a_kms_key {
+    ($($output:ty { $($field:ident),+ }),* $(,)?) => {
+        $(impl BackendAnswer for $output {
+            fn scrub_backend_identifiers(&mut self) {
+                $(self.$field = None;)+
+            }
+        })*
+    };
+}
+
+answers_naming_a_kms_key!(
+    GetObjectOutput { ssekms_key_id },
+    HeadObjectOutput { ssekms_key_id },
+    PutObjectOutput {
+        ssekms_key_id,
+        ssekms_encryption_context
+    },
+    PostObjectOutput {
+        ssekms_key_id,
+        ssekms_encryption_context
+    },
+    CopyObjectOutput {
+        ssekms_key_id,
+        ssekms_encryption_context
+    },
+    CreateMultipartUploadOutput {
+        ssekms_key_id,
+        ssekms_encryption_context
+    },
+    UploadPartOutput { ssekms_key_id },
+    UploadPartCopyOutput { ssekms_key_id },
+    CompleteMultipartUploadOutput {
+        ssekms_key_id,
+        location
+    },
+);
 
 /// Let a charged write's quota reservation see how far its client body gets, so a body
 /// that fails or stops short is not charged as stored. A write with no reservation (no
