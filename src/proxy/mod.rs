@@ -378,9 +378,11 @@ impl GatewayS3 {
     /// id of the request's audit record, so a client's report leads to that record.
     ///
     /// And it settles a write's quota reservation with what the backend answered: kept on
-    /// success, given back when the backend refused the write (a 4xx), kept when the
-    /// outcome is unknown. Taken out first, so a request refused before any backend call
-    /// gives its bytes back too.
+    /// success, given back when the backend refused the write (a 4xx), and on an unknown
+    /// outcome kept only if the write may have been stored — given back when its client
+    /// body failed or stopped short ([`QuotaReservation::settle_unknown`]). Taken out first,
+    /// so a request refused before any backend call gives its bytes back too, and marked
+    /// dispatched right before the call, so a request dropped before it does as well.
     async fn forward<T, O, F, Fut>(&self, req: S3Request<T>, call: F) -> S3Result<S3Response<O>>
     where
         F: FnOnce(Arc<Proxy>, S3Request<T>) -> Fut + Send,
@@ -402,13 +404,17 @@ impl GatewayS3 {
             .as_ref()
             .and_then(|p| p.decision_id())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        if let Some(reservation) = &reservation {
+            reservation.mark_dispatched();
+        }
         let result = call(proxy, req).await;
         if let Some(reservation) = &reservation {
             match &result {
+                Ok(_) => reservation.commit(),
                 Err(e) if backend_status(e).is_some_and(|s| (400..500).contains(&s)) => {
                     reservation.release();
                 }
-                _ => reservation.commit(),
+                Err(_) => reservation.settle_unknown(),
             }
         }
         if let Some(pending) = pending {
@@ -428,6 +434,18 @@ impl GatewayS3 {
                 Err(e)
             }
         }
+    }
+}
+
+/// Let a charged write's quota reservation see how far its client body gets, so a body
+/// that fails or stops short is not charged as stored. A write with no reservation (no
+/// quota applies) is forwarded exactly as it came.
+fn track_charged_body(extensions: &http::Extensions, body: &mut Option<StreamingBlob>) {
+    let Some(reservation) = extensions.get::<Arc<QuotaReservation>>() else {
+        return;
+    };
+    if let Some(blob) = body.take() {
+        *body = Some(reservation.track_body(blob));
     }
 }
 
@@ -480,8 +498,9 @@ impl S3 for GatewayS3 {
 
     async fn put_object(
         &self,
-        req: S3Request<PutObjectInput>,
+        mut req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
+        track_charged_body(&req.extensions, &mut req.input.body);
         self.forward(req, |p, r| async move { p.put_object(r).await })
             .await
     }
@@ -548,8 +567,9 @@ impl S3 for GatewayS3 {
 
     async fn upload_part(
         &self,
-        req: S3Request<UploadPartInput>,
+        mut req: S3Request<UploadPartInput>,
     ) -> S3Result<S3Response<UploadPartOutput>> {
+        track_charged_body(&req.extensions, &mut req.input.body);
         self.forward(req, |p, r| async move { p.upload_part(r).await })
             .await
     }

@@ -16,17 +16,25 @@
 //!   the collection is on its way to the bundle is not forgotten, and an in-flight write is
 //!   never dropped.
 //! - **Conservative.** Overwrites and deletes are not subtracted, and a write whose outcome
-//!   is unknown (a dropped connection, a backend 5xx) stays counted; the next collection
-//!   corrects both. A write the backend refused with a 4xx gives its bytes back.
+//!   is unknown (a backend 5xx or a timeout once the whole body was sent) stays counted;
+//!   the next collection corrects both. A write that cannot have been stored gives its
+//!   bytes back: one the backend refused with a 4xx, one never sent to the backend, and one
+//!   whose client body failed or stopped short, since an S3 write stores nothing without
+//!   its whole body.
 //! - **Atomic.** One lock covers the check and the reservation at every level, so two
 //!   writers on one replica can never both take the last bytes of a limit.
 
 use std::collections::{HashMap, VecDeque};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::task::{Context, Poll};
 
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use s3s::{S3Error, S3ErrorCode, s3_error};
+use hyper::body::{Body as HttpBody, Frame, SizeHint};
+use s3s::dto::StreamingBlob;
+use s3s::{S3Error, S3ErrorCode, StdError, s3_error};
 
 /// Bundle field names the quotas are read from. A contract with the control plane's
 /// projection, named once so the reader, the fixtures and the drift tests share them.
@@ -501,6 +509,8 @@ impl QuotaLedger {
             scopes,
             bytes,
             settled: AtomicBool::new(false),
+            dispatched: AtomicBool::new(false),
+            body: Arc::new(BodyProgress::default()),
         }))
     }
 
@@ -524,14 +534,29 @@ impl QuotaLedger {
 /// One admitted write's bytes, held in flight until the backend's answer settles them.
 ///
 /// Stashed in the request extensions by the access layer and settled by the forward path,
-/// like the pending audit record. Settling is idempotent, and a reservation dropped
-/// unsettled is committed: a write the gateway lost track of may have landed.
+/// like the pending audit record. Settling is idempotent. A reservation dropped unsettled is
+/// settled by [`Self::settle_unknown`]: committed if the write may have landed, released if
+/// it never reached the backend or its body never made it whole.
 #[derive(Debug)]
 pub struct QuotaReservation {
     ledger: Arc<QuotaLedger>,
     scopes: Vec<QuotaScope>,
     bytes: u64,
     settled: AtomicBool,
+    /// Set by the forward path right before the backend call. Until then nothing can have
+    /// been stored, however the request ends.
+    dispatched: AtomicBool,
+    /// What the client body delivered, when [`Self::track_body`] wraps it.
+    body: Arc<BodyProgress>,
+}
+
+/// How far a tracked client body got.
+#[derive(Debug, Default)]
+struct BodyProgress {
+    tracked: AtomicBool,
+    delivered: AtomicU64,
+    ended: AtomicBool,
+    failed: AtomicBool,
 }
 
 impl QuotaReservation {
@@ -540,9 +565,53 @@ impl QuotaReservation {
         self.settle(Some(Utc::now()));
     }
 
-    /// The backend refused the write: give its bytes back.
+    /// The write was not stored (the backend refused it): give its bytes back.
     pub fn release(&self) {
         self.settle(None);
+    }
+
+    /// The backend call is about to start. Called by the forward path, last thing before it.
+    pub fn mark_dispatched(&self) {
+        self.dispatched.store(true, Ordering::Release);
+    }
+
+    /// The outcome is not known (a backend 5xx, a timeout, a dropped request): commit if
+    /// the write may have been stored, release if it cannot have been.
+    pub fn settle_unknown(&self) {
+        if self.may_have_been_stored() {
+            self.commit();
+        } else {
+            self.release();
+        }
+    }
+
+    /// Whether the backend can have stored the write: it was sent, and its client body, if
+    /// tracked, was delivered whole — the stream ended, or gave all the bytes it declared —
+    /// without an error. An S3 write stores nothing without its whole body, so a client
+    /// that declares the remaining quota and then hangs up is charged nothing.
+    fn may_have_been_stored(&self) -> bool {
+        if !self.dispatched.load(Ordering::Acquire) {
+            return false;
+        }
+        let body = &self.body;
+        if !body.tracked.load(Ordering::Acquire) {
+            return true;
+        }
+        !body.failed.load(Ordering::Acquire)
+            && (body.ended.load(Ordering::Acquire)
+                || body.delivered.load(Ordering::Acquire) >= self.bytes)
+    }
+
+    /// Wrap the write's client body so [`Self::settle_unknown`] knows whether it made it
+    /// whole. Length and end-of-stream are passed through untouched.
+    #[must_use]
+    pub fn track_body(&self, body: StreamingBlob) -> StreamingBlob {
+        self.body.tracked.store(true, Ordering::Release);
+        let tracked = TrackedBody {
+            inner: Box::pin(s3s::Body::from(body)),
+            progress: Arc::clone(&self.body),
+        };
+        StreamingBlob::from(s3s::Body::http_body(tracked))
     }
 
     fn settle(&self, completed_at: Option<DateTime<Utc>>) {
@@ -560,7 +629,47 @@ impl QuotaReservation {
 
 impl Drop for QuotaReservation {
     fn drop(&mut self) {
-        self.commit();
+        self.settle_unknown();
+    }
+}
+
+/// A client body that reports to its reservation how far it got.
+struct TrackedBody {
+    inner: Pin<Box<s3s::Body>>,
+    progress: Arc<BodyProgress>,
+}
+
+impl HttpBody for TrackedBody {
+    type Data = Bytes;
+    type Error = StdError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, StdError>>> {
+        let polled = self.inner.as_mut().poll_frame(cx);
+        let progress = &self.progress;
+        match &polled {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    progress
+                        .delivered
+                        .fetch_add(data.len() as u64, Ordering::AcqRel);
+                }
+            }
+            Poll::Ready(Some(Err(_))) => progress.failed.store(true, Ordering::Release),
+            Poll::Ready(None) => progress.ended.store(true, Ordering::Release),
+            Poll::Pending => {}
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
     }
 }
 
@@ -798,7 +907,7 @@ mod tests {
     }
 
     #[test]
-    fn a_release_gives_the_bytes_back_and_a_drop_commits_them() {
+    fn a_release_gives_the_bytes_back_and_a_dispatched_drop_commits_them() {
         let ledger = Arc::new(QuotaLedger::new());
         let quotas = table(&[(bucket(), quota(100, 0, 0))]);
         let refused_upstream = reserved(ledger.admit(&quotas, &TARGET, Some(70)));
@@ -810,16 +919,109 @@ mod tests {
         assert_eq!(ledger.counted(&bucket()), Some(0));
 
         let lost = reserved(ledger.admit(&quotas, &TARGET, Some(70)));
+        lost.mark_dispatched();
         drop(lost);
         assert_eq!(
             ledger.counted(&bucket()),
             Some(70),
-            "a write nobody settled may have landed, so it stays counted"
+            "a write sent and never settled may have landed, so it stays counted"
         );
         assert!(matches!(
             ledger.admit(&quotas, &TARGET, Some(31)),
             Admission::Refused(QuotaRefusal::Exceeded { .. })
         ));
+    }
+
+    /// A write dropped before it was sent stored nothing, however it was dropped: a client
+    /// declaring the whole remaining quota and hanging up gets no charge to keep.
+    #[test]
+    fn a_reservation_dropped_before_dispatch_gives_its_bytes_back() {
+        let ledger = Arc::new(QuotaLedger::new());
+        let quotas = table(&[(bucket(), quota(100, 0, 0)), (backend(), quota(100, 0, 0))]);
+        let never_sent = reserved(ledger.admit(&quotas, &TARGET, Some(100)));
+        assert_eq!(ledger.counted(&bucket()), Some(100));
+        drop(never_sent);
+        assert_eq!(ledger.counted(&bucket()), Some(0));
+        assert_eq!(ledger.counted(&backend()), Some(0));
+        drop(reserved(ledger.admit(&quotas, &TARGET, Some(100))));
+
+        // An unknown outcome before dispatch is a release too.
+        let unknown = reserved(ledger.admit(&quotas, &TARGET, Some(100)));
+        unknown.settle_unknown();
+        assert_eq!(ledger.counted(&bucket()), Some(0));
+    }
+
+    async fn drain(blob: &mut StreamingBlob) -> Result<u64, StdError> {
+        let mut body = s3s::Body::from(std::mem::replace(
+            blob,
+            StreamingBlob::from(s3s::Body::empty()),
+        ));
+        let mut n = 0u64;
+        while let Some(frame) = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await
+        {
+            if let Ok(data) = frame?.into_data() {
+                n += data.len() as u64;
+            }
+        }
+        Ok(n)
+    }
+
+    struct Failing;
+
+    impl HttpBody for Failing {
+        type Data = Bytes;
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
+            Poll::Ready(Some(Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "the client hung up",
+            ))))
+        }
+    }
+
+    /// Once sent, an unknown outcome commits only a write whose client body made it whole.
+    #[tokio::test]
+    async fn an_unknown_outcome_commits_only_a_write_whose_body_made_it_whole() {
+        let ledger = Arc::new(QuotaLedger::new());
+        let quotas = table(&[(bucket(), quota(1_000, 0, 0))]);
+
+        // Whole: the stream gave every declared byte. Length passes through untouched.
+        let whole = reserved(ledger.admit(&quotas, &TARGET, Some(5)));
+        let mut body = whole.track_body(StreamingBlob::from(s3s::Body::from(b"hello".to_vec())));
+        assert_eq!(
+            s3s::stream::ByteStream::remaining_length(&body).exact(),
+            Some(5)
+        );
+        whole.mark_dispatched();
+        assert_eq!(drain(&mut body).await.expect("drained"), 5);
+        whole.settle_unknown();
+        assert_eq!(ledger.counted(&bucket()), Some(5));
+
+        // Failed: the client body errored, so the backend cannot have stored it.
+        let failed = reserved(ledger.admit(&quotas, &TARGET, Some(500)));
+        let mut body = failed.track_body(StreamingBlob::from(s3s::Body::http_body(Failing)));
+        failed.mark_dispatched();
+        assert!(drain(&mut body).await.is_err());
+        failed.settle_unknown();
+        assert_eq!(ledger.counted(&bucket()), Some(5));
+
+        // Short: sent, but dropped before the body was delivered.
+        let short = reserved(ledger.admit(&quotas, &TARGET, Some(500)));
+        let body = short.track_body(StreamingBlob::from(s3s::Body::from(vec![0u8; 500])));
+        short.mark_dispatched();
+        drop(body);
+        drop(short);
+        assert_eq!(ledger.counted(&bucket()), Some(5));
+
+        // Untracked (a copy, a form upload s3s already aggregated): sent is enough.
+        let copy = reserved(ledger.admit(&quotas, &TARGET, Some(70)));
+        copy.mark_dispatched();
+        copy.settle_unknown();
+        assert_eq!(ledger.counted(&bucket()), Some(75));
     }
 
     #[test]

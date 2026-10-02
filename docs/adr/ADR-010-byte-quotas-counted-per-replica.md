@@ -57,8 +57,14 @@ What a write is charged:
   reservation are one step under one lock, at every level at once, so two writers on one
   replica can never both take the last bytes of a limit.
 - The forward path settles it: kept when the backend accepted it, given back when the backend
-  refused it with a 4xx, kept when the outcome is unknown (a 5xx, a dropped connection, a
-  request that never reached the forward).
+  refused it with a 4xx. When the outcome is unknown it is kept only if the write may have
+  been stored: the request was dispatched to the backend (marked right before the call) and
+  its client body, for `PutObject` and `UploadPart`, was delivered whole, without an error.
+  A request dropped before dispatch (refused by s3s after the access hook, a client gone
+  first) and a body that failed or stopped short give their bytes back, since an S3 write
+  stores nothing without its whole body; otherwise a client could declare the remaining
+  quota, hang up, and block the level for every writer until the next collection. A 5xx or
+  a timeout once the body was sent stays counted.
 - A kept write is stamped with the time it completed, in one-second slots, at most 256 per
   level; past that the two oldest merge under the later stamp, which only ever keeps bytes
   counted longer.
@@ -93,7 +99,11 @@ between the two shifts the window by the skew.
   every write accepted between the measurement and the bundle's arrival. Rejected for the
   completion-stamped count above.
 - **Count on admission and never give back.** A write the backend refused would count until
-  the next collection. Kept only where the outcome is unknown.
+  the next collection. Kept only where the outcome is unknown and the write may have landed.
+- **Keep every write whose outcome is unknown.** Free for an attacker: a declared
+  `Content-Length` equal to the remaining quota and a closed connection would hold the
+  level full, org-wide on a backend quota, until each next collection. Rejected for
+  tracking dispatch and body delivery.
 - **Refuse copies under a quota**, since their size is not in the request. That breaks every
   client that copies server-side. Rejected for sizing the source with one `HeadObject`.
 
