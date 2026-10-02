@@ -84,10 +84,11 @@ async fn golden_corpus_matches_rego() {
 
 /// The reasons the default policy gives for refusing on placement. Each names the layer
 /// that refused, as the gateway's own refusal does.
-const PLACEMENT_REASONS: [&str; 3] = [
+const PLACEMENT_REASONS: [&str; 4] = [
     "deny: bucket belongs to another tenant",
     "deny: bucket not on this backend",
     "deny: bundle projected for another backend",
+    "deny: bundle grant_schema_version is not a number",
 ];
 
 /// Default-policy parity with the gateway (ADR-009): for every corpus case, the default

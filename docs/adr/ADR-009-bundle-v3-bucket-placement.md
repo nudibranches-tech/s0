@@ -33,7 +33,11 @@ From `grant_schema_version` **3** the control plane's bundle **places** buckets:
   of that backend under exactly one tenant, its owner; each entry may carry `object_name`
   (the control plane's own name for the bucket) and `created_at` (RFC 3339).
 
-Below version 3 nothing changes: no index is built and every path is the one it was.
+Below version 3 nothing changes: no index is built and every path is the one it was. That
+holds for a numeric version below 3 and for a document with no version at all. A version
+that is present but not a number (`"3"`, `null`) is a projection defect: no version was
+ever anything but a number, so it is read as an unusable placing document, never as an old
+one.
 
 **The index.** `Bundle::new` builds a `BucketPlacement` once per revision: `S3 name → owning
 tenant`, each tenant's bucket list, and the backend id. `check` pins it in the request's
