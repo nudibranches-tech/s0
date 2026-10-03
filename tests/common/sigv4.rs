@@ -22,6 +22,9 @@ pub struct RawRequest {
     pub query: Vec<(String, String)>,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// The signed `x-amz-content-sha256`, when it is not the body's hash — a
+    /// `STREAMING-…` payload, framed as aws-chunked.
+    pub payload_hash: Option<String>,
 }
 
 impl RawRequest {
@@ -32,6 +35,7 @@ impl RawRequest {
             query: Vec::new(),
             headers: Vec::new(),
             body: Vec::new(),
+            payload_hash: None,
         }
     }
 
@@ -50,6 +54,12 @@ impl RawRequest {
     #[must_use]
     pub fn body(mut self, body: Vec<u8>) -> Self {
         self.body = body;
+        self
+    }
+
+    #[must_use]
+    pub fn payload_hash(mut self, hash: &str) -> Self {
+        self.payload_hash = Some(hash.to_string());
         self
     }
 
@@ -92,7 +102,10 @@ impl RawRequest {
         let now = chrono::Utc::now();
         let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
         let date = now.format("%Y%m%d").to_string();
-        let payload_hash = hex::encode(Sha256::digest(&self.body));
+        let payload_hash = self
+            .payload_hash
+            .clone()
+            .unwrap_or_else(|| hex::encode(Sha256::digest(&self.body)));
 
         let mut signed: Vec<(String, String)> = vec![
             ("host".into(), host.to_string()),
