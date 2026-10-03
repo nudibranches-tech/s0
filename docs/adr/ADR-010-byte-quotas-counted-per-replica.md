@@ -45,7 +45,7 @@ What a write is charged:
 
 | Operation | Bytes |
 |---|---|
-| `PutObject`, `UploadPart` | the `Content-Length` forwarded (s3s sets it to the decoded length of an `aws-chunked` body). A write with none is refused `MissingContentLength` (411) where a quota applies |
+| `PutObject`, `UploadPart` | the size the body declares: `x-amz-decoded-content-length` for an `aws-chunked` body (its `Content-Length`, when there is one, is the encoded length, and the SDKs with default flexible checksums send none), `Content-Length` otherwise. A write that declares none, or an unreadable one, is refused `MissingContentLength` (411) where a quota applies |
 | `PostObject` | the size of the file s3s aggregated |
 | `CopyObject`, `UploadPartCopy` | the length of `x-amz-copy-source-range`, or else the source's size from one `HeadObject` on the backend, asked only where a quota applies and only after both halves of the copy were allowed |
 | `CompleteMultipartUpload` | zero, since its parts were charged as they arrived; still a write, so it is refused once a level is already over its limit |
@@ -119,5 +119,6 @@ between the two shifts the window by the skew.
 - Memory is bounded per level, and a level that no longer has a limit, or holds nothing, is
   forgotten the first time a write is charged under a newer revision.
 - s3s does not hold an `aws-chunked` body to its declared `x-amz-decoded-content-length`
-  (see `docs/substrate-api.md`, Traps). The count is the declared length, which is also the
-  `Content-Length` the gateway frames its upstream request with.
+  (see `docs/substrate-api.md`, Traps). The count is the declared length, and where a quota
+  applies the gateway holds the body to it: one that delivers more fails at the first byte
+  past it, is not stored, and is charged nothing.

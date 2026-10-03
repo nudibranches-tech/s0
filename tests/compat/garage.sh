@@ -22,7 +22,9 @@
 #  * An `aws-chunked` PUT carrying a CRC32 trailer (every modern SDK's default upload) goes
 #    through s0 to Garage and reads back byte-identical with no stored Content-Encoding —
 #    the s0 0.3.3 regression class, which MinIO tolerated and therefore never showed. Both
-#    PutObject and UploadPart are sent that way.
+#    PutObject and UploadPart are sent that way, and `acme-data` carries a bundle-stated
+#    byte quota (ADR-010), so every one of them is also charged by its decoded length —
+#    with and without a Content-Length — and one past the limit is refused `QuotaExceeded`.
 #  * The client signs with `us-east-1`; Garage refuses any scope but its own `s3_region`,
 #    so every success here is also s0 re-signing upstream with the backend's region.
 #
@@ -163,7 +165,8 @@ cat > "$STATE/bundle.json" <<'JSON'
     "acme": {
       "user_attributes": { "acme-user": { "groups": [], "attributes": [] } },
       "bucket_attributes": {
-        "acme-data": { "denylist": {}, "object_name": "data", "created_at": "2026-10-01T08:00:00Z" }
+        "acme-data": { "denylist": {}, "object_name": "data", "created_at": "2026-10-01T08:00:00Z",
+                       "quota": { "limit_bytes": 6291456, "used_bytes": 0, "collected_at": "2026-10-01T08:00:00Z" } }
       },
       "s3_grants": { "acme-user": [ { "bucket": "*", "actions": ["*"], "prefixes": [] } ] },
       "group_grants": {}

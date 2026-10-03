@@ -268,7 +268,8 @@ impl QuotaRefusal {
             ),
             QuotaRefusal::UnknownSize { scope } => format!(
                 "deny (gateway): a storage quota applies to {}, and the request does not \
-                 say how many bytes it writes (no Content-Length)",
+                 say how many bytes it writes (no Content-Length, nor an \
+                 x-amz-decoded-content-length for an aws-chunked body)",
                 scope.describe()
             ),
         }
@@ -303,7 +304,8 @@ pub const QUOTA_UNREADABLE: &str = "deny (gateway): a storage quota applies to t
 
 /// What a client is told when a quota applies to its write and the write states no size.
 pub const QUOTA_NEEDS_A_SIZE: &str = "deny (gateway): a storage quota applies to this write, \
-     which must state its size (Content-Length)";
+     which must state its size (Content-Length, or x-amz-decoded-content-length for an \
+     aws-chunked body)";
 
 /// The ledger's answer to one write.
 #[derive(Debug)]
@@ -604,12 +606,18 @@ impl QuotaReservation {
 
     /// Wrap the write's client body so [`Self::settle_unknown`] knows whether it made it
     /// whole. Length and end-of-stream are passed through untouched.
+    ///
+    /// A body that carries more than the bytes it was charged fails at the first byte
+    /// past them, so the backend stores none of it. `Content-Length` is held to by the
+    /// HTTP layer, but an `aws-chunked` body's decoded length is a claim s3s's decoder
+    /// does not check, and a quota trusting it would let a write under-declare its size.
     #[must_use]
     pub fn track_body(&self, body: StreamingBlob) -> StreamingBlob {
         self.body.tracked.store(true, Ordering::Release);
         let tracked = TrackedBody {
             inner: Box::pin(s3s::Body::from(body)),
             progress: Arc::clone(&self.body),
+            charged: self.bytes,
         };
         StreamingBlob::from(s3s::Body::http_body(tracked))
     }
@@ -637,6 +645,8 @@ impl Drop for QuotaReservation {
 struct TrackedBody {
     inner: Pin<Box<s3s::Body>>,
     progress: Arc<BodyProgress>,
+    /// The bytes the write was charged: the most the body may deliver.
+    charged: u64,
 }
 
 impl HttpBody for TrackedBody {
@@ -652,9 +662,14 @@ impl HttpBody for TrackedBody {
         match &polled {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
-                    progress
-                        .delivered
-                        .fetch_add(data.len() as u64, Ordering::AcqRel);
+                    let len = data.len() as u64;
+                    let before = progress.delivered.fetch_add(len, Ordering::AcqRel);
+                    if before.saturating_add(len) > self.charged {
+                        progress.failed.store(true, Ordering::Release);
+                        return Poll::Ready(Some(Err(Box::new(BodyOverran {
+                            charged: self.charged,
+                        }))));
+                    }
                 }
             }
             Poll::Ready(Some(Err(_))) => progress.failed.store(true, Ordering::Release),
@@ -671,6 +686,13 @@ impl HttpBody for TrackedBody {
     fn size_hint(&self) -> SizeHint {
         self.inner.size_hint()
     }
+}
+
+/// A tracked body delivered more bytes than its write was charged.
+#[derive(Debug, thiserror::Error)]
+#[error("the request body carries more than the {charged} bytes it declared")]
+struct BodyOverran {
+    charged: u64,
 }
 
 #[cfg(test)]
@@ -1022,6 +1044,30 @@ mod tests {
         copy.mark_dispatched();
         copy.settle_unknown();
         assert_eq!(ledger.counted(&bucket()), Some(75));
+    }
+
+    /// An aws-chunked body's decoded length is the client's claim: a body that carries more
+    /// fails before the extra bytes are forwarded, and is charged nothing.
+    #[tokio::test]
+    async fn a_body_longer_than_it_was_charged_fails_and_gives_its_bytes_back() {
+        let ledger = Arc::new(QuotaLedger::new());
+        let quotas = table(&[(bucket(), quota(1_000, 0, 0))]);
+
+        let liar = reserved(ledger.admit(&quotas, &TARGET, Some(5)));
+        let mut body = liar.track_body(StreamingBlob::from(s3s::Body::from(vec![0u8; 500])));
+        liar.mark_dispatched();
+        let err = drain(&mut body).await.expect_err("500 bytes charged as 5");
+        assert!(err.to_string().contains("more than the 5 bytes"), "{err}");
+        liar.settle_unknown();
+        assert_eq!(ledger.counted(&bucket()), Some(0));
+
+        // Exactly the declared length is whole.
+        let honest = reserved(ledger.admit(&quotas, &TARGET, Some(5)));
+        let mut body = honest.track_body(StreamingBlob::from(s3s::Body::from(b"hello".to_vec())));
+        honest.mark_dispatched();
+        assert_eq!(drain(&mut body).await.expect("drained"), 5);
+        honest.settle_unknown();
+        assert_eq!(ledger.counted(&bucket()), Some(5));
     }
 
     #[test]

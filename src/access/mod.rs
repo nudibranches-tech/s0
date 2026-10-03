@@ -954,6 +954,11 @@ impl S3Access for GatewayAccess {
     /// behind an audit record that said "allowed write". See [`headers`] for the
     /// classification and for why the answer is a denial rather than a silent strip.
     async fn put_object(&self, req: &mut S3Request<PutObjectInput>) -> S3Result<()> {
+        // Read before the strip: an aws-chunked body declares its object bytes apart.
+        let charge = Charge::Body(headers::declared_body_length(
+            &req.headers,
+            req.input.content_length,
+        ));
         headers::strip_aws_chunked(&mut req.input.content_encoding);
         let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
         let max_tags = self.gw.limits().max_tag_count;
@@ -963,8 +968,6 @@ impl S3Access for GatewayAccess {
             false,
             max_tags,
         );
-        // The length forwarded, which s3s sets to the decoded length of an aws-chunked body.
-        let charge = Charge::Body(req.input.content_length);
         let mut cx = ReqCtx::new(req)?;
         self.enforce_object_write(&mut cx, Action::WriteObjects, bucket, key, riders, charge)
             .await
@@ -1236,7 +1239,11 @@ impl S3Access for GatewayAccess {
     /// A part is where a multipart upload's bytes arrive, so it is what the quota charges.
     async fn upload_part(&self, req: &mut S3Request<UploadPartInput>) -> S3Result<()> {
         let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
-        let charge = Charge::Body(req.input.content_length);
+        // SDKs with default flexible checksums frame parts as aws-chunked too.
+        let charge = Charge::Body(headers::declared_body_length(
+            &req.headers,
+            req.input.content_length,
+        ));
         let mut cx = ReqCtx::new(req)?;
         self.enforce_object_charged(&mut cx, Action::WriteObjects, bucket, key, charge)
             .await

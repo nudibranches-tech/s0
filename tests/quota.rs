@@ -11,6 +11,7 @@ mod common;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+use common::sigv4::RawRequest;
 use http::Method;
 use s0::access::{AuthzProof, GatewayAccess};
 use s0::audit::{AuditRecord, Outcome};
@@ -897,4 +898,215 @@ async fn concurrent_writers_on_one_replica_never_pass_the_limit() {
     assert_eq!(admitted.len(), 14);
     assert_eq!(refused, 48 - 14);
     assert_eq!(fx.gw.quota.counted(&reports()), Some(98));
+}
+
+// ── aws-chunked bodies ──────────────────────────────────────────────────────────
+
+/// CRC-32 (IEEE), for the checksum trailer a default-configured SDK sends.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+/// Boot the real serving path over `fx` on a loopback port; its `host:port`.
+async fn serve(fx: &common::Fixture) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr: SocketAddr = listener.local_addr().expect("addr");
+    drop(listener);
+    let gw = fx.gw.clone();
+    tokio::spawn(async move {
+        let _ = s0::server::serve_with_shutdown(gw, addr, std::future::pending::<()>()).await;
+    });
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    addr.to_string()
+}
+
+/// How the HTTP layer frames the aws-chunked body.
+#[derive(Clone, Copy)]
+enum Framing {
+    /// boto3 ≥ 1.36: `Transfer-Encoding: chunked`, no `Content-Length` at all.
+    TransferChunked,
+    /// aws-cli / Java v2: `Content-Length` is the *encoded* length.
+    EncodedLength,
+}
+
+/// A PutObject the way an SDK with default flexible checksums sends it — `aws-chunked`,
+/// unsigned payload, CRC32 trailer — over real HTTP. Its status and body.
+async fn put_aws_chunked(host: &str, key: &str, len: usize, framing: Framing) -> (u16, String) {
+    put_aws_chunked_declaring(host, key, len, len, framing).await
+}
+
+/// [`put_aws_chunked`] carrying `len` bytes while declaring `declared`.
+async fn put_aws_chunked_declaring(
+    host: &str,
+    key: &str,
+    len: usize,
+    declared: usize,
+    framing: Framing,
+) -> (u16, String) {
+    let data = vec![b'x'; len];
+    let checksum = common::sigv4::base64(&crc32(&data).to_be_bytes());
+    let mut payload = Vec::new();
+    if len > 0 {
+        payload.extend_from_slice(format!("{len:x}\r\n").as_bytes());
+        payload.extend_from_slice(&data);
+        payload.extend_from_slice(b"\r\n");
+    }
+    payload.extend_from_slice(format!("0\r\nx-amz-checksum-crc32:{checksum}\r\n\r\n").as_bytes());
+
+    let req = RawRequest::new("PUT", format!("/reports/{key}"))
+        .header("content-encoding", "aws-chunked")
+        .header("x-amz-decoded-content-length", &declared.to_string())
+        .header("x-amz-trailer", "x-amz-checksum-crc32")
+        .payload_hash("STREAMING-UNSIGNED-PAYLOAD-TRAILER");
+    let mut wire = format!("PUT {} HTTP/1.1\r\n", req.url(""));
+    for (k, v) in req.sign(host, common::ACCESS_KEY, common::SECRET_KEY) {
+        wire.push_str(&format!("{k}: {v}\r\n"));
+    }
+    wire.push_str("connection: close\r\n");
+    let mut wire = wire.into_bytes();
+    match framing {
+        Framing::TransferChunked => {
+            wire.extend_from_slice(b"transfer-encoding: chunked\r\n\r\n");
+            wire.extend_from_slice(format!("{:x}\r\n", payload.len()).as_bytes());
+            wire.extend_from_slice(&payload);
+            wire.extend_from_slice(b"\r\n0\r\n\r\n");
+        }
+        Framing::EncodedLength => {
+            wire.extend_from_slice(format!("content-length: {}\r\n\r\n", payload.len()).as_bytes());
+            wire.extend_from_slice(&payload);
+        }
+    }
+
+    let mut sock = tokio::net::TcpStream::connect(host).await.expect("connect");
+    sock.write_all(&wire).await.expect("send");
+    let mut raw = Vec::new();
+    let _ = sock.read_to_end(&mut raw).await;
+    let text = String::from_utf8_lossy(&raw).to_string();
+    let status = text
+        .split(' ')
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("no HTTP status in {text:?}"));
+    (status, text)
+}
+
+/// A default-configured boto3 / aws-cli / Java v2 PutObject states its size only in
+/// `x-amz-decoded-content-length`. Under a quota it is admitted and charged that size —
+/// not refused for lacking a `Content-Length`, nor charged its encoded length — and a write
+/// past the limit is still refused before it reaches the backend.
+#[tokio::test]
+async fn an_aws_chunked_put_is_charged_its_decoded_length_over_real_http() {
+    let backend = backend().await;
+    let fx = common::fixture_with_backend("quota-chunked", bucket_limited(100, 0), &backend.url);
+    let host = serve(&fx).await;
+
+    let (status, body) = put_aws_chunked(&host, "2024/a", 60, Framing::TransferChunked).await;
+    assert_eq!(status, 200, "boto3's framing, 60 of 100 bytes: {body}");
+    assert_eq!(fx.gw.quota.counted(&reports()), Some(60));
+
+    // Encoded, these 40 bytes are ~100 on the wire: charged that, they would not fit.
+    let (status, body) = put_aws_chunked(&host, "2024/b", 40, Framing::EncodedLength).await;
+    assert_eq!(status, 200, "40 more bytes is exactly the limit: {body}");
+    assert_eq!(fx.gw.quota.counted(&reports()), Some(100));
+    assert_eq!(backend.count("PUT"), 2);
+
+    for framing in [Framing::TransferChunked, Framing::EncodedLength] {
+        let (status, body) = put_aws_chunked(&host, "2024/c", 1, framing).await;
+        assert_eq!(status, 403, "one byte past the limit: {body}");
+        assert!(body.contains(QUOTA_EXCEEDED), "{body}");
+    }
+    assert_eq!(
+        backend.count("PUT"),
+        2,
+        "the refused writes were never forwarded"
+    );
+    assert_eq!(fx.gw.quota.counted(&reports()), Some(100));
+}
+
+/// A multipart part from the same SDKs is aws-chunked too, and charged the same way.
+#[tokio::test]
+async fn an_aws_chunked_part_is_charged_its_decoded_length() {
+    let fx = common::fixture("quota-chunked-part", bucket_limited(100, 0));
+    let access = GatewayAccess::new(fx.gw.clone());
+    let part = |n: i32, decoded: &str| {
+        let mut req = fx.request(
+            "UploadPart",
+            UploadPartInput {
+                bucket: "reports".into(),
+                key: "2024/big".into(),
+                part_number: n,
+                upload_id: "u-1".into(),
+                content_length: None,
+                ..Default::default()
+            },
+            Method::PUT,
+        );
+        req.headers.insert(
+            http::header::CONTENT_ENCODING,
+            http::HeaderValue::from_static("aws-chunked"),
+        );
+        req.headers.insert(
+            "x-amz-decoded-content-length",
+            http::HeaderValue::from_str(decoded).expect("header value"),
+        );
+        req
+    };
+
+    let mut first = part(1, "70");
+    access
+        .upload_part(&mut first)
+        .await
+        .expect("70 of 100 bytes fits");
+    assert_eq!(fx.gw.quota.counted(&reports()), Some(70));
+
+    let mut second = part(2, "31");
+    assert_quota_exceeded(
+        "a part past the limit",
+        access.upload_part(&mut second).await,
+        BUCKET_FULL,
+    );
+
+    let mut malformed = part(2, "30 bytes");
+    let err = access
+        .upload_part(&mut malformed)
+        .await
+        .expect_err("a decoded length that cannot be read states no size");
+    assert_eq!(*err.code(), S3ErrorCode::MissingContentLength, "{err}");
+    assert_eq!(fx.gw.quota.counted(&reports()), Some(70));
+    drop(first);
+}
+
+/// The decoded length is the client's claim, and s3s's decoder does not hold the body to
+/// it: a body carrying more than it declared fails, and is charged nothing, rather than
+/// storing bytes the quota never counted.
+#[tokio::test]
+async fn an_aws_chunked_body_longer_than_it_declared_is_not_stored_or_charged() {
+    let backend = backend().await;
+    let fx =
+        common::fixture_with_backend("quota-chunked-liar", bucket_limited(100, 0), &backend.url);
+    let host = serve(&fx).await;
+
+    let (status, body) =
+        put_aws_chunked_declaring(&host, "2024/liar", 5_000, 10, Framing::TransferChunked).await;
+    assert_ne!(
+        status, 200,
+        "5000 bytes declared as 10 must not succeed: {body}"
+    );
+    assert_eq!(fx.gw.quota.counted(&reports()), Some(0), "{body}");
 }
