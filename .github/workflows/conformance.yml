@@ -6,6 +6,11 @@
 # Manually triggered because it needs a live backend service and gateway credentials.
 # The MinIO leg below is scaffolded; the s3-tests / Mint harness step is marked TODO
 # and must be wired before this can gate merges — it is intentionally NOT a green no-op.
+#
+# The Garage leg is wired: `tests/compat/garage.sh` starts a pinned single-node Garage
+# (`s3` backend, `garage` profile, path style, its own region) and the gateway in front
+# of it, and asserts tenant isolation on a shared upstream key plus an aws-chunked
+# CRC32-trailer upload. It fails the job on any failed check.
 
 name: conformance
 
@@ -54,3 +59,21 @@ jobs:
           # any regression. Until wired, fail loudly rather than pass silently.
           echo "conformance harness not yet wired" >&2
           exit 1
+
+  garage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install boto3
+        run: python -m pip install boto3
+
+      # The script pulls the digest-pinned Garage image, builds the release gateway and
+      # runs both behind loopback ports; see the header of tests/compat/garage.sh.
+      - name: gateway in front of Garage, asserted
+        run: bash tests/compat/run.sh garage

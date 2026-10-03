@@ -11,6 +11,8 @@
 //! - [`auth`]     — identity / credential authority + own STS.
 //! - [`access`]   — the OPA gate: deny-by-default `check` + typed per-op hooks.
 //! - [`proxy`]    — per-(backend,tenant) client pool + dispatch.
+//! - [`quota`]    — byte quotas the bundle states for a backend without native ones,
+//!   counted per replica between collections.
 //! - [`audit`]    — one reasoned decision record per request.
 //! - [`gateway`]  — assembled shared context.
 //! - [`server`]   — S3 front + hyper serving.
@@ -38,6 +40,7 @@ pub mod mint;
 pub mod model;
 pub mod pdp;
 pub mod proxy;
+pub mod quota;
 pub mod secret;
 pub mod server;
 pub mod shutdown;

@@ -29,7 +29,7 @@ use s0::authz::{Decision, OpaInput};
 use s0::config::GatewayConfig;
 use s0::gateway::Gateway;
 use s0::identity::ResolvedPrincipal;
-use s0::model::PrincipalType;
+use s0::model::{BackendKind, PrincipalType};
 use s0::pdp::{Bundle, BundleStore, CachingPdp, GATEWAY_REGO, Pdp, RegorusPdp};
 use s0::proxy::BackendRegistry;
 use s3s::S3Request;
@@ -102,6 +102,19 @@ pub fn bundle_without_reserved_tag_keys() -> serde_json::Value {
 /// *allowed* request gets: point it at a closed port and the forward fails loudly
 /// instead of silently succeeding against something real.
 pub fn config_json(dir: &std::path::Path, backend_endpoint: &str) -> String {
+    config_json_for_backend(dir, backend_endpoint, BackendKind::Ceph, "us-east-1")
+}
+
+/// [`config_json`] with the backend `kind` and signing `region` spelled out — for a test
+/// proving upstream re-signing uses `BackendConfig.region` regardless of what the
+/// *client* signed with (the Garage leg of S0.1: a backend pinned to `region: "garage"`
+/// must re-sign every forwarded request in that scope, never the inbound one).
+pub fn config_json_for_backend(
+    dir: &std::path::Path,
+    backend_endpoint: &str,
+    kind: BackendKind,
+    region: &str,
+) -> String {
     serde_json::json!({
         "listen": "127.0.0.1:0",
         "sts": { "master_key_hex": "00".repeat(32), "signing_key_hex": "11".repeat(32) },
@@ -109,7 +122,8 @@ pub fn config_json(dir: &std::path::Path, backend_endpoint: &str) -> String {
         "audit": { "sink_url": "http://127.0.0.1:59999/none",
                    "spill_path": dir.join("audit.ndjson") },
         "backends": [
-            { "id": "bay-1", "kind": "ceph", "endpoint_url": backend_endpoint }
+            { "id": "bay-1", "kind": kind.as_str(), "endpoint_url": backend_endpoint,
+              "region": region }
         ],
         "tenants": [
             { "tenant": "acme", "organization_id": "org-acme", "backend_id": "bay-1",
@@ -208,7 +222,52 @@ pub fn fixture(tag: &str, bundle: serde_json::Value) -> Fixture {
 /// the gateway does to a *response*.
 pub fn fixture_with_backend(tag: &str, bundle: serde_json::Value, endpoint: &str) -> Fixture {
     let dir = scratch(tag);
-    let cfg = GatewayConfig::from_json(&config_json(&dir, endpoint)).expect("config");
+    fixture_from_config(tag, dir.clone(), bundle, &config_json(&dir, endpoint))
+}
+
+/// [`fixture_with_backend`] with a second tenant, `globex` of the same organization,
+/// re-signed with **acme's own** upstream credential: one identity shared by two tenants,
+/// the shape of a backend that only has one identity per organization.
+pub fn fixture_with_shared_identity(
+    tag: &str,
+    bundle: serde_json::Value,
+    endpoint: &str,
+) -> Fixture {
+    let dir = scratch(tag);
+    let mut config: serde_json::Value =
+        serde_json::from_str(&config_json(&dir, endpoint)).expect("config json");
+    let acme = config["tenants"][0].clone();
+    let mut globex = acme.clone();
+    globex["tenant"] = serde_json::json!("globex");
+    config["tenants"] = serde_json::json!([acme, globex]);
+    fixture_from_config(tag, dir, bundle, &config.to_string())
+}
+
+/// [`fixture_with_backend`] with the backend `kind` and signing `region` spelled out —
+/// for a test that must observe the *upstream* re-signing, not just the inbound gate.
+pub fn fixture_with_backend_kind_region(
+    tag: &str,
+    bundle: serde_json::Value,
+    endpoint: &str,
+    kind: BackendKind,
+    region: &str,
+) -> Fixture {
+    let dir = scratch(tag);
+    fixture_from_config(
+        tag,
+        dir.clone(),
+        bundle,
+        &config_json_for_backend(&dir, endpoint, kind, region),
+    )
+}
+
+fn fixture_from_config(
+    tag: &str,
+    dir: PathBuf,
+    bundle: serde_json::Value,
+    config: &str,
+) -> Fixture {
+    let cfg = GatewayConfig::from_json(config).expect("config");
     let bundles = Arc::new(BundleStore::new(Bundle::new("rev-1", bundle.clone())));
     let engine = RegorusPdp::new(GATEWAY_REGO, &bundle).expect("regorus");
     let pdp_calls = Arc::new(AtomicUsize::new(0));
@@ -253,6 +312,7 @@ pub fn fixture_with_backend(tag: &str, bundle: serde_json::Value, endpoint: &str
         credentials,
         limits: Arc::new(arc_swap::ArcSwap::from_pointee(cfg.limits.clone())),
         bundles,
+        quota: Arc::new(s0::quota::QuotaLedger::new()),
         capture: Some(capture.clone()),
     });
     Fixture {
@@ -277,12 +337,14 @@ pub fn principal(sub: &str) -> ResolvedPrincipal {
 }
 
 /// Seed a request exactly as `S3Access::check` does: the resolved principal, the
-/// secret-free route snapshot, and the s3s op name. A hook that runs without all three
-/// fails closed, so a test that skipped this would measure the backstop, not the policy.
-/// The route snapshot comes from a real `BackendRegistry` over the same config the
-/// gateway uses, so the fixture cannot drift from the routing it claims to model.
+/// secret-free route snapshot, the bundle's bucket placement, and the s3s op name. A hook
+/// that runs without all four fails closed, so a test that skipped this would measure the
+/// backstop, not the policy. The route snapshot comes from a real `BackendRegistry` over
+/// the same config the gateway uses, and the placement from the bundle store the gateway
+/// decides against, so the fixture cannot drift from what it claims to model.
 pub fn seeded_request<T>(
     cfg: &GatewayConfig,
+    bundles: &BundleStore,
     principal: ResolvedPrincipal,
     op: &str,
     input: T,
@@ -296,6 +358,7 @@ pub fn seeded_request<T>(
     let mut extensions = Extensions::new();
     extensions.insert(Arc::new(route));
     extensions.insert(Arc::new(principal));
+    extensions.insert(bundles.current().placement().clone());
     extensions.insert(OperationName(op.into()));
     S3Request {
         input,
@@ -313,11 +376,19 @@ pub fn seeded_request<T>(
 impl Fixture {
     /// [`seeded_request`] bound to this fixture's config and to `alice`.
     pub fn request<T>(&self, op: &str, input: T, method: Method) -> S3Request<T> {
-        seeded_request(&self.cfg, principal("alice"), op, input, method, "/")
+        self.request_as("alice", op, input, method)
     }
 
     pub fn request_as<T>(&self, sub: &str, op: &str, input: T, method: Method) -> S3Request<T> {
-        seeded_request(&self.cfg, principal(sub), op, input, method, "/")
+        seeded_request(
+            &self.cfg,
+            &self.gw.bundles,
+            principal(sub),
+            op,
+            input,
+            method,
+            "/",
+        )
     }
 
     /// A request carrying the real method and URI this operation arrives with, taken
@@ -328,6 +399,7 @@ impl Fixture {
         let route = routes::route(op);
         seeded_request(
             &self.cfg,
+            &self.gw.bundles,
             principal("alice"),
             op,
             input,

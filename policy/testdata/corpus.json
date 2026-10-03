@@ -1,5 +1,5 @@
 {
-  "_comment": "Golden decision corpus for policy/gateway/authz.rego. Engine-agnostic: replayed through BOTH regorus (fast path) and OPA (sidecar) by the dual-engine parity gate, and the seed of the conformance corpus. `expect` asserts allow + obligations; obligations.allowed_prefixes is compared order-insensitively. NOTE (2026-08-08): there are no cases for create_bucket / delete_bucket / read_bucket_config / write_bucket_config / write_object_acl and there cannot be \u2014 each case's `input` is deserialized as a real OpaInput, so a verb outside the settled six does not parse. That is deliberate: it means the corpus cannot document a decision for an authority the gateway no longer brokers. NOTE (2026-08-09): an UNBOUNDED list (no `prefix`, or `\"prefix\": \"\"`) by a principal holding only prefix-scoped grants is a DENY, not a narrowing — AWS parity, and a filtered listing that does not say it is filtered reads as the whole bucket. The four list cases that pin the change are the two `-> DENIED (AWS parity...)` cases, the explicit-empty-prefix case, and `list whole-bucket grant -> no narrowing`, which is the positive control: bob's unbounded list still ALLOWS, so the deny is about the grant shape and not about the absent prefix. Narrowing itself is untouched and is pinned by the two `WIDER-but-overlapping` cases.",
+  "_comment": "Golden decision corpus for policy/gateway/authz.rego. Engine-agnostic: replayed through BOTH regorus (fast path) and OPA (sidecar) by the dual-engine parity gate, and the seed of the conformance corpus. `expect` asserts allow + obligations; obligations.allowed_prefixes is compared order-insensitively. NOTE (2026-08-08): there are no cases for create_bucket / delete_bucket / read_bucket_config / write_bucket_config / write_object_acl and there cannot be \u2014 each case's `input` is deserialized as a real OpaInput, so a verb outside the settled six does not parse. That is deliberate: it means the corpus cannot document a decision for an authority the gateway no longer brokers. NOTE (2026-08-09): an UNBOUNDED list (no `prefix`, or `\"prefix\": \"\"`) by a principal holding only prefix-scoped grants is a DENY, not a narrowing \u2014 AWS parity, and a filtered listing that does not say it is filtered reads as the whole bucket. The four list cases that pin the change are the two `-> DENIED (AWS parity...)` cases, the explicit-empty-prefix case, and `list whole-bucket grant -> no narrowing`, which is the positive control: bob's unbounded list still ALLOWS, so the deny is about the grant shape and not about the absent prefix. Narrowing itself is untouched and is pinned by the two `WIDER-but-overlapping` cases.",
   "bundles": {
     "default": {
       "org_settings": {
@@ -275,6 +275,399 @@
                 "actions": [
                   "read_objects",
                   "write_objects"
+                ],
+                "prefixes": []
+              }
+            ]
+          },
+          "group_grants": {}
+        }
+      }
+    },
+    "placed": {
+      "_comment": "A grant_schema_version 3 bundle (ADR-009): projected for ONE backend (`data.backend.id`), every bucket of it listed under exactly one tenant by S3 name. acme and globex are two tenants of one organization sharing one upstream identity, so the backend would serve either tenant's bucket to the other: the placement is the isolation. `contested` is listed under both tenants (a projection defect: no tenant may use it); `acme-logs` and `acme-null` pin that a key is a claim whatever it maps to. carol holds a WILDCARD grant, so every placement deny below is the placement and not a missing grant; mallory holds an explicit grant naming globex's bucket, which a projection must never emit and the policy must not honour.",
+      "grant_schema_version": 3,
+      "backend": {
+        "id": "garage-1",
+        "kind": "s3"
+      },
+      "org_settings": {
+        "freeze_writes": false
+      },
+      "tenants": {
+        "acme": {
+          "user_attributes": {
+            "carol": {
+              "groups": [
+                "admins"
+              ],
+              "attributes": []
+            },
+            "alice": {
+              "groups": [],
+              "attributes": []
+            },
+            "mallory": {
+              "groups": [],
+              "attributes": []
+            }
+          },
+          "bucket_attributes": {
+            "acme-data": {
+              "denylist": {},
+              "object_name": "data",
+              "created_at": "2026-09-30T08:00:00Z"
+            },
+            "acme-logs": {},
+            "acme-null": null,
+            "contested": {
+              "denylist": {}
+            }
+          },
+          "s3_grants": {
+            "carol": [
+              {
+                "bucket": "*",
+                "actions": [
+                  "*"
+                ],
+                "prefixes": []
+              }
+            ],
+            "alice": [
+              {
+                "bucket": "acme-data",
+                "actions": [
+                  "read",
+                  "read_objects",
+                  "list_objects"
+                ],
+                "prefixes": []
+              }
+            ],
+            "mallory": [
+              {
+                "bucket": "globex-data",
+                "actions": [
+                  "read",
+                  "read_objects",
+                  "write_objects"
+                ],
+                "prefixes": []
+              }
+            ]
+          },
+          "group_grants": {}
+        },
+        "globex": {
+          "user_attributes": {
+            "gina": {
+              "groups": [],
+              "attributes": []
+            }
+          },
+          "bucket_attributes": {
+            "globex-data": {
+              "denylist": {},
+              "object_name": "data",
+              "created_at": "2026-09-30T09:00:00Z"
+            },
+            "contested": {
+              "denylist": {}
+            }
+          },
+          "s3_grants": {
+            "gina": [
+              {
+                "bucket": "globex-data",
+                "actions": [
+                  "read",
+                  "read_objects"
+                ],
+                "prefixes": []
+              }
+            ]
+          },
+          "group_grants": {}
+        }
+      }
+    },
+    "placed_unnamed": {
+      "_comment": "A v3 bundle naming no backend. It cannot say which backend's buckets it places, so every decision is refused, account scope included.",
+      "grant_schema_version": 3,
+      "org_settings": {
+        "freeze_writes": false
+      },
+      "tenants": {
+        "acme": {
+          "user_attributes": {
+            "carol": {
+              "groups": [
+                "admins"
+              ],
+              "attributes": []
+            },
+            "alice": {
+              "groups": [],
+              "attributes": []
+            },
+            "mallory": {
+              "groups": [],
+              "attributes": []
+            }
+          },
+          "bucket_attributes": {
+            "acme-data": {
+              "denylist": {},
+              "object_name": "data",
+              "created_at": "2026-09-30T08:00:00Z"
+            },
+            "acme-logs": {},
+            "acme-null": null,
+            "contested": {
+              "denylist": {}
+            }
+          },
+          "s3_grants": {
+            "carol": [
+              {
+                "bucket": "*",
+                "actions": [
+                  "*"
+                ],
+                "prefixes": []
+              }
+            ],
+            "alice": [
+              {
+                "bucket": "acme-data",
+                "actions": [
+                  "read",
+                  "read_objects",
+                  "list_objects"
+                ],
+                "prefixes": []
+              }
+            ],
+            "mallory": [
+              {
+                "bucket": "globex-data",
+                "actions": [
+                  "read",
+                  "read_objects",
+                  "write_objects"
+                ],
+                "prefixes": []
+              }
+            ]
+          },
+          "group_grants": {}
+        }
+      }
+    },
+    "unplaced_v2": {
+      "_comment": "The same tenants at grant_schema_version 2: nothing is placed, so a bucket absent from bucket_attributes is decided by the grants alone, as before v3.",
+      "grant_schema_version": 2,
+      "org_settings": {
+        "freeze_writes": false
+      },
+      "tenants": {
+        "acme": {
+          "user_attributes": {
+            "carol": {
+              "groups": [
+                "admins"
+              ],
+              "attributes": []
+            },
+            "alice": {
+              "groups": [],
+              "attributes": []
+            },
+            "mallory": {
+              "groups": [],
+              "attributes": []
+            }
+          },
+          "bucket_attributes": {
+            "acme-data": {
+              "denylist": {},
+              "object_name": "data",
+              "created_at": "2026-09-30T08:00:00Z"
+            },
+            "acme-logs": {},
+            "acme-null": null,
+            "contested": {
+              "denylist": {}
+            }
+          },
+          "s3_grants": {
+            "carol": [
+              {
+                "bucket": "*",
+                "actions": [
+                  "*"
+                ],
+                "prefixes": []
+              }
+            ],
+            "alice": [
+              {
+                "bucket": "acme-data",
+                "actions": [
+                  "read",
+                  "read_objects",
+                  "list_objects"
+                ],
+                "prefixes": []
+              }
+            ],
+            "mallory": [
+              {
+                "bucket": "globex-data",
+                "actions": [
+                  "read",
+                  "read_objects",
+                  "write_objects"
+                ],
+                "prefixes": []
+              }
+            ]
+          },
+          "group_grants": {}
+        },
+        "globex": {
+          "user_attributes": {
+            "gina": {
+              "groups": [],
+              "attributes": []
+            }
+          },
+          "bucket_attributes": {
+            "globex-data": {
+              "denylist": {},
+              "object_name": "data",
+              "created_at": "2026-09-30T09:00:00Z"
+            },
+            "contested": {
+              "denylist": {}
+            }
+          },
+          "s3_grants": {
+            "gina": [
+              {
+                "bucket": "globex-data",
+                "actions": [
+                  "read",
+                  "read_objects"
+                ],
+                "prefixes": []
+              }
+            ]
+          },
+          "group_grants": {}
+        }
+      }
+    },
+    "unplaced_string_version": {
+      "_comment": "A version that is present but not a number is a projection defect: it places nothing the gate can read, so every decision is refused rather than read as an old document.",
+      "grant_schema_version": "3",
+      "backend": {
+        "id": "garage-1",
+        "kind": "s3"
+      },
+      "org_settings": {
+        "freeze_writes": false
+      },
+      "tenants": {
+        "acme": {
+          "user_attributes": {
+            "carol": {
+              "groups": [
+                "admins"
+              ],
+              "attributes": []
+            },
+            "alice": {
+              "groups": [],
+              "attributes": []
+            },
+            "mallory": {
+              "groups": [],
+              "attributes": []
+            }
+          },
+          "bucket_attributes": {
+            "acme-data": {
+              "denylist": {},
+              "object_name": "data",
+              "created_at": "2026-09-30T08:00:00Z"
+            },
+            "acme-logs": {},
+            "acme-null": null,
+            "contested": {
+              "denylist": {}
+            }
+          },
+          "s3_grants": {
+            "carol": [
+              {
+                "bucket": "*",
+                "actions": [
+                  "*"
+                ],
+                "prefixes": []
+              }
+            ],
+            "alice": [
+              {
+                "bucket": "acme-data",
+                "actions": [
+                  "read",
+                  "read_objects",
+                  "list_objects"
+                ],
+                "prefixes": []
+              }
+            ],
+            "mallory": [
+              {
+                "bucket": "globex-data",
+                "actions": [
+                  "read",
+                  "read_objects",
+                  "write_objects"
+                ],
+                "prefixes": []
+              }
+            ]
+          },
+          "group_grants": {}
+        },
+        "globex": {
+          "user_attributes": {
+            "gina": {
+              "groups": [],
+              "attributes": []
+            }
+          },
+          "bucket_attributes": {
+            "globex-data": {
+              "denylist": {},
+              "object_name": "data",
+              "created_at": "2026-09-30T09:00:00Z"
+            },
+            "contested": {
+              "denylist": {}
+            }
+          },
+          "s3_grants": {
+            "gina": [
+              {
+                "bucket": "globex-data",
+                "actions": [
+                  "read",
+                  "read_objects"
                 ],
                 "prefixes": []
               }
@@ -1651,6 +2044,787 @@
       "expect": {
         "allow": false,
         "reason_contains": "no grant"
+      }
+    },
+    {
+      "name": "v3: own bucket, wildcard grant -> allowed (positive control)",
+      "bundle": "placed",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "carol",
+          "type": "user",
+          "attributes": {
+            "groups": [
+              "admins"
+            ]
+          }
+        },
+        "backend": {
+          "id": "garage-1",
+          "kind": "s3"
+        },
+        "tenant": "acme",
+        "organization_id": "org-one",
+        "action": "read_objects",
+        "bucket": "acme-data",
+        "object": "x.csv",
+        "request": {
+          "method": "GET"
+        }
+      },
+      "expect": {
+        "allow": true,
+        "reason_contains": "grant matched"
+      }
+    },
+    {
+      "name": "v3: cross-harbor credential, wildcard grant, read -> DENIED (another tenant)",
+      "bundle": "placed",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "carol",
+          "type": "user",
+          "attributes": {
+            "groups": [
+              "admins"
+            ]
+          }
+        },
+        "backend": {
+          "id": "garage-1",
+          "kind": "s3"
+        },
+        "tenant": "acme",
+        "organization_id": "org-one",
+        "action": "read_objects",
+        "bucket": "globex-data",
+        "object": "x.csv",
+        "request": {
+          "method": "GET"
+        }
+      },
+      "expect": {
+        "allow": false,
+        "reason_contains": "deny: bucket belongs to another tenant"
+      }
+    },
+    {
+      "name": "v3: cross-harbor credential, wildcard grant, write -> DENIED (another tenant)",
+      "bundle": "placed",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "carol",
+          "type": "user",
+          "attributes": {
+            "groups": [
+              "admins"
+            ]
+          }
+        },
+        "backend": {
+          "id": "garage-1",
+          "kind": "s3"
+        },
+        "tenant": "acme",
+        "organization_id": "org-one",
+        "action": "write_objects",
+        "bucket": "globex-data",
+        "object": "x.csv",
+        "request": {
+          "method": "PUT"
+        }
+      },
+      "expect": {
+        "allow": false,
+        "reason_contains": "deny: bucket belongs to another tenant"
+      }
+    },
+    {
+      "name": "v3: cross-harbor credential holding a grant that names the other tenant's bucket -> DENIED",
+      "bundle": "placed",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "mallory",
+          "type": "user",
+          "attributes": {
+            "groups": []
+          }
+        },
+        "backend": {
+          "id": "garage-1",
+          "kind": "s3"
+        },
+        "tenant": "acme",
+        "organization_id": "org-one",
+        "action": "read_objects",
+        "bucket": "globex-data",
+        "object": "x.csv",
+        "request": {
+          "method": "GET"
+        }
+      },
+      "expect": {
+        "allow": false,
+        "reason_contains": "deny: bucket belongs to another tenant"
+      }
+    },
+    {
+      "name": "v3: cross-harbor HeadBucket -> DENIED (another tenant)",
+      "bundle": "placed",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "mallory",
+          "type": "user",
+          "attributes": {
+            "groups": []
+          }
+        },
+        "backend": {
+          "id": "garage-1",
+          "kind": "s3"
+        },
+        "tenant": "acme",
+        "organization_id": "org-one",
+        "action": "read",
+        "bucket": "globex-data",
+        "request": {
+          "method": "HEAD"
+        }
+      },
+      "expect": {
+        "allow": false,
+        "reason_contains": "deny: bucket belongs to another tenant"
+      }
+    },
+    {
+      "name": "v3: the owning tenant reaches the same bucket -> allowed",
+      "bundle": "placed",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "gina",
+          "type": "user",
+          "attributes": {
+            "groups": []
+          }
+        },
+        "backend": {
+          "id": "garage-1",
+          "kind": "s3"
+        },
+        "tenant": "globex",
+        "organization_id": "org-one",
+        "action": "read_objects",
+        "bucket": "globex-data",
+        "object": "x.csv",
+        "request": {
+          "method": "GET"
+        }
+      },
+      "expect": {
+        "allow": true
+      }
+    },
+    {
+      "name": "v3: copy into an own bucket from another tenant's bucket, destination half -> DENIED",
+      "bundle": "placed",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "carol",
+          "type": "user",
+          "attributes": {
+            "groups": [
+              "admins"
+            ]
+          }
+        },
+        "backend": {
+          "id": "garage-1",
+          "kind": "s3"
+        },
+        "tenant": "acme",
+        "organization_id": "org-one",
+        "action": "write_objects",
+        "bucket": "acme-data",
+        "object": "dst.csv",
+        "copy_source": {
+          "bucket": "globex-data",
+          "key": "src.csv"
+        },
+        "request": {
+          "method": "PUT"
+        }
+      },
+      "expect": {
+        "allow": false,
+        "reason_contains": "deny: bucket belongs to another tenant"
+      }
+    },
+    {
+      "name": "v3: copy within own buckets, destination half -> allowed",
+      "bundle": "placed",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "carol",
+          "type": "user",
+          "attributes": {
+            "groups": [
+              "admins"
+            ]
+          }
+        },
+        "backend": {
+          "id": "garage-1",
+          "kind": "s3"
+        },
+        "tenant": "acme",
+        "organization_id": "org-one",
+        "action": "write_objects",
+        "bucket": "acme-data",
+        "object": "dst.csv",
+        "copy_source": {
+          "bucket": "acme-logs",
+          "key": "src.csv"
+        },
+        "request": {
+          "method": "PUT"
+        }
+      },
+      "expect": {
+        "allow": true
+      }
+    },
+    {
+      "name": "v3: bucket absent from the bundle, wildcard grant, read -> DENIED (not on this backend)",
+      "bundle": "placed",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "carol",
+          "type": "user",
+          "attributes": {
+            "groups": [
+              "admins"
+            ]
+          }
+        },
+        "backend": {
+          "id": "garage-1",
+          "kind": "s3"
+        },
+        "tenant": "acme",
+        "organization_id": "org-one",
+        "action": "read_objects",
+        "bucket": "nowhere",
+        "object": "x.csv",
+        "request": {
+          "method": "GET"
+        }
+      },
+      "expect": {
+        "allow": false,
+        "reason_contains": "deny: bucket not on this backend"
+      }
+    },
+    {
+      "name": "v3: bucket absent from the bundle, list -> DENIED (not on this backend)",
+      "bundle": "placed",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "carol",
+          "type": "user",
+          "attributes": {
+            "groups": [
+              "admins"
+            ]
+          }
+        },
+        "backend": {
+          "id": "garage-1",
+          "kind": "s3"
+        },
+        "tenant": "acme",
+        "organization_id": "org-one",
+        "action": "list_objects",
+        "bucket": "nowhere",
+        "request": {
+          "method": "GET"
+        }
+      },
+      "expect": {
+        "allow": false,
+        "reason_contains": "deny: bucket not on this backend"
+      }
+    },
+    {
+      "name": "v3: bucket absent from the bundle, HeadBucket -> DENIED (not on this backend)",
+      "bundle": "placed",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "carol",
+          "type": "user",
+          "attributes": {
+            "groups": [
+              "admins"
+            ]
+          }
+        },
+        "backend": {
+          "id": "garage-1",
+          "kind": "s3"
+        },
+        "tenant": "acme",
+        "organization_id": "org-one",
+        "action": "read",
+        "bucket": "nowhere",
+        "request": {
+          "method": "HEAD"
+        }
+      },
+      "expect": {
+        "allow": false,
+        "reason_contains": "deny: bucket not on this backend"
+      }
+    },
+    {
+      "name": "v3: a bucket listed under two tenants is refused to both",
+      "bundle": "placed",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "carol",
+          "type": "user",
+          "attributes": {
+            "groups": [
+              "admins"
+            ]
+          }
+        },
+        "backend": {
+          "id": "garage-1",
+          "kind": "s3"
+        },
+        "tenant": "acme",
+        "organization_id": "org-one",
+        "action": "read_objects",
+        "bucket": "contested",
+        "object": "x.csv",
+        "request": {
+          "method": "GET"
+        }
+      },
+      "expect": {
+        "allow": false,
+        "reason_contains": "deny: bucket belongs to another tenant"
+      }
+    },
+    {
+      "name": "v3: a bucket placed with empty attributes is placed",
+      "bundle": "placed",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "carol",
+          "type": "user",
+          "attributes": {
+            "groups": [
+              "admins"
+            ]
+          }
+        },
+        "backend": {
+          "id": "garage-1",
+          "kind": "s3"
+        },
+        "tenant": "acme",
+        "organization_id": "org-one",
+        "action": "read_objects",
+        "bucket": "acme-logs",
+        "object": "x.csv",
+        "request": {
+          "method": "GET"
+        }
+      },
+      "expect": {
+        "allow": true
+      }
+    },
+    {
+      "name": "v3: a bucket placed with a null entry is still placed (a key is a claim)",
+      "bundle": "placed",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "carol",
+          "type": "user",
+          "attributes": {
+            "groups": [
+              "admins"
+            ]
+          }
+        },
+        "backend": {
+          "id": "garage-1",
+          "kind": "s3"
+        },
+        "tenant": "acme",
+        "organization_id": "org-one",
+        "action": "read_objects",
+        "bucket": "acme-null",
+        "object": "x.csv",
+        "request": {
+          "method": "GET"
+        }
+      },
+      "expect": {
+        "allow": true
+      }
+    },
+    {
+      "name": "v3: ListBuckets with a wildcard grant -> allowed, unfiltered (the gateway lists the tenant's own buckets from the bundle)",
+      "bundle": "placed",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "carol",
+          "type": "user",
+          "attributes": {
+            "groups": [
+              "admins"
+            ]
+          }
+        },
+        "backend": {
+          "id": "garage-1",
+          "kind": "s3"
+        },
+        "tenant": "acme",
+        "organization_id": "org-one",
+        "action": "read",
+        "bucket": "",
+        "request": {
+          "method": "GET"
+        }
+      },
+      "expect": {
+        "allow": true,
+        "all_buckets_visible": true
+      }
+    },
+    {
+      "name": "v3: ListBuckets with a named grant -> allowed, visibility follows access",
+      "bundle": "placed",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "alice",
+          "type": "user",
+          "attributes": {
+            "groups": []
+          }
+        },
+        "backend": {
+          "id": "garage-1",
+          "kind": "s3"
+        },
+        "tenant": "acme",
+        "organization_id": "org-one",
+        "action": "read",
+        "bucket": "",
+        "request": {
+          "method": "GET"
+        }
+      },
+      "expect": {
+        "allow": true,
+        "visible_buckets": [
+          "acme-data"
+        ],
+        "all_buckets_visible": false
+      }
+    },
+    {
+      "name": "v3: ListBuckets is not a bucket-scoped decision, so placement does not refuse it",
+      "bundle": "placed",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "gina",
+          "type": "user",
+          "attributes": {
+            "groups": []
+          }
+        },
+        "backend": {
+          "id": "garage-1",
+          "kind": "s3"
+        },
+        "tenant": "globex",
+        "organization_id": "org-one",
+        "action": "read",
+        "bucket": "",
+        "request": {
+          "method": "GET"
+        }
+      },
+      "expect": {
+        "allow": true,
+        "visible_buckets": [
+          "globex-data"
+        ]
+      }
+    },
+    {
+      "name": "v3: a decision routed to another backend than the bundle's -> DENIED",
+      "bundle": "placed",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "carol",
+          "type": "user",
+          "attributes": {
+            "groups": [
+              "admins"
+            ]
+          }
+        },
+        "backend": {
+          "id": "garage-2",
+          "kind": "s3"
+        },
+        "tenant": "acme",
+        "organization_id": "org-one",
+        "action": "read_objects",
+        "bucket": "acme-data",
+        "object": "x.csv",
+        "request": {
+          "method": "GET"
+        }
+      },
+      "expect": {
+        "allow": false,
+        "reason_contains": "deny: bundle projected for another backend"
+      }
+    },
+    {
+      "name": "v3: ListBuckets routed to another backend than the bundle's -> DENIED",
+      "bundle": "placed",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "carol",
+          "type": "user",
+          "attributes": {
+            "groups": [
+              "admins"
+            ]
+          }
+        },
+        "backend": {
+          "id": "garage-2",
+          "kind": "s3"
+        },
+        "tenant": "acme",
+        "organization_id": "org-one",
+        "action": "read",
+        "bucket": "",
+        "request": {
+          "method": "GET"
+        }
+      },
+      "expect": {
+        "allow": false,
+        "reason_contains": "deny: bundle projected for another backend"
+      }
+    },
+    {
+      "name": "v3: a bundle naming no backend refuses every decision",
+      "bundle": "placed_unnamed",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "carol",
+          "type": "user",
+          "attributes": {
+            "groups": [
+              "admins"
+            ]
+          }
+        },
+        "backend": {
+          "id": "garage-1",
+          "kind": "s3"
+        },
+        "tenant": "acme",
+        "organization_id": "org-one",
+        "action": "read_objects",
+        "bucket": "acme-data",
+        "object": "x.csv",
+        "request": {
+          "method": "GET"
+        }
+      },
+      "expect": {
+        "allow": false,
+        "reason_contains": "deny: bundle projected for another backend"
+      }
+    },
+    {
+      "name": "v2: a bucket absent from bucket_attributes is decided by the grants alone (unchanged)",
+      "bundle": "unplaced_v2",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "carol",
+          "type": "user",
+          "attributes": {
+            "groups": [
+              "admins"
+            ]
+          }
+        },
+        "backend": {
+          "id": "garage-1",
+          "kind": "s3"
+        },
+        "tenant": "acme",
+        "organization_id": "org-one",
+        "action": "read_objects",
+        "bucket": "nowhere",
+        "object": "x.csv",
+        "request": {
+          "method": "GET"
+        }
+      },
+      "expect": {
+        "allow": true
+      }
+    },
+    {
+      "name": "v2: another tenant's bucket name is decided by the grants alone (unchanged)",
+      "bundle": "unplaced_v2",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "carol",
+          "type": "user",
+          "attributes": {
+            "groups": [
+              "admins"
+            ]
+          }
+        },
+        "backend": {
+          "id": "garage-1",
+          "kind": "s3"
+        },
+        "tenant": "acme",
+        "organization_id": "org-one",
+        "action": "read_objects",
+        "bucket": "globex-data",
+        "object": "x.csv",
+        "request": {
+          "method": "GET"
+        }
+      },
+      "expect": {
+        "allow": true
+      }
+    },
+    {
+      "name": "a string grant_schema_version refuses every decision",
+      "bundle": "unplaced_string_version",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "carol",
+          "type": "user",
+          "attributes": {
+            "groups": [
+              "admins"
+            ]
+          }
+        },
+        "backend": {
+          "id": "garage-1",
+          "kind": "s3"
+        },
+        "tenant": "acme",
+        "organization_id": "org-one",
+        "action": "read_objects",
+        "bucket": "nowhere",
+        "object": "x.csv",
+        "request": {
+          "method": "GET"
+        }
+      },
+      "expect": {
+        "allow": false,
+        "reason_contains": "grant_schema_version is not a number"
+      }
+    },
+    {
+      "name": "a string grant_schema_version refuses the account scope too",
+      "bundle": "unplaced_string_version",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "carol",
+          "type": "user",
+          "attributes": {
+            "groups": [
+              "admins"
+            ]
+          }
+        },
+        "backend": {
+          "id": "garage-1",
+          "kind": "s3"
+        },
+        "tenant": "acme",
+        "organization_id": "org-one",
+        "action": "read",
+        "bucket": "",
+        "request": {
+          "method": "GET"
+        }
+      },
+      "expect": {
+        "allow": false,
+        "reason_contains": "grant_schema_version is not a number"
       }
     }
   ]

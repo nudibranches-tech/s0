@@ -116,6 +116,31 @@ table, so no pushed policy can enable them:
 - **Live policy and live revocation**: OPA holds the policy; a revoked grant denies on the
   next request. No policy is ever baked into a credential.
 - **`freeze_writes`** org kill-switch, per-bucket denylist, and the grant superset.
+- **Bucket placement on a shared upstream identity**: from `grant_schema_version` 3 the
+  bundle names the backend it was projected for and, per bucket, the one tenant that owns
+  it. A request naming a bucket owned by another tenant, or one no tenant lists, or a
+  bundle projected for a different backend, is refused by the gateway itself — before the
+  policy is even asked — with `ListBuckets` answered straight from the bundle instead of
+  forwarded, since the shared upstream identity generally cannot list at all. This is what
+  makes a backend profile such as `garage`, where every tenant of an organization shares
+  one upstream key scoped only by bucket grant, safe to front. Tenants that share an
+  upstream key are refused outright while the bundle in force places nothing (a v2 or seed
+  bundle), since the backend alone would not keep them apart
+  ([ADR-009](docs/adr/ADR-009-bundle-v3-bucket-placement.md)).
+- **Byte quotas where the backend has none**: a v3 bundle may state a quota on a bucket,
+  a tenant or the backend, and a write that would pass one is refused `QuotaExceeded`
+  (403) before it is forwarded, counting what was written since the last collection rather
+  than waiting for the next. Counted per replica
+  ([ADR-010](docs/adr/ADR-010-byte-quotas-counted-per-replica.md)).
+- **No backend text in an answer**: an error the backend returns is re-minted with its
+  code and HTTP status and a message of the gateway's own, so the ARN, account id or Ceph
+  tenant an upstream error names never reaches the client. A successful answer loses the
+  backend identifiers it carries: the SSE-KMS key id (an ARN with the account id, on AWS)
+  and encryption context, and `CompleteMultipartUpload`'s `Location`, which is the
+  object's URL on the backend's own host. The request id is the gateway's on every
+  forwarded answer (the decision id of the request's audit record), and the backend's host
+  id is dropped. Other fields of a successful answer (object metadata, ETags, listing
+  entries) are the backend's.
 
 ### Fail-closed by construction
 
@@ -258,10 +283,11 @@ key, so replacing it invalidates live sessions. Rotate it in a window.
 | Module | Role |
 |---|---|
 | [`authz`](src/authz) | the OPA input contract and the decision type — the core seam |
-| [`pdp`](src/pdp) | `Pdp` trait; embedded regorus + sidecar OPA; revision-keyed decision cache |
+| [`pdp`](src/pdp) | `Pdp` trait; embedded regorus + sidecar OPA; revision-keyed decision cache; v3 bundle bucket placement (`BucketPlacement`) |
 | [`auth`](src/auth) | identity authority, own STS, long-lived derived keys |
 | [`access`](src/access) | the OPA gate: deny-by-default `check` + typed per-op hooks |
 | [`proxy`](src/proxy) | per-`(backend, tenant)` client pool and dispatch |
+| [`quota`](src/quota.rs) | byte quotas a v3 bundle states, counted per replica between collections |
 | [`audit`](src/audit) | one reasoned decision record per request; async, non-blocking, disk-spill |
 | [`gateway`](src/gateway.rs) / [`server`](src/server.rs) | assembly and hardened hyper serving |
 | [`admin`](src/admin.rs) / [`shutdown`](src/shutdown.rs) | `/healthz` `/readyz` `/metrics`; one signal, ordered drain |
@@ -281,7 +307,7 @@ See [`docs/gateway.example.json`](docs/gateway.example.json) and
 
 ### More than one replica
 
-s0 is a Deployment, not a singleton. Three consequences a single-replica deployment never
+s0 is a Deployment, not a singleton. Four consequences a single-replica deployment never
 exercises:
 
 - **The audit spill is per-pod.** It is read-whole / POST / delete-whole, correct only for
@@ -298,6 +324,11 @@ exercises:
   → internal API and mint drain → audit worker drains (≤10s) → admin listener stops last.
   Kubernetes' 30s default truncates the audit drain and loses records; set
   `terminationGracePeriodSeconds: 60`.
+- **Quota counts are per pod.** A replica counts only the writes it accepted since the last
+  collection, so N replicas can together overshoot a bundle-stated quota by what the other
+  N − 1 accepted in one collection interval
+  ([ADR-010](docs/adr/ADR-010-byte-quotas-counted-per-replica.md)). Collect as often as that
+  overshoot requires; a backend's own per-bucket limit, where it has one, stays the backstop.
 
 ```yaml
 livenessProbe:  { httpGet: { path: /healthz, port: 8016 } }   # never depends on the control plane
@@ -408,7 +439,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md). Security reports: [`SECURITY.md`](SECU
 ## License
 
 Business Source License 1.1 (`BUSL-1.1`), converting to Apache-2.0 on the change
-date (`2030-09-28`, four years after this release). See [`LICENSE`](LICENSE);
+date (`2030-10-02`, four years after this release). See [`LICENSE`](LICENSE);
 the future Apache text is in [`LICENSE-APACHE-2.0.txt`](LICENSE-APACHE-2.0.txt).
 
 Until that date, in short:

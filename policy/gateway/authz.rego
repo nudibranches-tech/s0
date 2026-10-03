@@ -76,8 +76,12 @@
 #     may condition grants on them. ABSENT ⇒ every tag write is refused (tagging ships
 #     inert). `["*"]` means the same thing explicitly; `[]` means nothing is reserved and
 #     is a claim the control plane makes, not a default the gateway assumes.
+#   data.grant_schema_version : number   ≥ 3 ⇒ the bundle PLACES buckets (below)
+#   data.backend.id           : the backend a v3 bundle was projected for
 #   data.tenants[t].user_attributes[sub] : {groups, attributes}
 #   data.tenants[t].bucket_attributes[b].denylist[sub] : true
+#     At v3 `b` is an S3 name, and every bucket of the backend is listed under exactly
+#     one tenant, its owner; a bucket-scoped decision about any other is refused.
 #   data.tenants[t].s3_grants[sub]     : [ Grant ]
 #   data.tenants[t].group_grants[group]: [ Grant ]
 #     Grant := { "bucket": "<name>" | "*",
@@ -104,11 +108,80 @@ decision := {
 default allow := false
 
 allow if {
+	not placement_refused
 	not frozen
 	not denylisted
 	member
 	grant_matches
 }
+
+# ── bucket placement (grant_schema_version ≥ 3) ─────────────────────────────────
+#
+# A v3 bundle is projected for ONE backend (`data.backend.id`) and lists each of its
+# buckets under exactly one tenant, keyed by S3 name. On a backend whose upstream identity
+# every tenant of an organization shares, that listing is the only thing keeping one tenant
+# out of another's bucket. The gateway refuses the same three cases ahead of the PDP
+# (ADR-009); this module refuses them too, so the default policy stands on its own and a
+# pushed module can be checked against it. `tests/policy_corpus.rs` holds the two to the
+# same answer over the corpus.
+#
+# The version gate is the gateway's: a number below 3, or no version at all, places
+# nothing, and every rule below is inert. A version that is present but not a number
+# (`"3"`, `null`) is a projection defect, refused rather than read as an old document.
+places_buckets if {
+	is_number(data.grant_schema_version)
+	data.grant_schema_version >= 3
+}
+
+placement_version_unreadable if {
+	version := data.grant_schema_version
+	not is_number(version)
+}
+
+# Account scope included: a bundle projected for another backend (or naming none) describes
+# buckets this backend does not hold.
+placement_backend_mismatch if {
+	places_buckets
+	not data.backend.id == input.backend.id
+}
+
+# The buckets a decision names: its own, and a copy's source. The PEP also asks the source
+# half as a decision of its own, but the destination half must not stand on a source the
+# placement refuses either — the gateway screens both on every decision.
+screened_bucket contains input.bucket if bucket_scoped
+
+screened_bucket contains input.copy_source.bucket if input.copy_source.bucket != ""
+
+# Defined for ANY value, `false` and `null` included: the gateway reads a key as a claim
+# whatever it maps to, and a truthiness test here would let a falsy entry disagree.
+claims_bucket(t, bucket) if {
+	some b, _ in data.tenants[t].bucket_attributes
+	b == bucket
+}
+
+# Also covers a bucket listed under several tenants, ours among them: until the projection
+# says which one owns it, none may use it.
+placed_under_another_tenant if {
+	places_buckets
+	some bucket in screened_bucket
+	some t, _ in data.tenants
+	t != input.tenant
+	claims_bucket(t, bucket)
+}
+
+bucket_not_placed if {
+	places_buckets
+	some bucket in screened_bucket
+	not claims_bucket(input.tenant, bucket)
+}
+
+placement_refused if placement_version_unreadable
+
+placement_refused if placement_backend_mismatch
+
+placement_refused if placed_under_another_tenant
+
+placement_refused if bucket_not_placed
 
 # ── org-global and per-bucket denies (evaluated ahead of grants) ────────────────
 
@@ -470,14 +543,36 @@ list_obligations := {} if {
 
 default reason := "deny: no grant matches action/scope"
 
-reason := "deny: org writes frozen (freeze_writes)" if frozen
+# Placement first: it says the question was about the wrong bucket or the wrong backend,
+# which no grant, membership or freeze could change.
+reason := "deny: bundle grant_schema_version is not a number" if placement_version_unreadable
+
+reason := "deny: bundle projected for another backend" if placement_backend_mismatch
+
+reason := "deny: bucket belongs to another tenant" if {
+	not placement_backend_mismatch
+	placed_under_another_tenant
+}
+
+reason := "deny: bucket not on this backend" if {
+	not placement_backend_mismatch
+	not placed_under_another_tenant
+	bucket_not_placed
+}
+
+reason := "deny: org writes frozen (freeze_writes)" if {
+	not placement_refused
+	frozen
+}
 
 reason := "deny: principal on bucket denylist" if {
+	not placement_refused
 	not frozen
 	denylisted
 }
 
 reason := "deny: principal not a tenant member" if {
+	not placement_refused
 	not frozen
 	not denylisted
 	not member
@@ -509,6 +604,7 @@ prefix_scoped_list_grant if {
 # which is the only unbounded list that still allows. Two matching bodies with
 # different values would be an eval error, i.e. no decision at all.
 reason := "deny: an unbounded list needs a whole-bucket grant; name a prefix inside your grant" if {
+	not placement_refused
 	not frozen
 	not denylisted
 	member

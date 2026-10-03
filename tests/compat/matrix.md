@@ -301,6 +301,47 @@ gateway correctly *authorized*.
 
 ---
 
+## 5a. The Garage leg (asserted, not recorded)
+
+`tests/compat/run.sh garage` (`tests/compat/garage.sh`) is the one leg that asserts: it
+exits non-zero on any failed check, and `.github/workflows/conformance.yml` runs it as job
+`garage`. Backend: `dxflrs/garage:v2.4.1` pinned by digest, one node, `replication_factor =
+1`, `s3_region = "garage"`, behind a TLS relay. s0: one backend `kind: s3`,
+`profile: garage`, path style, a v3 bundle. Client: boto3, signing with `us-east-1`.
+
+What it checks (40 checks; all pass on 2026-10-02):
+
+- Two tenants of one organization share **one** Garage key holding read+write on both
+  buckets, so Garage itself serves either bucket to either tenant (checked directly). Each
+  tenant's principal holds a **wildcard** grant. Through s0, tenant A gets `403` on
+  Get/Head/Put/Delete/List/HeadBucket of tenant B's bucket and on a copy out of it, nothing
+  lands or moves, and each tenant's `ListBuckets` shows only its own bucket.
+- A second organization's key, granted on its own bucket only, cannot read the first
+  organization's buckets on Garage and lists only its own.
+- An `aws-chunked` PutObject and two UploadParts carrying a CRC32 trailer
+  (`STREAMING-UNSIGNED-PAYLOAD-TRAILER`, every current SDK's default upload over TLS) go
+  through s0 and read back byte-identical, with no stored `Content-Encoding`.
+
+Two Garage v2.4.1 behaviours it found, neither s0's:
+
+1. **A signed aws-chunked trailer is refused.** Over plain HTTP the upstream SDK signs the
+   trailer (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`). Garage verifies the trailer
+   signature against `AWS4-HMAC-SHA256-PAYLOAD` and the last *data* chunk's signature,
+   where SigV4 specifies `AWS4-HMAC-SHA256-TRAILER` and the zero-length chunk's
+   (`src/api/common/signature/streaming.rs`, `compute_streaming_trailer_signature`). Every
+   trailer upload through s0 to an `http://` Garage endpoint therefore fails with
+   `InvalidRequest` ("Invalid payload signature"); a correctly signed request sent straight
+   to Garage fails the same way. Over TLS the SDK sends the unsigned trailer form, which
+   works. **A Garage backend's endpoint must be `https`**, and s0 refuses to load a
+   `profile: garage` backend whose `endpoint_url` is not (`BackendConfig::validate`).
+2. **A multipart object's checksum fails SDK validation.** A GET of a multipart object
+   returns its composite CRC32 with no `-<parts>` suffix and no `COMPOSITE` type, so boto3
+   validates it as a full-object checksum and raises `FlexibleChecksumError`, on Garage
+   directly as through s0. The leg reads that object with response validation off and
+   compares the bytes.
+
+---
+
 ## 6. What this matrix does NOT cover
 
 - **RGW.** The backend here is MinIO. `PutBucketCors` is `501` on MinIO and untested
