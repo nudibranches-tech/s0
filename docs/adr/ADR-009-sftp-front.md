@@ -2,6 +2,9 @@
 
 - **Status**: Proposed
 - **Date**: 2026-09-29
+- **Extends**: ADR-002 (a new record shape and an optional `gateway.session` block, D13) and
+  ADR-006 (a new verb and `grant_schema_version: 3`, D5, D7). Both stay in force; this ADR
+  adds to their contracts and does not edit them.
 - **Owners**: gateway team (this repository); projecting SFTP accounts, SSH keys and user CAs
   into the bundle is control-plane integration (out of scope for this repository)
 - **Scope**: Adds SFTP as a second protocol front on the existing core (identity, PDP, bundle
@@ -88,7 +91,14 @@ Apache-2.0. The BSD-3-Clause and ISC notices must ship with the image; PR 1 adds
   exactly as with `sts_mint` and `internal`. `"sftp"` in `frontends` without the section, or
   the section without `"sftp"` in `frontends`, is refused by `GatewayConfig::validate`.
 - An SFTP-only process (`frontends: ["sftp"]`) binds no S3 port. It still runs the bundle
-  poller, the audit worker and the admin listener. The production shape is **two
+  poller, the audit worker and the admin listener.
+- **Config fields that only the S3 front needs become conditional.** Today `listen` and `sts`
+  (including its signing key) are required, and `Gateway::build` always builds the STS
+  authority. After this change `listen` is required iff `"s3"` is in `frontends`, and `sts`
+  iff the process serves S3 or the mint or internal listeners, which mint STS sessions. An
+  SFTP pod therefore carries no STS key material. Every existing config names no
+  `frontends`, so it still means `["s3"]`, and its required fields do not change. This
+  lands with the refactor in D2, behind the existing suite. The production shape is **two
   Deployments from one image**: a crash, a resource exhaustion or a memory-safety bug in SSH
   parsing takes down SFTP pods and never the S3 front.
 - `sftp.listen` joins the listener-uniqueness check in `GatewayConfig::validate`.
@@ -149,9 +159,14 @@ exists to avoid.
 
 **Library.** `russh = "=0.63.3"`, pinned exactly, for the reason `s3s` is: the safety
 argument depends on which `Handler` methods exist and what their defaults do (E5). A
-`tests/data/russh-0.63.3-handler.txt` list of every `Handler` method is pinned by a test,
-alongside a compile-time check that s0's handler overrides each one. A version bump that adds
-a method with a permissive default fails the suite instead of opening a channel type.
+`tests/data/russh-0.63.3-handler.txt` lists every `Handler` method of the pinned version.
+Rust cannot reject a default method that was left in place, so the guarantee is a test, in
+the style of `tests/op_coverage.rs`:
+
+- one assertion compares the list against the `Handler` trait in the pinned russh source;
+- another compares it against the method names in s0's `impl Handler` source;
+- a method with no override fails the suite, and so does a version bump that adds a method
+  with a permissive default, instead of opening a channel type.
 
 **Algorithms** are `const` lists in `sftp::transport`, not configuration, so tightening them
 ships with a release:
@@ -182,6 +197,17 @@ ships with a release:
   `keyboard-interactive`, `hostbased` and `gssapi-*` are rejected. `max_auth_attempts` is
   6 by default and configurable from 1 to 10. russh's `auth_rejection_time` gives failures a
   constant delay, so an unknown login and a known login with a wrong key take the same time.
+- **Key probes are capped separately.** russh does not count a probe — a public key offered
+  without a signature — toward `max_auth_attempts` (its test
+  `publickey_probes_do_not_burn_auth_attempts`), so the attempt cap alone does not bound
+  probes. s0 counts them itself:
+  - `max_key_probes` per connection, default 10;
+  - exceeding it disconnects, and counts as one authentication failure toward the ban (D12).
+  - A probe for an unknown login and a probe for an unauthorized key get the same answer
+    after the same delay.
+  - A probe does answer "accepted" for an authorized (login, key) pair, as in every SSH
+    server. That confirms an account to someone who already holds its public key, which is
+    accepted: possession of the private key is what authenticates.
 - **Channels.** One `session` channel per connection, carrying one `subsystem` request whose
   name is exactly `sftp`. Every other channel type (`direct-tcpip`, `forwarded-tcpip`, `x11`,
   `direct-streamlocal@openssh.com`, `auth-agent@openssh.com`, …) is rejected with
@@ -204,7 +230,7 @@ is about twenty packet types, and the v3 draft has not changed since 2001.
 | | russh-sftp 3.0.1 | In-tree v3 codec |
 |---|---|---|
 | Correctness | Lossy UTF-8 decoding (E7): two byte strings, one key. Continues reading after a parse error: stream desync. | Paths stay bytes until `sftp::paths` validates them. Any framing error ends the session. |
-| Attack surface | Parses v3–v6 structures s0 will never serve, in a spawned task s0 does not control. | Parses exactly the table in D11, as a pure `&[u8] → Result<Request, CodecError>` function, fuzzed. |
+| Attack surface | Parses v3–v6 structures s0 will never serve, in a spawned task s0 does not control. | Parses exactly the requests in D7 and D11, as a pure `&[u8] → Result<Request, CodecError>` function, fuzzed. |
 | Maintenance | Single-maintainer crate on the critical path, a second pin to track. | About 1,000 lines against a frozen spec, owned here, and tested like the rest of the gateway. |
 | Concurrency | One request at a time, reply before the next read. | Same ordering for requests, but WRITE data is accepted into a bounded transfer buffer so uploads pipeline (D9). |
 
@@ -296,12 +322,34 @@ per-person certificates still attributes each action to the person who performed
 
 **Principal construction** happens per operation, from the current bundle: `subject_key` is
 split into (`service_account` | `user`, `sub`) by the inverse of `principal_subject_key`, and
-an unknown prefix makes the account unusable. Groups come from
-`user_attributes[subject_key].groups`. The organization comes from s0's own routing table for
-`accounts[L].tenant`, never from the bundle and never from the client. At authentication time
-the subject must be a member (`is_object(user_attributes[subject_key])`, the same predicate as
-`bundle_knows_service_account`) and the tenant must be routable. The PDP re-checks membership
-on every operation regardless.
+an unknown prefix makes the account unusable. The organization comes from s0's own routing
+table for `accounts[L].tenant`, never from the bundle and never from the client. At
+authentication time the subject must be a member and the tenant must be routable. The PDP
+re-checks membership on every operation regardless.
+
+**One subject, one key space — the one the module in force reads.** The bundle carries two
+key spaces today:
+
+- a control-plane module keys `user_attributes` and `s3_grants` by the prefixed subject key
+  (`sa:<client id>`, `user:<oidc sub>`);
+- the compiled-in default (`policy/gateway/authz.rego`) keys them by the raw
+  `input.principal.sub`, and so do hand-written bundles such as `tests/e2e/bundle.e2e.json`.
+
+If the login check read one space and the PDP the other, no subject could pass both: every
+account would be refused at login, or denied on every operation. So the login check
+(membership, and the groups placed on the principal) reads **the same key the PDP will
+read**:
+
+- the prefixed key when the bundle carries a `policy` module;
+- the raw `sub` when the compiled-in default is in force.
+
+The two cases are already told apart by the predicate behind
+`is_platform_data_missing_its_module`. One function, next to `principal_subject_key`, makes
+this choice, and a test runs a login and an operation against both bundle kinds.
+`accounts[L].subject_key` is always written in prefixed form, because it is the identity
+contract; only the lookup follows the module. The STS door's membership check
+(`bundle_knows_service_account`) always reads the prefixed key whatever module is in force.
+That asymmetry predates this ADR and is out of its scope.
 
 **Schema version and absence.** This is a contract change: `create_objects` (D7) and the
 `sftp` section define **`grant_schema_version: 3`**. The pushed module's exact-match gate (E3)
@@ -313,7 +361,7 @@ PEP gate, which fails closed on every degenerate input:
 | no `sftp` section | every login rejected |
 | `sftp.version` absent or `≠ 1` | every login rejected; `error` log once per revision |
 | `grant_schema_version` present and `< 3` | every login rejected (a v2 module predates `create_objects`) |
-| `grant_schema_version` absent (a hand-written bundle on the compiled-in module) | governed by `sftp.version` alone |
+| `grant_schema_version` absent (a hand-written bundle on the compiled-in module) | governed by `sftp.version` alone; subjects looked up by raw `sub` (D5, key spaces) |
 | account present but malformed (bad login, unknown tenant, bad `subject_key`, `home.prefix` not `/`-terminated) | that account rejected, others unaffected; `error` log |
 | `authorized_keys` absent or `[]` and no usable CA | that account cannot authenticate |
 | `allowed_source_cidrs` absent | no source restriction for that account |
@@ -340,6 +388,10 @@ because it is an additional restriction on top of key possession, not a grant.
   - On every bundle swap the session registry also re-validates the credentials of all
     sessions in the process. An idle session with a revoked key is therefore closed within
     one poll interval, not left open until its next request.
+  - `bundle_refresh` has no swap notification today. It gains a `tokio::sync::watch` of the
+    installed revision, published after the engine reload and the `BundleStore` swap, in
+    that order. The registry subscribes to it, and the S3 front ignores it. This lands with
+    SFTP authentication (slice 3).
   - The revocation-latency bound is the one ADR-006 already documents: build + poll interval.
 
 ### D6 — The virtual root, and paths that cannot escape it
@@ -351,7 +403,10 @@ pitfall — `partner-x` also matching `partner-x-old/` — is refused at bundle 
 
 Normalization, applied to every path argument before anything else:
 
-1. the bytes must be valid UTF-8; otherwise `SSH_FX_NO_SUCH_FILE` (no key can match);
+1. the bytes must be valid UTF-8. Otherwise the answer is `SSH_FX_NO_SUCH_FILE` for a
+   request that names an existing entry (STAT, OPEN for read, REMOVE, RMDIR, OPENDIR, a
+   RENAME source), because no key can match it. A request that would create one (OPEN for
+   write, MKDIR, a RENAME target) gets `SSH_FX_FAILURE` ("invalid file name");
 2. reject NUL, any control character (U+0000–U+001F, U+007F) and `\`;
 3. relative paths are resolved against `/`: the working directory lives in the client, and
    the server has none;
@@ -393,7 +448,14 @@ read it.
 - `create_objects` joins `write_actions` in the rego and `Action::is_write` in the PEP, so
   `freeze_writes` covers it. `the_write_set_matches_the_shipped_rego` enforces the equality.
 - It joins `GATEWAY_VERBS`, `Action::ALL`, the README verb table and
-  `tests/readme_optable.rs`. It is asked only by the SFTP front in this ADR. Mapping an S3
+  `tests/readme_optable.rs`. The verb count is also pinned to six elsewhere, and each place
+  moves to seven in the same PR:
+  - `tests/op_coverage.rs::the_gateway_vocabulary_is_the_six_projected_verbs`;
+  - the README's "one of six grant verbs";
+  - the doc comment on `Action` in `src/model.rs`.
+
+  `create_objects` is the first verb no enforced S3 operation names. Any test assuming every
+  verb has an operation is amended to say so explicitly, rather than weakened. It is asked only by the SFTP front in this ADR. Mapping an S3
   `PutObject` or `CompleteMultipartUpload` that carries `If-None-Match: *` onto it is a
   follow-up (F1), with its own corpus cases.
 
@@ -414,7 +476,7 @@ are taken **before** its first backend call.
 | `INIT`, `REALPATH`, `STAT("/")` | none — they touch no object and reveal only the account's own configuration; counted on the disconnect record | none |
 | `STAT` / `LSTAT` `p` | `list_objects`, `prefix = key(p)` | `HeadObject(key)` (metadata only), `ListObjectsV2(prefix = key/, max-keys = 1)` |
 | `FSTAT h` | none — answered from the handle's own state | none |
-| `OPENDIR p` | `list_objects`, `prefix = key(p)/` | none at open |
+| `OPENDIR p` | `list_objects`, `prefix = dir(p)` | none at open |
 | `READDIR h` | re-decided on a revision change | `ListObjectsV2(prefix, delimiter = "/", continuation)` |
 | `OPEN p` read | `read_objects`, `object = key` | `GetObject` (ranged on a non-sequential READ) |
 | `OPEN p` write | `create_objects` or `write_objects` (D8) | `HeadObject`, `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`, `AbortMultipartUpload`, `PutObject` |
@@ -428,6 +490,11 @@ RMDIR takes a `list_objects` decision because emptiness is a fact about the pref
 bit returned to the client must be authorized. The internal `HeadObject` issued under a
 write, delete or stat decision returns **no content**. Only existence, size and modification
 time reach the client, and only where the table says so.
+
+`dir(p)` is `key(p)` with a `/` appended, unless the key is empty (a home of the whole
+bucket) or already ends in `/` (the virtual root, whose key is `home.prefix`). Listing `/`
+under `home.prefix = "partner-x/"` therefore asks for `partner-x/`, never `partner-x//`. The
+same rule builds the `key/` forms in this table (MKDIR, RMDIR) and in D10.
 
 **Obligations, filters and denials apply exactly as on S3.**
 
@@ -627,6 +694,7 @@ restart.
 | `preauth_rate_per_ip` | 10/min, burst 20 | process, token bucket |
 | `handshake_timeout_secs` | 30 | from TCP accept to authentication success, including the PROXY header |
 | `max_auth_attempts` | 6 | connection |
+| `max_key_probes` | 10 | connection, counted separately from attempts (D3) |
 | `auth_failure_ban` | 10 failures in 5 min ⇒ 15 min ban | process, per /32 or /64, LRU-bounded table |
 | `idle_timeout_secs` | 300 | session, no SFTP request |
 | `transfer_idle_timeout_secs` | 120 | transfer |
@@ -712,6 +780,26 @@ Exactly one of `input`, `gate` or `session_event` is present, and `path` is `sft
 | `auth_succeeded` | principal and org label | no |
 | `disconnected` (client close, idle, credential revoked, shutdown, protocol error) with duration, operation count and bytes in each direction | principal and org label | no |
 
+Every record still carries the required `result: Decision`. For a session event it states
+what happened rather than a PDP answer, and `obligations` is always empty:
+
+| Event | `result.allow` | `result.reason` |
+|---|---|---|
+| `preauth_rejected`, `auth_failed`, `banned` | `false` | `deny (gateway): <why>` — for example `deny (gateway): key not authorized for login` |
+| `auth_succeeded` | `true` | `allow (gateway): publickey` or `allow (gateway): openssh-cert` |
+| `disconnected` | whether the session had authenticated | `disconnect: <reason>` |
+
+The `(gateway)` prefix follows `GatewayAccess::refuse`: no policy was asked, and the reason
+must not read as a policy verdict.
+
+**Consumer impact.** `sftp/session` is a new `path`, and `gateway.session` a new block.
+ADR-002 I4 freezes path values per deployment, and I6 requires consumers to ignore unknown
+fields. A consumer that routes by label still receives these records, but until it
+recognizes the new shape it drops them with its warning. That is the same fail-closed
+posture as ADR-002 R1, and it carries the same consequence: the connection-level trail is
+not live until the consumer is extended. Decision records for SFTP operations keep `path =
+s3/authz/decision` and are ingested with no change.
+
 A failed authentication is attributed to no organization, as gate records are (ADR-002 R6):
 the login is a client claim, and a scanner that guesses logins must not be able to write
 records into a chosen organization's trail. Unauthenticated events share the gate budget, so
@@ -753,7 +841,7 @@ against client timeouts.
 | T4 | Overwrite or destroy existing drops | `create_objects` in policy. Existence refused at OPEN. Conditional commit, or re-check plus in-flight registry (D8). Delete requires `delete_objects`. | `check_then_write` backends: a one-round-trip cross-replica race. |
 | T5 | Reading other drops through stat, readdir or rename | Stat and readdir need `list_objects`. Rename needs `read_objects` on the source. Internal HEADs return no content (D7). | A `list_objects` holder sees names, sizes and times, by design. |
 | T6 | A revoked key keeps a session | Per-operation credential re-check, a sweep on every bundle swap, transfer re-decision (D5). | Up to one poll interval. |
-| T7 | Pre-auth flood, brute force | Per-IP rate, connection caps, handshake timeout, constant-time rejection, auth-attempt cap, bans, bundle-distributed CIDR denylist (D12). | Bans are per replica: an `R`× budget across `R` replicas. |
+| T7 | Pre-auth flood, brute force | Per-IP rate, connection caps, handshake timeout, constant-time rejection, auth-attempt and key-probe caps, bans, bundle-distributed CIDR denylist (D12). | Bans are per replica: an `R`× budget across `R` replicas. |
 | T8 | Resource exhaustion by pipelined writes, many handles or slow clients | Up-front memory reservation, bounded reorder window, handle caps, idle timeouts, SSH flow control (D9, D12). | None beyond configured bounds. |
 | T9 | Orphaned multipart parts consuming storage | Abort on every error path (D9). | A hard kill leaves parts; a lifecycle rule is an operator obligation. |
 | T10 | Spoofed client IP | PROXY v2 only from trusted CIDRs, and required from them (D12). | s0 cannot detect a load balancer that rewrites the source without PROXY v2; that is a documented deployment requirement. |
@@ -885,7 +973,9 @@ Every client is exercised in PR 8 against the real stack. The expected settings 
   - a write after a key is revoked mid-session;
   - a bundle without `sftp`, with the wrong version, and with `grant_schema_version: 2`;
   - oversized packets, malformed length fields, truncated strings;
-  - a non-strict-KEX client, an RSA client key, an SHA-1 signature attempt;
+  - a non-strict-KEX client, an RSA client key, an SHA-1 signature attempt, a key-probe flood;
+  - a login and an operation against a bundle with a pushed module (prefixed keys) and one on
+    the compiled-in default (raw `sub`), both succeeding;
   - certificates with empty principals, a foreign-tenant CA, an unknown critical option, and a
     revoked serial or key id.
 - **Fuzzing**: cargo-fuzz targets `sftp_codec` and `proxy_v2_header`, run for a bounded time
