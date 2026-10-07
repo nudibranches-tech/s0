@@ -16,7 +16,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::error::{GatewayError, Result};
-use crate::model::BackendKind;
+use crate::model::{BackendKind, BackendProfile};
 use crate::secret::Secret;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -453,6 +453,13 @@ pub struct BackendConfig {
     pub region: String,
     #[serde(default = "default_true")]
     pub force_path_style: bool,
+    /// Vendor hint for an `s3`-kind backend (B2). s0 records it, and the request path
+    /// never branches on it — addressing style stays `force_path_style` and the SigV4
+    /// re-signing scope stays `region`, both set explicitly regardless of profile. An
+    /// unknown value (anything but `generic`) is refused at load. Absent for `ceph`, and optional
+    /// for `s3` too.
+    #[serde(default)]
+    pub profile: Option<BackendProfile>,
 }
 
 /// Maps a tenant to its Org, its backend, and the per-tenant backend
@@ -1697,5 +1704,104 @@ mod tests {
         cfg.as_object_mut().unwrap().remove("admin_listen");
         let loaded = GatewayConfig::from_json(&cfg.to_string()).unwrap();
         assert_eq!(loaded.admin_listen.port(), 8016);
+    }
+
+    // ── B2: the `s3` backend kind + profile (S0.1) ──────────────────────────────
+
+    /// A backend with no `profile` key at all — today's shape, and every `ceph`
+    /// backend forever — must still load, with `profile` staying `None` rather than
+    /// some silently-materialized default. Mirrors the CRD "absent stays absent" rule.
+    #[test]
+    fn a_backend_without_profile_loads_with_profile_absent() {
+        let base = example();
+        assert!(base["backends"][0].get("profile").is_none());
+        let loaded = GatewayConfig::from_json(&base.to_string()).expect("loads");
+        assert_eq!(loaded.backends[0].kind, BackendKind::Ceph);
+        assert_eq!(loaded.backends[0].profile, None);
+    }
+
+    /// The canonical `s3` spelling, with every documented profile value.
+    #[test]
+    fn an_s3_backend_parses_every_profile_value() {
+        for (wire, profile) in [("generic", BackendProfile::Generic)] {
+            let mut cfg = example();
+            cfg["backends"][0]["kind"] = serde_json::json!("s3");
+            cfg["backends"][0]["profile"] = serde_json::json!(wire);
+            let loaded = GatewayConfig::from_json(&cfg.to_string())
+                .unwrap_or_else(|e| panic!("profile {wire}: {e}"));
+            assert_eq!(loaded.backends[0].kind, BackendKind::S3);
+            assert_eq!(loaded.backends[0].profile, Some(profile));
+        }
+    }
+
+    /// An `s3` backend with no `profile` is "some S3-compatible endpoint" — valid,
+    /// since the profile is informational only and never gates behavior.
+    #[test]
+    fn an_s3_backend_without_a_profile_still_loads() {
+        let mut cfg = example();
+        cfg["backends"][0]["kind"] = serde_json::json!("s3");
+        let loaded = GatewayConfig::from_json(&cfg.to_string()).expect("loads");
+        assert_eq!(loaded.backends[0].kind, BackendKind::S3);
+        assert_eq!(loaded.backends[0].profile, None);
+    }
+
+    /// 0.3.x configs spelled this backend `remote_s3`. The deserialization alias keeps
+    /// them loading on 0.4.0 unchanged — no flag day across a config bump.
+    #[test]
+    fn a_remote_s3_backend_still_loads_as_the_s3_kind() {
+        let mut cfg = example();
+        cfg["backends"][0]["kind"] = serde_json::json!("remote_s3");
+        let loaded = GatewayConfig::from_json(&cfg.to_string()).expect("alias loads");
+        assert_eq!(loaded.backends[0].kind, BackendKind::S3);
+    }
+
+    /// Only Ceph and generic S3 are supported. A config still naming `profile: "garage"`,
+    /// `"aws"`, `"objectscale"` or `"powerstore"` (earlier 0.4.0 drafts accepted them)
+    /// does not load, and says why.
+    #[test]
+    fn a_garage_profile_is_refused_at_load() {
+        for wire in ["garage", "aws", "objectscale", "powerstore"] {
+            let mut cfg = example();
+            cfg["backends"][0]["kind"] = serde_json::json!("s3");
+            cfg["backends"][0]["profile"] = serde_json::json!(wire);
+            cfg["backends"][0]["endpoint_url"] = serde_json::json!("https://s3.example.com");
+            let err = GatewayConfig::from_json(&cfg.to_string())
+                .expect_err("an unsupported profile must not load");
+            assert!(
+                err.to_string().contains(&format!(
+                    "unknown profile '{wire}' (expected one of: generic)"
+                )),
+                "{wire}: {err}"
+            );
+        }
+    }
+
+    /// No profile holds its backend to a URL scheme: plain HTTP loads on every one.
+    #[test]
+    fn no_profile_requires_https() {
+        for profile in [None, Some("generic")] {
+            let mut cfg = example();
+            cfg["backends"][0]["kind"] = serde_json::json!("s3");
+            cfg["backends"][0]["endpoint_url"] = serde_json::json!("http://127.0.0.1:9000");
+            if let Some(profile) = profile {
+                cfg["backends"][0]["profile"] = serde_json::json!(profile);
+            }
+            GatewayConfig::from_json(&cfg.to_string())
+                .unwrap_or_else(|e| panic!("{profile:?}: {e}"));
+        }
+    }
+
+    /// Profile never changes addressing or signing: both stay exactly what the config
+    /// says regardless of which profile (or none) is set.
+    #[test]
+    fn profile_does_not_change_addressing_style_or_region() {
+        let mut cfg = example();
+        cfg["backends"][0]["kind"] = serde_json::json!("s3");
+        cfg["backends"][0]["profile"] = serde_json::json!("generic");
+        cfg["backends"][0]["region"] = serde_json::json!("eu-west-3");
+        cfg["backends"][0]["force_path_style"] = serde_json::json!(true);
+        let loaded = GatewayConfig::from_json(&cfg.to_string()).expect("loads");
+        assert_eq!(loaded.backends[0].region, "eu-west-3");
+        assert!(loaded.backends[0].force_path_style);
     }
 }

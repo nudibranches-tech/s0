@@ -8,12 +8,27 @@
 //! 3. every `input.<path>` the shipped policy reads resolves in at least one *captured*
 //!    input;
 //! 4. `policy/testdata/corpus.json` may only use fields the producer is observed to emit.
+//!
+//! The same argument runs the other way for the **bundle**, whose producer is the control
+//! plane: the v3 fixture must carry every field the gateway reads from a placing bundle,
+//! in the shape it reads it, and be the v2 capture plus exactly those fields — so the
+//! placement and the byte quotas are tested against the document the projection is pinned
+//! to, not against one written to suit the reader.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use s0::authz::capture::round_trip;
 use s0::authz::{OPA_INPUT_FIELDS, OpaInput};
+use s0::model::BackendKind;
+use s0::pdp::{
+    BACKEND_FIELD, BUCKET_ATTRIBUTES_FIELD, BucketPlacement, CREATED_AT_FIELD,
+    GRANT_SCHEMA_VERSION_FIELD, OBJECT_NAME_FIELD, PLACEMENT_SCHEMA_VERSION, parse_bundle,
+};
+use s0::quota::{
+    BACKEND_QUOTA_FIELD, COLLECTED_AT_FIELD, LIMIT_BYTES_FIELD, QUOTA_FIELD, Quota, QuotaScope,
+    QuotaSpec, USED_BYTES_FIELD,
+};
 
 const REGO: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -22,6 +37,20 @@ const REGO: &str = include_str!(concat!(
 const CORPUS: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/policy/testdata/corpus.json"
+));
+/// The control plane's v2 document, captured verbatim (see `tests/external_bundle.rs`).
+const V2_BUNDLE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/data/platform/s3_gateway_bundle.json"
+));
+/// The v3 document, written by hand from the pinned contract: the v2 capture filtered to
+/// one `s3` backend (`archive`), with bucket attributes and grants keyed by S3 name, and
+/// the v3 fields added. It is the data half only; the module arrives with the control
+/// plane's own capture of a v3 projection, which replaces this file and must still pass
+/// every check below.
+const V3_BUNDLE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/data/platform/s3_gateway_bundle_v3.json"
 ));
 
 fn captured_inputs() -> Vec<(String, serde_json::Value)> {
@@ -220,4 +249,264 @@ fn the_reference_extractor_would_catch_an_invented_field() {
         "the shipped policy references input.op — the field the previous attempt's \
          fixtures injected and no producer ever sent"
     );
+}
+
+// ── the bundle: v3 is the v2 document plus the placement ────────────────────────
+
+fn bundle_data(raw: &str) -> serde_json::Value {
+    parse_bundle(raw).expect("the fixture parses").data
+}
+
+fn keys(v: &serde_json::Value) -> BTreeSet<String> {
+    v.as_object()
+        .unwrap_or_else(|| panic!("expected an object, got {v}"))
+        .keys()
+        .cloned()
+        .collect()
+}
+
+fn set(names: &[&str]) -> BTreeSet<String> {
+    names.iter().map(|s| (*s).to_string()).collect()
+}
+
+fn assert_rfc3339(label: &str, v: &serde_json::Value) {
+    let s = v
+        .as_str()
+        .unwrap_or_else(|| panic!("{label} must be an RFC 3339 string, got {v}"));
+    chrono::DateTime::parse_from_rfc3339(s)
+        .unwrap_or_else(|e| panic!("{label} = {s:?} is not RFC 3339: {e}"));
+}
+
+/// `{ limit_bytes: u64, used_bytes: u64, collected_at: RFC 3339 }`, and nothing else —
+/// and the placement reads it, under the level a write names it by.
+fn assert_quota_shape(
+    label: &str,
+    quota: &serde_json::Value,
+    placement: &BucketPlacement,
+    scope: QuotaScope,
+) {
+    assert_eq!(
+        keys(quota),
+        set(&[LIMIT_BYTES_FIELD, USED_BYTES_FIELD, COLLECTED_AT_FIELD]),
+        "{label}"
+    );
+    for field in [LIMIT_BYTES_FIELD, USED_BYTES_FIELD] {
+        assert!(
+            quota[field].as_u64().is_some(),
+            "{label}.{field} must be an unsigned integer, got {}",
+            quota[field]
+        );
+    }
+    assert_rfc3339(
+        &format!("{label}.{COLLECTED_AT_FIELD}"),
+        &quota[COLLECTED_AT_FIELD],
+    );
+    let read = placement
+        .quotas()
+        .and_then(|quotas| quotas.get(&scope))
+        .unwrap_or_else(|| panic!("{label}: the placement does not read it as {scope:?}"));
+    assert_eq!(
+        *read,
+        QuotaSpec::Limit(Quota::from_value(quota).expect("the fixture's quota parses")),
+        "{label}"
+    );
+}
+
+/// Every field the gateway reads from a placing bundle is present, in the shape it reads
+/// it, and the placement built from it places every bucket under its own tenant.
+#[test]
+fn the_v3_fixture_carries_every_field_the_placement_reads() {
+    let data = bundle_data(V3_BUNDLE);
+    assert_eq!(
+        data[GRANT_SCHEMA_VERSION_FIELD].as_u64(),
+        Some(PLACEMENT_SCHEMA_VERSION),
+        "the v3 fixture must be a placing document"
+    );
+    let backend = &data[BACKEND_FIELD];
+    assert_eq!(
+        keys(backend),
+        set(&["id", "kind"]),
+        "data.backend is {{id, kind}}"
+    );
+    let backend_id = backend["id"].as_str().expect("data.backend.id is a string");
+    assert!(!backend_id.is_empty());
+    let kind = backend["kind"]
+        .as_str()
+        .expect("data.backend.kind is a string");
+    assert!(
+        ["ceph", "s3"].contains(&kind),
+        "data.backend.kind is the canonical spelling, never the 0.3.x alias: {kind:?}"
+    );
+    serde_json::from_value::<BackendKind>(backend["kind"].clone())
+        .expect("data.backend.kind is a backend kind this gateway knows");
+
+    let placement = BucketPlacement::from_data(&data);
+    assert!(
+        matches!(placement, BucketPlacement::Placed(_)),
+        "the v3 fixture does not build a placement: {placement:?}"
+    );
+    let mut total = 0;
+    for (tenant, tenant_data) in data["tenants"].as_object().expect("tenants") {
+        let buckets = tenant_data[BUCKET_ATTRIBUTES_FIELD]
+            .as_object()
+            .unwrap_or_else(|| panic!("{tenant} has no {BUCKET_ATTRIBUTES_FIELD}"));
+        for (bucket, attrs) in buckets {
+            let label = format!("tenants.{tenant}.{BUCKET_ATTRIBUTES_FIELD}.{bucket}");
+            let object_name = attrs[OBJECT_NAME_FIELD]
+                .as_str()
+                .unwrap_or_else(|| panic!("{label}.{OBJECT_NAME_FIELD} must be a string"));
+            assert!(
+                object_name == bucket || object_name == format!("{bucket}.{backend_id}"),
+                "{label}: the object name is the S3 name, or `<S3 name>.<backend>` off the \
+                 default backend; got {object_name:?}"
+            );
+            assert_rfc3339(
+                &format!("{label}.{CREATED_AT_FIELD}"),
+                &attrs[CREATED_AT_FIELD],
+            );
+            if let Some(quota) = attrs.get(QUOTA_FIELD) {
+                assert_quota_shape(
+                    &format!("{label}.{QUOTA_FIELD}"),
+                    quota,
+                    &placement,
+                    QuotaScope::Bucket(bucket.clone()),
+                );
+            }
+            assert_eq!(
+                placement.refusal(backend_id, tenant, bucket),
+                None,
+                "{label} is not usable by its own tenant"
+            );
+            assert_eq!(placement.object_name(bucket), Some(object_name), "{label}");
+            total += 1;
+        }
+        let listed: BTreeSet<String> = placement
+            .listing(backend_id, tenant)
+            .expect("placed")
+            .into_iter()
+            .map(|b| {
+                assert!(b.created_at.is_some(), "{tenant}/{} lost its date", b.name);
+                b.name
+            })
+            .collect();
+        assert_eq!(
+            listed,
+            keys(&tenant_data[BUCKET_ATTRIBUTES_FIELD]),
+            "{tenant}"
+        );
+        if let Some(quota) = tenant_data.get(QUOTA_FIELD) {
+            assert_quota_shape(
+                &format!("tenants.{tenant}.{QUOTA_FIELD}"),
+                quota,
+                &placement,
+                QuotaScope::Tenant(tenant.clone()),
+            );
+        }
+    }
+    assert!(
+        total >= 2,
+        "the fixture must place buckets under more than one tenant"
+    );
+    if let Some(quota) = data.get(BACKEND_QUOTA_FIELD) {
+        assert_quota_shape(
+            BACKEND_QUOTA_FIELD,
+            quota,
+            &placement,
+            QuotaScope::Backend(backend_id.to_string()),
+        );
+    }
+    let quotas = placement.quotas().expect("the fixture states quotas");
+    assert_eq!(
+        quotas.unreadable().count(),
+        0,
+        "every quota in the fixture is readable"
+    );
+
+    // The data half only, so it is recognized as a platform document missing its module.
+    assert!(
+        parse_bundle(V3_BUNDLE)
+            .expect("parses")
+            .is_platform_data_missing_its_module()
+    );
+}
+
+/// v3 is backward compatible: the v2 document with the same shape everywhere, plus the
+/// v3 fields and nothing else. A field renamed or dropped on the way is what this catches.
+#[test]
+fn the_v3_fixture_is_the_v2_capture_plus_the_v3_fields() {
+    let v2 = bundle_data(V2_BUNDLE);
+    let v3 = bundle_data(V3_BUNDLE);
+
+    let mut expected = keys(&v2);
+    expected.extend(set(&[BACKEND_FIELD, BACKEND_QUOTA_FIELD]));
+    assert_eq!(keys(&v3), expected, "top-level data keys");
+    assert_eq!(keys(&v2["org_settings"]), keys(&v3["org_settings"]));
+    assert_eq!(
+        keys(&v2["tenants"]),
+        keys(&v3["tenants"]),
+        "the same tenants"
+    );
+
+    let v2_bucket_keys: BTreeSet<String> = v2["tenants"]
+        .as_object()
+        .expect("tenants")
+        .values()
+        .flat_map(|t| t[BUCKET_ATTRIBUTES_FIELD].as_object().into_iter().flatten())
+        .flat_map(|(_, attrs)| keys(attrs))
+        .collect();
+    let mut allowed_bucket_keys = v2_bucket_keys.clone();
+    allowed_bucket_keys.extend(set(&[OBJECT_NAME_FIELD, CREATED_AT_FIELD, QUOTA_FIELD]));
+
+    for (tenant, t3) in v3["tenants"].as_object().expect("tenants") {
+        let t2 = &v2["tenants"][tenant];
+        let mut tenant_keys = keys(t2);
+        let v3_only: BTreeSet<String> = keys(t3).difference(&tenant_keys).cloned().collect();
+        assert!(
+            v3_only.is_subset(&set(&[QUOTA_FIELD])),
+            "{tenant} gained {v3_only:?}, which the contract does not pin"
+        );
+        tenant_keys.extend(v3_only);
+        assert_eq!(keys(t3), tenant_keys, "{tenant} lost a v2 field");
+        // What v3 does not touch is byte-identical.
+        for field in ["user_attributes", "group_grants", "s3_key_epoch"] {
+            assert_eq!(t2[field], t3[field], "{tenant}.{field}");
+        }
+        for (bucket, attrs) in t3[BUCKET_ATTRIBUTES_FIELD].as_object().expect("buckets") {
+            let k = keys(attrs);
+            assert!(
+                k.is_subset(&allowed_bucket_keys) && k.contains("denylist"),
+                "{tenant}/{bucket} has keys {k:?}; allowed are {allowed_bucket_keys:?}"
+            );
+        }
+        for field in ["s3_grants", "s3_deny"] {
+            assert_eq!(
+                keys(&t2[field]),
+                keys(&t3[field]),
+                "{tenant}.{field} subjects"
+            );
+        }
+    }
+}
+
+/// Grant scopes are projected from object names to S3 names: every bucket a v3 grant
+/// names is an S3 name its own tenant has on this backend (or `*`). A grant still naming
+/// an object name would match nothing the gateway lets through.
+#[test]
+fn every_grant_in_the_v3_fixture_names_its_tenants_s3_name() {
+    let v3 = bundle_data(V3_BUNDLE);
+    for (tenant, t) in v3["tenants"].as_object().expect("tenants") {
+        let owned = keys(&t[BUCKET_ATTRIBUTES_FIELD]);
+        for field in ["s3_grants", "s3_deny", "group_grants"] {
+            for (subject, grants) in t[field].as_object().expect("grant map") {
+                for grant in grants.as_array().expect("grant list") {
+                    let bucket = grant["bucket"].as_str().expect("grant bucket");
+                    assert!(
+                        bucket == "*" || owned.contains(bucket),
+                        "{tenant}.{field}.{subject} names {bucket:?}, not an S3 name of \
+                         {tenant} on this backend ({owned:?})"
+                    );
+                }
+            }
+        }
+    }
 }

@@ -22,6 +22,9 @@ pub struct RawRequest {
     pub query: Vec<(String, String)>,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// The signed `x-amz-content-sha256`, when it is not the body's hash — a
+    /// `STREAMING-…` payload, framed as aws-chunked.
+    pub payload_hash: Option<String>,
 }
 
 impl RawRequest {
@@ -32,6 +35,7 @@ impl RawRequest {
             query: Vec::new(),
             headers: Vec::new(),
             body: Vec::new(),
+            payload_hash: None,
         }
     }
 
@@ -50,6 +54,12 @@ impl RawRequest {
     #[must_use]
     pub fn body(mut self, body: Vec<u8>) -> Self {
         self.body = body;
+        self
+    }
+
+    #[must_use]
+    pub fn payload_hash(mut self, hash: &str) -> Self {
+        self.payload_hash = Some(hash.to_string());
         self
     }
 
@@ -73,10 +83,29 @@ impl RawRequest {
     /// `host` must be exactly the `Host` the client will put on the wire, because it is
     /// part of the canonical request.
     pub fn sign(&self, host: &str, access_key: &str, secret_key: &str) -> Vec<(String, String)> {
+        self.sign_scoped(host, access_key, secret_key, REGION)
+    }
+
+    /// [`Self::sign`] with the credential-scope region spelled out, so a test can prove
+    /// the gateway accepts whatever region string a real client happens to sign with
+    /// (`s0-backend-kind-region`): s3s verifies a SigV4 signature against the region
+    /// carried in its OWN Authorization header, never against a server-side expectation,
+    /// so any syntactically valid region (`default`, `local`, a vendor's own string) must
+    /// verify so long as the signature itself is correct.
+    pub fn sign_scoped(
+        &self,
+        host: &str,
+        access_key: &str,
+        secret_key: &str,
+        region: &str,
+    ) -> Vec<(String, String)> {
         let now = chrono::Utc::now();
         let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
         let date = now.format("%Y%m%d").to_string();
-        let payload_hash = hex::encode(Sha256::digest(&self.body));
+        let payload_hash = self
+            .payload_hash
+            .clone()
+            .unwrap_or_else(|| hex::encode(Sha256::digest(&self.body)));
 
         let mut signed: Vec<(String, String)> = vec![
             ("host".into(), host.to_string()),
@@ -118,13 +147,13 @@ impl RawRequest {
             payload_hash,
         );
 
-        let scope = format!("{date}/{REGION}/{SERVICE}/aws4_request");
+        let scope = format!("{date}/{region}/{SERVICE}/aws4_request");
         let string_to_sign = format!(
             "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
             hex::encode(Sha256::digest(canonical_request.as_bytes()))
         );
         let signature = hex::encode(hmac(
-            &signing_key(secret_key, &date),
+            &signing_key(secret_key, &date, region),
             string_to_sign.as_bytes(),
         ));
 
@@ -143,12 +172,15 @@ impl RawRequest {
 /// The signature over a base64 POST policy — the only authentication a browser form
 /// upload carries, and so the only way to reach `PostObject`.
 pub fn sign_post_policy(policy_b64: &str, secret_key: &str, date: &str) -> String {
-    hex::encode(hmac(&signing_key(secret_key, date), policy_b64.as_bytes()))
+    hex::encode(hmac(
+        &signing_key(secret_key, date, REGION),
+        policy_b64.as_bytes(),
+    ))
 }
 
-fn signing_key(secret_key: &str, date: &str) -> Vec<u8> {
+fn signing_key(secret_key: &str, date: &str, region: &str) -> Vec<u8> {
     let k = hmac(format!("AWS4{secret_key}").as_bytes(), date.as_bytes());
-    let k = hmac(&k, REGION.as_bytes());
+    let k = hmac(&k, region.as_bytes());
     let k = hmac(&k, SERVICE.as_bytes());
     hmac(&k, b"aws4_request")
 }

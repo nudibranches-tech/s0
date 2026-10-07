@@ -173,6 +173,8 @@ mod tests {
                 denied_keys: vec![],
                 backend: BackendOutcome::NotAttempted,
                 backend_status: None,
+                object_name: None,
+                copy_source_object_name: None,
             },
             &crate::audit::LabelPolicy::default(),
         )

@@ -19,15 +19,17 @@ use aws_sdk_s3::config::timeout::TimeoutConfig;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::{Client, Config};
 use s3s::dto::*;
+use s3s::header::{X_AMZ_ID_2, X_AMZ_REQUEST_ID};
 use s3s::{S3, S3Error, S3Request, S3Response, S3Result, s3_error};
 use s3s_aws::Proxy;
 
 use crate::access::proof;
 use crate::audit::{BackendOutcome, PendingAudit};
 use crate::config::{BackendConfig, GatewayConfig, LimitsConfig};
-use crate::error::{GatewayError, Result};
+use crate::error::{GatewayError, Result, is_backend_error, remint_backend_error};
 use crate::model::{BackendId, BackendKind};
-use crate::proxy::obligations::{BucketVisibility, ResponseObligations};
+use crate::proxy::obligations::{BucketSource, BucketVisibility, ResponseObligations};
+use crate::quota::QuotaReservation;
 use crate::secret::Secret;
 
 /// One tenant's routing: which backend, which per-tenant credential, which Org.
@@ -38,6 +40,8 @@ struct TenantRoute {
     /// intermediate struct can print it — see `src/secret.rs`.
     owner_secret_key: Secret<String>,
     organization_id: String,
+    /// See [`RouteSnapshot::shares_upstream_identity`].
+    shares_upstream_identity: bool,
 }
 
 /// The secret-free half of a [`TenantRoute`]. `S3Access::check` resolves one per request
@@ -52,6 +56,11 @@ pub struct RouteSnapshot {
     /// The gateway's AUTHORITATIVE tenant→org binding — never the credential's
     /// self-declared org, so audit attribution is not drift-able.
     pub organization_id: String,
+    /// Another tenant of this config is re-signed with the same upstream credential on the
+    /// same backend, so the backend would serve either tenant's buckets to the other. Only
+    /// a placing bundle keeps them apart, and without one this tenant is refused
+    /// ([`crate::pdp::BucketPlacement::shared_identity_refusal`]). A flag, never the key.
+    pub shares_upstream_identity: bool,
 }
 
 /// The routing table: one immutable snapshot, swapped wholesale.
@@ -94,8 +103,10 @@ impl crate::auth::TenantDirectory for BackendRegistry {
 
 impl BackendRegistry {
     pub fn from_config(cfg: &GatewayConfig) -> Result<Self> {
+        let routes = build_routes(cfg)?;
+        log_shared_upstream_identities(&routes);
         Ok(BackendRegistry {
-            routes: ArcSwap::from_pointee(build_routes(cfg)?),
+            routes: ArcSwap::from_pointee(routes),
             pool: Mutex::new(HashMap::new()),
             timeouts: backend_timeouts(&cfg.limits),
         })
@@ -111,6 +122,7 @@ impl BackendRegistry {
     pub fn apply_config(&self, cfg: &GatewayConfig) -> Result<()> {
         let routes = build_routes(cfg)?;
         let tenants = routes.len();
+        log_shared_upstream_identities(&routes);
         self.routes.store(Arc::new(routes));
         let dropped = {
             let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
@@ -135,6 +147,7 @@ impl BackendRegistry {
             backend_id: BackendId(route.backend.id.clone()),
             backend_kind: route.backend.kind,
             organization_id: route.organization_id.clone(),
+            shares_upstream_identity: route.shares_upstream_identity,
         })
     }
 
@@ -155,6 +168,20 @@ impl BackendRegistry {
                 "tenant {} was authorized against backend {} but now routes to {}; \
                  refusing to forward across a routing change",
                 snapshot.tenant, snapshot.backend_id.0, route.backend.id
+            )));
+        }
+        // The placement screen was chosen by this flag: a tenant that started sharing its
+        // upstream identity since `check` was screened as one that did not.
+        if route.shares_upstream_identity != snapshot.shares_upstream_identity {
+            return Err(GatewayError::Backend(format!(
+                "tenant {} was authorized under a routing table where it {} its upstream \
+                 identity; refusing to forward across a routing change",
+                snapshot.tenant,
+                if snapshot.shares_upstream_identity {
+                    "shared"
+                } else {
+                    "did not share"
+                }
             )));
         }
         let key: PoolKey = (route.backend.id.clone(), snapshot.tenant.clone());
@@ -181,12 +208,24 @@ fn build_routes(cfg: &GatewayConfig) -> Result<Routes> {
         .iter()
         .map(|b| (b.id.as_str(), Arc::new(b.clone())))
         .collect();
+    // How many tenants each upstream identity re-signs for. One identity is one
+    // `(backend, access key)`: the same key on two backends is two accounts.
+    let mut identities: HashMap<(&str, &str), usize> = HashMap::new();
+    for t in &cfg.tenants {
+        *identities
+            .entry((t.backend_id.as_str(), t.owner_access_key.as_str()))
+            .or_default() += 1;
+    }
     let mut routes = Routes::new();
     for t in &cfg.tenants {
         let backend = backends
             .get(t.backend_id.as_str())
             .ok_or_else(|| GatewayError::Config(format!("unknown backend {}", t.backend_id)))?
             .clone();
+        let sharers = identities
+            .get(&(t.backend_id.as_str(), t.owner_access_key.as_str()))
+            .copied()
+            .unwrap_or(0);
         routes.insert(
             t.tenant.clone(),
             TenantRoute {
@@ -194,10 +233,31 @@ fn build_routes(cfg: &GatewayConfig) -> Result<Routes> {
                 owner_access_key: t.owner_access_key.clone(),
                 owner_secret_key: t.owner_secret_key.clone(),
                 organization_id: t.organization_id.clone(),
+                shares_upstream_identity: sharers > 1,
             },
         );
     }
     Ok(routes)
+}
+
+/// Say, once per installed table, which tenants share an upstream identity: each of them
+/// is refused while the bundle in force places no buckets, and a refusal whose cause is in
+/// the config rather than the bundle is otherwise hard to find.
+fn log_shared_upstream_identities(routes: &Routes) {
+    let mut sharing: Vec<&str> = routes
+        .iter()
+        .filter(|(_, r)| r.shares_upstream_identity)
+        .map(|(tenant, _)| tenant.as_str())
+        .collect();
+    if sharing.is_empty() {
+        return;
+    }
+    sharing.sort_unstable();
+    tracing::info!(
+        tenants = ?sharing,
+        "these tenants share an upstream identity with another tenant; each is refused \
+         while the bundle in force places no buckets (grant_schema_version >= 3)"
+    );
 }
 
 /// Connection bounds for the backend client.
@@ -296,10 +356,11 @@ impl GatewayS3 {
             .extensions
             .get::<Arc<RouteSnapshot>>()
             .ok_or_else(|| s3_error!(InternalError, "route snapshot missing from request"))?;
-        self.state
-            .registry
-            .proxy_for(route)
-            .map_err(|e| s3_error!(ServiceUnavailable, "backend unavailable: {e}"))
+        self.state.registry.proxy_for(route).map_err(|e| {
+            // The detail names tenants and backends; the client gets the code alone.
+            tracing::warn!(error = %e, "no backend client for an authorized request");
+            s3_error!(ServiceUnavailable, "backend unavailable")
+        })
     }
 
     /// Resolve the proxy, run the backend call, and settle this request's audit record
@@ -310,21 +371,175 @@ impl GatewayS3 {
     /// otherwise the request's extensions — and the last reference to the record — would be
     /// dropped inside the backend call, and the record emitted unenriched a moment before
     /// the answer arrived.
+    ///
+    /// It is also the one place a backend answer turns into the gateway's: a backend error
+    /// is re-minted ([`remint_backend_error`]) and the backend's request and host ids are
+    /// replaced by the gateway's own, on success and failure alike. The id is the decision
+    /// id of the request's audit record, so a client's report leads to that record. A
+    /// successful answer also loses the backend identifiers its body or headers name
+    /// ([`BackendAnswer`]).
+    ///
+    /// And it settles a write's quota reservation with what the backend answered: kept on
+    /// success, given back when the backend refused the write (a 4xx), and on an unknown
+    /// outcome kept only if the write may have been stored — given back when its client
+    /// body failed or stopped short ([`QuotaReservation::settle_unknown`]). Taken out first,
+    /// so a request refused before any backend call gives its bytes back too, and marked
+    /// dispatched right before the call, so a request dropped before it does as well.
     async fn forward<T, O, F, Fut>(&self, req: S3Request<T>, call: F) -> S3Result<S3Response<O>>
     where
+        O: BackendAnswer,
         F: FnOnce(Arc<Proxy>, S3Request<T>) -> Fut + Send,
         Fut: std::future::Future<Output = S3Result<S3Response<O>>> + Send,
     {
-        let proxy = self.proxy_for_req(&req)?;
+        let reservation = req.extensions.get::<Arc<QuotaReservation>>().cloned();
+        let proxy = match self.proxy_for_req(&req) {
+            Ok(proxy) => proxy,
+            Err(e) => {
+                if let Some(reservation) = &reservation {
+                    reservation.release();
+                }
+                return Err(e);
+            }
+        };
         let pending = req.extensions.get::<Arc<PendingAudit>>().cloned();
+        // Read before the settle below takes the record with it.
+        let request_id = pending
+            .as_ref()
+            .and_then(|p| p.decision_id())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        if let Some(reservation) = &reservation {
+            reservation.mark_dispatched();
+        }
         let result = call(proxy, req).await;
+        if let Some(reservation) = &reservation {
+            match &result {
+                Ok(_) => reservation.commit(),
+                Err(e) if backend_status(e).is_some_and(|s| (400..500).contains(&s)) => {
+                    reservation.release();
+                }
+                Err(_) => reservation.settle_unknown(),
+            }
+        }
         if let Some(pending) = pending {
             match &result {
                 Ok(_) => pending.settle(BackendOutcome::SucceededStatusUnknown, None),
                 Err(e) => pending.settle(BackendOutcome::Failed, backend_status(e)),
             }
         }
-        result
+        match result {
+            Ok(mut resp) => {
+                stamp_request_id(&mut resp.headers, &request_id);
+                resp.output.scrub_backend_identifiers();
+                Ok(resp)
+            }
+            Err(e) if is_backend_error(&e) => Err(remint_backend_error(e, &request_id)),
+            Err(mut e) => {
+                e.set_request_id(request_id);
+                Err(e)
+            }
+        }
+    }
+}
+
+/// A successful backend answer, cleared of the identifiers the backend authored about
+/// itself before it reaches the client — the success-side half of re-minting errors.
+///
+/// - `x-amz-server-side-encryption-aws-kms-key-id` (and the encryption context next to it)
+///   names the backend's key: on AWS a KMS key ARN, which carries the account id; on Ceph
+///   or another store, the operator's key name. The client still learns that the object
+///   is encrypted (`x-amz-server-side-encryption`).
+/// - `CompleteMultipartUpload`'s `Location` is the object's URL on the backend endpoint,
+///   an internal host the client never addressed. It is dropped rather than rebuilt: the
+///   gateway's own URL is the one the client already used, and the field is optional.
+///
+/// Applied on every backend kind, like the error re-mint. A bound on [`GatewayS3::forward`],
+/// so an arm added for a new output type does not compile until it says what it carries.
+pub trait BackendAnswer {
+    fn scrub_backend_identifiers(&mut self) {}
+}
+
+macro_rules! answers_without_backend_identifiers {
+    ($($output:ty),* $(,)?) => { $(impl BackendAnswer for $output {})* };
+}
+
+answers_without_backend_identifiers!(
+    AbortMultipartUploadOutput,
+    DeleteObjectOutput,
+    DeleteObjectTaggingOutput,
+    DeleteObjectsOutput,
+    GetBucketLocationOutput,
+    GetObjectAttributesOutput,
+    GetObjectTaggingOutput,
+    HeadBucketOutput,
+    ListBucketsOutput,
+    ListMultipartUploadsOutput,
+    ListObjectsOutput,
+    ListObjectsV2Output,
+    ListPartsOutput,
+    PutObjectTaggingOutput,
+);
+
+macro_rules! answers_naming_a_kms_key {
+    ($($output:ty { $($field:ident),+ }),* $(,)?) => {
+        $(impl BackendAnswer for $output {
+            fn scrub_backend_identifiers(&mut self) {
+                $(self.$field = None;)+
+            }
+        })*
+    };
+}
+
+answers_naming_a_kms_key!(
+    GetObjectOutput { ssekms_key_id },
+    HeadObjectOutput { ssekms_key_id },
+    PutObjectOutput {
+        ssekms_key_id,
+        ssekms_encryption_context
+    },
+    PostObjectOutput {
+        ssekms_key_id,
+        ssekms_encryption_context
+    },
+    CopyObjectOutput {
+        ssekms_key_id,
+        ssekms_encryption_context
+    },
+    CreateMultipartUploadOutput {
+        ssekms_key_id,
+        ssekms_encryption_context
+    },
+    UploadPartOutput { ssekms_key_id },
+    UploadPartCopyOutput { ssekms_key_id },
+    CompleteMultipartUploadOutput {
+        ssekms_key_id,
+        location
+    },
+);
+
+/// Let a charged write's quota reservation see how far its client body gets, so a body
+/// that fails or stops short is not charged as stored. A write with no reservation (no
+/// quota applies) is forwarded exactly as it came.
+fn track_charged_body(extensions: &http::Extensions, body: &mut Option<StreamingBlob>) {
+    let Some(reservation) = extensions.get::<Arc<QuotaReservation>>() else {
+        return;
+    };
+    if let Some(blob) = body.take() {
+        *body = Some(reservation.track_body(blob));
+    }
+}
+
+/// Put the gateway's request id where s3s-aws copied the backend's, and drop the backend's
+/// host id (`x-amz-id-2`): the gateway has no host id of its own to put in its place, and
+/// Ceph's names the zone and zonegroup that served the request.
+fn stamp_request_id(headers: &mut http::HeaderMap, request_id: &str) {
+    headers.remove(X_AMZ_ID_2);
+    match http::HeaderValue::from_str(request_id) {
+        Ok(value) => {
+            headers.insert(X_AMZ_REQUEST_ID, value);
+        }
+        Err(_) => {
+            headers.remove(X_AMZ_REQUEST_ID);
+        }
     }
 }
 
@@ -362,8 +577,9 @@ impl S3 for GatewayS3 {
 
     async fn put_object(
         &self,
-        req: S3Request<PutObjectInput>,
+        mut req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
+        track_charged_body(&req.extensions, &mut req.input.body);
         self.forward(req, |p, r| async move { p.put_object(r).await })
             .await
     }
@@ -430,8 +646,9 @@ impl S3 for GatewayS3 {
 
     async fn upload_part(
         &self,
-        req: S3Request<UploadPartInput>,
+        mut req: S3Request<UploadPartInput>,
     ) -> S3Result<S3Response<UploadPartOutput>> {
+        track_charged_body(&req.extensions, &mut req.input.body);
         self.forward(req, |p, r| async move { p.upload_part(r).await })
             .await
     }
@@ -522,13 +739,16 @@ impl S3 for GatewayS3 {
     /// the access hook installed *is* the authorization, and its absence is refused rather
     /// than forwarded. [`BucketVisibility::Nothing`] serves both "denied" and "allowed with
     /// no grants", so the caller cannot tell them apart.
+    ///
+    /// When the bundle places buckets the list is the bundle's ([`BucketSource::Bundle`])
+    /// and nothing is forwarded; the same visibility and the same paging apply to it.
     async fn list_buckets(
         &self,
         req: S3Request<ListBucketsInput>,
     ) -> S3Result<S3Response<ListBucketsOutput>> {
-        let Some(visibility) =
-            ResponseObligations::of(&req).and_then(|o| o.visible_buckets.clone())
-        else {
+        let obligation = ResponseObligations::of(&req)
+            .and_then(|o| Some((o.visible_buckets.clone()?, o.bucket_source.clone()?)));
+        let Some((visibility, source)) = obligation else {
             return Err(s3_error!(
                 InternalError,
                 "list buckets reached the forward path with no bucket-visibility \
@@ -552,10 +772,17 @@ impl S3 for GatewayS3 {
             .input
             .max_buckets
             .map_or(max_page, |m| (m.max(1) as usize).min(max_page));
-        self.forward(req, move |proxy, req| async move {
-            filtered_bucket_listing(proxy, req, &visibility, page_size, max_pages).await
-        })
-        .await
+        match source {
+            BucketSource::Backend => {
+                self.forward(req, move |proxy, req| async move {
+                    filtered_bucket_listing(proxy, req, &visibility, page_size, max_pages).await
+                })
+                .await
+            }
+            BucketSource::Bundle(buckets) => {
+                bundle_bucket_listing(&req, buckets, &visibility, page_size)
+            }
+        }
     }
 
     /// PostObject: the ONE `S3` method whose s3s default is not `NotImplemented` — it
@@ -712,9 +939,6 @@ async fn fan_out_list_v2(
 /// drained, sorted gateway-side and paged from there, bounded by a page cap and a check
 /// that the backend's token advances — both fail loudly rather than truncating, because a
 /// listing that quietly omitted buckets looks exactly like a revoked grant.
-// ListBucketsOutput is constructed field-by-field: struct-update syntax on a
-// `#[non_exhaustive]`-adjacent generated DTO is unavailable, as in fan_out_list_v2.
-#[allow(clippy::field_reassign_with_default)]
 async fn filtered_bucket_listing(
     proxy: Arc<Proxy>,
     req: S3Request<ListBucketsInput>,
@@ -753,6 +977,43 @@ async fn filtered_bucket_listing(
         }
     }
 
+    bucket_listing_page(all, visibility, name_prefix, cursor, page_size)
+}
+
+/// One gateway-cut page of the tenant's buckets as the bundle places them. The backend
+/// is not asked, so nothing here can fail on its account; the page is cut exactly as a
+/// drained backend listing is.
+///
+/// The authorization proof is still required: the list is the tenant's, and only an
+/// allowed decision may hand it out.
+fn bundle_bucket_listing(
+    req: &S3Request<ListBucketsInput>,
+    buckets: Vec<Bucket>,
+    visibility: &BucketVisibility,
+    page_size: usize,
+) -> S3Result<S3Response<ListBucketsOutput>> {
+    proof::require(req)?;
+    let cursor = decode_cursor(req.input.continuation_token.as_deref())?;
+    bucket_listing_page(
+        buckets,
+        visibility,
+        req.input.prefix.clone(),
+        cursor,
+        page_size,
+    )
+}
+
+/// Filter, sort and cut one page of `all`, whichever source it came from.
+// ListBucketsOutput is constructed field-by-field: struct-update syntax on a
+// `#[non_exhaustive]`-adjacent generated DTO is unavailable, as in fan_out_list_v2.
+#[allow(clippy::field_reassign_with_default)]
+fn bucket_listing_page(
+    all: Vec<Bucket>,
+    visibility: &BucketVisibility,
+    name_prefix: Option<String>,
+    cursor: Option<fanout::Cursor>,
+    page_size: usize,
+) -> S3Result<S3Response<ListBucketsOutput>> {
     let page = bucketfilter::page(all, visibility, name_prefix.as_deref(), cursor, page_size)
         .map_err(|e| s3_error!(InvalidArgument, "{e}"))?;
 
@@ -836,11 +1097,83 @@ mod tests {
             backend_id,
             backend_kind,
             organization_id,
+            // A flag derived from the credentials, never one of them.
+            shares_upstream_identity,
         } = registry().route_snapshot("acme").expect("acme is routable");
         assert_eq!(tenant, "acme");
         assert_eq!(backend_id, BackendId("bay-1".into()));
         assert_eq!(backend_kind, BackendKind::Ceph);
         assert_eq!(organization_id, "org-acme");
+        assert!(!shares_upstream_identity);
+    }
+
+    /// Two tenants re-signed with one key on one backend share an upstream identity; the
+    /// same key on another backend, or another key on the same backend, does not.
+    #[test]
+    fn tenants_re_signed_with_one_key_on_one_backend_share_an_upstream_identity() {
+        let reg = BackendRegistry::from_config(&config(
+            two_backends(),
+            serde_json::json!([
+                { "tenant": "acme", "organization_id": "org-one", "backend_id": "bay-2",
+                  "owner_access_key": "ORG-ONE", "owner_secret_key": "S" },
+                { "tenant": "globex", "organization_id": "org-one", "backend_id": "bay-2",
+                  "owner_access_key": "ORG-ONE", "owner_secret_key": "S" },
+                { "tenant": "initech", "organization_id": "org-one", "backend_id": "bay-1",
+                  "owner_access_key": "ORG-ONE", "owner_secret_key": "S" },
+                { "tenant": "hooli", "organization_id": "org-two", "backend_id": "bay-2",
+                  "owner_access_key": "ORG-TWO", "owner_secret_key": "S" },
+            ]),
+        ))
+        .expect("registry");
+        let shares = |t: &str| {
+            reg.route_snapshot(t)
+                .expect("routable")
+                .shares_upstream_identity
+        };
+        assert!(shares("acme"));
+        assert!(shares("globex"));
+        assert!(!shares("initech"), "the same key on another backend");
+        assert!(!shares("hooli"), "another key on the same backend");
+
+        // Re-derived on every apply, in both directions.
+        reg.apply_config(&config(
+            two_backends(),
+            serde_json::json!([
+                { "tenant": "acme", "organization_id": "org-one", "backend_id": "bay-2",
+                  "owner_access_key": "ORG-ONE", "owner_secret_key": "S" },
+                { "tenant": "hooli", "organization_id": "org-two", "backend_id": "bay-2",
+                  "owner_access_key": "ORG-ONE", "owner_secret_key": "S" },
+            ]),
+        ))
+        .expect("apply");
+        assert!(shares("acme"));
+        assert!(shares("hooli"));
+        reg.apply_config(&config(two_backends(), acme_on("bay-2", "S")))
+            .expect("apply");
+        assert!(!shares("acme"));
+    }
+
+    /// A request screened as a tenant with its own identity is not forwarded once the
+    /// tenant shares one: the screen it passed is not the one that now applies.
+    #[test]
+    fn a_forward_cannot_cross_a_change_in_identity_sharing() {
+        let reg = registry();
+        let authorized_against = reg.route_snapshot("acme").expect("routable");
+        reg.apply_config(&config(
+            two_backends(),
+            serde_json::json!([
+                { "tenant": "acme", "organization_id": "org-acme", "backend_id": "bay-1",
+                  "owner_access_key": "OWNER", "owner_secret_key": "S" },
+                { "tenant": "globex", "organization_id": "org-acme", "backend_id": "bay-1",
+                  "owner_access_key": "OWNER", "owner_secret_key": "S" },
+            ]),
+        ))
+        .expect("apply");
+        assert!(reg.proxy_for(&authorized_against).is_err());
+        assert!(
+            reg.proxy_for(&reg.route_snapshot("acme").expect("routable"))
+                .is_ok()
+        );
     }
 
     #[test]
@@ -872,7 +1205,10 @@ mod tests {
 
         let acme = reg.route_snapshot("acme").unwrap();
         assert_eq!(acme.backend_id, BackendId("bay-2".into()));
-        assert_eq!(acme.backend_kind, BackendKind::RemoteS3);
+        // The fixture spells this backend `remote_s3` (the 0.3.x wire value) precisely so
+        // this assertion also proves the deserialization alias still resolves to the
+        // canonical `S3` variant.
+        assert_eq!(acme.backend_kind, BackendKind::S3);
         assert_eq!(
             reg.route_snapshot("globex").unwrap().organization_id,
             "org-globex"

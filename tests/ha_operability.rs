@@ -88,6 +88,7 @@ async fn test_gateway(dir: &std::path::Path) -> Arc<Gateway> {
         credentials,
         limits: Arc::new(arc_swap::ArcSwap::from_pointee(cfg.limits.clone())),
         bundles,
+        quota: Arc::new(s0::quota::QuotaLedger::new()),
         capture: None,
     })
 }
@@ -128,6 +129,8 @@ fn record(id: &str) -> AuditRecord {
             denied_keys: vec![],
             backend: BackendOutcome::NotAttempted,
             backend_status: None,
+            object_name: None,
+            copy_source_object_name: None,
         },
         &LabelPolicy::default(),
     )

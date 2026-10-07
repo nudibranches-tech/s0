@@ -81,6 +81,15 @@ pub struct GatewayMeta {
     /// why the success path cannot fill this in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_status: Option<u16>,
+    /// The control plane's own name for `input.bucket` (`object_name`), as published by a
+    /// bundle that places buckets: an S3 name is unique only per backend, so this is what
+    /// the record joins to. Absent below bundle v3 and for a bucket the bundle does not
+    /// place — never derived from the S3 name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_name: Option<String>,
+    /// The same, for a copy's source bucket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_source_object_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -245,6 +254,8 @@ impl AuditRecord {
                 denied_keys: vec![],
                 backend: BackendOutcome::NotAttempted,
                 backend_status: None,
+                object_name: None,
+                copy_source_object_name: None,
             },
         }
     }
@@ -304,6 +315,8 @@ mod tests {
             denied_keys,
             backend: BackendOutcome::NotAttempted,
             backend_status: None,
+            object_name: None,
+            copy_source_object_name: None,
         }
     }
 
@@ -354,6 +367,43 @@ mod tests {
         );
         let json = serde_json::to_value(&rec).unwrap();
         assert_eq!(json["gateway"]["denied_keys"][0], "secret/x");
+    }
+
+    #[test]
+    fn object_names_are_recorded_when_published_and_absent_otherwise() {
+        let mut named = meta(Outcome::Allowed, vec![]);
+        named.object_name = Some("reports.archive".into());
+        named.copy_source_object_name = Some("raw.archive".into());
+        let rec = AuditRecord::new(
+            "dec-6".into(),
+            "2026-07-15T00:00:00Z".into(),
+            sample_input(),
+            Decision::allow("grant matched"),
+            named,
+            &labels(),
+        );
+        let json = serde_json::to_value(&rec).unwrap();
+        assert_eq!(json["gateway"]["object_name"], "reports.archive");
+        assert_eq!(json["gateway"]["copy_source_object_name"], "raw.archive");
+        let back: AuditRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(back.gateway.object_name.as_deref(), Some("reports.archive"));
+
+        // Unpublished: omitted, so a record from a bundle that places nothing is the
+        // record it always was.
+        let rec = AuditRecord::new(
+            "dec-7".into(),
+            "2026-07-15T00:00:00Z".into(),
+            sample_input(),
+            Decision::allow("grant matched"),
+            meta(Outcome::Allowed, vec![]),
+            &labels(),
+        );
+        let json = serde_json::to_value(&rec).unwrap();
+        assert!(json["gateway"].get("object_name").is_none(), "{json}");
+        assert!(
+            json["gateway"].get("copy_source_object_name").is_none(),
+            "{json}"
+        );
     }
 
     #[test]
