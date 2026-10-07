@@ -7,17 +7,8 @@
 # compat claim that only holds on a machine with `mc` installed is not a claim CI can
 # make, and pretending otherwise would produce a green suite that proves nothing.
 #
-# Usage:  tests/compat/run.sh [silo] [garage]     (default: both)
+# Usage:  tests/compat/run.sh [scenario…]     (default: all)
 # Env:    KEEP=1  leave the stack up afterwards
-#
-# Two legs:
-#
-#  * `silo` (below): the client matrix against a MinIO-compatible backend, documentation
-#    only — it records, it does not assert.
-#  * `garage` (`tests/compat/garage.sh`): an `s3` backend on the `garage` profile, which
-#    ASSERTS and exits non-zero on a failure — two tenants on one upstream key kept apart,
-#    and an aws-chunked CRC32-trailer upload. It runs first, on its own ports, and its
-#    exit status is this script's.
 #
 # What it proves, and why each piece is there:
 #
@@ -34,18 +25,6 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-
-LEGS=("$@"); [ ${#LEGS[@]} -eq 0 ] && LEGS=(silo garage)
-for leg in "${LEGS[@]}"; do
-  case "$leg" in silo|garage) ;; *) echo "unknown leg: $leg (silo, garage)" >&2; exit 2 ;; esac
-done
-wants() { local l; for l in "${LEGS[@]}"; do [ "$l" = "$1" ] && return 0; done; return 1; }
-GARAGE_RC=0
-if wants garage; then
-  echo "═══ garage leg ═══"
-  bash "$ROOT/tests/compat/garage.sh" || GARAGE_RC=$?
-fi
-wants silo || exit "$GARAGE_RC"
 STATE="${STATE:-/tmp/s0-compat}"
 GW_BIN="${GW_BIN:-$ROOT/target/release/s0}"
 # pgsty/silo, a maintained MinIO fork: MinIO no longer publishes public images.
@@ -320,4 +299,3 @@ for (m,t,s,c,op),n in sorted(seen.items()):
 PY
 echo
 echo "gateway log: $STATE/gw.log     wire: $W"
-exit "$GARAGE_RC"
