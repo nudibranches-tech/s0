@@ -456,7 +456,7 @@ pub struct BackendConfig {
     /// Vendor hint for an `s3`-kind backend (B2). s0 records it, and the request path
     /// never branches on it — addressing style stays `force_path_style` and the SigV4
     /// re-signing scope stays `region`, both set explicitly regardless of profile. An
-    /// unknown value (e.g. `garage`) is refused at load. Absent for `ceph`, and optional
+    /// unknown value (anything but `generic`) is refused at load. Absent for `ceph`, and optional
     /// for `s3` too.
     #[serde(default)]
     pub profile: Option<BackendProfile>,
@@ -1723,12 +1723,7 @@ mod tests {
     /// The canonical `s3` spelling, with every documented profile value.
     #[test]
     fn an_s3_backend_parses_every_profile_value() {
-        for (wire, profile) in [
-            ("generic", BackendProfile::Generic),
-            ("aws", BackendProfile::Aws),
-            ("objectscale", BackendProfile::Objectscale),
-            ("powerstore", BackendProfile::Powerstore),
-        ] {
+        for (wire, profile) in [("generic", BackendProfile::Generic)] {
             let mut cfg = example();
             cfg["backends"][0]["kind"] = serde_json::json!("s3");
             cfg["backends"][0]["profile"] = serde_json::json!(wire);
@@ -1760,32 +1755,31 @@ mod tests {
         assert_eq!(loaded.backends[0].kind, BackendKind::S3);
     }
 
-    /// Garage is not a supported backend. A config still naming `profile: "garage"`
-    /// (earlier 0.4.0 drafts accepted it) does not load, and says why.
+    /// Only Ceph and generic S3 are supported. A config still naming `profile: "garage"`,
+    /// `"aws"`, `"objectscale"` or `"powerstore"` (earlier 0.4.0 drafts accepted them)
+    /// does not load, and says why.
     #[test]
     fn a_garage_profile_is_refused_at_load() {
-        let mut cfg = example();
-        cfg["backends"][0]["kind"] = serde_json::json!("s3");
-        cfg["backends"][0]["profile"] = serde_json::json!("garage");
-        cfg["backends"][0]["endpoint_url"] = serde_json::json!("https://s3.example.com");
-        let err =
-            GatewayConfig::from_json(&cfg.to_string()).expect_err("a garage profile must not load");
-        assert!(
-            err.to_string().contains("unknown profile 'garage'"),
-            "{err}"
-        );
+        for wire in ["garage", "aws", "objectscale", "powerstore"] {
+            let mut cfg = example();
+            cfg["backends"][0]["kind"] = serde_json::json!("s3");
+            cfg["backends"][0]["profile"] = serde_json::json!(wire);
+            cfg["backends"][0]["endpoint_url"] = serde_json::json!("https://s3.example.com");
+            let err = GatewayConfig::from_json(&cfg.to_string())
+                .expect_err("an unsupported profile must not load");
+            assert!(
+                err.to_string().contains(&format!(
+                    "unknown profile '{wire}' (expected one of: generic)"
+                )),
+                "{wire}: {err}"
+            );
+        }
     }
 
     /// No profile holds its backend to a URL scheme: plain HTTP loads on every one.
     #[test]
     fn no_profile_requires_https() {
-        for profile in [
-            None,
-            Some("generic"),
-            Some("aws"),
-            Some("objectscale"),
-            Some("powerstore"),
-        ] {
+        for profile in [None, Some("generic")] {
             let mut cfg = example();
             cfg["backends"][0]["kind"] = serde_json::json!("s3");
             cfg["backends"][0]["endpoint_url"] = serde_json::json!("http://127.0.0.1:9000");
