@@ -455,38 +455,11 @@ pub struct BackendConfig {
     pub force_path_style: bool,
     /// Vendor hint for an `s3`-kind backend (B2). s0 records it, and the request path
     /// never branches on it — addressing style stays `force_path_style` and the SigV4
-    /// re-signing scope stays `region`, both set explicitly regardless of profile. The
-    /// one use is a load-time check: a `garage` backend's endpoint must be `https`
-    /// ([`GatewayConfig::validate`]). Absent for `ceph`, and optional for `s3` too.
+    /// re-signing scope stays `region`, both set explicitly regardless of profile. An
+    /// unknown value (e.g. `garage`) is refused at load. Absent for `ceph`, and optional
+    /// for `s3` too.
     #[serde(default)]
     pub profile: Option<BackendProfile>,
-}
-
-impl BackendConfig {
-    /// A Garage backend must be reached over TLS. Over plain HTTP the upstream SDK signs
-    /// an upload's checksum trailer (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`), and
-    /// Garage (v2.4.1) verifies that signature against the wrong string to sign, so every
-    /// PutObject and UploadPart carrying a checksum — every current SDK's default — fails
-    /// `InvalidRequest`. Over TLS the SDK sends the unsigned trailer form, which works
-    /// (`tests/compat/matrix.md`, the Garage leg). Refused at load rather than discovered
-    /// as a broken upload path.
-    fn validate(&self) -> Result<()> {
-        if self.profile == Some(BackendProfile::Garage) && !is_https(&self.endpoint_url) {
-            return Err(GatewayError::Config(format!(
-                "backend {} has profile garage and endpoint {}, which is not https; Garage \
-                 refuses the signed checksum trailer an SDK sends over plain HTTP, so every \
-                 upload with a checksum would fail. Front it with TLS",
-                self.id, self.endpoint_url
-            )));
-        }
-        Ok(())
-    }
-}
-
-fn is_https(url: &str) -> bool {
-    url.trim()
-        .get(..8)
-        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
 }
 
 /// Maps a tenant to its Org, its backend, and the per-tenant backend
@@ -549,9 +522,6 @@ impl GatewayConfig {
     fn validate(&self) -> Result<()> {
         self.validate_sts_key_ring()?;
         self.validate_derived_key_ring()?;
-        for b in &self.backends {
-            b.validate()?;
-        }
         let ids: HashMap<&str, &BackendConfig> =
             self.backends.iter().map(|b| (b.id.as_str(), b)).collect();
         for t in &self.tenants {
@@ -1755,7 +1725,6 @@ mod tests {
     fn an_s3_backend_parses_every_profile_value() {
         for (wire, profile) in [
             ("generic", BackendProfile::Generic),
-            ("garage", BackendProfile::Garage),
             ("aws", BackendProfile::Aws),
             ("objectscale", BackendProfile::Objectscale),
             ("powerstore", BackendProfile::Powerstore),
@@ -1791,33 +1760,32 @@ mod tests {
         assert_eq!(loaded.backends[0].kind, BackendKind::S3);
     }
 
-    /// A Garage backend over plain HTTP would fail every upload carrying a checksum
-    /// trailer, so it does not load; over TLS it does, and no other profile is held to it.
+    /// Garage is not a supported backend. A config still naming `profile: "garage"`
+    /// (earlier 0.4.0 drafts accepted it) does not load, and says why.
     #[test]
-    fn a_garage_backend_must_be_reached_over_https() {
-        for endpoint in [
-            "http://garage.example.com:3900",
-            "HTTP://garage.example.com:3900",
-            "garage.example.com:3900",
-            "",
+    fn a_garage_profile_is_refused_at_load() {
+        let mut cfg = example();
+        cfg["backends"][0]["kind"] = serde_json::json!("s3");
+        cfg["backends"][0]["profile"] = serde_json::json!("garage");
+        cfg["backends"][0]["endpoint_url"] = serde_json::json!("https://s3.example.com");
+        let err =
+            GatewayConfig::from_json(&cfg.to_string()).expect_err("a garage profile must not load");
+        assert!(
+            err.to_string().contains("unknown profile 'garage'"),
+            "{err}"
+        );
+    }
+
+    /// No profile holds its backend to a URL scheme: plain HTTP loads on every one.
+    #[test]
+    fn no_profile_requires_https() {
+        for profile in [
+            None,
+            Some("generic"),
+            Some("aws"),
+            Some("objectscale"),
+            Some("powerstore"),
         ] {
-            let mut cfg = example();
-            cfg["backends"][0]["kind"] = serde_json::json!("s3");
-            cfg["backends"][0]["profile"] = serde_json::json!("garage");
-            cfg["backends"][0]["endpoint_url"] = serde_json::json!(endpoint);
-            let err = GatewayConfig::from_json(&cfg.to_string())
-                .expect_err("a garage backend without TLS must not load");
-            assert!(err.to_string().contains("not https"), "{endpoint}: {err}");
-        }
-        for endpoint in ["https://garage.example.com:3900", "HTTPS://garage:3900"] {
-            let mut cfg = example();
-            cfg["backends"][0]["kind"] = serde_json::json!("s3");
-            cfg["backends"][0]["profile"] = serde_json::json!("garage");
-            cfg["backends"][0]["endpoint_url"] = serde_json::json!(endpoint);
-            GatewayConfig::from_json(&cfg.to_string())
-                .unwrap_or_else(|e| panic!("{endpoint}: {e}"));
-        }
-        for profile in [None, Some("generic"), Some("aws")] {
             let mut cfg = example();
             cfg["backends"][0]["kind"] = serde_json::json!("s3");
             cfg["backends"][0]["endpoint_url"] = serde_json::json!("http://127.0.0.1:9000");
@@ -1835,11 +1803,11 @@ mod tests {
     fn profile_does_not_change_addressing_style_or_region() {
         let mut cfg = example();
         cfg["backends"][0]["kind"] = serde_json::json!("s3");
-        cfg["backends"][0]["profile"] = serde_json::json!("garage");
-        cfg["backends"][0]["region"] = serde_json::json!("garage");
+        cfg["backends"][0]["profile"] = serde_json::json!("generic");
+        cfg["backends"][0]["region"] = serde_json::json!("eu-west-3");
         cfg["backends"][0]["force_path_style"] = serde_json::json!(true);
         let loaded = GatewayConfig::from_json(&cfg.to_string()).expect("loads");
-        assert_eq!(loaded.backends[0].region, "garage");
+        assert_eq!(loaded.backends[0].region, "eu-west-3");
         assert!(loaded.backends[0].force_path_style);
     }
 }

@@ -104,7 +104,7 @@ impl Action {
 /// backend-native features; this only selects the proxy client + re-signing.
 ///
 /// `S3` is D8's "`s3` with a profile": any S3-compatible endpoint that is not the
-/// platform's own Ceph RGW (Garage, AWS, OVH Object Storage, ObjectScale, PowerStore...).
+/// platform's own Ceph RGW (AWS, OVH Object Storage, ObjectScale, PowerStore...).
 /// It serializes as `"s3"`; `#[serde(alias = "remote_s3")]` keeps 0.3.x `gateway.json`
 /// files and audit fixtures parsing unchanged, since s0 0.3.4 shipped the variant as
 /// `remote_s3`. Addressing style stays `BackendConfig::force_path_style` and the signing
@@ -130,26 +130,46 @@ impl BackendKind {
 /// Vendor hint for an `s3`-kind [`BackendConfig`] (D8, B2). s0 records it (config, logs)
 /// and the request path never branches on it — addressing style is
 /// `BackendConfig::force_path_style` and the SigV4 scope s0 re-signs with is
-/// `BackendConfig::region`, both already backend-agnostic. A `Garage` profile, for
-/// instance, still needs path-style addressing and its own region string set explicitly;
-/// the profile itself does not imply either. Its one use is at load: a `Garage` backend's
-/// endpoint must be `https`, since Garage refuses the signed upload trailer an SDK sends
-/// over plain HTTP.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// `BackendConfig::region`, both already backend-agnostic and set explicitly.
+///
+/// The vocabulary is closed: a value outside it (notably `garage`, which earlier 0.4.0
+/// drafts accepted and which is not a supported backend) is refused at config load with
+/// `unknown profile '<value>'`, never read as `generic`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendProfile {
     Generic,
-    Garage,
     Aws,
     Objectscale,
     Powerstore,
 }
 
+impl<'de> Deserialize<'de> for BackendProfile {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = String::deserialize(deserializer)?;
+        BackendProfile::ALL
+            .into_iter()
+            .find(|profile| profile.as_str() == wire)
+            .ok_or_else(|| {
+                serde::de::Error::custom(format!(
+                    "unknown profile '{wire}' (expected one of: generic, aws, objectscale, \
+                     powerstore)"
+                ))
+            })
+    }
+}
+
 impl BackendProfile {
+    pub const ALL: [BackendProfile; 4] = [
+        BackendProfile::Generic,
+        BackendProfile::Aws,
+        BackendProfile::Objectscale,
+        BackendProfile::Powerstore,
+    ];
+
     pub const fn as_str(self) -> &'static str {
         match self {
             BackendProfile::Generic => "generic",
-            BackendProfile::Garage => "garage",
             BackendProfile::Aws => "aws",
             BackendProfile::Objectscale => "objectscale",
             BackendProfile::Powerstore => "powerstore",
@@ -241,7 +261,6 @@ mod tests {
     fn backend_profile_round_trips_every_variant() {
         let all = [
             (BackendProfile::Generic, "generic"),
-            (BackendProfile::Garage, "garage"),
             (BackendProfile::Aws, "aws"),
             (BackendProfile::Objectscale, "objectscale"),
             (BackendProfile::Powerstore, "powerstore"),
@@ -256,6 +275,21 @@ mod tests {
                 serde_json::from_str::<BackendProfile>(&format!("\"{wire}\""))
                     .expect("deserialize"),
                 profile
+            );
+        }
+    }
+
+    /// `garage` is not a supported backend: an old config naming it is refused, with the
+    /// value in the message, rather than read as some other profile.
+    #[test]
+    fn backend_profile_refuses_garage_and_any_unknown_value() {
+        for wire in ["garage", "Generic", "minio", ""] {
+            let err = serde_json::from_str::<BackendProfile>(&format!("\"{wire}\""))
+                .expect_err("an unknown profile must not deserialize");
+            assert!(
+                err.to_string()
+                    .contains(&format!("unknown profile '{wire}'")),
+                "{wire}: {err}"
             );
         }
     }

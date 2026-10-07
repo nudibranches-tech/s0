@@ -107,8 +107,8 @@ pub fn config_json(dir: &std::path::Path, backend_endpoint: &str) -> String {
 
 /// [`config_json`] with the backend `kind` and signing `region` spelled out — for a test
 /// proving upstream re-signing uses `BackendConfig.region` regardless of what the
-/// *client* signed with (the Garage leg of S0.1: a backend pinned to `region: "garage"`
-/// must re-sign every forwarded request in that scope, never the inbound one).
+/// *client* signed with (S0.1: a backend pinned to its own region must re-sign every
+/// forwarded request in that scope, never the inbound one).
 pub fn config_json_for_backend(
     dir: &std::path::Path,
     backend_endpoint: &str,
