@@ -288,7 +288,7 @@
       "_comment": "A grant_schema_version 3 bundle (ADR-009): projected for ONE backend (`data.backend.id`), every bucket of it listed under exactly one tenant by S3 name. acme and globex are two tenants of one organization sharing one upstream identity, so the backend would serve either tenant's bucket to the other: the placement is the isolation. `contested` is listed under both tenants (a projection defect: no tenant may use it); `acme-logs` and `acme-null` pin that a key is a claim whatever it maps to. carol holds a WILDCARD grant, so every placement deny below is the placement and not a missing grant; mallory holds an explicit grant naming globex's bucket, which a projection must never emit and the policy must not honour.",
       "grant_schema_version": 3,
       "backend": {
-        "id": "garage-1",
+        "id": "s3-1",
         "kind": "s3"
       },
       "org_settings": {
@@ -573,7 +573,7 @@
       "_comment": "A version that is present but not a number is a projection defect: it places nothing the gate can read, so every decision is refused rather than read as an old document.",
       "grant_schema_version": "3",
       "backend": {
-        "id": "garage-1",
+        "id": "s3-1",
         "kind": "s3"
       },
       "org_settings": {
@@ -2062,7 +2062,7 @@
           }
         },
         "backend": {
-          "id": "garage-1",
+          "id": "s3-1",
           "kind": "s3"
         },
         "tenant": "acme",
@@ -2095,7 +2095,7 @@
           }
         },
         "backend": {
-          "id": "garage-1",
+          "id": "s3-1",
           "kind": "s3"
         },
         "tenant": "acme",
@@ -2128,7 +2128,7 @@
           }
         },
         "backend": {
-          "id": "garage-1",
+          "id": "s3-1",
           "kind": "s3"
         },
         "tenant": "acme",
@@ -2159,7 +2159,7 @@
           }
         },
         "backend": {
-          "id": "garage-1",
+          "id": "s3-1",
           "kind": "s3"
         },
         "tenant": "acme",
@@ -2190,7 +2190,7 @@
           }
         },
         "backend": {
-          "id": "garage-1",
+          "id": "s3-1",
           "kind": "s3"
         },
         "tenant": "acme",
@@ -2220,7 +2220,7 @@
           }
         },
         "backend": {
-          "id": "garage-1",
+          "id": "s3-1",
           "kind": "s3"
         },
         "tenant": "globex",
@@ -2252,7 +2252,7 @@
           }
         },
         "backend": {
-          "id": "garage-1",
+          "id": "s3-1",
           "kind": "s3"
         },
         "tenant": "acme",
@@ -2289,7 +2289,7 @@
           }
         },
         "backend": {
-          "id": "garage-1",
+          "id": "s3-1",
           "kind": "s3"
         },
         "tenant": "acme",
@@ -2325,7 +2325,7 @@
           }
         },
         "backend": {
-          "id": "garage-1",
+          "id": "s3-1",
           "kind": "s3"
         },
         "tenant": "acme",
@@ -2358,7 +2358,7 @@
           }
         },
         "backend": {
-          "id": "garage-1",
+          "id": "s3-1",
           "kind": "s3"
         },
         "tenant": "acme",
@@ -2390,7 +2390,7 @@
           }
         },
         "backend": {
-          "id": "garage-1",
+          "id": "s3-1",
           "kind": "s3"
         },
         "tenant": "acme",
@@ -2422,7 +2422,7 @@
           }
         },
         "backend": {
-          "id": "garage-1",
+          "id": "s3-1",
           "kind": "s3"
         },
         "tenant": "acme",
@@ -2455,7 +2455,7 @@
           }
         },
         "backend": {
-          "id": "garage-1",
+          "id": "s3-1",
           "kind": "s3"
         },
         "tenant": "acme",
@@ -2487,7 +2487,7 @@
           }
         },
         "backend": {
-          "id": "garage-1",
+          "id": "s3-1",
           "kind": "s3"
         },
         "tenant": "acme",
@@ -2519,7 +2519,7 @@
           }
         },
         "backend": {
-          "id": "garage-1",
+          "id": "s3-1",
           "kind": "s3"
         },
         "tenant": "acme",
@@ -2549,7 +2549,7 @@
           }
         },
         "backend": {
-          "id": "garage-1",
+          "id": "s3-1",
           "kind": "s3"
         },
         "tenant": "acme",
@@ -2582,7 +2582,7 @@
           }
         },
         "backend": {
-          "id": "garage-1",
+          "id": "s3-1",
           "kind": "s3"
         },
         "tenant": "globex",
@@ -2616,7 +2616,7 @@
           }
         },
         "backend": {
-          "id": "garage-2",
+          "id": "s3-2",
           "kind": "s3"
         },
         "tenant": "acme",
@@ -2649,7 +2649,7 @@
           }
         },
         "backend": {
-          "id": "garage-2",
+          "id": "s3-2",
           "kind": "s3"
         },
         "tenant": "acme",
@@ -2681,7 +2681,7 @@
           }
         },
         "backend": {
-          "id": "garage-1",
+          "id": "s3-1",
           "kind": "s3"
         },
         "tenant": "acme",
@@ -2714,7 +2714,7 @@
           }
         },
         "backend": {
-          "id": "garage-1",
+          "id": "s3-1",
           "kind": "s3"
         },
         "tenant": "acme",
@@ -2746,7 +2746,7 @@
           }
         },
         "backend": {
-          "id": "garage-1",
+          "id": "s3-1",
           "kind": "s3"
         },
         "tenant": "acme",
@@ -2778,7 +2778,7 @@
           }
         },
         "backend": {
-          "id": "garage-1",
+          "id": "s3-1",
           "kind": "s3"
         },
         "tenant": "acme",
@@ -2811,7 +2811,7 @@
           }
         },
         "backend": {
-          "id": "garage-1",
+          "id": "s3-1",
           "kind": "s3"
         },
         "tenant": "acme",

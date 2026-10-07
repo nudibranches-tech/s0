@@ -1748,7 +1748,7 @@ const UPSTREAM_TENANT: &str = "tenant-owner-acme";
 const UPSTREAM_REQUEST_ID: &str = "tx00000UPSTREAMREQ4242-zone-a";
 const UPSTREAM_HOST_ID: &str = "upstreamhostid-zone-a-zonegroup-b";
 /// The backend's own host, which a `CompleteMultipartUpload` `Location` names.
-const UPSTREAM_ENDPOINT: &str = "garage-internal.storage.svc";
+const UPSTREAM_ENDPOINT: &str = "s3-internal.storage.svc";
 
 fn leak_markers() -> [&'static str; 7] {
     [

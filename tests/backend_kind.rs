@@ -10,11 +10,10 @@
 //!    signature itself is correct over that scope.
 //! 2. **Outbound**: the proxy always re-signs the forwarded request with
 //!    `BackendConfig.region` (`build_proxy`, `src/proxy/mod.rs`), never with whatever
-//!    region the inbound client happened to sign with. Garage makes this observable:
-//!    Garage v2.4.1 refuses any SigV4 scope whose region is not its configured
-//!    `s3_region` (`AuthorizationHeaderMalformed`), so a `profile: "garage"` backend with
-//!    `region: "garage"` must re-sign in that scope even when nothing on the inbound
-//!    side ever mentioned it.
+//!    region the inbound client happened to sign with. An S3 backend refuses a SigV4
+//!    scope whose region is not its own (AWS answers `AuthorizationHeaderMalformed`), so
+//!    an `s3` backend with `region: "eu-west-3"` must re-sign in that scope even when
+//!    nothing on the inbound side ever mentioned it.
 
 mod common;
 
@@ -183,20 +182,20 @@ fn scope_region(head: &str) -> String {
         .to_string()
 }
 
-/// The property Garage forces into the open: s0 re-signs the forwarded request with the
-/// BACKEND's configured region, never the inbound client's. Here the backend is `s3`
-/// profile `garage` with `region: "garage"` — the scope the recording backend must see,
-/// even though nothing about the request as authorized (the typed-hook path, which never
-/// carries an inbound SigV4 header at all) mentions "garage" anywhere else.
+/// s0 re-signs the forwarded request with the BACKEND's configured region, never the
+/// inbound client's. Here the backend is `s3` with `region: "eu-west-3"` — the scope the
+/// recording backend must see, even though nothing about the request as authorized (the
+/// typed-hook path, which never carries an inbound SigV4 header at all) mentions
+/// "eu-west-3" anywhere else.
 #[tokio::test]
 async fn upstream_resigning_uses_the_backend_region_not_the_clients() {
     let (url, heads) = recording_backend().await;
     let fx = common::fixture_with_backend_kind_region(
-        "bkr-garage-scope",
+        "bkr-backend-scope",
         common::alice_bundle(),
         &url,
         BackendKind::S3,
-        "garage",
+        "eu-west-3",
     );
     let body = b"hello".to_vec();
     let mut req = fx.request(
@@ -223,7 +222,7 @@ async fn upstream_resigning_uses_the_backend_region_not_the_clients() {
     assert_eq!(heads.len(), 1, "exactly one request must reach the backend");
     assert_eq!(
         scope_region(&heads[0]),
-        "garage",
+        "eu-west-3",
         "the upstream request must carry the backend's configured region, not the \
          gateway's default, in its SigV4 scope:\n{}",
         heads[0]

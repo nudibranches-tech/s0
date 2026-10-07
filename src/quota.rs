@@ -715,7 +715,7 @@ mod tests {
     }
 
     const TARGET: WriteTarget<'static> = WriteTarget {
-        backend: "garage",
+        backend: "bay-1",
         tenant: "acme",
         bucket: "reports",
     };
@@ -729,7 +729,7 @@ mod tests {
     }
 
     fn backend() -> QuotaScope {
-        QuotaScope::Backend("garage".into())
+        QuotaScope::Backend("bay-1".into())
     }
 
     fn table(specs: &[(QuotaScope, QuotaSpec)]) -> BundleQuotas {
