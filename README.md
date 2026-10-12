@@ -90,7 +90,9 @@ table, so no pushed policy can enable them:
   on them.
 - **Presigned URLs** are supported (the STS session token is resolved from the query
   string), and the presigned credential is redacted from the audit record.
-- **Anonymous access** is never allowed. There is no public-bucket concept.
+- **Anonymous access** is never allowed. There is no public-bucket concept. The one request
+  answered without a verified signature is a CORS preflight, which grants nothing; see
+  [Browsers and CORS](#browsers-and-cors).
 
 ---
 
@@ -253,6 +255,32 @@ key, so replacing it invalidates live sessions. Rotate it in a window.
 
 ---
 
+## Browsers and CORS
+
+A browser that uploads to or downloads from a presigned URL pointing at s0 sends a preflight
+(`OPTIONS`) first, and can read the answer only if it names the page's origin. s0 serves both
+from **the CORS configuration the control plane already set on the backend bucket**. There is
+no gateway-level CORS setting, and `GetBucketCors` / `PutBucketCors` stay refused to clients:
+CORS remains a property of the managed resource, and s0 only reads it back.
+
+| | |
+|---|---|
+| **Source** | `GetBucketCors` against the backend, signed with the tenant's own backend credential, cached per `(backend, tenant, bucket)` for about 60 s. "No CORS configuration" is cached too; a failed read is remembered for a few seconds only. A rule written on the backend reaches browsers within about a minute. |
+| **Evaluation** | As S3 does it: `*` wildcards in `AllowedOrigin` and `AllowedHeader`, `AllowedMethod`, `ExposeHeader`, `MaxAgeSeconds`; the first rule that matches wins, and a preflight rule must allow the origin, the method **and every** requested header. |
+| **Preflight** | Answered before s3s sees it, since `OPTIONS` is never an S3 operation. `200` with `Access-Control-Allow-Origin` (`*` for a `*` rule, otherwise the request origin), `-Allow-Methods`, `-Allow-Headers`, `-Expose-Headers`, `-Max-Age` and `Vary`; every refusal is the same `403`, whether the cause is the rule, the credential, the tenant or the bucket. |
+| **Real requests** | Any other request that carries `Origin` gets the matching `Access-Control-Allow-Origin`, `-Expose-Headers` and `Vary` after s3s has answered, success or S3 error. A request with no `Origin` is untouched. |
+| **Which tenant** | A preflight carries no credential of its own but goes to the same URL as the request, and a presigned URL names its access key (`X-Amz-Credential`) and, for an STS session, its token (`X-Amz-Security-Token`) in the query. s0 resolves them with the identity resolution the data plane uses, which gives the tenant and so the backend. The signature is not verified: an `OPTIONS` has nothing to verify it against, and a preflight grants nothing. |
+| **Not covered** | Browser form uploads (`PostObject`), whose credential is in the multipart body; SigV2; and requests an SDK in the page signs in headers, because a browser never puts `Authorization` on the preflight, so there is no credential to resolve a tenant from. None of them gets CORS headers. |
+
+A preflight never reaches the policy engine and is not an access decision, so it is counted
+rather than audited: `s0_cors_preflight_total{result,reason}`, plus
+`s0_cors_backend_lookups_total` and `s0_cors_backend_lookup_failures_total`. The
+gate-denial audit budget stays reserved for requests that reach the gate. A sustained rise in
+`s0_cors_backend_lookup_failures_total` usually means the tenant's backend credential may not
+read bucket CORS. The implementation is [`src/cors`](src/cors).
+
+---
+
 ## Module map
 
 | Module | Role |
@@ -261,6 +289,7 @@ key, so replacing it invalidates live sessions. Rotate it in a window.
 | [`pdp`](src/pdp) | `Pdp` trait; embedded regorus + sidecar OPA; revision-keyed decision cache |
 | [`auth`](src/auth) | identity authority, own STS, long-lived derived keys |
 | [`access`](src/access) | the OPA gate: deny-by-default `check` + typed per-op hooks |
+| [`cors`](src/cors) | preflights and response headers for browsers, from the bucket's own CORS rule |
 | [`proxy`](src/proxy) | per-`(backend, tenant)` client pool and dispatch |
 | [`audit`](src/audit) | one reasoned decision record per request; async, non-blocking, disk-spill |
 | [`gateway`](src/gateway.rs) / [`server`](src/server.rs) | assembly and hardened hyper serving |

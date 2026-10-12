@@ -253,6 +253,7 @@ pub fn fixture_with_backend(tag: &str, bundle: serde_json::Value, endpoint: &str
         credentials,
         limits: Arc::new(arc_swap::ArcSwap::from_pointee(cfg.limits.clone())),
         bundles,
+        cors: Arc::new(s0::cors::CorsState::new()),
         capture: Some(capture.clone()),
     });
     Fixture {
