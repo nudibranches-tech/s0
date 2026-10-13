@@ -1430,7 +1430,7 @@ fn redact_query(q: &str) -> String {
 /// The STS session token from the `X-Amz-Security-Token` header (signed requests) or
 /// query param (presigned URLs). Our session tokens are URL-safe JWTs, but we
 /// percent-decode defensively.
-fn session_token(headers: &http::HeaderMap, uri: &http::Uri) -> Option<String> {
+pub(crate) fn session_token(headers: &http::HeaderMap, uri: &http::Uri) -> Option<String> {
     if let Some(v) = headers
         .get(SECURITY_TOKEN_HEADER)
         .and_then(|v| v.to_str().ok())
@@ -1444,7 +1444,7 @@ fn session_token(headers: &http::HeaderMap, uri: &http::Uri) -> Option<String> {
     })
 }
 
-fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

@@ -12,6 +12,7 @@ use crate::auth::sts::StsAuthority;
 use crate::auth::{DerivedKeys, Identity, StaticCredentialStore};
 use crate::authz::CaptureSink;
 use crate::config::{GatewayConfig, LimitsConfig, PdpConfig};
+use crate::cors::CorsState;
 use crate::error::{GatewayError, Result};
 use crate::pdp::{
     Bundle, BundleStore, CachingPdp, GATEWAY_REGO, Pdp, RegorusPdp, SidecarPdp, content_revision,
@@ -37,6 +38,8 @@ pub struct Gateway {
     pub limits: Arc<ArcSwap<LimitsConfig>>,
     /// Kept so a bundle-refresh loop can swap revisions (cache stays coherent).
     pub bundles: Arc<BundleStore>,
+    /// The CORS layer's cache of bucket configurations, and its counters.
+    pub cors: Arc<CorsState>,
     /// Golden-capture tap. `None` in every deployed binary: [`Gateway::build`] is the only
     /// production construction path and hard-codes `None`, with no setter and no config
     /// knob, so only a test that builds a `Gateway` literally can enable it.
@@ -84,6 +87,7 @@ impl Gateway {
             credentials,
             limits: Arc::new(ArcSwap::from_pointee(cfg.limits.clone())),
             bundles,
+            cors: Arc::new(CorsState::new()),
             // Never enabled from config: a capture sink retains principal identifiers
             // and object keys in memory, and nothing an operator can set should be able
             // to turn that on.
@@ -300,6 +304,7 @@ mod tests {
             credentials,
             limits: Arc::new(ArcSwap::from_pointee(cfg.limits.clone())),
             bundles,
+            cors: Arc::new(CorsState::new()),
             capture: None,
         };
         (gw, handle)

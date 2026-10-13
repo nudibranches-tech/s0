@@ -12,6 +12,7 @@
 //! - [`access`]   — the OPA gate: deny-by-default `check` + typed per-op hooks.
 //! - [`proxy`]    — per-(backend,tenant) client pool + dispatch.
 //! - [`audit`]    — one reasoned decision record per request.
+//! - [`cors`]     — preflights and response headers for browsers, from the bucket's own rule.
 //! - [`gateway`]  — assembled shared context.
 //! - [`server`]   — S3 front + hyper serving.
 //! - [`admin`]    — health / readiness / metrics, on a listener of its own.
@@ -30,6 +31,7 @@ pub mod auth;
 pub mod authz;
 pub mod bundle_refresh;
 pub mod config;
+pub mod cors;
 pub mod error;
 pub mod gateway;
 pub mod identity;

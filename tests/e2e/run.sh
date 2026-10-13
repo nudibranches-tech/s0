@@ -254,6 +254,112 @@ anon_code="$(curl -s -o /dev/null -w '%{http_code}' "$GW_ENDPOINT/open/pub/greet
 expect_code InvalidAccessKeyId "unknown access key rejected" \
   aws_id AKIABOGUS bogus-secret s3api get-object --bucket open --key pub/greeting.txt /work/dl4.txt
 
+echo ""; echo "-- CORS: browser preflights and responses ------------------"
+# The rule is the bucket owner's, written on the backend with the backend credential — the
+# control plane's job. A client cannot write it through the gateway (asserted below), and
+# the gateway only ever reads it back. Written before the first request that carries an
+# Origin, so no negative answer is cached ahead of it.
+cat > "$WORK/cors-open.json" <<'JSON'
+{"CORSRules":[{"AllowedOrigins":["*"],"AllowedMethods":["PUT"],"AllowedHeaders":["content-type"],"ExposeHeaders":["ETag"],"MaxAgeSeconds":3000}]}
+JSON
+cat > "$WORK/cors-secret.json" <<'JSON'
+{"CORSRules":[{"AllowedOrigins":["https://app.example.com"],"AllowedMethods":["GET","PUT"],"AllowedHeaders":["*"],"ExposeHeaders":["ETag"],"MaxAgeSeconds":60}]}
+JSON
+aws_backend s3 mb s3://nocors >/dev/null 2>&1
+aws_backend s3api put-bucket-cors --bucket open   --cors-configuration file:///work/cors-open.json   >/dev/null 2>&1
+aws_backend s3api put-bucket-cors --bucket secret --cors-configuration file:///work/cors-secret.json >/dev/null 2>&1
+
+BROWSER_ORIGIN="https://app.proarchives360.fr"
+# `aws s3 presign` signs a GET and is the only presigner on hand. A preflight is judged on
+# its own Origin / Access-Control-Request-* headers and on the credential in the URL, not on
+# the method the URL was signed for, so it stands in for the browser's URL.
+presigned_open="$(aws_open s3 presign s3://open/pub/cors-probe.txt --expires-in 600)"
+presigned_nocors="$(aws_open s3 presign s3://nocors/x.txt --expires-in 600)"
+presigned_secret="$(aws_open s3 presign s3://secret/x.txt --expires-in 600)"
+# The same URL with the credential taken out, and with an access key the gateway does not know.
+unsigned_open="${presigned_open%%\?*}"
+bogus_open="${unsigned_open}?X-Amz-Credential=AKIABOGUS%2F20260101%2Fus-east-1%2Fs3%2Faws4_request"
+
+preflight() { # url origin method [request-headers] -> response head on stdout
+  local url=$1 origin=$2 method=$3 reqh=${4:-}
+  local args=(-s -o /dev/null -D - -X OPTIONS "$url" -H "Origin: $origin" -H "Access-Control-Request-Method: $method")
+  [ -n "$reqh" ] && args+=(-H "Access-Control-Request-Headers: $reqh")
+  curl "${args[@]}" | tr -d '\r'
+}
+# expect_head "label" "<head>" <status> [header-regex ...]
+expect_head() {
+  local label=$1 head=$2 want=$3; shift 3
+  local got re
+  got="$(printf '%s\n' "$head" | head -n1 | awk '{print $2}')"
+  [ "$got" = "$want" ] || { fail "$label" "wanted HTTP $want, got ${got:-none}: $head"; return; }
+  for re in "$@"; do
+    printf '%s\n' "$head" | grep -qiE "$re" || { fail "$label" "no header matching /$re/ in: $head"; return; }
+  done
+  pass "$label"
+}
+expect_no_cors_headers() { # "label" "<head>"
+  if printf '%s\n' "$2" | grep -qi '^access-control-'; then
+    fail "$1" "unexpected CORS header in: $2"
+  else
+    pass "$1"
+  fi
+}
+
+head="$(preflight "$presigned_open" "$BROWSER_ORIGIN" PUT content-type)"
+expect_head "preflight PUT from an allowed origin: 200 and the bucket's rule" "$head" 200 \
+  '^access-control-allow-origin: \*$' '^access-control-allow-methods: PUT$' \
+  '^access-control-allow-headers: content-type$' '^access-control-expose-headers: ETag$' \
+  '^access-control-max-age: 3000$' '^vary:.*Origin'
+head="$(preflight "$presigned_secret" "https://app.example.com" PUT "content-type, x-amz-meta-k")"
+expect_head "preflight against a named-origin rule echoes the origin" "$head" 200 \
+  '^access-control-allow-origin: https://app.example.com$' '^vary:.*Origin'
+expect_head "preflight from an origin the rule does not name: 403" \
+  "$(preflight "$presigned_secret" "https://evil.example" PUT)" 403
+expect_head "preflight for a method the rule does not allow: 403" \
+  "$(preflight "$presigned_secret" "https://app.example.com" DELETE)" 403
+expect_head "preflight asking for a header the rule does not allow: 403" \
+  "$(preflight "$presigned_open" "$BROWSER_ORIGIN" PUT "content-type, authorization")" 403
+expect_head "preflight on a bucket with no CORS configuration: 403" \
+  "$(preflight "$presigned_nocors" "$BROWSER_ORIGIN" PUT)" 403
+expect_head "preflight with no credential: 403" \
+  "$(preflight "$unsigned_open" "$BROWSER_ORIGIN" PUT)" 403
+expect_head "preflight with an unknown access key: 403" \
+  "$(preflight "$bogus_open" "$BROWSER_ORIGIN" PUT)" 403
+refused_a="$(preflight "$unsigned_open" "$BROWSER_ORIGIN" PUT | grep -viE '^(date|HTTP)')"
+refused_b="$(preflight "$presigned_nocors" "$BROWSER_ORIGIN" PUT | grep -viE '^(date|HTTP)')"
+[ "$refused_a" = "$refused_b" ] && pass "refusals do not say why (no credential and no rule look the same)" \
+  || fail "refusals do not say why" "$refused_a // $refused_b"
+expect_head "OPTIONS that is not a preflight: 403, never s3s's 501" \
+  "$(curl -s -o /dev/null -D - -X OPTIONS "$GW_ENDPOINT/open/pub/x" | tr -d '\r')" 403
+
+# Actual requests, signed in the Authorization header as an SDK would, from a browser origin.
+printf 'cors upload\n' > "$WORK/cors-body.txt"
+curl_signed_put() { # url [extra curl args...]
+  local url=$1; shift
+  curl -s -o /dev/null -D - -X PUT "$url" --aws-sigv4 "aws:amz:us-east-1:s3" \
+    --user "AKIAOPEN:open-virtual-secret" -H "x-amz-content-sha256: UNSIGNED-PAYLOAD" \
+    -H "Content-Type: text/plain" --data-binary @"$WORK/cors-body.txt" "$@" | tr -d '\r'
+}
+expect_head "PUT from a browser origin: ACAO and ETag exposed" \
+  "$(curl_signed_put "$GW_ENDPOINT/open/pub/cors-put.txt" -H "Origin: $BROWSER_ORIGIN")" 200 \
+  '^access-control-allow-origin: \*$' '^access-control-expose-headers: ETag$' '^etag: '
+upload_id="$(aws_open s3api create-multipart-upload --bucket open --key pub/cors-mpu.bin --query UploadId --output text 2>/dev/null)"
+expect_head "UploadPart from a browser origin: ACAO and ETag exposed" \
+  "$(curl_signed_put "$GW_ENDPOINT/open/pub/cors-mpu.bin?partNumber=1&uploadId=${upload_id}" -H "Origin: $BROWSER_ORIGIN")" 200 \
+  '^access-control-allow-origin: \*$' '^access-control-expose-headers: ETag$' '^etag: '
+aws_open s3api abort-multipart-upload --bucket open --key pub/cors-mpu.bin --upload-id "$upload_id" >/dev/null 2>&1
+head="$(curl_signed_put "$GW_ENDPOINT/open/private/cors-denied.txt" -H "Origin: $BROWSER_ORIGIN")"
+expect_head "an S3 error answered to a browser origin carries ACAO too" "$head" 403 \
+  '^access-control-allow-origin: \*$'
+head="$(curl_signed_put "$GW_ENDPOINT/open/pub/cors-plain.txt")"
+expect_head "PUT with no Origin is served as before" "$head" 200 '^etag: '
+expect_no_cors_headers "PUT with no Origin carries no CORS headers" "$head"
+
+expect deny "AKIAADMIN GetBucketCors through the gateway stays refused" \
+  aws_admin s3api get-bucket-cors --bucket open
+expect deny "AKIAADMIN PutBucketCors through the gateway stays refused" \
+  aws_admin s3api put-bucket-cors --bucket open --cors-configuration file:///work/cors-open.json
+
 echo ""; echo "-- live revocation (policy is live, not baked in creds) ----"
 expect ok "AKIAOPEN GET open/pub/greeting.txt (still granted)" \
   aws_open s3api get-object --bucket open --key pub/greeting.txt /work/dl5.txt
