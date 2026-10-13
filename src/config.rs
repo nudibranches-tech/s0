@@ -1720,18 +1720,15 @@ mod tests {
         assert_eq!(loaded.backends[0].profile, None);
     }
 
-    /// The canonical `s3` spelling, with every documented profile value.
+    /// The canonical `s3` spelling, with the one documented profile value.
     #[test]
-    fn an_s3_backend_parses_every_profile_value() {
-        for (wire, profile) in [("generic", BackendProfile::Generic)] {
-            let mut cfg = example();
-            cfg["backends"][0]["kind"] = serde_json::json!("s3");
-            cfg["backends"][0]["profile"] = serde_json::json!(wire);
-            let loaded = GatewayConfig::from_json(&cfg.to_string())
-                .unwrap_or_else(|e| panic!("profile {wire}: {e}"));
-            assert_eq!(loaded.backends[0].kind, BackendKind::S3);
-            assert_eq!(loaded.backends[0].profile, Some(profile));
-        }
+    fn an_s3_backend_parses_the_generic_profile() {
+        let mut cfg = example();
+        cfg["backends"][0]["kind"] = serde_json::json!("s3");
+        cfg["backends"][0]["profile"] = serde_json::json!("generic");
+        let loaded = GatewayConfig::from_json(&cfg.to_string()).expect("profile generic loads");
+        assert_eq!(loaded.backends[0].kind, BackendKind::S3);
+        assert_eq!(loaded.backends[0].profile, Some(BackendProfile::Generic));
     }
 
     /// An `s3` backend with no `profile` is "some S3-compatible endpoint" — valid,
