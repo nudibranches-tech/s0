@@ -12,8 +12,11 @@ use serde::{Deserialize, Serialize};
 /// which maps to two. The set is a contract with whatever control plane projects grants.
 ///
 /// **The gateway is data-plane only**, so there is no verb for acting on a bucket as a
-/// *managed resource*: existence, policy, CORS and quota are control-plane concerns, and
-/// `write_object_acl` is refused in code ([`crate::access::headers`]).
+/// *managed resource*: existence, policy, CORS and quota *settings* are control-plane
+/// concerns, and `write_object_acl` is refused in code ([`crate::access::headers`]). The one
+/// quota the gateway enforces is the byte quota a v3 bundle states for a backend without
+/// native ones ([`crate::quota`]): a limit the control plane set, applied to writes, and
+/// never a verb.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Action {
@@ -99,18 +102,66 @@ impl Action {
 
 /// Which backend family a request is proxied to. Enforcement never depends on
 /// backend-native features; this only selects the proxy client + re-signing.
+///
+/// `S3` is D8's "`s3` with a profile": any S3-compatible endpoint that is not the
+/// platform's own Ceph RGW. Only Ceph and generic S3 are supported.
+/// It serializes as `"s3"`; `#[serde(alias = "remote_s3")]` keeps 0.3.x `gateway.json`
+/// files and audit fixtures parsing unchanged, since s0 0.3.4 shipped the variant as
+/// `remote_s3`. Addressing style stays `BackendConfig::force_path_style` and the signing
+/// region stays `BackendConfig::region`; which vendor it is never gates behavior, it is
+/// recorded on `BackendConfig::profile` for operators only (see `BackendProfile`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendKind {
     Ceph,
-    RemoteS3,
+    #[serde(alias = "remote_s3")]
+    S3,
 }
 
 impl BackendKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             BackendKind::Ceph => "ceph",
-            BackendKind::RemoteS3 => "remote_s3",
+            BackendKind::S3 => "s3",
+        }
+    }
+}
+
+/// Vendor hint for an `s3`-kind [`BackendConfig`] (D8, B2). s0 records it (config, logs)
+/// and the request path never branches on it — addressing style is
+/// `BackendConfig::force_path_style` and the SigV4 scope s0 re-signs with is
+/// `BackendConfig::region`, both already backend-agnostic and set explicitly.
+///
+/// The vocabulary is closed to `generic`: any other value (notably `garage`, `aws`,
+/// `objectscale` and `powerstore`, which earlier 0.4.0 drafts accepted and which are not
+/// supported backends) is refused at config load with `unknown profile '<value>'`,
+/// never read as `generic`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendProfile {
+    Generic,
+}
+
+impl<'de> Deserialize<'de> for BackendProfile {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = String::deserialize(deserializer)?;
+        BackendProfile::ALL
+            .into_iter()
+            .find(|profile| profile.as_str() == wire)
+            .ok_or_else(|| {
+                serde::de::Error::custom(format!(
+                    "unknown profile '{wire}' (expected one of: generic)"
+                ))
+            })
+    }
+}
+
+impl BackendProfile {
+    pub const ALL: [BackendProfile; 1] = [BackendProfile::Generic];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            BackendProfile::Generic => "generic",
         }
     }
 }
@@ -161,4 +212,78 @@ impl std::fmt::Display for OrgId {
 pub struct PoolKey {
     pub backend: BackendId,
     pub tenant: Tenant,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backend_kind_s3_is_the_wire_value_and_remote_s3_still_parses() {
+        assert_eq!(BackendKind::S3.as_str(), "s3");
+        assert_eq!(
+            serde_json::to_string(&BackendKind::S3).expect("serialize"),
+            "\"s3\""
+        );
+        // 0.3.x configs and audit fixtures spelled it `remote_s3`; the alias keeps them
+        // loading unchanged rather than forcing a flag-day rewrite.
+        assert_eq!(
+            serde_json::from_str::<BackendKind>("\"remote_s3\"").expect("alias parses"),
+            BackendKind::S3
+        );
+        assert_eq!(
+            serde_json::from_str::<BackendKind>("\"s3\"").expect("canonical parses"),
+            BackendKind::S3
+        );
+    }
+
+    #[test]
+    fn backend_kind_ceph_is_unchanged() {
+        assert_eq!(BackendKind::Ceph.as_str(), "ceph");
+        assert_eq!(
+            serde_json::from_str::<BackendKind>("\"ceph\"").expect("ceph parses"),
+            BackendKind::Ceph
+        );
+    }
+
+    #[test]
+    fn backend_profile_round_trips_every_variant() {
+        let all = [(BackendProfile::Generic, "generic")];
+        for (profile, wire) in all {
+            assert_eq!(profile.as_str(), wire);
+            assert_eq!(
+                serde_json::to_string(&profile).expect("serialize"),
+                format!("\"{wire}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<BackendProfile>(&format!("\"{wire}\""))
+                    .expect("deserialize"),
+                profile
+            );
+        }
+    }
+
+    /// `garage`, `aws`, `objectscale` and `powerstore` are not supported backends: an old
+    /// config naming one is refused, with the value in the message, rather than read as
+    /// `generic`.
+    #[test]
+    fn backend_profile_refuses_garage_and_any_unknown_value() {
+        for wire in [
+            "garage",
+            "aws",
+            "objectscale",
+            "powerstore",
+            "Generic",
+            "minio",
+            "",
+        ] {
+            let err = serde_json::from_str::<BackendProfile>(&format!("\"{wire}\""))
+                .expect_err("an unknown profile must not deserialize");
+            assert!(
+                err.to_string()
+                    .contains(&format!("unknown profile '{wire}'")),
+                "{wire}: {err}"
+            );
+        }
+    }
 }
