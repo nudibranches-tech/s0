@@ -15,9 +15,14 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
+use aws_sdk_s3::config::interceptors::BeforeTransmitInterceptorContextMut;
 use aws_sdk_s3::config::timeout::TimeoutConfig;
-use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
+use aws_sdk_s3::config::{
+    BehaviorVersion, ConfigBag, Credentials, Intercept, Region, RuntimeComponents,
+};
+use aws_sdk_s3::error::BoxError;
 use aws_sdk_s3::{Client, Config};
+use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
 use s3s::dto::*;
 use s3s::header::{X_AMZ_ID_2, X_AMZ_REQUEST_ID};
 use s3s::{S3, S3Error, S3Request, S3Response, S3Result, s3_error};
@@ -296,8 +301,39 @@ fn build_proxy(
         .credentials_provider(creds)
         .force_path_style(backend.force_path_style)
         .timeout_config(timeouts)
+        .interceptor(ExplicitEmptyBodyLength)
         .build();
     Proxy::from(Client::from_conf(conf))
+}
+
+/// Sends `Content-Length: 0` on a body-less `PUT`/`POST` (`UploadPartCopy`, `CopyObject`,
+/// `CreateMultipartUpload`). The SDK sets no length for an operation without a payload,
+/// and hyper then sends no framing header at all, which Ceph RGW refuses on
+/// `UploadPartCopy` with `411 MissingContentLength`.
+#[derive(Debug)]
+struct ExplicitEmptyBodyLength;
+
+impl Intercept for ExplicitEmptyBodyLength {
+    fn name(&self) -> &'static str {
+        "ExplicitEmptyBodyLength"
+    }
+
+    fn modify_before_signing(
+        &self,
+        context: &mut BeforeTransmitInterceptorContextMut<'_>,
+        _runtime_components: &RuntimeComponents,
+        _cfg: &mut ConfigBag,
+    ) -> std::result::Result<(), BoxError> {
+        let request = context.request_mut();
+        if matches!(request.method(), "PUT" | "POST")
+            && request.body().content_length() == Some(0)
+            && !request.headers().contains_key(CONTENT_LENGTH)
+            && !request.headers().contains_key(TRANSFER_ENCODING)
+        {
+            request.headers_mut().insert(CONTENT_LENGTH, "0");
+        }
+        Ok(())
+    }
 }
 
 /// Everything the forwarding path draws on — deliberately *not* the whole `Gateway`: by
