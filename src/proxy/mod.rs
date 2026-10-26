@@ -306,10 +306,9 @@ fn build_proxy(
     Proxy::from(Client::from_conf(conf))
 }
 
-/// Sends `Content-Length: 0` on a body-less `PUT`/`POST` (`UploadPartCopy`, `CopyObject`,
-/// `CreateMultipartUpload`). The SDK sets no length for an operation without a payload,
-/// and hyper then sends no framing header at all, which Ceph RGW refuses on
-/// `UploadPartCopy` with `411 MissingContentLength`.
+/// Sends `Content-Length: 0` on a body-less `PUT`/`POST` such as `UploadPartCopy`: the SDK
+/// sets no length without a payload and hyper then sends no framing header at all, which
+/// Ceph RGW refuses with `411 MissingContentLength`.
 #[derive(Debug)]
 struct ExplicitEmptyBodyLength;
 

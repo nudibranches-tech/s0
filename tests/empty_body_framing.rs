@@ -1,11 +1,6 @@
-//! A body-less `PUT`/`POST` must reach the backend with `Content-Length: 0`. The backend
-//! SDK sets no length for an operation without a payload, and hyper then sends neither
-//! `Content-Length` nor `Transfer-Encoding`; Ceph RGW refuses such an `UploadPartCopy`
-//! with `411 MissingContentLength`, which broke every multipart copy through the gateway
-//! (and with it every registry push of a layer above 32 MiB).
-//!
-//! These tests drive the real hook and the real dispatch arm into a backend that refuses
-//! an unframed `PUT`/`POST` the way RGW does, and keeps every request head it received.
+//! A body-less `PUT`/`POST` must reach the backend with `Content-Length: 0`: Ceph RGW
+//! refuses an unframed `UploadPartCopy` with `411 MissingContentLength`. These tests drive
+//! the real hook and dispatch arm into a backend that refuses it the same way.
 
 mod common;
 
