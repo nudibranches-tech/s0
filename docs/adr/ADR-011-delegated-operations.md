@@ -1,7 +1,8 @@
 # ADR-011: Delegated operations — bucket configuration answered by a control backend
 
-- **Status**: Proposed — not yet implemented (`src/access/optable.rs`, `src/access/delegation.rs`,
-  `src/proxy/control.rs`, `src/config.rs`, `src/audit/record.rs`)
+- **Status**: Proposed — implemented in part: D1 to D5 and D7 (`src/access/optable.rs`,
+  `src/access/delegation.rs`, `src/proxy/control.rs`, `src/config.rs`, `src/audit/record.rs`);
+  D6 (read-your-writes) is not yet implemented
 - **Date**: 2026-11-02
 - **Owners**: gateway team (this repo); the control backend is the console of the platform that
   deploys s0
@@ -193,7 +194,7 @@ A **delegated** record is a third half, `delegated`, under its own path:
 | `labels` | the same trusted organization label as every other shape |
 | `gateway.outcome` | `allowed` for a 2xx; `denied` for `403 AccessDenied`; `error` otherwise (any other answered status, or no answer) |
 | `gateway.backend` | `not_attempted`: the storage backend was never contacted |
-| `result` | `allow` is the control backend's authorization answer, not an s0 verdict: `true` for a 2xx, `false` only for `403 AccessDenied`. For any other answered status, `allow` is `true` and the reason names the control backend and its error code, with `control_status` / `control_error` set; with no answer, `outcome` is `error`, `control_status` is absent and the reason is "control backend unreachable" |
+| `result` | `allow` is the control backend's authorization answer, not an s0 verdict: `true` for a 2xx, `false` only for `403 AccessDenied`. For any other answered status, `allow` is `true` and the reason names the control backend and its error code, with `control_status` / `control_error` set; with no answer, `outcome` is `error` and `control_status` is absent: the reason is "control backend unreachable" when the call was made and nothing came back, or "request ended before the control backend was called" (with `allow` `false`, since nothing was observed) when the request failed after authorization and before dispatch, as a malformed body does, or "request ended before the control backend answered" (also `allow` `false`, `control_status` absent) when the request ended while the call was in flight, as a client disconnect does. A 2xx whose body then failed is `error` too, and the control backend's `403` about the gateway's own credential is answered `503` and recorded as `error`, never as a denial |
 
 One record per delegated request, emitted when the request finishes (through `PendingAudit`, as a
 decision record is), and never rate-limited: it is a decision about a caller, not

@@ -20,8 +20,10 @@ Operations it does not own are denied, not passed through.
 ## Supported operations
 
 s0 knows all **99** operations in the `s3s` 0.14.1 surface. **23** are enforced and
-forwarded; the other **76** are refused with `403 AccessDenied`. There is no third
-category — an operation with no entry in the table cannot reach a backend.
+forwarded; the other **76** are refused with `403 AccessDenied`, unless a control backend
+is configured: **15** of those can be delegated to it and answered there instead (below).
+An operation with no entry in the table cannot reach a backend, and one that is delegated
+never reaches the storage backend either.
 
 The table is [`src/access/optable.rs`](src/access/optable.rs) and it is the only source
 of truth. `tests/gate_blackbox.rs` drives every refused operation as a signed HTTP
@@ -45,6 +47,36 @@ per-verb, with object-prefix scopes.
 That covers ordinary object storage: get/put/head/delete, multipart upload, server-side
 copy, listing, and object tagging.
 
+### Delegated (15)
+
+Bucket creation and bucket configuration cannot be answered by the storage backend alone:
+on a platform that owns its buckets through a control plane, a bucket is a declared
+resource. When `control_backend` is configured, s0 hands the operations it lists to that
+S3 endpoint and returns its answer; without it they are refused like any other.
+
+| Group | Operations |
+|---|---|
+| Creation | `CreateBucket` |
+| CORS | `GetBucketCors`, `PutBucketCors`, `DeleteBucketCors` |
+| Lifecycle | `GetBucketLifecycleConfiguration`, `PutBucketLifecycleConfiguration`, `DeleteBucketLifecycle` |
+| Tags | `GetBucketTagging`, `PutBucketTagging`, `DeleteBucketTagging` |
+| Versioning | `GetBucketVersioning`, `PutBucketVersioning` |
+| Default encryption | `GetBucketEncryption`, `PutBucketEncryption`, `DeleteBucketEncryption` |
+
+Whatever s0 forwards to the storage backend, s0 authorizes; **whatever it delegates, the
+control backend authorizes.** For these operations s0 authenticates the caller, resolves the
+tenant's route, and never asks the policy engine. It checks no placement, quota,
+`freeze_writes` or rider either: the control backend sees the whole request and owns those
+answers. It re-issues the parsed request signed with a dedicated control credential, adds the
+caller's identity in `x-s0-caller-subject`, `x-s0-caller-tenant`, `x-s0-caller-organization`,
+`x-s0-backend-id` and `x-s0-request-id` **before** signing so all of them are in
+`SignedHeaders`, does not retry (a delegated write is not known to be idempotent), and passes
+the control backend's S3 error through unchanged except for the request id, which becomes the
+delegated audit record's id. A control backend that cannot be reached answers `503
+ServiceUnavailable`. `GetBucketPolicy`, `PutBucketPolicy` and `DeleteBucket` are never
+delegated. See [ADR-011](docs/adr/ADR-011-delegated-operations.md) and `control_backend` in
+[`docs/gateway.example.json`](docs/gateway.example.json).
+
 ### Not supported (76)
 
 **Bucket lifecycle and configuration — 63 operations.** Every `*BucketAcl`, `*BucketPolicy`,
@@ -60,7 +92,8 @@ with nothing upstream knowing. Those five verbs (`create_bucket`, `delete_bucket
 `read_bucket_config`, `write_bucket_config`, `write_object_acl`) are held in
 `NON_GATEWAY_VERBS` as a classification only — three tests hold that set disjoint from the
 grantable vocabulary, so flipping one of these operations to enforced does not quietly
-compile.
+compile. The 15 operations of the section above are the exception, and only when a
+control backend answers them; without one they are in this list too.
 
 **Object-level operations outside the model — 11 operations.**
 
@@ -150,8 +183,9 @@ Three independent layers, and they only work together:
 
 | Layer | What it stops |
 |---|---|
-| `check`, pre-deserialization | Denies anonymous requests and any operation the table does not mark `Enforced`. Emits a **gate** audit record naming the stage, operation and access-key id. |
+| `check`, pre-deserialization | Denies anonymous requests and any operation the table does not mark `Enforced`, or `Delegable` and listed in `control_backend.operations`. Emits a **gate** audit record naming the stage, operation and access-key id. |
 | `AuthzProof` ([`src/access/proof.rs`](src/access/proof.rs)) | The enforce path mints a proof; the forward path requires one bound to the same operation. A typed hook that forgets to authorize cannot reach a backend — it fails with an internal error. |
+| `DelegationProof` ([`src/access/delegation.rs`](src/access/delegation.rs)) | `check` mints a proof for a request it admitted as delegated; the delegated hook and dispatch arm both require one bound to the same operation. Neither proof opens the other's arm, so a delegated operation never reaches the policy engine or the storage backend, and an enforced one never reaches the control backend. |
 | PDP error handling | Any PDP error, missing key, or unparseable decision denies. |
 
 The table proves a hook *exists*; the proof proves it *ran*.
@@ -285,8 +319,9 @@ key, so replacing it invalidates live sessions. Rotate it in a window.
 A browser that uploads to or downloads from a presigned URL pointing at s0 sends a preflight
 (`OPTIONS`) first, and can read the answer only if it names the page's origin. s0 serves both
 from **the CORS configuration the control plane already set on the backend bucket**. There is
-no gateway-level CORS setting, and `GetBucketCors` / `PutBucketCors` stay refused to clients:
-CORS remains a property of the managed resource, and s0 only reads it back.
+no gateway-level CORS setting. `GetBucketCors` / `PutBucketCors` stay refused to clients
+unless a control backend is configured to answer them (see Delegated, above): CORS remains
+a property of the managed resource, and s0 only reads it back.
 
 | | |
 |---|---|

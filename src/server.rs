@@ -26,10 +26,11 @@ use crate::gateway::Gateway;
 use crate::proxy::{GatewayS3, S3GatewayState};
 
 pub fn build_service(gw: Arc<Gateway>) -> CorsFront {
-    let s3 = GatewayS3::new(Arc::new(S3GatewayState::new(
-        gw.registry.clone(),
-        gw.limits.clone(),
-    )));
+    let mut state = S3GatewayState::new(gw.registry.clone(), gw.limits.clone());
+    if let Some(control) = &gw.control {
+        state = state.with_control(control.clone());
+    }
+    let s3 = GatewayS3::new(Arc::new(state));
     let mut builder = S3ServiceBuilder::new(s3);
     builder.set_auth(GatewayAuth::new(gw.identity.clone()));
     builder.set_access(GatewayAccess::new(gw.clone()));
@@ -54,6 +55,10 @@ fn s3_config(gw: &Gateway) -> S3Config {
     cfg
 }
 
+/// How long the S3 front waits for in-flight requests on shutdown, raised to the control
+/// backend's call budget when one is configured so a delegated call is not cut mid-flight.
+const DRAIN_BOUND: Duration = Duration::from_secs(30);
+
 /// Serve the S3 front until SIGTERM/Ctrl-C, then drain.
 pub async fn serve(gw: Arc<Gateway>, listen: SocketAddr) -> Result<()> {
     serve_with_shutdown(gw, listen, crate::shutdown::signal()).await
@@ -69,6 +74,9 @@ pub async fn serve_with_shutdown(
     // Read once, before the gateway is moved into the service: the accept loop's
     // connection cap is a property of this listener and cannot change under it.
     let max_connections = gw.limits().max_connections;
+    let drain_bound = gw.control.as_ref().map_or(DRAIN_BOUND, |control| {
+        DRAIN_BOUND.max(control.call_budget())
+    });
     let service = build_service(gw);
     let listener = TcpListener::bind(listen).await?;
     tracing::info!(%listen, "gateway listening");
@@ -127,8 +135,8 @@ pub async fn serve_with_shutdown(
 
     tokio::select! {
         _ = graceful.shutdown() => tracing::info!("all connections drained"),
-        _ = tokio::time::sleep(Duration::from_secs(30)) => {
-            tracing::warn!("drain timed out after 30s");
+        _ = tokio::time::sleep(drain_bound) => {
+            tracing::warn!(?drain_bound, "drain timed out");
         }
     }
     Ok(())

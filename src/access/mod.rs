@@ -2,7 +2,8 @@
 //! request — including the riders (canned ACL, `x-amz-grant-*`, inline `x-amz-tagging`,
 //! governance bypass) a path-only check would miss. `check` is the deny-by-default
 //! backstop: it refuses anonymous callers and every op [`optable`] does not mark
-//! [`Coverage::Enforced`], because the default hooks fail OPEN. Every refusal is audited;
+//! [`Coverage::Enforced`], or [`Coverage::Delegable`] and listed by `control_backend`
+//! (ADR-011), because the default hooks fail OPEN. Every refusal is audited;
 //! an allowed record is held for the forward leg ([`crate::audit::PendingAudit`]), a
 //! denied one emitted at once. Riders no grant may authorize are refused in code, never
 //! silently stripped ([`headers`], ADR-008); an inline tag set is decomposed onto
@@ -13,6 +14,7 @@
 //! the policy allowed is then charged to the byte quotas that bundle states, if any
 //! ([`crate::quota`]).
 
+pub mod delegation;
 pub mod headers;
 pub mod optable;
 pub mod proof;
@@ -30,7 +32,8 @@ use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Result, s3_error};
 use crate::access::headers::RequestRiders;
 use crate::access::tagging::ReservedTagKeys;
 use crate::audit::{
-    AuditRecord, BackendOutcome, GateContext, GateStage, GatewayMeta, Outcome, PendingAudit,
+    AuditRecord, BackendOutcome, DelegationContext, GateContext, GateStage, GatewayMeta, Outcome,
+    PendingAudit,
 };
 use crate::auth::SECURITY_TOKEN_HEADER;
 use crate::authz::{Backend, CopySource as AuthzCopySource, Decision, OpaInput, RequestMeta};
@@ -43,7 +46,8 @@ use crate::proxy::RouteSnapshot;
 use crate::proxy::obligations::{BucketSource, BucketVisibility, ResponseObligations};
 use crate::quota::{Admission, QuotaRefusal, WriteTarget};
 
-pub use optable::{Coverage, DangerTier, GateDenial, OP_TABLE, OpSpec, ResourceShape};
+pub use delegation::DelegationProof;
+pub use optable::{Coverage, DangerTier, Gate, GateDenial, OP_TABLE, OpSpec, ResourceShape};
 pub use proof::AuthzProof;
 
 /// The ACL fields of an object-shaped s3s input, as [`headers::AclFields`].
@@ -341,6 +345,46 @@ impl GatewayAccess {
             principal_sub.unwrap_or_default().to_string(),
             self.gw.audit.labels(),
         ));
+    }
+
+    /// The record of a request handed to the control backend, held until the dispatcher
+    /// knows what the control backend answered. Names the live bundle's own name for the
+    /// bucket when it has one, like every other record.
+    fn delegated_record(
+        &self,
+        op: &str,
+        bucket: String,
+        principal: &ResolvedPrincipal,
+        route: &RouteSnapshot,
+    ) -> AuditRecord {
+        let object_name = self
+            .gw
+            .bundles
+            .current()
+            .placement()
+            .object_name(&bucket)
+            .map(str::to_string);
+        AuditRecord::delegated(
+            new_decision_id(),
+            now_rfc3339(),
+            DelegationContext {
+                operation: op.to_string(),
+                bucket,
+                tenant: route.tenant.clone(),
+                subject: crate::pdp::principal_subject_key(
+                    principal.principal_type,
+                    &principal.sub,
+                ),
+                control_status: None,
+                control_error: None,
+            },
+            principal.sub.clone(),
+            &route.organization_id,
+            route.backend_id.0.clone(),
+            route.backend_kind.as_str().to_string(),
+            object_name,
+            self.gw.audit.labels(),
+        )
     }
 
     /// Ask the PDP about one prepared input, then act on the answer: hold the record and
@@ -864,20 +908,24 @@ impl S3Access for GatewayAccess {
         };
         // Deny-by-default backstop: an op the table does not mark `Enforced` fails
         // OPEN at its typed hook (s3s defaults every one of them to `Ok(())`), so it
-        // MUST be rejected here. `gate_op` also refuses the two structurally
-        // unauthorizable ops ahead of, and independently of, their coverage.
-        if let Err(denial) = optable::gate_op(&op) {
-            tracing::warn!(%op, %access_key, reason = denial.as_str(), "gate deny: operation refused");
-            self.audit_gate_denial(
-                &op,
-                GateStage::OperationNotEnforced,
-                Some(&access_key),
-                None,
-                None,
-                denial.as_str().to_string(),
-            );
-            return Err(s3_error!(AccessDenied, "{}: {op}", denial.as_str()));
-        }
+        // MUST be rejected here. `gate` also refuses the two structurally unauthorizable
+        // ops ahead of, and independently of, their coverage, and a `Delegable` op only
+        // passes when `control_backend.operations` lists it.
+        let gate = match optable::gate(&op, self.gw.delegated_ops()) {
+            Ok(gate) => gate,
+            Err(denial) => {
+                tracing::warn!(%op, %access_key, reason = denial.as_str(), "gate deny: operation refused");
+                self.audit_gate_denial(
+                    &op,
+                    GateStage::OperationNotEnforced,
+                    Some(&access_key),
+                    None,
+                    None,
+                    denial.as_str().to_string(),
+                );
+                return Err(s3_error!(AccessDenied, "{}: {op}", denial.as_str()));
+            }
+        };
         // The STS session token rides in the header for signed requests and in the
         // query string for presigned URLs — presigned links flow through the
         // same OPA gate, so accept both.
@@ -922,6 +970,24 @@ impl S3Access for GatewayAccess {
                 principal.tenant
             ));
         };
+        if matches!(gate, Gate::Delegated(_)) {
+            // No policy question, placement, quota, freeze or rider check: the control
+            // backend sees the whole request and owns those answers (ADR-011 D3).
+            let bucket = cx
+                .s3_path()
+                .get_bucket_name()
+                .unwrap_or_default()
+                .to_string();
+            let (principal, route) = (Arc::new(principal), Arc::new(route));
+            let record = self.delegated_record(&op, bucket, &principal, &route);
+            let ext = cx.extensions_mut();
+            ext.insert(principal);
+            ext.insert(route);
+            ext.insert(OperationName(Arc::from(op.as_str())));
+            ext.insert(Arc::new(PendingAudit::new(self.gw.audit.clone(), record)));
+            ext.insert(DelegationProof::mint(Arc::from(op.as_str())));
+            return Ok(());
+        }
         // The placement is pinned here for the same reason: a bundle swap mid-request must
         // not let one sub-decision see a bucket where another did not.
         let placement = self.gw.bundles.current().placement().clone();
@@ -1354,18 +1420,105 @@ impl S3Access for GatewayAccess {
         Ok(())
     }
 
-    // ── bucket existence (client compatibility) ─────────────────────────────────
+    // ── delegated operations ────────────────────────────────────────────────────
     //
-    // Deliberately absent: `create_bucket`, `delete_bucket`, `{get,put}_bucket_policy`
-    // and `{get,put}_bucket_cors`. The gateway is data-plane only, and these are REMOVED
-    // rather than stubbed — a stub returning `Ok(())` is the s3s fail-OPEN default wearing
-    // a comment. With no hook and no dispatch arm, `OP_TABLE` marks each
-    // `Coverage::Denied`, `check` refuses before deserialization, and even a bug in
-    // `check` lands on s3s's `NotImplemented`;
+    // The 15 `Coverage::Delegable` operations. Each hook only demands the
+    // `DelegationProof` that `check` mints for a request it admitted as delegated, because
+    // the s3s default would answer `Ok(())` and a hook that did nothing would read as an
+    // authorization. They never reach the policy engine: the control backend authorizes
+    // (ADR-011). `delete_bucket` and `{get,put}_bucket_policy` stay absent, so the table
+    // keeps them `Coverage::Denied`, `check` refuses them before deserialization, and even
+    // a bug in `check` lands on s3s's `NotImplemented`;
     // `tests/gate_invariants.rs::denied_ops_have_no_dispatch_arm` holds that.
-    //
-    // Bucket existence, policy, CORS and quota are properties of the managed resource and
-    // are changed through the control plane. See `optable::NON_GATEWAY_VERBS`.
+
+    async fn create_bucket(&self, req: &mut S3Request<CreateBucketInput>) -> S3Result<()> {
+        delegation::require(req)
+    }
+
+    async fn get_bucket_cors(&self, req: &mut S3Request<GetBucketCorsInput>) -> S3Result<()> {
+        delegation::require(req)
+    }
+
+    async fn put_bucket_cors(&self, req: &mut S3Request<PutBucketCorsInput>) -> S3Result<()> {
+        delegation::require(req)
+    }
+
+    async fn delete_bucket_cors(&self, req: &mut S3Request<DeleteBucketCorsInput>) -> S3Result<()> {
+        delegation::require(req)
+    }
+
+    async fn get_bucket_lifecycle_configuration(
+        &self,
+        req: &mut S3Request<GetBucketLifecycleConfigurationInput>,
+    ) -> S3Result<()> {
+        delegation::require(req)
+    }
+
+    async fn put_bucket_lifecycle_configuration(
+        &self,
+        req: &mut S3Request<PutBucketLifecycleConfigurationInput>,
+    ) -> S3Result<()> {
+        delegation::require(req)
+    }
+
+    async fn delete_bucket_lifecycle(
+        &self,
+        req: &mut S3Request<DeleteBucketLifecycleInput>,
+    ) -> S3Result<()> {
+        delegation::require(req)
+    }
+
+    async fn get_bucket_tagging(&self, req: &mut S3Request<GetBucketTaggingInput>) -> S3Result<()> {
+        delegation::require(req)
+    }
+
+    async fn put_bucket_tagging(&self, req: &mut S3Request<PutBucketTaggingInput>) -> S3Result<()> {
+        delegation::require(req)
+    }
+
+    async fn delete_bucket_tagging(
+        &self,
+        req: &mut S3Request<DeleteBucketTaggingInput>,
+    ) -> S3Result<()> {
+        delegation::require(req)
+    }
+
+    async fn get_bucket_versioning(
+        &self,
+        req: &mut S3Request<GetBucketVersioningInput>,
+    ) -> S3Result<()> {
+        delegation::require(req)
+    }
+
+    async fn put_bucket_versioning(
+        &self,
+        req: &mut S3Request<PutBucketVersioningInput>,
+    ) -> S3Result<()> {
+        delegation::require(req)
+    }
+
+    async fn get_bucket_encryption(
+        &self,
+        req: &mut S3Request<GetBucketEncryptionInput>,
+    ) -> S3Result<()> {
+        delegation::require(req)
+    }
+
+    async fn put_bucket_encryption(
+        &self,
+        req: &mut S3Request<PutBucketEncryptionInput>,
+    ) -> S3Result<()> {
+        delegation::require(req)
+    }
+
+    async fn delete_bucket_encryption(
+        &self,
+        req: &mut S3Request<DeleteBucketEncryptionInput>,
+    ) -> S3Result<()> {
+        delegation::require(req)
+    }
+
+    // ── bucket existence (client compatibility) ─────────────────────────────────
 
     async fn head_bucket(&self, req: &mut S3Request<HeadBucketInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();

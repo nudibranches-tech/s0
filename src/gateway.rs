@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 
+use crate::access::optable::DelegatedOps;
 use crate::audit::{self, AuditConfig, AuditHandle, AuditSink};
 use crate::auth::derived::DerivedKeyAuthority;
 use crate::auth::sts::StsAuthority;
@@ -19,6 +20,7 @@ use crate::pdp::{
     parse_bundle,
 };
 use crate::proxy::BackendRegistry;
+use crate::proxy::control::ControlBackend;
 use crate::quota::QuotaLedger;
 
 /// Shared, cheaply-cloneable state. `Arc<Gateway>` is held by the auth, access, and
@@ -48,7 +50,12 @@ pub struct Gateway {
     /// production construction path and hard-codes `None`, with no setter and no config
     /// knob, so only a test that builds a `Gateway` literally can enable it.
     pub capture: Option<Arc<CaptureSink>>,
+    /// The control backend the delegable operations go to, when configured. Built once:
+    /// it is restart-only, like the STS ring.
+    pub control: Option<Arc<ControlBackend>>,
 }
+
+static NO_DELEGATION: DelegatedOps = DelegatedOps::none();
 
 impl Gateway {
     /// Build the full gateway from config. Must run inside a tokio runtime (spawns
@@ -83,6 +90,11 @@ impl Gateway {
             ..AuditConfig::default()
         });
 
+        let control = cfg
+            .control_backend
+            .as_ref()
+            .map(|c| ControlBackend::from_config(c).map(|b| Arc::new(b.bound_to(&cfg.tenants))))
+            .transpose()?;
         let gateway = Arc::new(Gateway {
             identity,
             pdp,
@@ -97,6 +109,7 @@ impl Gateway {
             // and object keys in memory, and nothing an operator can set should be able
             // to turn that on.
             capture: None,
+            control,
         });
         Ok((gateway, audit_handle))
     }
@@ -104,6 +117,13 @@ impl Gateway {
     /// The hardening limits in force right now.
     pub fn limits(&self) -> arc_swap::Guard<Arc<LimitsConfig>> {
         self.limits.load()
+    }
+
+    /// The operations handed to the control backend; none without one.
+    pub fn delegated_ops(&self) -> &DelegatedOps {
+        self.control
+            .as_ref()
+            .map_or(&NO_DELEGATION, |control| control.delegated())
     }
 
     /// Re-apply a rendered config to the running gateway. There is deliberately no producer
@@ -121,6 +141,24 @@ impl Gateway {
     /// no decision reads both. A single request's view of its own route must not tear, and
     /// that is guaranteed one level up by the `RouteSnapshot` in `req.extensions`.
     pub fn apply_config(&self, cfg: &GatewayConfig) -> Result<()> {
+        let unchanged = match &self.control {
+            Some(control) => control.is_built_from(cfg.control_backend.as_ref()),
+            None => cfg.control_backend.is_none(),
+        };
+        if !unchanged {
+            tracing::warn!(
+                "control_backend changed in a re-applied configuration; it is restart-only, \
+                 the running one is kept"
+            );
+        }
+        if let Some(control) = &self.control
+            && !control.serves(&cfg.tenants)
+        {
+            return Err(GatewayError::Config(
+                "the re-applied tenants are not all bound to the (organization, backend) the                  control backend serves; one control credential is bound to one"
+                    .into(),
+            ));
+        }
         let credentials = crate::auth::credentials_from_config(cfg);
         self.registry.apply_config(cfg)?;
         self.credentials.replace(credentials);
@@ -312,6 +350,7 @@ mod tests {
             cors: Arc::new(CorsState::new()),
             quota: Arc::new(QuotaLedger::new()),
             capture: None,
+            control: None,
         };
         (gw, handle)
     }
@@ -427,5 +466,29 @@ mod tests {
         store.replace(StaticCredentials::new());
         assert!(store.is_empty());
         assert_eq!(store.secret("AKIA1"), None);
+    }
+
+    #[tokio::test]
+    async fn a_reload_cannot_rebind_a_gateway_with_a_control_backend() {
+        let mut cfg: serde_json::Value =
+            serde_json::from_str(include_str!("../docs/gateway.example.json")).expect("example");
+        cfg["sts"]["master_keys"]["k0"] = "00".repeat(32).into();
+        cfg["sts"]["signing_key_hex"] = "11".repeat(32).into();
+        cfg.as_object_mut().expect("object").remove("derived_keys");
+        let bundle = std::env::temp_dir().join(format!("s0-gwbind-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&bundle, "{}").expect("bundle file");
+        cfg["bundle_path"] = bundle.to_string_lossy().into();
+        cfg["audit"]["spill_path"] = std::env::temp_dir()
+            .join(format!("s0-gwbind-{}.ndjson", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .into();
+        let load = |v: &serde_json::Value| GatewayConfig::from_json(&v.to_string());
+        let (gw, _audit) = Gateway::build(&load(&cfg).expect("config")).expect("gateway");
+        assert!(gw.apply_config(&load(&cfg).expect("config")).is_ok());
+
+        let mut other_org = cfg.clone();
+        other_org["tenants"][0]["organization_id"] = "org-globex".into();
+        let refused = gw.apply_config(&load(&other_org).expect("config"));
+        assert!(refused.is_err(), "a re-bound organization was accepted");
     }
 }

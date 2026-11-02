@@ -17,6 +17,10 @@ fn the_readme_operation_counts_match_the_table() {
         .filter(|s| s.tier == DangerTier::NeverImplement)
         .count();
     let refused = total - enforced;
+    let delegable = OP_TABLE
+        .iter()
+        .filter(|s| s.coverage == Coverage::Delegable)
+        .count();
 
     for (claim, what) in [
         (
@@ -27,6 +31,14 @@ fn the_readme_operation_counts_match_the_table() {
         (
             format!("other **{refused}** are refused"),
             "the refused count",
+        ),
+        (
+            format!("**{delegable}** of those can be delegated"),
+            "the delegable count",
+        ),
+        (
+            format!("Delegated ({delegable})"),
+            "the delegated-section heading",
         ),
         (
             format!("all {refused} are driven"),
@@ -67,6 +79,21 @@ fn every_enforced_operation_is_named_in_the_readme_table() {
         missing.is_empty(),
         "these operations are Enforced but the README's supported table does not name \
          them: {missing:?}. A reader would believe they are refused."
+    );
+}
+
+#[test]
+fn every_delegable_operation_is_named_in_the_readme_table() {
+    let missing: Vec<&str> = OP_TABLE
+        .iter()
+        .filter(|s| s.coverage == Coverage::Delegable)
+        .map(|s| s.name)
+        .filter(|op| !README.contains(&format!("`{op}`")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "these operations are Delegable but the README's delegated table does not name \
+         them: {missing:?}"
     );
 }
 

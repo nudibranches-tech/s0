@@ -11,9 +11,11 @@
 
 #![allow(dead_code)] // each test binary uses a different subset
 
+pub mod control_stub;
 pub mod ops;
 pub mod routes;
 pub mod sigv4;
+pub mod wire;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -31,7 +33,8 @@ use s0::gateway::Gateway;
 use s0::identity::ResolvedPrincipal;
 use s0::model::{BackendKind, PrincipalType};
 use s0::pdp::{Bundle, BundleStore, CachingPdp, GATEWAY_REGO, Pdp, RegorusPdp};
-use s0::proxy::BackendRegistry;
+use s0::proxy::control::ControlBackend;
+use s0::proxy::{BackendRegistry, GatewayS3, S3GatewayState};
 use s3s::S3Request;
 
 /// The static credential the black-box tests sign with.
@@ -225,6 +228,53 @@ pub fn fixture_with_backend(tag: &str, bundle: serde_json::Value, endpoint: &str
     fixture_from_config(tag, dir.clone(), bundle, &config_json(&dir, endpoint))
 }
 
+/// The control backend section of a config that delegates all 15 operations to `endpoint`,
+/// signed with [`control_stub::CONTROL_ACCESS_KEY`].
+pub fn control_backend_json(endpoint: &str) -> serde_json::Value {
+    serde_json::json!({
+        "endpoint_url": endpoint,
+        "access_key_id": control_stub::CONTROL_ACCESS_KEY,
+        "secret_access_key": control_stub::CONTROL_SECRET_KEY,
+        "operations": s0::access::optable::delegable_ops(),
+        "connect_timeout_secs": 2,
+        "call_timeout_secs": 5,
+        "create_bucket_placement_wait_secs": 1,
+    })
+}
+
+/// [`fixture`] with a control backend at `control_endpoint`. The storage backend stays a
+/// closed port, so a request that wrongly reaches it fails loudly.
+pub fn fixture_with_control(
+    tag: &str,
+    bundle: serde_json::Value,
+    control_endpoint: &str,
+) -> Fixture {
+    fixture_with_control_section(tag, bundle, control_backend_json(control_endpoint))
+}
+
+/// [`fixture_with_control`] with the `control_backend` section spelled out.
+pub fn fixture_with_control_section(
+    tag: &str,
+    bundle: serde_json::Value,
+    section: serde_json::Value,
+) -> Fixture {
+    let dir = scratch(tag);
+    let mut config: serde_json::Value =
+        serde_json::from_str(&config_json(&dir, "http://127.0.0.1:1")).expect("config json");
+    config["control_backend"] = section;
+    fixture_from_config(tag, dir, bundle, &config.to_string())
+}
+
+/// The dispatcher for `gw`, wired to its control backend when it has one — what
+/// `server::build_service` assembles.
+pub fn gateway_s3(gw: &Arc<Gateway>) -> GatewayS3 {
+    let mut state = S3GatewayState::new(gw.registry.clone(), gw.limits.clone());
+    if let Some(control) = &gw.control {
+        state = state.with_control(control.clone());
+    }
+    GatewayS3::new(Arc::new(state))
+}
+
 /// [`fixture_with_backend`] with a second tenant, `globex` of the same organization,
 /// re-signed with **acme's own** upstream credential: one identity shared by two tenants,
 /// the shape of a backend that only has one identity per organization.
@@ -315,6 +365,10 @@ fn fixture_from_config(
         cors: Arc::new(s0::cors::CorsState::new()),
         quota: Arc::new(s0::quota::QuotaLedger::new()),
         capture: Some(capture.clone()),
+        control: cfg
+            .control_backend
+            .as_ref()
+            .map(|c| Arc::new(ControlBackend::from_config(c).expect("control backend"))),
     });
     Fixture {
         gw,

@@ -91,6 +91,7 @@ async fn test_gateway(dir: &std::path::Path) -> Arc<Gateway> {
         cors: Arc::new(s0::cors::CorsState::new()),
         quota: Arc::new(s0::quota::QuotaLedger::new()),
         capture: None,
+        control: None,
     })
 }
 

@@ -129,8 +129,10 @@ async fn put_object_with_x_amz_acl_public_read_is_refused() {
 async fn every_public_canned_acl_is_refused_on_every_write_shaped_op() {
     // The hole is not PutObject-specific. CopyObject is the worst of the four: its
     // destination bucket need not be the source's, so a public ACL there publishes a copy
-    // of data the caller only held read on. `CreateBucket` is refused at the gate instead,
-    // which is strictly earlier, and `security_regressions.rs` pins that.
+    // of data the caller only held read on. `CreateBucket` is refused at the gate instead
+    // when no control backend lists it, which is strictly earlier, and
+    // `security_regressions.rs` pins that; a delegated one is screened by the control
+    // backend (ADR-011 D3).
     let fx = common::fixture("riders-acl-ops", wildcard_bundle());
     let access = GatewayAccess::new(fx.gw.clone());
     for acl in ["public-read", "public-read-write", "authenticated-read"] {
@@ -266,7 +268,8 @@ async fn each_x_amz_grant_header_is_refused_when_it_names_a_public_group() {
 }
 
 // `grant-write` exists only on the bucket ACL, and no enforced op can carry one — the
-// gate refuses `CreateBucket` outright — so there is nothing to screen here.
+// gate refuses `CreateBucket` unless a control backend answers it, and that one screens
+// the grants (ADR-011 D3) — so there is nothing to screen here.
 // `AclFields::write` is kept anyway: it is what makes the ACL normalizer complete, so a
 // future op that CAN carry the header is screened the day it is added.
 

@@ -46,6 +46,29 @@ impl PendingAudit {
         self.sink.emit(record);
     }
 
+    /// Emit the delegated record, enriched with what the control backend answered.
+    /// Idempotent, like [`Self::settle`].
+    pub fn settle_delegated(&self, status: Option<u16>, error_code: Option<String>) {
+        let Some(mut record) = self.take() else {
+            return;
+        };
+        record.settle_delegated(status, error_code);
+        self.sink.emit(record);
+    }
+
+    /// Note on the held record that the control backend call is starting, so a request
+    /// that ends mid-call is not recorded as having ended before the call.
+    pub fn mark_delegation_dispatched(&self) {
+        if let Some(record) = self
+            .record
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            record.mark_delegation_dispatched();
+        }
+    }
+
     /// The id of the record this request is audited under, while it is still held. The
     /// forward path hands it to the client as the request id, so a reported error leads
     /// straight to its decision record.

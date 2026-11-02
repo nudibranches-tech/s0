@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 
 use s0::access::optable::{
     Coverage, DangerTier, GATEWAY_VERBS, GateDenial, NON_GATEWAY_VERBS, OP_TABLE, action_for,
-    enforced_ops, gate_op, spec,
+    delegable_ops, enforced_ops, gate_op, spec,
 };
 use s0::model::Action;
 
@@ -29,7 +29,7 @@ const CARGO_TOML: &str = include_str!("../Cargo.toml");
 /// Checked in so the target is a diff against a written-down set rather than a number
 /// someone remembers, and so that flipping an op to `Enforced` that is NOT in this list
 /// is a visible, deliberate act. The ops deliberately kept out are named in
-/// `RE_DENIED_2026_08_08` rather than silently absent.
+/// `NEVER_DELEGABLE` or `DELEGABLE_ADR_0056` rather than silently absent.
 const TARGET_ENFORCED: [&str; 23] = [
     // the object data plane
     "AbortMultipartUpload",
@@ -59,21 +59,17 @@ const TARGET_ENFORCED: [&str; 23] = [
     "PutObjectTagging",
 ];
 
-/// The six control-plane operations that are `Denied` **permanently** rather than
-/// pending work, each with its reason.
+/// The control-plane operations that no configuration delegates, each with its reason.
 ///
-/// The other half of `TARGET_ENFORCED`: that array says what may be enforced, this one
-/// says what may not. Without it, adding `CreateBucket` to `TARGET_ENFORCED` would read
-/// as restoring something dropped by accident.
-const RE_DENIED_2026_08_08: [(&str, &str); 6] = [
-    (
-        "CreateBucket",
-        "a bucket made through S3 has no HFBucket CR: unmanaged, unquota'd, invisible to \
-         the console, and absent from the bucket_attributes the denylist is keyed on",
-    ),
+/// The other half of `DELEGABLE_ADR_0056`: that array says what a control backend may
+/// answer, this one says what stays refused whatever the configuration. Without it,
+/// adding `DeleteBucket` to the delegable set would read as restoring something dropped by
+/// accident.
+const NEVER_DELEGABLE: [(&str, &str); 3] = [
     (
         "DeleteBucket",
-        "destroys a bucket the console still believes it manages",
+        "destroys a bucket the console still believes it manages; ADR-0056 leaves its \
+         delegation undecided",
     ),
     (
         "GetBucketPolicy",
@@ -85,15 +81,26 @@ const RE_DENIED_2026_08_08: [(&str, &str); 6] = [
         "a bucket policy IS a second PDP this gateway does not evaluate, so an Allow \
          written here widens access to a principal no projected grant named",
     ),
-    (
-        "GetBucketCors",
-        "CORS is bucket posture, and posture is control-plane",
-    ),
-    (
-        "PutBucketCors",
-        "rule contents were never inspected, so a write-config grant permitted \
-         AllowedOrigin `*`",
-    ),
+];
+
+/// The 15 operations ADR-0056 hands to a control backend: refused unless
+/// `control_backend.operations` lists them, answered by the control backend when it does.
+const DELEGABLE_ADR_0056: [&str; 15] = [
+    "CreateBucket",
+    "DeleteBucketCors",
+    "DeleteBucketEncryption",
+    "DeleteBucketLifecycle",
+    "DeleteBucketTagging",
+    "GetBucketCors",
+    "GetBucketEncryption",
+    "GetBucketLifecycleConfiguration",
+    "GetBucketTagging",
+    "GetBucketVersioning",
+    "PutBucketCors",
+    "PutBucketEncryption",
+    "PutBucketLifecycleConfiguration",
+    "PutBucketTagging",
+    "PutBucketVersioning",
 ];
 
 fn s3s_op_names() -> Vec<&'static str> {
@@ -165,26 +172,44 @@ fn exactly_23_enforced_76_denied() {
 }
 
 #[test]
-fn the_re_denied_ops_are_not_quietly_re_enforced() {
+fn the_non_delegable_ops_are_not_quietly_enforced_or_delegated() {
     // The count above is the weak form of this claim: an edit could re-enforce
-    // `PutBucketPolicy` and deny something else to keep 23/76 true. Naming the six also
+    // `PutBucketPolicy` and deny something else to keep 23/76 true. Naming them also
     // asserts they are refused by the TABLE rather than by a hook that returns an error.
     let target: BTreeSet<&str> = TARGET_ENFORCED.into_iter().collect();
-    for (op, why) in RE_DENIED_2026_08_08 {
+    for (op, why) in NEVER_DELEGABLE {
         assert!(
             spec(op).is_some(),
-            "RE_DENIED_2026_08_08 names {op}, which is not an s3s operation"
+            "NEVER_DELEGABLE names {op}, which is not an s3s operation"
         );
         assert_eq!(
             spec(op).unwrap().coverage,
             Coverage::Denied,
-            "{op} is Enforced again. It was removed from the gateway's scope on \
-             2026-08-08 and the reason has not expired: {why}"
+            "{op} is Enforced or Delegable again. The reason it was kept out has not \
+             expired: {why}"
         );
         assert_eq!(gate_op(op), Err(GateDenial::NotEnforced), "{op}");
         assert!(
             !target.contains(op),
-            "{op} is back in TARGET_ENFORCED; the two lists now contradict each other"
+            "{op} is in TARGET_ENFORCED; the two lists now contradict each other"
+        );
+    }
+}
+
+#[test]
+fn the_delegable_ops_are_exactly_the_adr_0056_fifteen() {
+    let mut named: Vec<&str> = DELEGABLE_ADR_0056.to_vec();
+    named.sort_unstable();
+    let mut delegable = delegable_ops();
+    delegable.sort_unstable();
+    assert_eq!(delegable, named);
+    let target: BTreeSet<&str> = TARGET_ENFORCED.into_iter().collect();
+    for op in DELEGABLE_ADR_0056 {
+        assert_ne!(spec(op).unwrap().coverage, Coverage::Enforced, "{op}");
+        assert!(!target.contains(op), "{op} is delegable, not enforced");
+        assert!(
+            !NEVER_DELEGABLE.iter().any(|(n, _)| *n == op),
+            "{op} is listed as both delegable and never delegable"
         );
     }
 }
@@ -223,6 +248,15 @@ fn every_non_enforced_op_is_denied_at_the_gate() {
                     s.tier,
                     DangerTier::NeverImplement,
                     "{} is both enforced and structurally unauthorizable",
+                    s.name
+                );
+            }
+            Coverage::Delegable => {
+                // Refused exactly like a denied op until a control backend lists it.
+                assert_eq!(
+                    gate_op(s.name),
+                    Err(GateDenial::NotEnforced),
+                    "{} is delegable and must be refused with no delegation configured",
                     s.name
                 );
             }

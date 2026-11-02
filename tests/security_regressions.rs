@@ -1349,8 +1349,8 @@ async fn a_tag_set_with_a_duplicate_key_is_refused() {
 
 // ── the gateway is data-plane only ──────────────────────────────────────────────
 
-/// The six control-plane operations that must stay `Denied`, each with the S3 request
-/// that reaches it, so the refusal is measured over the wire rather than asserted
+/// The six control-plane operations that are refused at the gate when no control backend
+/// lists them, each with the S3 request that reaches it, so the refusal is measured over the wire rather than asserted
 /// against the table that decides it.
 ///
 /// `(op, method, path, query)`. Query strings are what route a bucket sub-resource:
@@ -1373,8 +1373,10 @@ const RE_DENIED_REQUESTS: [ReDeniedRequest; 6] = [
 
 #[tokio::test]
 async fn the_six_control_plane_ops_are_refused_at_the_gate_and_on_the_record() {
-    // Deliberately black-box: a real, correctly-signed S3 request for each of the six is
-    // refused by the *gate* — before deserialization, with no policy question asked —
+    // Deliberately black-box, on a gateway with no control backend (with one, CreateBucket,
+    // GetBucketCors and PutBucketCors are delegated and their ACL and grant screening
+    // belongs to the control backend, ADR-011 D3): a real, correctly-signed S3 request for
+    // each of the six is refused by the *gate* — before deserialization, with no policy question asked —
     // and leaves a record saying so. It matters that the refusal is the gate's rather
     // than a bundle's: the bundle is pushed by the control plane and can be wrong.
     //
