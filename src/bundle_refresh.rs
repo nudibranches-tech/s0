@@ -259,9 +259,14 @@ pub trait PlacementWait: Send + Sync {
 
 #[derive(Default)]
 struct OnDemand {
+    /// When the latest on-demand fetch was allowed to start.
     last_started: Option<Instant>,
-    /// The `completed` count when the fetch in flight was reserved, while one is.
-    in_flight_from: Option<u64>,
+}
+
+/// The fetch behind [`BundleRefresher::last`]: its start number and its answer.
+struct LastFetch {
+    started: u64,
+    result: Result<Refreshed, String>,
 }
 
 /// The one place a bundle is fetched and applied: the poll loop, a placement wait and a
@@ -272,8 +277,11 @@ pub struct BundleRefresher {
     source: Arc<BundleSource>,
     health: Arc<BundleHealth>,
     gate: Arc<tokio::sync::Mutex<()>>,
-    completed: tokio::sync::watch::Sender<u64>,
-    last: Arc<Mutex<Result<Refreshed, String>>>,
+    /// Fetches started, counted under the gate.
+    started: AtomicU64,
+    /// Fetches finished.
+    completed: AtomicU64,
+    last: Arc<Mutex<LastFetch>>,
     on_demand: Mutex<OnDemand>,
     on_demand_total: LabeledCounters,
 }
@@ -291,8 +299,12 @@ impl BundleRefresher {
             source: Arc::new(source),
             health,
             gate: Arc::new(tokio::sync::Mutex::new(())),
-            completed: tokio::sync::watch::channel(0).0,
-            last: Arc::new(Mutex::new(Ok(Refreshed::Unchanged))),
+            started: AtomicU64::new(0),
+            completed: AtomicU64::new(0),
+            last: Arc::new(Mutex::new(LastFetch {
+                started: 0,
+                result: Ok(Refreshed::Unchanged),
+            })),
             on_demand: Mutex::new(OnDemand::default()),
             on_demand_total: LabeledCounters::default(),
         })
@@ -319,11 +331,31 @@ impl BundleRefresher {
     /// split the engine reload from the revision store, nor let a second refresh start
     /// while the first still runs.
     pub async fn refresh(self: &Arc<Self>) -> Result<Refreshed, String> {
-        let seen = *self.completed.borrow();
+        self.fetch(None).await
+    }
+
+    /// [`Self::refresh`], but the answer is always that of a fetch that started after
+    /// this call did. A fetch already running when the caller arrives may have read the
+    /// bundle before the change the caller is waiting for, so it is not reused.
+    pub async fn refresh_fresh(self: &Arc<Self>) -> Result<Refreshed, String> {
+        self.fetch(Some(self.started.load(Ordering::SeqCst))).await
+    }
+
+    /// `since`: when set, only a fetch numbered above it may answer.
+    async fn fetch(self: &Arc<Self>, since: Option<u64>) -> Result<Refreshed, String> {
+        let completed_at_arrival = self.completed.load(Ordering::SeqCst);
         let guard = self.gate.clone().lock_owned().await;
-        if *self.completed.borrow() != seen {
-            return self.last.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        {
+            let last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+            let reusable = match since {
+                Some(since) => last.started > since,
+                None => self.completed.load(Ordering::SeqCst) != completed_at_arrival,
+            };
+            if reusable {
+                return last.result.clone();
+            }
         }
+        let number = self.started.fetch_add(1, Ordering::SeqCst) + 1;
         let this = self.clone();
         tokio::spawn(async move {
             let result = refresh_once(&this.pdp, &this.bundles, &this.source).await;
@@ -331,8 +363,11 @@ impl BundleRefresher {
                 Ok(_) => this.health.record_success(),
                 Err(_) => this.health.record_failure(),
             }
-            *this.last.lock().unwrap_or_else(|e| e.into_inner()) = result.clone();
-            this.completed.send_modify(|n| *n += 1);
+            *this.last.lock().unwrap_or_else(|e| e.into_inner()) = LastFetch {
+                started: number,
+                result: result.clone(),
+            };
+            this.completed.fetch_add(1, Ordering::SeqCst);
             drop(guard);
             result
         })
@@ -342,66 +377,52 @@ impl BundleRefresher {
 
     /// Fetch now because a request was refused for a bucket the bundle does not place.
     ///
-    /// At most one fetch per [`ON_DEMAND_MIN_INTERVAL`] per replica: a request arriving
-    /// while one is in flight joins it, one arriving within the interval after it does
-    /// not fetch. A request waits at most [`ON_MISS_WAIT`]. Returns whether a fetch
-    /// finished in that time.
+    /// The decision that follows is made on a fetch that started after this call: one
+    /// already running is not taken. Fetches triggered this way start at most once per
+    /// [`ON_DEMAND_MIN_INTERVAL`] per replica, so a miss arriving inside the interval
+    /// waits for it to pass and shares the fetch of every other miss waiting with it. A
+    /// request waits at most [`ON_MISS_WAIT`]. Returns whether a fetch finished in that
+    /// time.
     pub async fn refresh_on_miss(self: &Arc<Self>) -> bool {
-        enum Role {
-            Lead,
-            Join(u64),
-            Skip,
-        }
-        let role = {
-            let mut state = self.on_demand.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(from) = state.in_flight_from {
-                Role::Join(from)
-            } else if state
-                .last_started
-                .is_some_and(|t| t.elapsed() < ON_DEMAND_MIN_INTERVAL)
-            {
-                Role::Skip
-            } else {
-                state.in_flight_from = Some(*self.completed.borrow());
-                state.last_started = Some(Instant::now());
-                Role::Lead
-            }
-        };
-        match role {
-            Role::Skip => {
-                self.on_demand_total.increment("miss", "rate_limited");
-                false
-            }
-            Role::Join(from) => {
-                let mut rx = self.completed.subscribe();
-                let done = tokio::time::timeout(ON_MISS_WAIT, rx.wait_for(|n| *n != from))
-                    .await
-                    .is_ok();
-                self.on_demand_total
-                    .increment("miss", if done { "coalesced" } else { "timed_out" });
-                done
-            }
-            Role::Lead => {
-                let _clear = ClearInFlight(self);
-                match tokio::time::timeout(ON_MISS_WAIT, self.refresh()).await {
-                    Ok(Ok(Refreshed::Reloaded)) => {
-                        self.on_demand_total.increment("miss", "reloaded");
-                        true
-                    }
-                    Ok(Ok(Refreshed::Unchanged)) => {
-                        self.on_demand_total.increment("miss", "unchanged");
-                        true
-                    }
-                    Ok(Err(e)) => {
-                        tracing::warn!(%e, "on-demand bundle refresh failed");
-                        self.on_demand_total.increment("miss", "failed");
-                        false
-                    }
-                    Err(_) => {
-                        self.on_demand_total.increment("miss", "timed_out");
-                        false
+        let arrived = self.started.load(Ordering::SeqCst);
+        let work = async {
+            let slot = {
+                let mut state = self.on_demand.lock().unwrap_or_else(|e| e.into_inner());
+                let earliest = state.last_started.map(|t| t + ON_DEMAND_MIN_INTERVAL);
+                match earliest {
+                    Some(at) if at > Instant::now() => Some(at),
+                    _ => {
+                        state.last_started = Some(Instant::now());
+                        None
                     }
                 }
+            };
+            if let Some(at) = slot {
+                tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await;
+                let mut state = self.on_demand.lock().unwrap_or_else(|e| e.into_inner());
+                if state.last_started.is_none_or(|t| t < at) {
+                    state.last_started = Some(at);
+                }
+            }
+            self.fetch(Some(arrived)).await
+        };
+        match tokio::time::timeout(ON_MISS_WAIT, work).await {
+            Ok(Ok(Refreshed::Reloaded)) => {
+                self.on_demand_total.increment("miss", "reloaded");
+                true
+            }
+            Ok(Ok(Refreshed::Unchanged)) => {
+                self.on_demand_total.increment("miss", "unchanged");
+                true
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(%e, "on-demand bundle refresh failed");
+                self.on_demand_total.increment("miss", "failed");
+                false
+            }
+            Err(_) => {
+                self.on_demand_total.increment("miss", "timed_out");
+                false
             }
         }
     }
@@ -410,18 +431,6 @@ impl BundleRefresher {
         let bundle = self.bundles.current();
         let placement = bundle.placement();
         placement.places_buckets() && placement.refusal(backend, tenant, bucket).is_none()
-    }
-}
-
-struct ClearInFlight<'a>(&'a BundleRefresher);
-
-impl Drop for ClearInFlight<'_> {
-    fn drop(&mut self) {
-        self.0
-            .on_demand
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .in_flight_from = None;
     }
 }
 
@@ -449,9 +458,16 @@ impl PlacementWait for Arc<BundleRefresher> {
             if remaining.is_zero() {
                 return PlacementWaitOutcome::TimedOut;
             }
-            if let Ok(Err(e)) = tokio::time::timeout(remaining, self.refresh()).await {
-                tracing::warn!(%e, "bundle refresh while waiting for a placement failed");
-            }
+            let result = match tokio::time::timeout(remaining, self.refresh_fresh()).await {
+                Ok(Ok(Refreshed::Reloaded)) => "reloaded",
+                Ok(Ok(Refreshed::Unchanged)) => "unchanged",
+                Ok(Err(e)) => {
+                    tracing::warn!(%e, "bundle refresh while waiting for a placement failed");
+                    "failed"
+                }
+                Err(_) => "timed_out",
+            };
+            self.on_demand_total.increment("placement_wait", result);
             if self.placed(backend, tenant, bucket) {
                 return PlacementWaitOutcome::Placed;
             }
@@ -697,24 +713,40 @@ mod tests {
         out
     }
 
-    #[tokio::test]
-    async fn refresh_on_miss_is_rate_limited() {
-        let (url, served) = scripted_server(vec![bundle_body(&["a"])], Duration::ZERO).await;
-        let refresher = refresher_for(url);
-        assert!(refresher.refresh_on_miss().await);
-        assert!(!refresher.refresh_on_miss().await);
-        assert!(!refresher.refresh_on_miss().await);
-        assert_eq!(served.load(Ordering::SeqCst), 1);
-        assert_eq!(refresher.on_demand_total().get("miss", "reloaded"), 1);
-        assert_eq!(refresher.on_demand_total().get("miss", "rate_limited"), 2);
-
-        tokio::time::sleep(ON_DEMAND_MIN_INTERVAL).await;
-        assert!(refresher.refresh_on_miss().await);
-        assert_eq!(served.load(Ordering::SeqCst), 2);
+    fn places(refresher: &Arc<BundleRefresher>, bucket: &str) -> bool {
+        refresher.placed("bay-1", "acme", bucket)
     }
 
     #[tokio::test]
-    async fn a_burst_of_misses_costs_one_fetch() {
+    async fn misses_are_spaced_by_the_interval_and_share_a_fetch() {
+        let (url, served) = scripted_server(vec![bundle_body(&["a"])], Duration::ZERO).await;
+        let refresher = refresher_for(url);
+        assert!(refresher.refresh_on_miss().await);
+        assert_eq!(served.load(Ordering::SeqCst), 1);
+        assert_eq!(refresher.on_demand_total().get("miss", "reloaded"), 1);
+
+        let second = tokio::spawn({
+            let r = refresher.clone();
+            async move { r.refresh_on_miss().await }
+        });
+        let third = tokio::spawn({
+            let r = refresher.clone();
+            async move { r.refresh_on_miss().await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            1,
+            "no second fetch inside the interval"
+        );
+        assert!(second.await.expect("task"));
+        assert!(third.await.expect("task"));
+        assert_eq!(served.load(Ordering::SeqCst), 2);
+        assert_eq!(refresher.on_demand_total().get("miss", "unchanged"), 2);
+    }
+
+    #[tokio::test]
+    async fn a_burst_of_misses_costs_at_most_two_fetches() {
         let (url, served) =
             scripted_server(vec![bundle_body(&["a"])], Duration::from_millis(200)).await;
         let refresher = refresher_for(url);
@@ -728,7 +760,42 @@ mod tests {
         )
         .await;
         assert!(results.iter().all(|done| *done), "{results:?}");
-        assert_eq!(served.load(Ordering::SeqCst), 1);
+        assert!(served.load(Ordering::SeqCst) <= 2);
+    }
+
+    #[tokio::test]
+    async fn a_miss_inside_the_interval_is_decided_on_a_newer_bundle() {
+        let (url, served) = scripted_server(
+            vec![bundle_body(&["a"]), bundle_body(&["a", "b"])],
+            Duration::ZERO,
+        )
+        .await;
+        let refresher = refresher_for(url);
+        assert!(refresher.refresh_on_miss().await);
+        assert!(!places(&refresher, "b"));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(refresher.refresh_on_miss().await);
+        assert!(places(&refresher, "b"), "the second miss was refused");
+        assert_eq!(served.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_miss_does_not_take_a_fetch_that_started_before_it() {
+        let (url, served) = scripted_server(
+            vec![bundle_body(&["a"]), bundle_body(&["a", "b"])],
+            Duration::from_millis(300),
+        )
+        .await;
+        let refresher = refresher_for(url);
+        let poll = tokio::spawn({
+            let r = refresher.clone();
+            async move { r.refresh().await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(refresher.refresh_on_miss().await);
+        assert!(places(&refresher, "b"), "decided on the older fetch");
+        assert_eq!(served.load(Ordering::SeqCst), 2);
+        assert!(poll.await.expect("task").is_ok());
     }
 
     #[tokio::test]
@@ -773,6 +840,12 @@ mod tests {
             .await;
         assert_eq!(outcome, PlacementWaitOutcome::Placed);
         assert_eq!(served.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            refresher
+                .on_demand_total()
+                .get("placement_wait", "reloaded"),
+            2
+        );
     }
 
     #[tokio::test]
