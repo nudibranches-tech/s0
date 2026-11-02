@@ -18,6 +18,7 @@ ADR rather than editing it in place — but the **Status** line tracks reality.
 | [ADR-009](ADR-009-bundle-v3-bucket-placement.md) | From bundle v3 the gateway enforces the bucket placement itself, ahead of the PDP: a bucket placed under another tenant, or on no tenant of this backend, is refused whatever the policy says, and a bundle projected for another backend refuses everything. `ListBuckets` is answered from the bundle and never forwarded. Below v3 nothing changes. | Accepted |
 | [ADR-010](ADR-010-byte-quotas-counted-per-replica.md) | A v3 bundle may state byte quotas on a bucket, a tenant and the backend. A write the policy allowed is refused `QuotaExceeded` when the last collection's `used_bytes`, plus what this replica accepted since, plus the write would pass a limit. Counted per replica: N replicas can overshoot by what the other N − 1 accepted between two collections. | Accepted |
 | [ADR-011](ADR-011-summarised-platform-identities.md) | The control plane may name service accounts (`sa:` keys only) in `org_settings.audit_summary_subjects`. Their allowed reads and lists that the backend served are folded, ahead of the queue, into one `s3/authz/summary` record per operation, session, bucket and window. Denials, failures, people and every other verb keep a record per request, and an unreadable list summarises nobody. Amends ADR-002. | Accepted |
+| [ADR-012](ADR-012-delegated-operations.md) | Fifteen bucket creation and configuration operations may be delegated to a control backend: an S3 endpoint served by the control plane. s0 authenticates the caller, asks its policy engine nothing, forwards the typed request with signed identity headers and returns the control backend's answer, under a third audit record shape. Delegation exists only when configured; otherwise the operations are refused as before. | Proposed |
 
 ## Settled invariants
 
@@ -31,3 +32,6 @@ Every decision above assumes these, and resolves open questions without reopenin
   the same policy holds across any S3-compatible backend.
 - **Per-request, per-end-user audit**: one decision record per S3 request, attributed to
   the end-user identity.
+- **A delegated operation is authorized by the control backend, never by s0**: s0 authorizes
+  whatever it forwards to the storage backend, and asks its policy engine nothing about what it
+  delegates. Neither class's proof opens the other's dispatch arm.
