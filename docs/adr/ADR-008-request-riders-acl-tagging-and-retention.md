@@ -1,6 +1,6 @@
 # ADR-008 — Request riders: ACL grants, inline tagging, and governance bypass
 
-- **Status:** Accepted — implemented
+- **Status:** Accepted — implemented; amended by ADR-011: when `CreateBucket` is delegated, its riders (`x-amz-acl`, `x-amz-grant-*`, object ownership, object lock) are screened by the control backend, not by s0
 - **Date:** 2026-07-28
 - **Scope:** `src/access/headers.rs`, `src/access/tagging.rs`, `src/access/mod.rs`
   (`screen_riders`, `authorize_riders`, `enforce_object_write`),

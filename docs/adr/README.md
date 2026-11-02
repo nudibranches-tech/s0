@@ -17,6 +17,7 @@ ADR rather than editing it in place — but the **Status** line tracks reality.
 | [ADR-008](ADR-008-request-riders-acl-tagging-and-retention.md) | Closes the ACL / grant-header / inline-tagging / governance-bypass blind spots on write operations. The answer is **deny, never strip**: a strip answers 200 to a request whose intent was not honoured. Conferring ACLs and governance bypass are refused in code, ahead of the PDP, so no pushed policy can confer them. | Accepted |
 | [ADR-009](ADR-009-bundle-v3-bucket-placement.md) | From bundle v3 the gateway enforces the bucket placement itself, ahead of the PDP: a bucket placed under another tenant, or on no tenant of this backend, is refused whatever the policy says, and a bundle projected for another backend refuses everything. `ListBuckets` is answered from the bundle and never forwarded. Below v3 nothing changes. | Accepted |
 | [ADR-010](ADR-010-byte-quotas-counted-per-replica.md) | A v3 bundle may state byte quotas on a bucket, a tenant and the backend. A write the policy allowed is refused `QuotaExceeded` when the last collection's `used_bytes`, plus what this replica accepted since, plus the write would pass a limit. Counted per replica: N replicas can overshoot by what the other N − 1 accepted between two collections. | Accepted |
+| [ADR-011](ADR-011-delegated-operations.md) | Fifteen bucket creation and configuration operations may be delegated to a control backend: an S3 endpoint served by the control plane. s0 authenticates the caller, asks its policy engine nothing, forwards the typed request with signed identity headers and returns the control backend's answer, under a third audit record shape. Delegation exists only when configured; otherwise the operations are refused as before. | Proposed |
 
 ## Settled invariants
 
@@ -30,3 +31,6 @@ Every decision above assumes these, and resolves open questions without reopenin
   the same policy holds across any S3-compatible backend.
 - **Per-request, per-end-user audit**: one decision record per S3 request, attributed to
   the end-user identity.
+- **A delegated operation is authorized by the control backend, never by s0**: s0 authorizes
+  whatever it forwards to the storage backend, and asks its policy engine nothing about what it
+  delegates. Neither class's proof opens the other's dispatch arm.
