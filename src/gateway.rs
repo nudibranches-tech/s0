@@ -12,6 +12,7 @@ use crate::auth::derived::DerivedKeyAuthority;
 use crate::auth::sts::StsAuthority;
 use crate::auth::{DerivedKeys, Identity, StaticCredentialStore};
 use crate::authz::CaptureSink;
+use crate::bundle_refresh::{BundleHealth, BundleRefresher, BundleSource};
 use crate::config::{GatewayConfig, LimitsConfig, PdpConfig};
 use crate::cors::CorsState;
 use crate::error::{GatewayError, Result};
@@ -53,6 +54,9 @@ pub struct Gateway {
     /// The control backend the delegable operations go to, when configured. Built once:
     /// it is restart-only, like the STS ring.
     pub control: Option<Arc<ControlBackend>>,
+    /// The bundle fetcher shared by the poll loop, the placement wait and the refresh on
+    /// a placement miss. `None` when a gateway is assembled without a bundle source.
+    pub refresher: Option<Arc<BundleRefresher>>,
 }
 
 static NO_DELEGATION: DelegatedOps = DelegatedOps::none();
@@ -95,6 +99,9 @@ impl Gateway {
             .as_ref()
             .map(|c| ControlBackend::from_config(c).map(|b| Arc::new(b.bound_to(&cfg.tenants))))
             .transpose()?;
+        let source = BundleSource::from_config(cfg)?;
+        let health = Arc::new(BundleHealth::new(source.is_remote()));
+        let refresher = BundleRefresher::new(pdp.clone(), bundles.clone(), source, health);
         let gateway = Arc::new(Gateway {
             identity,
             pdp,
@@ -110,6 +117,7 @@ impl Gateway {
             // to turn that on.
             capture: None,
             control,
+            refresher: Some(refresher),
         });
         Ok((gateway, audit_handle))
     }
@@ -351,6 +359,7 @@ mod tests {
             quota: Arc::new(QuotaLedger::new()),
             capture: None,
             control: None,
+            refresher: None,
         };
         (gw, handle)
     }

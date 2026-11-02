@@ -11,6 +11,7 @@
 
 #![allow(dead_code)] // each test binary uses a different subset
 
+pub mod bundle_server;
 pub mod control_stub;
 pub mod ops;
 pub mod routes;
@@ -272,6 +273,10 @@ pub fn gateway_s3(gw: &Arc<Gateway>) -> GatewayS3 {
     if let Some(control) = &gw.control {
         state = state.with_control(control.clone());
     }
+    state = state.with_cors(gw.cors.clone());
+    if let Some(refresher) = &gw.refresher {
+        state = state.with_placement_wait(Arc::new(refresher.clone()));
+    }
     GatewayS3::new(Arc::new(state))
 }
 
@@ -369,6 +374,7 @@ fn fixture_from_config(
             .control_backend
             .as_ref()
             .map(|c| Arc::new(ControlBackend::from_config(c).expect("control backend"))),
+        refresher: None,
     });
     Fixture {
         gw,

@@ -7,9 +7,14 @@
 
 mod common;
 
+use std::time::Duration;
+
+use common::bundle_server::{BundleServer, install_refresher};
 use common::control_stub::{ControlStub, StubCall};
 use common::ops::assert_matches_delegable_set;
-use common::wire::{Answer, send_op, serve};
+use common::sigv4::RawRequest;
+use common::wire::{Answer, send_op, send_raw, serve};
+use common::{ACCESS_KEY, SECRET_KEY};
 use http::Method;
 use s0::access::GatewayAccess;
 use s0::access::optable::delegable_ops;
@@ -607,4 +612,181 @@ async fn the_never_delegable_control_plane_ops_stay_refused_with_delegation_on()
         let gate = rec.gate.as_ref().expect("a gate record");
         assert_eq!(gate.stage, GateStage::OperationNotEnforced, "{rec:#?}");
     }
+}
+
+// ── read your writes: the bundle refresh ────────────────────────────────────────────────
+
+/// A v3 bundle for backend `bay-1` that places `buckets` under `acme`, with alice's
+/// grants on `reports`.
+fn placing_bundle(buckets: &[&str]) -> serde_json::Value {
+    let mut b = common::alice_bundle();
+    b["grant_schema_version"] = serde_json::json!(3);
+    b["backend"] = serde_json::json!({ "id": BACKEND, "kind": "ceph" });
+    let attributes: serde_json::Map<String, serde_json::Value> = buckets
+        .iter()
+        .map(|name| {
+            (
+                (*name).to_string(),
+                serde_json::json!({ "denylist": {},
+                    "object_name": format!("{name}.{BACKEND}"),
+                    "created_at": "2026-01-01T00:00:00Z" }),
+            )
+        })
+        .collect();
+    b["tenants"]["acme"]["bucket_attributes"] = serde_json::Value::Object(attributes);
+    b
+}
+
+fn placement_wait(records: &[AuditRecord]) -> Option<s0::bundle_refresh::PlacementWaitOutcome> {
+    delegated(records)
+        .first()
+        .and_then(|r| r.delegated.as_ref())
+        .and_then(|d| d.placement_wait)
+}
+
+#[tokio::test]
+async fn create_bucket_answers_after_the_bucket_is_placed() {
+    let stub = ControlStub::start().await;
+    let mut fx =
+        common::fixture_with_control("deleg-placed", placing_bundle(&["reports"]), &stub.endpoint);
+    let bundles = BundleServer::start(
+        vec![
+            placing_bundle(&["reports"]),
+            placing_bundle(&["reports", "fresh"]),
+        ],
+        Duration::ZERO,
+    )
+    .await;
+    install_refresher(&mut fx, &bundles);
+    let base = serve(&fx).await;
+
+    let answer = send_op(&base, "CreateBucket", "fresh").await;
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    assert_eq!(stub.count(), 1);
+    assert!(
+        fx.gw
+            .bundles
+            .current()
+            .placement()
+            .refusal(BACKEND, "acme", "fresh")
+            .is_none(),
+        "the 200 went out before the bucket was placed"
+    );
+    assert_eq!(bundles.fetches(), 2);
+
+    let records = fx.await_audit_records(1).await;
+    assert_eq!(
+        placement_wait(&records),
+        Some(s0::bundle_refresh::PlacementWaitOutcome::Placed)
+    );
+}
+
+#[tokio::test]
+async fn create_bucket_still_answers_200_when_the_wait_times_out() {
+    let stub = ControlStub::start().await;
+    let mut fx = common::fixture_with_control(
+        "deleg-timeout",
+        placing_bundle(&["reports"]),
+        &stub.endpoint,
+    );
+    let bundles = BundleServer::start(vec![placing_bundle(&["reports"])], Duration::ZERO).await;
+    install_refresher(&mut fx, &bundles);
+    let base = serve(&fx).await;
+
+    let started = std::time::Instant::now();
+    let answer = send_op(&base, "CreateBucket", "fresh").await;
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    assert!(
+        started.elapsed() >= Duration::from_millis(900),
+        "answered before the placement wait ran out: {:?}",
+        started.elapsed()
+    );
+
+    let records = fx.await_audit_records(1).await;
+    assert_eq!(
+        placement_wait(&records),
+        Some(s0::bundle_refresh::PlacementWaitOutcome::TimedOut)
+    );
+}
+
+#[tokio::test]
+async fn a_replica_refusing_bucket_not_on_this_backend_refreshes_once_and_decides_again() {
+    let mut fx =
+        common::fixture_with_backend("deleg-miss", placing_bundle(&[]), "http://127.0.0.1:1");
+    let bundles = BundleServer::start(vec![placing_bundle(&["reports"])], Duration::ZERO).await;
+    let refresher = install_refresher(&mut fx, &bundles);
+    let base = serve(&fx).await;
+
+    let answer = get_object(&base, "reports", "2024/a.txt", ACCESS_KEY).await;
+    assert_ne!(
+        answer.status, 403,
+        "refused as not on this backend after the refresh: {}",
+        answer.body
+    );
+    assert_eq!(bundles.fetches(), 1);
+    assert_eq!(refresher.on_demand_total().get("miss", "reloaded"), 1);
+}
+
+#[tokio::test]
+async fn an_anonymous_or_unknown_key_miss_triggers_no_refresh() {
+    let mut fx =
+        common::fixture_with_backend("deleg-no-miss", placing_bundle(&[]), "http://127.0.0.1:1");
+    let bundles = BundleServer::start(vec![placing_bundle(&["reports"])], Duration::ZERO).await;
+    install_refresher(&mut fx, &bundles);
+    let base = serve(&fx).await;
+
+    let anonymous = reqwest::Client::new()
+        .get(format!("{base}/reports/2024/a.txt"))
+        .send()
+        .await
+        .expect("answer");
+    assert_eq!(anonymous.status(), 403);
+    let unknown = get_object(&base, "reports", "2024/a.txt", "AKIAUNKNOWN").await;
+    assert_eq!(unknown.status, 403);
+    assert_eq!(bundles.fetches(), 0);
+}
+
+#[tokio::test]
+async fn a_burst_of_misses_costs_one_fetch() {
+    let mut fx =
+        common::fixture_with_backend("deleg-burst", placing_bundle(&[]), "http://127.0.0.1:1");
+    let bundles = BundleServer::start(
+        vec![placing_bundle(&["reports"])],
+        Duration::from_millis(300),
+    )
+    .await;
+    install_refresher(&mut fx, &bundles);
+    let base = serve(&fx).await;
+
+    let answers = futures_join(
+        (0..6)
+            .map(|_| {
+                let base = base.clone();
+                tokio::spawn(
+                    async move { get_object(&base, "reports", "2024/a.txt", ACCESS_KEY).await },
+                )
+            })
+            .collect(),
+    )
+    .await;
+    assert!(
+        answers.iter().all(|a| a.status != 403),
+        "{:?}",
+        answers.iter().map(|a| a.status).collect::<Vec<_>>()
+    );
+    assert_eq!(bundles.fetches(), 1);
+}
+
+async fn futures_join<T>(handles: Vec<tokio::task::JoinHandle<T>>) -> Vec<T> {
+    let mut out = Vec::new();
+    for handle in handles {
+        out.push(handle.await.expect("task"));
+    }
+    out
+}
+
+async fn get_object(base: &str, bucket: &str, key: &str, access_key: &str) -> Answer {
+    let host = base.trim_start_matches("http://").to_string();
+    let req = RawRequest::new("GET", format!("/{bucket}/{key}"));
+    send_raw(base, &host, req, access_key, SECRET_KEY).await
 }

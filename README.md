@@ -74,7 +74,21 @@ caller's identity in `x-s0-caller-subject`, `x-s0-caller-tenant`, `x-s0-caller-o
 the control backend's S3 error through unchanged except for the request id, which becomes the
 delegated audit record's id. A control backend that cannot be reached answers `503
 ServiceUnavailable`. `GetBucketPolicy`, `PutBucketPolicy` and `DeleteBucket` are never
-delegated. See [ADR-011](docs/adr/ADR-011-delegated-operations.md) and `control_backend` in
+delegated.
+
+**Read your writes.** The bucket a delegated `CreateBucket` made reaches s0 through the
+bundle, and the bundle is polled. So after a `2xx` from the control backend s0 fetches the
+bundle itself, with a short backoff, until the bucket is placed under the caller's tenant
+(at most `create_bucket_placement_wait_secs`, and never past 55 s from the request's
+arrival), and only then passes the `200` on. If the wait runs out s0 answers `200` anyway,
+because refusing would make the client retry into `BucketAlreadyOwnedByYou`; the delegated
+audit record says `placement_wait: timed_out`. A replica that did not serve the create
+catches up the same way: an authenticated request refused as "not on this backend" makes it
+fetch the bundle once (at most once a second per replica, concurrent misses share the fetch)
+and decide again with the result. A delegated `PutBucketCors` or `DeleteBucketCors` drops
+this replica's cached CORS entry for the bucket; other replicas follow within about a
+minute. The fetches are counted in `s0_bundle_on_demand_refresh_total{trigger,result}` and
+the delegated requests in `s0_delegated_requests_total{operation,status_class}`. See [ADR-011](docs/adr/ADR-011-delegated-operations.md) and `control_backend` in
 [`docs/gateway.example.json`](docs/gateway.example.json).
 
 ### Not supported (76)
@@ -325,7 +339,7 @@ a property of the managed resource, and s0 only reads it back.
 
 | | |
 |---|---|
-| **Source** | `GetBucketCors` against the backend, signed with the tenant's own backend credential, cached per `(backend, tenant, bucket)` for about 60 s. "No CORS configuration" is cached too; a failed read is remembered for a few seconds only. A rule written on the backend reaches browsers within about a minute. |
+| **Source** | `GetBucketCors` against the backend, signed with the tenant's own backend credential, cached per `(backend, tenant, bucket)` for about 60 s. "No CORS configuration" is cached too; a failed read is remembered for a few seconds only. A rule written on the backend reaches browsers within about a minute; a rule written through a delegated `PutBucketCors` or `DeleteBucketCors` reaches them at once on the replica that served the write. |
 | **Evaluation** | As S3 does it: `*` wildcards in `AllowedOrigin` and `AllowedHeader`, `AllowedMethod`, `ExposeHeader`, `MaxAgeSeconds`; the first rule that matches wins, and a preflight rule must allow the origin, the method **and every** requested header. |
 | **Preflight** | Answered before s3s sees it, since `OPTIONS` is never an S3 operation. `200` with `Access-Control-Allow-Origin` (`*` for a `*` rule, otherwise the request origin), `-Allow-Methods`, `-Allow-Headers`, `-Expose-Headers`, `-Max-Age` and `Vary`; every refusal is the same `403`, whether the cause is the rule, the credential, the tenant or the bucket. |
 | **Real requests** | Any other request that carries `Origin` gets the matching `Access-Control-Allow-Origin`, `-Expose-Headers` and `Vary` after s3s has answered, success or S3 error. A request with no `Origin` is untouched. |

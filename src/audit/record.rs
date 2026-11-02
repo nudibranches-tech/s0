@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::authz::{Decision, OpaInput};
+use crate::bundle_refresh::PlacementWaitOutcome;
 
 /// The label key carrying org attribution when the operator configures none.
 ///
@@ -197,6 +198,10 @@ pub struct DelegationContext {
     /// The error code the control backend answered; absent on success.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_error: Option<String>,
+    /// How the wait for a created bucket to be placed ended; absent for an operation that
+    /// waits for nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_wait: Option<PlacementWaitOutcome>,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -337,6 +342,13 @@ impl AuditRecord {
                 object_name,
                 copy_source_object_name: None,
             },
+        }
+    }
+
+    /// Note how the wait for a created bucket to be placed ended.
+    pub fn note_placement_wait(&mut self, outcome: PlacementWaitOutcome) {
+        if let Some(delegated) = self.delegated.as_mut() {
+            delegated.placement_wait = Some(outcome);
         }
     }
 
@@ -627,6 +639,7 @@ mod tests {
                 subject: "user:alice".into(),
                 control_status: None,
                 control_error: None,
+                placement_wait: None,
             },
             "alice".into(),
             "org-acme",

@@ -129,14 +129,19 @@ impl CorsState {
         route: &RouteSnapshot,
         bucket: &str,
     ) -> Lookup {
-        let key = (
-            route.backend_id.0.clone(),
-            route.tenant.clone(),
-            bucket.to_string(),
-        );
         self.cache
-            .get_with(key, self.read_backend(registry, route, bucket))
+            .get_with(
+                cache_key(route, bucket),
+                self.read_backend(registry, route, bucket),
+            )
             .await
+    }
+
+    /// Forget what is cached for `bucket` on the backend `route` names, so the next
+    /// request reads the configuration afresh. Only this replica's entry: the others
+    /// follow within [`CONFIG_TTL`].
+    pub async fn invalidate(&self, route: &RouteSnapshot, bucket: &str) {
+        self.cache.invalidate(&cache_key(route, bucket)).await;
     }
 
     async fn read_backend(
@@ -204,6 +209,14 @@ impl CorsState {
             }
         }
     }
+}
+
+fn cache_key(route: &RouteSnapshot, bucket: &str) -> (String, String, String) {
+    (
+        route.backend_id.0.clone(),
+        route.tenant.clone(),
+        bucket.to_string(),
+    )
 }
 
 #[cfg(test)]
