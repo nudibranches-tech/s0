@@ -853,3 +853,55 @@ async fn a_rule_written_after_a_negative_answer_is_honoured_once_the_entry_expir
     assert_eq!(preflight(&url, ORIGIN, "PUT", None).await.status, 200);
     assert_eq!(h.stub.reads("late-rule"), 3);
 }
+
+// ── a delegated CORS write drops the cached entry ───────────────────────────────────────
+
+#[tokio::test]
+async fn a_delegated_cors_write_drops_the_cached_entry() {
+    let stub = common::control_stub::ControlStub::start().await;
+    let fx = common::fixture_with_control("cors-drop", common::alice_bundle(), &stub.endpoint);
+    let base = common::wire::serve(&fx).await;
+    let route = fx.gw.registry.route_snapshot("acme").expect("route");
+    let lookups = || fx.gw.cors.metrics().backend_lookups();
+
+    fx.gw.cors.lookup(&fx.gw.registry, &route, "reports").await;
+    fx.gw.cors.lookup(&fx.gw.registry, &route, "reports").await;
+    assert_eq!(lookups(), 1, "the second lookup should have been cached");
+
+    for op in ["PutBucketCors", "DeleteBucketCors"] {
+        let before = lookups();
+        let answer = common::wire::send_op(&base, op, "reports").await;
+        assert!(
+            answer.status / 100 == 2,
+            "{op}: {} {}",
+            answer.status,
+            answer.body
+        );
+        fx.gw.cors.lookup(&fx.gw.registry, &route, "reports").await;
+        assert_eq!(lookups(), before + 1, "{op} left the cached entry in place");
+        fx.gw.cors.lookup(&fx.gw.registry, &route, "reports").await;
+        assert_eq!(lookups(), before + 1);
+    }
+}
+
+#[tokio::test]
+async fn another_tenants_entry_is_not_dropped() {
+    let fx = common::fixture_with_shared_identity(
+        "cors-drop-tenant",
+        common::alice_bundle(),
+        "http://127.0.0.1:1",
+    );
+    let acme = fx.gw.registry.route_snapshot("acme").expect("acme");
+    let globex = fx.gw.registry.route_snapshot("globex").expect("globex");
+    let lookups = || fx.gw.cors.metrics().backend_lookups();
+
+    fx.gw.cors.lookup(&fx.gw.registry, &acme, "reports").await;
+    fx.gw.cors.lookup(&fx.gw.registry, &globex, "reports").await;
+    assert_eq!(lookups(), 2);
+
+    fx.gw.cors.invalidate(&acme, "reports").await;
+    fx.gw.cors.lookup(&fx.gw.registry, &globex, "reports").await;
+    assert_eq!(lookups(), 2, "globex's entry went with acme's");
+    fx.gw.cors.lookup(&fx.gw.registry, &acme, "reports").await;
+    assert_eq!(lookups(), 3);
+}

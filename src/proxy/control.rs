@@ -25,6 +25,7 @@ use s3s_aws::Proxy;
 
 use crate::access::optable::DelegatedOps;
 use crate::config::ControlBackendConfig;
+use crate::counters::LabeledCounters;
 use crate::error::{GatewayError, Result};
 use crate::proxy::ExplicitEmptyBodyLength;
 
@@ -39,6 +40,15 @@ pub const BACKEND_ID_HEADER: &str = "x-s0-backend-id";
 /// The decision id of the delegated audit record.
 pub const REQUEST_ID_HEADER: &str = "x-s0-request-id";
 
+/// When `check` admitted a delegated request, for the budget of the wait that follows
+/// the call.
+#[derive(Debug, Clone, Copy)]
+pub struct CheckedAt(pub std::time::Instant);
+
+/// The longest a delegated request may take from `check` to its answer: below the 60 s
+/// the client waits for a response.
+pub const DELEGATED_DEADLINE: Duration = Duration::from_secs(55);
+
 /// The control backend: its client, and the operations it answers.
 pub struct ControlBackend {
     config: ControlBackendConfig,
@@ -46,6 +56,7 @@ pub struct ControlBackend {
     delegated: DelegatedOps,
     placement_wait: Duration,
     binding: Option<(String, String)>,
+    requests_total: Arc<LabeledCounters>,
 }
 
 impl ControlBackend {
@@ -58,6 +69,7 @@ impl ControlBackend {
             delegated,
             placement_wait: cfg.placement_wait(),
             binding: None,
+            requests_total: Arc::new(LabeledCounters::default()),
         })
     }
 
@@ -92,6 +104,12 @@ impl ControlBackend {
 
     pub fn delegated(&self) -> &DelegatedOps {
         &self.delegated
+    }
+
+    /// Delegated requests by operation and the class of the status the control backend
+    /// answered.
+    pub fn requests_total(&self) -> Arc<LabeledCounters> {
+        self.requests_total.clone()
     }
 
     pub fn placement_wait(&self) -> Duration {

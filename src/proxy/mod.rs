@@ -29,13 +29,17 @@ use s3s::header::{X_AMZ_ID_2, X_AMZ_REQUEST_ID};
 use s3s::{S3, S3Error, S3Request, S3Response, S3Result, s3_error};
 use s3s_aws::Proxy;
 
-use crate::access::{delegation, proof};
+use crate::access::{OperationName, delegation, proof};
 use crate::audit::{BackendOutcome, PendingAudit};
+use crate::bundle_refresh::{PlacementWait, PlacementWaitOutcome};
 use crate::config::{BackendConfig, GatewayConfig, LimitsConfig};
+use crate::cors::CorsState;
 use crate::error::{GatewayError, Result, is_backend_error, remint_backend_error};
 use crate::identity::ResolvedPrincipal;
 use crate::model::{BackendId, BackendKind};
-use crate::proxy::control::{CALLER, ControlBackend, DelegatedCaller};
+use crate::proxy::control::{
+    CALLER, CheckedAt, ControlBackend, DELEGATED_DEADLINE, DelegatedCaller,
+};
 use crate::proxy::obligations::{BucketSource, BucketVisibility, ResponseObligations};
 use crate::quota::QuotaReservation;
 use crate::secret::Secret;
@@ -349,6 +353,11 @@ pub struct S3GatewayState {
     /// Where the delegated operations go; `None` without a `control_backend`, and then no
     /// operation is ever admitted as delegated.
     control: Option<Arc<ControlBackend>>,
+    /// The CORS cache a delegated CORS write drops its entry from.
+    cors: Option<Arc<CorsState>>,
+    /// Waits for a created bucket to be placed. Never the refresher itself: this layer
+    /// has no PDP handle to re-decide with.
+    placement_wait: Option<Arc<dyn PlacementWait>>,
 }
 
 impl S3GatewayState {
@@ -357,7 +366,24 @@ impl S3GatewayState {
             registry,
             limits,
             control: None,
+            cors: None,
+            placement_wait: None,
         }
+    }
+
+    /// The same state, dropping CORS cache entries from `cors` after a delegated write.
+    #[must_use]
+    pub fn with_cors(mut self, cors: Arc<CorsState>) -> Self {
+        self.cors = Some(cors);
+        self
+    }
+
+    /// The same state, answering a delegated `CreateBucket` once `wait` sees the bucket
+    /// placed.
+    #[must_use]
+    pub fn with_placement_wait(mut self, wait: Arc<dyn PlacementWait>) -> Self {
+        self.placement_wait = Some(wait);
+        self
     }
 
     /// The same state, answering its delegated operations through `control`.
@@ -509,7 +535,33 @@ impl GatewayS3 {
         F: FnOnce(Arc<ControlBackend>, S3Request<T>) -> Fut + Send,
         Fut: std::future::Future<Output = S3Result<S3Response<O>>> + Send,
     {
+        self.delegate_then(req, AfterDelegation::Nothing, call)
+            .await
+    }
+
+    /// [`Self::delegate`], then what the operation needs done once the control backend
+    /// has answered: wait for the created bucket to be placed, or drop the CORS entry the
+    /// write made stale. Both run before the audit record is settled.
+    async fn delegate_then<T, O, F, Fut>(
+        &self,
+        req: S3Request<T>,
+        after: AfterDelegation,
+        call: F,
+    ) -> S3Result<S3Response<O>>
+    where
+        F: FnOnce(Arc<ControlBackend>, S3Request<T>) -> Fut + Send,
+        Fut: std::future::Future<Output = S3Result<S3Response<O>>> + Send,
+    {
         delegation::require(&req)?;
+        let checked_at = req
+            .extensions
+            .get::<CheckedAt>()
+            .map_or_else(std::time::Instant::now, |c| c.0);
+        let operation = req
+            .extensions
+            .get::<OperationName>()
+            .map(|o| o.0.to_string())
+            .unwrap_or_default();
         let control = self.state.control.clone().ok_or_else(|| {
             tracing::error!("delegation refused: no control backend is configured");
             s3_error!(InternalError, "no control backend is configured")
@@ -536,8 +588,39 @@ impl GatewayS3 {
             request_id.clone(),
         ));
         pending.mark_delegation_dispatched();
-        let result = CALLER.scope(caller.clone(), call(control, req)).await;
+        let result = CALLER
+            .scope(caller.clone(), call(control.clone(), req))
+            .await;
         let status = caller.observed_status();
+        control.requests_total().increment(
+            &operation,
+            &status.map_or_else(|| "none".to_string(), |s| format!("{}xx", s / 100)),
+        );
+        match &after {
+            AfterDelegation::Nothing => {}
+            AfterDelegation::DropCors { bucket } => {
+                if let Some(cors) = &self.state.cors {
+                    cors.invalidate(&route, bucket).await;
+                }
+            }
+            AfterDelegation::AwaitPlacement { bucket } => {
+                if let (Ok(_), Some(wait)) = (&result, &self.state.placement_wait) {
+                    let budget = control
+                        .placement_wait()
+                        .min(DELEGATED_DEADLINE.saturating_sub(checked_at.elapsed()));
+                    let outcome = wait
+                        .wait_until_placed(&route.backend_id.0, &route.tenant, bucket, budget)
+                        .await;
+                    if outcome == PlacementWaitOutcome::TimedOut {
+                        tracing::warn!(
+                            tenant = %route.tenant, %bucket,
+                            "the created bucket is not in the bundle yet; answering anyway"
+                        );
+                    }
+                    pending.note_placement_wait(outcome);
+                }
+            }
+        }
         match result {
             Ok(mut resp) => {
                 pending.settle_delegated(status, None);
@@ -573,6 +656,20 @@ impl GatewayS3 {
             }
         }
     }
+}
+
+/// What a delegated operation needs done after the control backend has answered.
+enum AfterDelegation {
+    Nothing,
+    /// A created bucket must be in the bundle before the client is answered, or its next
+    /// request would be refused as not on this backend.
+    AwaitPlacement {
+        bucket: String,
+    },
+    /// The bucket's cached CORS configuration is stale, whatever the answer was.
+    DropCors {
+        bucket: String,
+    },
 }
 
 /// Whether `e` is an error the control backend itself authored: a non-2xx answer the SDK
@@ -988,8 +1085,13 @@ impl S3 for GatewayS3 {
         &self,
         req: S3Request<CreateBucketInput>,
     ) -> S3Result<S3Response<CreateBucketOutput>> {
-        self.delegate(req, |c, r| async move { c.proxy().create_bucket(r).await })
-            .await
+        let bucket = req.input.bucket.clone();
+        self.delegate_then(
+            req,
+            AfterDelegation::AwaitPlacement { bucket },
+            |c, r| async move { c.proxy().create_bucket(r).await },
+        )
+        .await
     }
 
     async fn get_bucket_cors(
@@ -1007,8 +1109,10 @@ impl S3 for GatewayS3 {
         &self,
         req: S3Request<PutBucketCorsInput>,
     ) -> S3Result<S3Response<PutBucketCorsOutput>> {
-        self.delegate(
+        let bucket = req.input.bucket.clone();
+        self.delegate_then(
             req,
+            AfterDelegation::DropCors { bucket },
             |c, r| async move { c.proxy().put_bucket_cors(r).await },
         )
         .await
@@ -1018,8 +1122,10 @@ impl S3 for GatewayS3 {
         &self,
         req: S3Request<DeleteBucketCorsInput>,
     ) -> S3Result<S3Response<DeleteBucketCorsOutput>> {
-        self.delegate(
+        let bucket = req.input.bucket.clone();
+        self.delegate_then(
             req,
+            AfterDelegation::DropCors { bucket },
             |c, r| async move { c.proxy().delete_bucket_cors(r).await },
         )
         .await

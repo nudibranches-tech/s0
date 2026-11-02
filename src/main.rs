@@ -14,9 +14,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use s0::admin::{self, AdminState};
-use s0::bundle_refresh::{self, BundleHealth, BundleSource};
+use s0::bundle_refresh;
 use s0::config::GatewayConfig;
-use s0::error::Result;
+use s0::error::{GatewayError, Result};
 use s0::internal::{self, InternalApi};
 use s0::mint::{self, Mint, MintLimits, MintMetrics, StandardVerifier};
 use s0::webidentity::{WebIdentityConfig, WebIdentitySts};
@@ -55,15 +55,11 @@ async fn main() -> Result<()> {
     );
     let (gateway, audit_handle) = Gateway::build(&config)?;
 
-    let source = match &config.bundle_url {
-        Some(url) => BundleSource::http(
-            url.clone(),
-            Duration::from_secs(config.bundle_timeout_secs),
-            config.bundle_shared_secret.clone(),
-        )?,
-        None => BundleSource::File(config.bundle_path.clone()),
-    };
-    if source.is_remote() && !source.is_authenticated() {
+    let refresher = gateway
+        .refresher
+        .clone()
+        .ok_or_else(|| GatewayError::Config("the gateway has no bundle refresher".into()))?;
+    if refresher.source().is_remote() && !refresher.source().is_authenticated() {
         // Not fatal — s0 must stay runnable against an unauthenticated URL — but the
         // bundle endpoint carries the org's grant rules and answers 304, which makes it
         // a change-detection oracle over the grant table.
@@ -72,13 +68,10 @@ async fn main() -> Result<()> {
              if the control plane requires one"
         );
     }
-    let health = Arc::new(BundleHealth::new(source.is_remote()));
+    let health = refresher.health().clone();
     bundle_refresh::spawn(
-        gateway.pdp.clone(),
-        gateway.bundles.clone(),
-        source,
+        refresher.clone(),
         Duration::from_secs(config.bundle_poll_secs),
-        health.clone(),
     );
 
     // Built here, before the admin listener, because the same `Arc` has to reach two
@@ -90,7 +83,12 @@ async fn main() -> Result<()> {
     // "not ready" rather than refuse the connection.
     let admin_state = {
         let state = AdminState::new(&gateway.audit, health, gateway.bundles.clone())
-            .with_cors_metrics(gateway.cors.metrics());
+            .with_cors_metrics(gateway.cors.metrics())
+            .with_bundle_refresher(refresher.clone());
+        let state = match &gateway.control {
+            Some(control) => state.with_delegation_metrics(control.requests_total()),
+            None => state,
+        };
         // Only when a mint is actually served — see `AdminState::mint`.
         let state = if config.sts_mint.is_some() {
             state.with_mint_metrics(mint_metrics.clone())

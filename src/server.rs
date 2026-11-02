@@ -30,6 +30,10 @@ pub fn build_service(gw: Arc<Gateway>) -> CorsFront {
     if let Some(control) = &gw.control {
         state = state.with_control(control.clone());
     }
+    state = state.with_cors(gw.cors.clone());
+    if let Some(refresher) = &gw.refresher {
+        state = state.with_placement_wait(Arc::new(refresher.clone()));
+    }
     let s3 = GatewayS3::new(Arc::new(state));
     let mut builder = S3ServiceBuilder::new(s3);
     builder.set_auth(GatewayAuth::new(gw.identity.clone()));

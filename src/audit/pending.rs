@@ -56,6 +56,18 @@ impl PendingAudit {
         self.sink.emit(record);
     }
 
+    /// Note on the held record how the wait for a created bucket's placement ended.
+    pub fn note_placement_wait(&self, outcome: crate::bundle_refresh::PlacementWaitOutcome) {
+        if let Some(record) = self
+            .record
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            record.note_placement_wait(outcome);
+        }
+    }
+
     /// Note on the held record that the control backend call is starting, so a request
     /// that ends mid-call is not recorded as having ended before the call.
     pub fn mark_delegation_dispatched(&self) {
