@@ -712,7 +712,7 @@ async fn create_bucket_still_answers_200_when_the_wait_times_out() {
 #[tokio::test]
 async fn a_replica_refusing_bucket_not_on_this_backend_refreshes_once_and_decides_again() {
     let mut fx =
-        common::fixture_with_backend("deleg-miss", placing_bundle(&[]), "http://127.0.0.1:1");
+        common::fixture_with_control("deleg-miss", placing_bundle(&[]), "http://127.0.0.1:2");
     let bundles = BundleServer::start(vec![placing_bundle(&["reports"])], Duration::ZERO).await;
     let refresher = install_refresher(&mut fx, &bundles);
     let base = serve(&fx).await;
@@ -725,12 +725,115 @@ async fn a_replica_refusing_bucket_not_on_this_backend_refreshes_once_and_decide
     );
     assert_eq!(bundles.fetches(), 1);
     assert_eq!(refresher.on_demand_total().get("miss", "reloaded"), 1);
+
+    fx.await_audit_records(1).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let records = fx.audit_log.all();
+    let decisions: Vec<_> = records
+        .iter()
+        .filter(|r| r.input.as_ref().is_some_and(|i| i.bucket == "reports"))
+        .collect();
+    assert_eq!(decisions.len(), 1, "{records:#?}");
+    assert!(decisions[0].result.allow, "{:#?}", decisions[0].result);
+    assert!(
+        !decisions[0].result.reason.contains("not on this backend"),
+        "{:#?}",
+        decisions[0].result
+    );
+}
+
+#[tokio::test]
+async fn a_gateway_without_a_control_backend_does_not_refresh_on_a_miss() {
+    let mut fx = common::fixture_with_backend(
+        "deleg-no-control",
+        placing_bundle(&[]),
+        "http://127.0.0.1:1",
+    );
+    let bundles = BundleServer::start(vec![placing_bundle(&["reports"])], Duration::ZERO).await;
+    install_refresher(&mut fx, &bundles);
+    let base = serve(&fx).await;
+
+    let answer = get_object(&base, "reports", "2024/a.txt", ACCESS_KEY).await;
+    assert_eq!(answer.status, 403);
+    assert_eq!(bundles.fetches(), 0);
+}
+
+#[tokio::test]
+async fn a_request_that_ends_during_the_placement_wait_keeps_the_control_answer() {
+    let stub = ControlStub::start().await;
+    let mut fx = common::fixture_with_control(
+        "deleg-abandoned-wait",
+        placing_bundle(&["reports"]),
+        &stub.endpoint,
+    );
+    let bundles = BundleServer::start(vec![placing_bundle(&["reports"])], Duration::ZERO).await;
+    install_refresher(&mut fx, &bundles);
+    let base = serve(&fx).await;
+
+    let client = tokio::spawn({
+        let base = base.clone();
+        async move { send_op(&base, "CreateBucket", "fresh").await }
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while stub.calls().is_empty() {
+        assert!(std::time::Instant::now() < deadline, "no control call");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    client.abort();
+
+    let records = fx.await_audit_records(1).await;
+    let records = delegated(&records);
+    assert_eq!(records.len(), 1, "{records:#?}");
+    let rec = records[0];
+    assert_eq!(rec.gateway.outcome, Outcome::Allowed);
+    assert!(rec.result.allow, "{:#?}", rec.result);
+    let d = rec.delegated.as_ref().expect("context");
+    assert_eq!(d.control_status, Some(200));
+    assert_eq!(d.placement_wait, None);
+}
+
+#[tokio::test]
+async fn delegated_requests_are_counted_by_operation_and_status_class() {
+    let stub = ControlStub::start().await;
+    let fx = common::fixture_with_control("deleg-count", common::alice_bundle(), &stub.endpoint);
+    let base = serve(&fx).await;
+    let counters = || {
+        fx.gw
+            .control
+            .as_ref()
+            .expect("control")
+            .requests_total()
+            .clone()
+    };
+
+    send_op(&base, "PutBucketCors", "reports").await;
+    stub.fail("PutBucketCors", S3ErrorCode::MalformedXML, 400, "bad");
+    send_op(&base, "PutBucketCors", "reports").await;
+    assert_eq!(counters().get("PutBucketCors", "2xx"), 1);
+    assert_eq!(counters().get("PutBucketCors", "4xx"), 1);
+
+    let down = common::fixture_with_control(
+        "deleg-count-down",
+        common::alice_bundle(),
+        "http://127.0.0.1:2",
+    );
+    let down_base = serve(&down).await;
+    send_op(&down_base, "PutBucketCors", "reports").await;
+    let down_counters = down
+        .gw
+        .control
+        .as_ref()
+        .expect("control")
+        .requests_total()
+        .clone();
+    assert_eq!(down_counters.get("PutBucketCors", "none"), 1);
 }
 
 #[tokio::test]
 async fn an_anonymous_or_unknown_key_miss_triggers_no_refresh() {
     let mut fx =
-        common::fixture_with_backend("deleg-no-miss", placing_bundle(&[]), "http://127.0.0.1:1");
+        common::fixture_with_control("deleg-no-miss", placing_bundle(&[]), "http://127.0.0.1:2");
     let bundles = BundleServer::start(vec![placing_bundle(&["reports"])], Duration::ZERO).await;
     install_refresher(&mut fx, &bundles);
     let base = serve(&fx).await;
@@ -747,9 +850,9 @@ async fn an_anonymous_or_unknown_key_miss_triggers_no_refresh() {
 }
 
 #[tokio::test]
-async fn a_burst_of_misses_costs_one_fetch() {
+async fn a_burst_of_misses_costs_at_most_two_fetches() {
     let mut fx =
-        common::fixture_with_backend("deleg-burst", placing_bundle(&[]), "http://127.0.0.1:1");
+        common::fixture_with_control("deleg-burst", placing_bundle(&[]), "http://127.0.0.1:2");
     let bundles = BundleServer::start(
         vec![placing_bundle(&["reports"])],
         Duration::from_millis(300),
@@ -774,7 +877,7 @@ async fn a_burst_of_misses_costs_one_fetch() {
         "{:?}",
         answers.iter().map(|a| a.status).collect::<Vec<_>>()
     );
-    assert_eq!(bundles.fetches(), 1);
+    assert!(bundles.fetches() <= 2, "{}", bundles.fetches());
 }
 
 async fn futures_join<T>(handles: Vec<tokio::task::JoinHandle<T>>) -> Vec<T> {

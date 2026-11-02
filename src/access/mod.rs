@@ -997,7 +997,9 @@ impl S3Access for GatewayAccess {
         let mut placement = self.gw.bundles.current().placement().clone();
         // A bucket this replica's bundle does not place may have been created since the
         // last poll: fetch once, rate-limited, and decide with what that brings.
-        if let (Gate::Enforced(_), Some(refresher)) = (&gate, &self.gw.refresher) {
+        if let (Gate::Enforced(_), Some(refresher), Some(_)) =
+            (&gate, &self.gw.refresher, &self.gw.control)
+        {
             let bucket = cx.s3_path().get_bucket_name().map(str::to_string);
             let missing = bucket.is_some_and(|bucket| {
                 matches!(

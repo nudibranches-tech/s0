@@ -84,10 +84,12 @@ arrival), and only then passes the `200` on. If the wait runs out s0 answers `20
 because refusing would make the client retry into `BucketAlreadyOwnedByYou`; the delegated
 audit record says `placement_wait: timed_out`. A replica that did not serve the create
 catches up the same way: an authenticated request refused as "not on this backend" makes it
-fetch the bundle once (at most once a second per replica, concurrent misses share the fetch)
-and decide again with the result. A delegated `PutBucketCors` or `DeleteBucketCors` drops
+fetch the bundle once (fetches start at most once a second per replica, concurrent misses share one) and decide
+again on a bundle fetched after the request arrived; without a `control_backend` nothing is
+fetched on a miss. A delegated `PutBucketCors` or `DeleteBucketCors` drops
 this replica's cached CORS entry for the bucket; other replicas follow within about a
-minute. The fetches are counted in `s0_bundle_on_demand_refresh_total{trigger,result}` and
+minute. The fetches are counted in `s0_bundle_on_demand_refresh_total{trigger,result}`
+(`trigger` is `miss` or `placement_wait`) and
 the delegated requests in `s0_delegated_requests_total{operation,status_class}`. See [ADR-011](docs/adr/ADR-011-delegated-operations.md) and `control_backend` in
 [`docs/gateway.example.json`](docs/gateway.example.json).
 

@@ -56,6 +56,19 @@ impl PendingAudit {
         self.sink.emit(record);
     }
 
+    /// Write what the control backend answered onto the held record without emitting it,
+    /// so a request that ends before it is settled is audited with the answer it got.
+    pub fn note_control_answer(&self, status: Option<u16>, error_code: Option<String>) {
+        if let Some(record) = self
+            .record
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            record.settle_delegated(status, error_code);
+        }
+    }
+
     /// Note on the held record how the wait for a created bucket's placement ended.
     pub fn note_placement_wait(&self, outcome: crate::bundle_refresh::PlacementWaitOutcome) {
         if let Some(record) = self

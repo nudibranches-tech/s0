@@ -681,6 +681,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[tokio::test]
+    async fn metrics_expose_on_demand_refreshes_by_trigger_and_result() {
+        let dir = tmpdir();
+        let (st, _h) = state(false, &dir);
+        let pdp: Arc<dyn crate::pdp::Pdp> = Arc::new(
+            crate::pdp::RegorusPdp::new(crate::pdp::GATEWAY_REGO, &serde_json::json!({})).unwrap(),
+        );
+        let bundles = Arc::new(BundleStore::new(Bundle::new(
+            "rev-1",
+            serde_json::json!({}),
+        )));
+        let refresher = BundleRefresher::new(
+            pdp,
+            bundles,
+            crate::bundle_refresh::BundleSource::File(dir.join("none.json")),
+            Arc::new(BundleHealth::new(false)),
+        );
+        refresher.on_demand_total().increment("miss", "reloaded");
+        refresher
+            .on_demand_total()
+            .increment("placement_wait", "timed_out");
+        let st = st_with(st, |s| s.with_bundle_refresher(refresher));
+        let body = prometheus(&st).into_body();
+        let text = String::from_utf8(
+            http_body_util::BodyExt::collect(body)
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            text.contains(
+                "\ns0_bundle_on_demand_refresh_total{trigger=\"miss\",result=\"reloaded\"} 1\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "\ns0_bundle_on_demand_refresh_total{trigger=\"placement_wait\",result=\"timed_out\"} 1\n"
+            ),
+            "{text}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn st_with(st: Arc<AdminState>, f: impl FnOnce(AdminState) -> AdminState) -> Arc<AdminState> {
         Arc::new(f(
             Arc::try_unwrap(st).unwrap_or_else(|_| panic!("sole owner"))

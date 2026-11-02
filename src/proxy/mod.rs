@@ -588,6 +588,12 @@ impl GatewayS3 {
             request_id.clone(),
         ));
         pending.mark_delegation_dispatched();
+        let cors_guard = match (&after, &self.state.cors) {
+            (AfterDelegation::DropCors { bucket }, Some(cors)) => {
+                DropCorsOnCancel::armed(cors.clone(), route.clone(), bucket.clone())
+            }
+            _ => DropCorsOnCancel::disarmed(),
+        };
         let result = CALLER
             .scope(caller.clone(), call(control.clone(), req))
             .await;
@@ -596,12 +602,20 @@ impl GatewayS3 {
             &operation,
             &status.map_or_else(|| "none".to_string(), |s| format!("{}xx", s / 100)),
         );
+        if result.is_ok() {
+            pending.note_control_answer(status, None);
+        }
         match &after {
             AfterDelegation::Nothing => {}
             AfterDelegation::DropCors { bucket } => {
                 if let Some(cors) = &self.state.cors {
-                    cors.invalidate(&route, bucket).await;
+                    if !matches!(&result, Err(e) if status == Some(403)
+                        && e.code().as_str() == "AccessDenied")
+                    {
+                        cors.invalidate(&route, bucket).await;
+                    }
                 }
+                cors_guard.disarm();
             }
             AfterDelegation::AwaitPlacement { bucket } => {
                 if let (Ok(_), Some(wait)) = (&result, &self.state.placement_wait) {
@@ -653,6 +667,35 @@ impl GatewayS3 {
                 out.set_request_id(request_id);
                 out.set_source(Box::new(e));
                 Err(out)
+            }
+        }
+    }
+}
+
+/// Drops a bucket's cached CORS entry when the request ends before the control backend's
+/// answer was handled, so a write the control backend may already have applied is not
+/// served stale from this replica.
+struct DropCorsOnCancel(Option<(Arc<CorsState>, Arc<RouteSnapshot>, String)>);
+
+impl DropCorsOnCancel {
+    fn armed(cors: Arc<CorsState>, route: Arc<RouteSnapshot>, bucket: String) -> Self {
+        DropCorsOnCancel(Some((cors, route, bucket)))
+    }
+
+    fn disarmed() -> Self {
+        DropCorsOnCancel(None)
+    }
+
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for DropCorsOnCancel {
+    fn drop(&mut self) {
+        if let Some((cors, route, bucket)) = self.0.take() {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move { cors.invalidate(&route, &bucket).await });
             }
         }
     }

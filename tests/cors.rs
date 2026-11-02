@@ -884,6 +884,58 @@ async fn a_delegated_cors_write_drops_the_cached_entry() {
     }
 }
 
+async fn lookups_after_a_write_that_answered(
+    tag: &str,
+    control_endpoint: &str,
+    scripted: Option<(s3s::S3ErrorCode, u16)>,
+    stub: Option<&common::control_stub::ControlStub>,
+) -> (u64, u64) {
+    let fx = common::fixture_with_control(tag, common::alice_bundle(), control_endpoint);
+    if let (Some(stub), Some((code, status))) = (stub, scripted) {
+        stub.fail("PutBucketCors", code, status, "scripted");
+    }
+    let base = common::wire::serve(&fx).await;
+    let route = fx.gw.registry.route_snapshot("acme").expect("route");
+    let lookups = || fx.gw.cors.metrics().backend_lookups();
+    fx.gw.cors.lookup(&fx.gw.registry, &route, "reports").await;
+    fx.gw.cors.lookup(&fx.gw.registry, &route, "reports").await;
+    let before = lookups();
+    common::wire::send_op(&base, "PutBucketCors", "reports").await;
+    fx.gw.cors.lookup(&fx.gw.registry, &route, "reports").await;
+    (before, lookups())
+}
+
+#[tokio::test]
+async fn a_delegated_cors_write_drops_the_cached_entry_whatever_the_control_backend_answered() {
+    let stub = common::control_stub::ControlStub::start().await;
+    let (before, after) = lookups_after_a_write_that_answered(
+        "cors-drop-error",
+        &stub.endpoint,
+        Some((s3s::S3ErrorCode::InternalError, 500)),
+        Some(&stub),
+    )
+    .await;
+    assert_eq!(after, before + 1, "an error answer left the entry cached");
+
+    let (before, after) =
+        lookups_after_a_write_that_answered("cors-drop-down", "http://127.0.0.1:2", None, None)
+            .await;
+    assert_eq!(after, before + 1, "no answer left the entry cached");
+}
+
+#[tokio::test]
+async fn a_refused_delegated_cors_write_leaves_the_cached_entry() {
+    let stub = common::control_stub::ControlStub::start().await;
+    let (before, after) = lookups_after_a_write_that_answered(
+        "cors-drop-refused",
+        &stub.endpoint,
+        Some((s3s::S3ErrorCode::AccessDenied, 403)),
+        Some(&stub),
+    )
+    .await;
+    assert_eq!(after, before, "a refused write evicted the entry");
+}
+
 #[tokio::test]
 async fn another_tenants_entry_is_not_dropped() {
     let fx = common::fixture_with_shared_identity(

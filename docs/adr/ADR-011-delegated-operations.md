@@ -1,8 +1,10 @@
 # ADR-011: Delegated operations — bucket configuration answered by a control backend
 
-- **Status**: Proposed — implemented in part: D1 to D5 and D7 (`src/access/optable.rs`,
-  `src/access/delegation.rs`, `src/proxy/control.rs`, `src/config.rs`, `src/audit/record.rs`);
-  D6 (read-your-writes) is not yet implemented
+- **Status**: Proposed — implemented: D1 to D5 and D7 (`src/access/optable.rs`,
+  `src/access/delegation.rs`, `src/proxy/control.rs`, `src/config.rs`, `src/audit/record.rs`)
+  and D6, read-your-writes (`src/bundle_refresh.rs` for `BundleRefresher` and `PlacementWait`,
+  `src/access/mod.rs` for the refresh on miss in `check`, `src/proxy/mod.rs` for
+  `delegate_then`, `src/cors/lookup.rs` for `CorsState::invalidate`)
 - **Date**: 2026-11-02
 - **Owners**: gateway team (this repo); the control backend is the console of the platform that
   deploys s0
@@ -217,11 +219,17 @@ Three things make a delegated write visible to the next request, each bounded:
   A timeout is not an error: the bucket exists, and the next request refreshes on a miss.
 - **Refresh on miss.** An enforced request refused because the pinned bundle does not place the
   path bucket on this backend triggers, in `check` and before any hook, at most one bundle
-  refresh, and only after authentication and route resolution. On-demand fetches are coalesced
-  and limited to one per second per replica, and the caller waits at most 2 s for one, then
-  decides with whatever placement is current. The hook then decides once against the re-pinned
+  refresh, and only after authentication and route resolution. The refresh happens only when a
+  `control_backend` is configured. The decision is made on a fetch that started after the
+  request arrived, never on one already running. Fetches triggered by a miss start at most once
+  per second per replica: a miss arriving inside that interval waits for it to pass and shares
+  the fetch of the misses waiting with it. The caller waits at most 2 s, then decides with
+  whatever placement is current. The hook then decides once against the re-pinned
   placement, so the request has one decision and one audit record. The `CreateBucket` placement
-  wait's refresh is coalesced under the same limit.
+  wait's fetches go through the same single-flight gate as every other fetch and are shared
+  with any fetch that starts after the wait began; they use their own 250 ms to 1 s backoff and
+  are not subject to the one-per-second miss interval, so one `CreateBucket` costs about 1 to 12
+  fetches. They are counted under `trigger="placement_wait"`.
 - **CORS cache drop.** A delegated CORS write or delete drops the replica's cached CORS
   configuration for the bucket. Other replicas follow within the cache TTL (60 s); "at once"
   holds only for the replica that served the write.

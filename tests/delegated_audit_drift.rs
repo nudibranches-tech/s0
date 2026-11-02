@@ -132,6 +132,28 @@ async fn the_gateway_emits_the_committed_unanswered_record() {
     check_against_fixture("delegated_audit_record_unanswered.json", doc).await;
 }
 
+#[tokio::test]
+async fn the_gateway_emits_the_committed_create_bucket_record() {
+    let stub = ControlStub::start().await;
+    let mut fx =
+        common::fixture_with_control("drift-create", common::alice_bundle(), &stub.endpoint);
+    let bundles = common::bundle_server::BundleServer::start(
+        vec![common::alice_bundle()],
+        std::time::Duration::ZERO,
+    )
+    .await;
+    common::bundle_server::install_refresher(&mut fx, &bundles);
+    let base = serve(&fx).await;
+    send_op(&base, "CreateBucket", "reports").await;
+    let records = fx.await_audit_records(1).await;
+    assert_eq!(records.len(), 1, "{records:#?}");
+    let mut doc = serde_json::to_value(&records[0]).expect("record serializes");
+    doc["decision_id"] = VOLATILE_ID.into();
+    doc["timestamp"] = VOLATILE_TIME.into();
+    assert_eq!(doc["delegated"]["placement_wait"], "not_placing");
+    check_against_fixture("delegated_audit_record_create_bucket.json", doc).await;
+}
+
 fn keys(doc: &serde_json::Value) -> BTreeSet<&str> {
     doc.as_object()
         .expect("object")
@@ -147,6 +169,7 @@ fn the_committed_records_have_the_shape_the_ingest_dispatches_on() {
         "delegated_audit_record_error.json",
         "delegated_audit_record_denied.json",
         "delegated_audit_record_unanswered.json",
+        "delegated_audit_record_create_bucket.json",
     ] {
         let doc: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(fixture_path(name)).expect("fixture present"),
@@ -170,6 +193,21 @@ fn the_committed_records_have_the_shape_the_ingest_dispatches_on() {
         let delegated = keys(&doc["delegated"]);
         for required in ["operation", "bucket", "tenant", "subject"] {
             assert!(delegated.contains(required), "{name}: delegated.{required}");
+        }
+        for key in &delegated {
+            assert!(
+                [
+                    "operation",
+                    "bucket",
+                    "tenant",
+                    "subject",
+                    "control_status",
+                    "control_error",
+                    "placement_wait",
+                ]
+                .contains(key),
+                "{name}: unexpected delegated.{key}"
+            );
         }
         assert_eq!(doc["gateway"]["backend"], "not_attempted", "{name}");
         assert!(doc["labels"]["s0/organization-id"].is_string(), "{name}");
