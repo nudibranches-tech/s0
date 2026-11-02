@@ -12,20 +12,17 @@ mod common;
 
 use std::sync::Arc;
 
-use common::ops::assert_matches_enforced_set;
+use common::ops::{assert_matches_delegable_set, assert_matches_enforced_set};
 use http::{Extensions, HeaderMap, Method};
 use s0::access::{AuthzProof, GatewayAccess, OperationName};
 use s0::gateway::Gateway;
-use s0::proxy::{GatewayS3, S3GatewayState};
+use s0::proxy::GatewayS3;
 use s3s::access::S3Access;
 use s3s::dto::*;
 use s3s::{S3, S3ErrorCode, S3Request};
 
 fn gateway_s3(gw: &Arc<Gateway>) -> GatewayS3 {
-    GatewayS3::new(Arc::new(S3GatewayState::new(
-        gw.registry.clone(),
-        gw.limits.clone(),
-    )))
+    common::gateway_s3(gw)
 }
 
 /// A request with NO `check` context at all — what a hook sees if the backstop never
@@ -156,11 +153,11 @@ async fn denied_ops_have_no_dispatch_arm() {
     expect_not_implemented(e.code(), "PutBucketAcl");
 
     let e = s3
-        .get_bucket_versioning(bare_request(GetBucketVersioningInput::default()))
+        .get_bucket_replication(bare_request(GetBucketReplicationInput::default()))
         .await
         .err()
         .unwrap();
-    expect_not_implemented(e.code(), "GetBucketVersioning");
+    expect_not_implemented(e.code(), "GetBucketReplication");
 
     let e = s3
         .list_object_versions(bare_request(ListObjectVersionsInput::default()))
@@ -313,4 +310,126 @@ async fn a_proof_minted_for_another_operation_does_not_forward() {
         format!("{err}").contains("does not match"),
         "unexpected error: {err}"
     );
+}
+
+// ── the delegated class: the same three layers, with a proof of its own ─────────
+
+#[tokio::test]
+async fn every_delegable_op_has_a_hook_that_demands_a_delegation_proof() {
+    let fx = common::fixture("gate-delegated-hooks", common::alice_bundle());
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut seen = Vec::new();
+    macro_rules! probe {
+        ($m:ident, $name:literal, $input:expr) => {{
+            // Bare: the s3s default hook would answer `Ok(())`, which for a delegated
+            // operation would read as an authorization nobody made.
+            let mut bare = bare_request($input.clone());
+            assert!(
+                access.$m(&mut bare).await.is_err(),
+                "{} is Delegable but its S3Access hook returned Ok(()) with no check \
+                 context — the s3s fail-OPEN default, i.e. the hook is missing",
+                $name
+            );
+            // Seeded exactly as `check` seeds an enforced request, but with no
+            // `DelegationProof`: the hook must still refuse.
+            let mut seeded = fx.request($name, $input, Method::GET);
+            let err = access
+                .$m(&mut seeded)
+                .await
+                .expect_err("a delegated hook must refuse without a delegation proof");
+            assert_eq!(*err.code(), S3ErrorCode::InternalError, "{}", $name);
+            assert!(
+                format!("{err}").contains("delegation decision"),
+                "{} refused for a reason other than the missing proof: {err}",
+                $name
+            );
+            seen.push($name);
+        }};
+    }
+    crate::each_delegable_op!(probe);
+    assert_matches_delegable_set(seen);
+}
+
+#[tokio::test]
+async fn every_delegable_op_arm_refuses_without_a_delegation_proof() {
+    let stub = common::control_stub::ControlStub::start().await;
+    let fx = common::fixture_with_control(
+        "gate-delegated-arms",
+        common::alice_bundle(),
+        &stub.endpoint,
+    );
+    let s3 = gateway_s3(&fx.gw);
+    let mut seen = Vec::new();
+    macro_rules! probe {
+        ($m:ident, $name:literal, $input:expr) => {{
+            let Err(err) = s3.$m(fx.request($name, $input, Method::GET)).await else {
+                panic!("{} was delegated with no delegation proof", $name)
+            };
+            assert_ne!(
+                *err.code(),
+                S3ErrorCode::NotImplemented,
+                "{} is Delegable but has no GatewayS3 dispatch arm",
+                $name
+            );
+            assert_eq!(*err.code(), S3ErrorCode::InternalError, "{}", $name);
+            assert!(
+                format!("{err}").contains("delegation decision"),
+                "{} failed for a reason other than the missing proof: {err}",
+                $name
+            );
+            seen.push($name);
+        }};
+    }
+    crate::each_delegable_op!(probe);
+    assert_matches_delegable_set(seen);
+    assert_eq!(
+        stub.count(),
+        0,
+        "a refused arm must not reach the control backend"
+    );
+}
+
+#[tokio::test]
+async fn an_authz_proof_does_not_open_a_delegated_arm() {
+    // The strongest `AuthzProof` there is: one a real enforced hook minted for a real
+    // request, carried onto a delegable one.
+    let stub = common::control_stub::ControlStub::start().await;
+    let fx = common::fixture_with_control(
+        "gate-authz-not-delegation",
+        common::alice_bundle(),
+        &stub.endpoint,
+    );
+    let access = GatewayAccess::new(fx.gw.clone());
+    let s3 = gateway_s3(&fx.gw);
+    let mut enforced = fx.request(
+        "GetObject",
+        GetObjectInput {
+            bucket: "reports".into(),
+            key: "2024/q1.csv".into(),
+            ..Default::default()
+        },
+        Method::GET,
+    );
+    access.get_object(&mut enforced).await.expect("allowed");
+    let proof = enforced
+        .extensions
+        .get::<AuthzProof>()
+        .cloned()
+        .expect("minted");
+
+    let mut req = fx.request(
+        "CreateBucket",
+        CreateBucketInput {
+            bucket: "reports".into(),
+            ..Default::default()
+        },
+        Method::PUT,
+    );
+    req.extensions.insert(proof);
+    let Err(err) = s3.create_bucket(req).await else {
+        panic!("an authorization proof opened a delegated arm")
+    };
+    assert_eq!(*err.code(), S3ErrorCode::InternalError);
+    assert!(format!("{err}").contains("delegation decision"), "{err}");
+    assert_eq!(stub.count(), 0);
 }

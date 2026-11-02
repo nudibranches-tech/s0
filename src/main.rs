@@ -6,8 +6,9 @@
 //! secret). Authentication is a property of the socket, never of the path.
 //!
 //! Shutdown is ordered, not detached: readiness fails first, then the S3 front, mint and
-//! internal API drain, then the audit worker, and the admin listener last — ~45 s total,
-//! so `terminationGracePeriodSeconds` must exceed it or audit records are lost.
+//! internal API drain, then the audit worker, and the admin listener last — ~45 s total
+//! (~60 s with a control backend, whose in-flight calls the S3 drain waits for), so
+//! `terminationGracePeriodSeconds` must exceed it or audit records are lost.
 
 use std::sync::Arc;
 use std::time::Duration;
