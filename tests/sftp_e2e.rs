@@ -843,7 +843,22 @@ async fn a_drop_box_partner_can_create_and_nothing_else() {
         )
         .await;
     assert_eq!(code(&r), PERMISSION_DENIED, "{r:?}");
+    let Reply::Status(_, msg) = &r else { panic!() };
+    assert!(
+        msg.starts_with("file exists and overwrite is not granted: "),
+        "{msg}"
+    );
     assert_eq!(h.mem.calls_matching("PutObject"), before);
+    let recs = records(&h.fx, |r| {
+        r.iter()
+            .any(|x| x.result.reason.contains("overwrite is not granted"))
+    })
+    .await;
+    assert!(
+        recs.iter()
+            .any(|x| !x.result.allow && x.result.reason.contains("overwrite is not granted")),
+        "the refused overwrite is on the record"
+    );
     let r = c
         .open(
             "/2026-11-03.csv",
@@ -1513,4 +1528,209 @@ async fn a_download_larger_than_the_read_ahead_streams_intact() {
         "seek back"
     );
     assert_eq!(code(&c.close(&hd).await), OK);
+}
+
+// ── regressions ──────────────────────────────────────────────────────────────
+
+impl Harness {
+    /// Push a new bundle revision, to the PDP and to the session watchers.
+    async fn push(&self, rev: &str, b: serde_json::Value) {
+        self.fx.gw.pdp.reload(None, &b).await.unwrap();
+        self.fx.gw.bundles.store(s0::pdp::Bundle::new(rev, b));
+    }
+
+    fn put(&self, key: &str, data: &[u8]) {
+        self.mem
+            .objects
+            .lock()
+            .unwrap()
+            .insert(("inbound".into(), key.into()), Bytes::copy_from_slice(data));
+    }
+
+    /// The test bundle with the ops grant scoped to `prefixes`.
+    fn ops_scoped(&self, prefixes: &[&str]) -> serde_json::Value {
+        let mut b = bundle(&self.drop_key, &self.ops_key);
+        b["tenants"]["acme"]["s3_grants"]["ops"] =
+            serde_json::json!([{ "bucket": "inbound", "actions": ["*"], "prefixes": prefixes }]);
+        b
+    }
+}
+
+#[tokio::test]
+async fn a_listing_whose_scope_narrows_mid_way_is_refused() {
+    let h = harness("sftp-rescope", "native").await;
+    for i in 0..(READDIR_PAGE + 10) {
+        h.put(&format!("reports/f{i:04}.csv"), b"x");
+    }
+    h.put("reports/public/p.csv", b"x");
+    let mut c = connect(h.addr, "acme-ops", &h.ops_key)
+        .await
+        .expect("connect");
+    let Reply::Handle(hd) = c.path_op(SSH_FXP_OPENDIR, "/reports").await.unwrap() else {
+        panic!()
+    };
+    assert!(matches!(
+        c.call(SSH_FXP_READDIR, |b| s(b, &hd)).await.unwrap(),
+        Reply::Name(_)
+    ));
+    // The policy narrows the user to reports/public/ while the handle is open.
+    h.push("rev-narrow", h.ops_scoped(&["reports/public/"]))
+        .await;
+    let r = c.call(SSH_FXP_READDIR, |b| s(b, &hd)).await.unwrap();
+    assert_eq!(code(&r), PERMISSION_DENIED, "{r:?}");
+    // A reopened listing is scoped by the new decision.
+    assert_eq!(
+        c.listdir("/reports").await.unwrap(),
+        vec![".", "..", "public"]
+    );
+}
+
+/// The server's READDIR batch (`READDIR_BATCH`): more entries than this need a second page.
+const READDIR_PAGE: usize = 128;
+
+#[tokio::test]
+async fn stat_inside_one_of_several_overlapping_grants_finds_the_file() {
+    let h = harness("sftp-stat-overlap", "native").await;
+    h.push("rev-overlap", h.ops_scoped(&["home/", "home/docs/2024/"]))
+        .await;
+    h.put("home/doc", b"hello");
+    let mut c = connect(h.addr, "acme-ops", &h.ops_key)
+        .await
+        .expect("connect");
+    let r = c.path_op(SSH_FXP_STAT, "/home/doc").await.unwrap();
+    assert!(matches!(r, Reply::Attrs(_)), "{r:?}");
+    let r = c.path_op(SSH_FXP_STAT, "/home/nothing").await.unwrap();
+    assert_eq!(code(&r), NO_SUCH_FILE, "{r:?}");
+}
+
+#[tokio::test]
+async fn read_and_directory_handles_are_capped() {
+    let h = harness("sftp-handle-cap", "native").await;
+    h.put("f.csv", b"x");
+    let mut c = connect(h.addr, "acme-ops", &h.ops_key)
+        .await
+        .expect("connect");
+    let mut open = Vec::new();
+    for i in 0..64 {
+        let r = if i % 2 == 0 {
+            c.open("/f.csv", SSH_FXF_READ).await
+        } else {
+            c.path_op(SSH_FXP_OPENDIR, "/").await.unwrap()
+        };
+        let Reply::Handle(hd) = r else {
+            panic!("handle {i}: {r:?}")
+        };
+        open.push(hd);
+    }
+    let r = c.open("/f.csv", SSH_FXF_READ).await;
+    assert_eq!(code(&r), FAILURE, "{r:?}");
+    let r = c.path_op(SSH_FXP_OPENDIR, "/").await.unwrap();
+    assert_eq!(code(&r), FAILURE, "{r:?}");
+    // Write handles have their own budget, and closing frees a slot.
+    let r = c.upload("/w.csv", b"y").await;
+    assert_eq!(code(&r), OK, "{r:?}");
+    assert_eq!(code(&c.close(&open.pop().unwrap()).await), OK);
+    assert!(matches!(
+        c.open("/f.csv", SSH_FXF_READ).await,
+        Reply::Handle(_)
+    ));
+}
+
+#[tokio::test]
+async fn an_in_order_write_over_a_held_chunk_is_refused() {
+    let h = harness("sftp-overlap-ahead", "native").await;
+    let mut c = connect(h.addr, "acme-partner-drop", &h.drop_key)
+        .await
+        .expect("connect");
+    let Reply::Handle(hd) = c
+        .open("/o.bin", SSH_FXF_WRITE | SSH_FXF_CREAT | SSH_FXF_TRUNC)
+        .await
+    else {
+        panic!()
+    };
+    assert_eq!(code(&c.write(&hd, 100, &[2u8; 50]).await), OK, "held ahead");
+    assert_eq!(
+        code(&c.write(&hd, 0, &[1u8; 150]).await),
+        OP_UNSUPPORTED,
+        "covers the held chunk"
+    );
+    // The transfer is intact: the bytes that do fit complete it.
+    assert_eq!(code(&c.write(&hd, 0, &[1u8; 100]).await), OK);
+    assert_eq!(code(&c.close(&hd).await), OK);
+    let got = h.mem.get("inbound", "partner-x/o.bin").unwrap();
+    assert_eq!(&got[..100], &[1u8; 100][..]);
+    assert_eq!(&got[100..], &[2u8; 50][..]);
+}
+
+#[tokio::test]
+async fn a_session_does_not_outlive_its_certificate() {
+    use russh::keys::ssh_key::certificate::{Builder, CertType};
+    let h = harness("sftp-cert-expiry", "native").await;
+    let ca = ed25519();
+    let user = ed25519();
+    let mut b = bundle(&h.drop_key, &h.ops_key);
+    b["sftp"]["accounts"]["acme-cert"] = serde_json::json!({
+        "tenant": "acme",
+        "subject_key": "user:ops",
+        "home": { "bucket": "inbound", "prefix": "" },
+        "certificate_authorities": ["ops-ca"]
+    });
+    b["sftp"]["user_cas"] = serde_json::json!({
+        "ops-ca": { "key_type": "ssh-ed25519", "fingerprint": fp(&ca), "tenants": ["acme"] }
+    });
+    h.push("rev-ca", b).await;
+    h.put("f.csv", b"x");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let valid_before = now + 3;
+    let mut cb = Builder::new_with_random_nonce(
+        &mut TestRng(uuid::Uuid::new_v4().as_u128()),
+        user.public_key().key_data().clone(),
+        now - 60,
+        valid_before,
+    )
+    .unwrap();
+    cb.serial(1).unwrap();
+    cb.key_id("ops@example.org").unwrap();
+    cb.cert_type(CertType::User).unwrap();
+    cb.valid_principal("acme-cert").unwrap();
+    let cert = cb.sign(&ca).unwrap();
+
+    let cfg = Arc::new(russh::client::Config::default());
+    let mut session = russh::client::connect(cfg, h.addr, Client).await.unwrap();
+    let ok = session
+        .authenticate_openssh_cert("acme-cert", Arc::new(user), cert)
+        .await
+        .unwrap();
+    assert!(ok.success(), "certificate login");
+    let ch = session.channel_open_session().await.unwrap();
+    ch.request_subsystem(true, "sftp").await.unwrap();
+    let mut c = Sftp {
+        stream: ch.into_stream(),
+        next_id: 1,
+        _session: session,
+    };
+    let mut init = BytesMut::new();
+    init.put_u8(SSH_FXP_INIT);
+    init.put_u32(3);
+    c.send_raw(init).await;
+    assert_eq!(c.recv_raw().await.unwrap().0, SSH_FXP_VERSION);
+    assert!(matches!(
+        c.path_op(SSH_FXP_STAT, "/f.csv").await,
+        Some(Reply::Attrs(_))
+    ));
+
+    // No bundle change; only the clock moves past valid_before.
+    while std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        < valid_before + 1
+    {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let r = c.path_op(SSH_FXP_STAT, "/f.csv").await;
+    assert!(r.is_none(), "the session must be closed, got {r:?}");
 }

@@ -802,3 +802,46 @@ impl Pacer {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_idle_stretch_banks_at_most_one_second_of_credit() {
+        let rate = 1_000_000;
+        let t0 = Instant::now();
+        let mut p = Pacer {
+            base: t0,
+            base_moved: 0,
+        };
+        // An hour of near-idle requests: a few bytes a minute, never held.
+        let mut moved = 0;
+        for minute in 1..=60 {
+            moved += 100;
+            let now = t0 + Duration::from_secs(60 * minute);
+            assert_eq!(p.delay(moved, rate, now), None);
+        }
+        // Then 3.6 GB at once: only one second of it is free, the rest is paced.
+        let now = t0 + Duration::from_secs(3600);
+        let wait = p.delay(moved + 3_600_000_000, rate, now).expect("held");
+        assert!(
+            wait >= Duration::from_secs(3598) && wait <= Duration::from_secs(3600),
+            "{wait:?}"
+        );
+    }
+
+    #[test]
+    fn a_session_at_its_rate_is_held_to_it() {
+        let t0 = Instant::now();
+        let mut p = Pacer {
+            base: t0,
+            base_moved: 0,
+        };
+        assert_eq!(
+            p.delay(2_000, 1_000, t0 + Duration::from_secs(1)),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(p.delay(2_000, 1_000, t0 + Duration::from_secs(2)), None);
+    }
+}
