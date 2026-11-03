@@ -819,8 +819,13 @@ impl SftpSession {
         let Some(hid) = Self::handle_id(handle) else {
             return status(id, StatusCode::Failure, "invalid handle");
         };
-        let Some(Handle::Dir(mut h)) = self.handles.remove(&hid) else {
+        // Checked before removal: a request naming a handle of another kind must not
+        // take that handle (and an open transfer with it) out of the table.
+        if !matches!(self.handles.get(&hid), Some(Handle::Dir(_))) {
             return status(id, StatusCode::Failure, "invalid handle");
+        }
+        let Some(Handle::Dir(mut h)) = self.handles.remove(&hid) else {
+            unreachable!("checked above");
         };
         // Re-decided on a revision change.
         if h.decided_rev != self.checked_rev {
@@ -987,7 +992,16 @@ impl SftpSession {
             return status(id, StatusCode::Failure, "internal error: no proof");
         };
         let audit = self.pending(input.clone(), &decided[0].decision, self.block(op, flags));
-        match Download::open(self.backend(route), proof, bucket, m.key.clone()).await {
+        let read_ahead = self.shared.gw.limits().sftp.read_ahead;
+        match Download::open(
+            self.backend(route),
+            proof,
+            bucket,
+            m.key.clone(),
+            read_ahead,
+        )
+        .await
+        {
             Ok(Some(dl)) => {
                 let h = self.alloc_handle(Handle::Read(ReadHandle {
                     dl,
@@ -1196,8 +1210,13 @@ impl SftpSession {
         let Some(hid) = Self::handle_id(handle) else {
             return status(id, StatusCode::Failure, "invalid handle");
         };
-        let Some(Handle::Read(mut h)) = self.handles.remove(&hid) else {
+        // Checked before removal: a request naming a handle of another kind must not
+        // take that handle (and an open transfer with it) out of the table.
+        if !matches!(self.handles.get(&hid), Some(Handle::Read(_))) {
             return status(id, StatusCode::Failure, "invalid handle");
+        }
+        let Some(Handle::Read(mut h)) = self.handles.remove(&hid) else {
+            unreachable!("checked above");
         };
         if h.decided_rev != self.checked_rev {
             match self.authorize(op, h.inputs.clone(), &[], vec![], id).await {
@@ -1206,6 +1225,12 @@ impl SftpSession {
                     let bytes = h.dl.bytes_sent;
                     h.audit
                         .settle_with(BackendOutcome::SucceededStatusUnknown, None, |r| {
+                            // As for an upload denied mid-transfer (`settle_transfer`): the
+                            // record states the denial, not the original allow.
+                            r.result = Decision::deny(format!(
+                                "denied mid-transfer at byte offset {offset}"
+                            ));
+                            r.gateway.outcome = Outcome::Denied;
                             if let Some(s) = r.gateway.session.as_mut() {
                                 s.transfer = Some(TransferBlock {
                                     bytes,
@@ -1240,8 +1265,13 @@ impl SftpSession {
         let Some(hid) = Self::handle_id(handle) else {
             return status(id, StatusCode::Failure, "invalid handle");
         };
-        let Some(Handle::Write(mut h)) = self.handles.remove(&hid) else {
+        // Checked before removal: a request naming a handle of another kind must not
+        // take that handle (and an open transfer with it) out of the table.
+        if !matches!(self.handles.get(&hid), Some(Handle::Write(_))) {
             return status(id, StatusCode::Failure, "invalid handle");
+        }
+        let Some(Handle::Write(mut h)) = self.handles.remove(&hid) else {
+            unreachable!("checked above");
         };
         let len = data.len() as u64;
         if h.decided_rev != self.checked_rev {
@@ -1706,11 +1736,9 @@ impl SftpSession {
         let Some(proof) = proof else {
             return status(id, StatusCode::Failure, "internal error: no proof");
         };
-        let audit = self.pending(
-            write,
-            &Decision::allow("rename allowed (source read + target write + source delete)"),
-            self.block(op, vec![]),
-        );
+        // The record carries the PDP's own answer for the primary (target write) input,
+        // obligations included — never a decision the gateway made up.
+        let audit = self.pending(write, &decided[0].decision, self.block(op, vec![]));
         let backend = self.backend(route.clone());
         let size = match backend.head(&proof, &bucket, &a.key).await {
             Ok(Some(m)) => m.size,

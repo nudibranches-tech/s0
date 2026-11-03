@@ -1340,8 +1340,9 @@ async fn every_channel_type_and_request_other_than_sftp_is_refused() {
         "a second session channel"
     );
 
-    // exec / shell / env / pty on a session channel: an explicit failure, never a silent Ok.
-    for which in ["exec", "shell", "env", "pty", "subsystem-other"] {
+    // exec / shell / pty on a session channel: an explicit failure, never a silent Ok.
+    // (`env` is refused without closing the channel: see `env_then_sftp_works_like_stock_openssh`.)
+    for which in ["exec", "shell", "pty", "subsystem-other"] {
         let cfg = Arc::new(russh::client::Config::default());
         let mut session = russh::client::connect(cfg, h.addr, Client).await.unwrap();
         assert!(
@@ -1358,7 +1359,6 @@ async fn every_channel_type_and_request_other_than_sftp_is_refused() {
         match which {
             "exec" => ch.exec(true, "id").await.unwrap(),
             "shell" => ch.request_shell(true).await.unwrap(),
-            "env" => ch.set_env(true, "LANG", "C").await.unwrap(),
             "pty" => ch
                 .request_pty(true, "xterm", 80, 24, 0, 0, &[])
                 .await
@@ -1416,4 +1416,101 @@ async fn a_client_without_strict_kex_is_refused_before_authentication() {
         "{}",
         rej.result.reason
     );
+}
+
+/// Stock OpenSSH with `SendEnv LANG LC_*` (the Debian, Ubuntu and macOS default) sends
+/// `env` before `subsystem sftp` on the same channel. The env is refused, and the session
+/// must still start.
+#[tokio::test]
+async fn env_then_sftp_works_like_stock_openssh() {
+    let h = harness("sftp-env", "native").await;
+    let cfg = Arc::new(russh::client::Config::default());
+    let mut session = russh::client::connect(cfg, h.addr, Client).await.unwrap();
+    assert!(
+        session
+            .authenticate_publickey(
+                "acme-ops",
+                PrivateKeyWithHashAlg::new(Arc::new(h.ops_key.clone()), None)
+            )
+            .await
+            .unwrap()
+            .success()
+    );
+    let mut ch = session.channel_open_session().await.unwrap();
+    // As OpenSSH does it: no reply asked for…
+    ch.set_env(false, "LANG", "en_US.UTF-8").await.unwrap();
+    // …and with one, the refusal is explicit.
+    ch.set_env(true, "LC_ALL", "C").await.unwrap();
+    let mut refused = false;
+    while let Some(msg) = tokio::time::timeout(Duration::from_secs(5), ch.wait())
+        .await
+        .ok()
+        .flatten()
+    {
+        match msg {
+            russh::ChannelMsg::Failure => {
+                refused = true;
+                break;
+            }
+            russh::ChannelMsg::Success => panic!("env was accepted"),
+            russh::ChannelMsg::Close => panic!("env closed the channel"),
+            _ => {}
+        }
+    }
+    assert!(
+        refused,
+        "env must get SSH_MSG_CHANNEL_FAILURE when a reply is asked for"
+    );
+    ch.request_subsystem(true, "sftp").await.unwrap();
+    let mut sftp = Sftp {
+        stream: ch.into_stream(),
+        next_id: 1,
+        _session: session,
+    };
+    let mut b = BytesMut::new();
+    b.put_u8(SSH_FXP_INIT);
+    b.put_u32(3);
+    assert!(sftp.send_raw(b).await);
+    let (t, _) = sftp.recv_raw().await.expect("VERSION after env");
+    assert_eq!(t, SSH_FXP_VERSION);
+    assert_eq!(code(&sftp.upload("/after-env.csv", b"ok").await), OK);
+    assert_eq!(
+        h.mem.get("inbound", "after-env.csv").as_deref(),
+        Some(&b"ok"[..])
+    );
+}
+
+/// Downloads larger than the read-ahead budget stream intact, sequentially and after a
+/// seek.
+#[tokio::test]
+async fn a_download_larger_than_the_read_ahead_streams_intact() {
+    let h = harness("sftp-readahead", "native").await;
+    let mut c = connect(h.addr, "acme-ops", &h.ops_key)
+        .await
+        .expect("connect");
+    let data: Vec<u8> = (0..(3 * 1024 * 1024 + 7))
+        .map(|i| (i % 253) as u8)
+        .collect();
+    assert_eq!(code(&c.upload("/big.bin", &data).await), OK);
+    let Reply::Handle(hd) = c.open("/big.bin", SSH_FXF_READ).await else {
+        panic!()
+    };
+    let mut got = Vec::new();
+    loop {
+        match c.read(&hd, got.len() as u64, 64 * 1024).await {
+            Reply::Data(d) => got.extend_from_slice(&d),
+            Reply::Status(1, _) => break,
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(got, data, "sequential read through the read-ahead");
+    let off = 2 * 1024 * 1024 + 5;
+    assert!(
+        matches!(c.read(&hd, off as u64, 100).await, Reply::Data(d) if d == data[off..off + 100])
+    );
+    assert!(
+        matches!(c.read(&hd, 10, 100).await, Reply::Data(d) if d == data[10..110]),
+        "seek back"
+    );
+    assert_eq!(code(&c.close(&hd).await), OK);
 }

@@ -434,7 +434,10 @@ impl SftpFront {
             "sftp listener closed; draining sessions"
         );
         let _ = self.shared.shutdown.send(true);
-        let deadline = self.shared.drain + Duration::from_secs(3);
+        // Longer than a connection's own wait for its session teardown (`drain + 5s` in
+        // `handle_connection`), so a slow abort still ends in its `disconnected` record
+        // rather than being cut off here.
+        let deadline = self.shared.drain + Duration::from_secs(8);
         if tokio::time::timeout(deadline, async {
             while tasks.join_next().await.is_some() {}
         })
@@ -667,6 +670,11 @@ pub(crate) async fn run_sftp(
     );
     let mut bundle_rx = shared.gw.bundles.subscribe();
     let mut shutdown_rx = shared.shutdown.subscribe();
+    // `subscribe` marks the current value seen: a session that reaches this point after
+    // the drain began (it was still authenticating) would otherwise never drain.
+    if *shutdown_rx.borrow() {
+        shutdown_rx.mark_changed();
+    }
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut last_request = Instant::now();
     let mut draining: Option<Instant> = None;

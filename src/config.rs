@@ -158,7 +158,7 @@ pub struct SftpConfig {
     pub listen: SocketAddr,
     /// Paths to mounted host private keys (OpenSSH format, unencrypted). An ed25519 key is
     /// required; an ECDSA P-256 key is optional. Never generated: a missing, unreadable,
-    /// group/world-readable, encrypted, RSA or duplicate key refuses startup.
+    /// world-readable, encrypted, RSA or duplicate key refuses startup.
     pub host_keys: Vec<PathBuf>,
     #[serde(default)]
     pub proxy_protocol: Option<ProxyProtocolConfig>,
@@ -211,7 +211,8 @@ pub struct SftpLimits {
     pub max_write_handles: usize,
     pub max_transfer_memory: usize,
     pub max_sftp_packet_len: usize,
-    /// Read-ahead for downloads.
+    /// Bytes a download prefetches from the backend ahead of the client's READs, per
+    /// open read handle. Bounded: a slow client stops the prefetch, never grows it.
     pub read_ahead: usize,
 }
 

@@ -13,7 +13,6 @@ use std::borrow::Cow;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
 
 use russh::keys::{Algorithm, Certificate, EcdsaCurve, HashAlg, PrivateKey, PublicKey};
 use russh::server::{Auth, Msg, Session};
@@ -545,6 +544,16 @@ impl russh::server::Handler for SshHandler {
         refuse_request(channel, session)
     }
 
+    /// Refused, but the channel stays open — the one channel request that does not end
+    /// the session.
+    ///
+    /// Stock OpenSSH sends `env` on the session channel *before* `subsystem sftp`
+    /// whenever its config has `SendEnv` (the Debian, Ubuntu and macOS defaults carry
+    /// `SendEnv LANG LC_*`). Closing the channel here would lock every such partner out.
+    /// No variable is set — there is no process to set it in — and the refusal is
+    /// explicit (`SSH_MSG_CHANNEL_FAILURE`, sent when the client asked for a reply), so
+    /// nothing relies on a russh default (E5). Deviation from ADR-009 D3, which closes the
+    /// channel on every non-`sftp` request.
     async fn env_request(
         &mut self,
         channel: ChannelId,
@@ -552,7 +561,8 @@ impl russh::server::Handler for SshHandler {
         _variable_value: &str,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        refuse_request(channel, session)
+        session.channel_failure(channel)?;
+        Ok(())
     }
 
     async fn shell_request(
@@ -674,9 +684,4 @@ fn refuse_request(channel: ChannelId, session: &mut Session) -> Result<(), Handl
     session.channel_failure(channel)?;
     session.close(channel)?;
     Ok(())
-}
-
-/// Seconds since `start`, for the disconnect record.
-pub fn elapsed_secs(start: Instant) -> u64 {
-    start.elapsed().as_secs()
 }

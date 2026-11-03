@@ -224,9 +224,19 @@ async fn main() -> Result<()> {
     let sftp_task = match config.sftp_enabled() {
         Some(sftp_cfg) => {
             let front = s0::sftp::SftpFront::build(gateway.clone(), sftp_cfg)?;
+            // Bound here, not inside the spawned task: a port that cannot be bound must
+            // fail startup, not leave an SFTP-only pod running (and ready) serving nothing.
+            let listener = tokio::net::TcpListener::bind(sftp_cfg.listen)
+                .await
+                .map_err(|e| {
+                    s0::error::GatewayError::Config(format!(
+                        "bind sftp listener {}: {e}",
+                        sftp_cfg.listen
+                    ))
+                })?;
             admin_state.set_sftp(front.host_key_fingerprints(), front.metrics());
             Some(tokio::spawn(async move {
-                if let Err(e) = front.serve(shutdown::signal()).await {
+                if let Err(e) = front.serve_on(listener, shutdown::signal()).await {
                     tracing::error!(%e, "sftp front exited");
                 }
             }))
@@ -243,7 +253,7 @@ async fn main() -> Result<()> {
     if let Some(task) = sftp_task {
         // The front applies its own drain budget (`frontends.sftp.drain_secs`), then aborts every
         // open transfer; this bound only guards a front that failed to honour it.
-        let budget = Duration::from_secs(config.sftp_enabled().map_or(20, |s| s.drain_secs) + 5);
+        let budget = Duration::from_secs(config.sftp_enabled().map_or(20, |s| s.drain_secs) + 10);
         if tokio::time::timeout(budget, task).await.is_err() {
             tracing::error!("sftp front drain timed out");
         }

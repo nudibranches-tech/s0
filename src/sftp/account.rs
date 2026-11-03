@@ -11,7 +11,7 @@
 //! "absent means unrestricted" field is `allowed_source_cidrs`, because it restricts on top
 //! of key possession rather than granting anything.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
@@ -606,10 +606,6 @@ impl DirectoryCache {
         d
     }
 }
-
-/// `BTreeMap` for deterministic iteration in tests.
-#[allow(dead_code)]
-type Ordered<K, V> = BTreeMap<K, V>;
 
 #[cfg(test)]
 mod tests {

@@ -475,6 +475,55 @@ impl Upload {
 }
 
 /// One read handle.
+/// A chunk the read-ahead task has pulled, with the budget it holds until consumed.
+type Prefetched = (Result<Bytes, String>, Option<OwnedSemaphorePermit>);
+
+/// Download read-ahead (ADR-009 D9): a task pulls the `GetObject` stream ahead of the
+/// client's READs, holding at most `budget` bytes. The budget is a semaphore: the task
+/// takes permits for a chunk before handing it over, and the reader releases them only
+/// once the chunk is fully served, so a slow client stops the task rather than growing
+/// memory. Dropping the prefetcher aborts the task and the backend body with it.
+struct Prefetch {
+    rx: tokio::sync::mpsc::UnboundedReceiver<Prefetched>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Prefetch {
+    fn spawn(mut stream: ByteStream, budget: usize) -> Self {
+        let budget = budget.max(1);
+        let sem = Arc::new(tokio::sync::Semaphore::new(budget));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            while let Some(item) = stream.next().await {
+                let permit = match &item {
+                    Ok(b) => {
+                        // A chunk larger than the whole budget takes all of it rather than
+                        // waiting forever.
+                        let n = u32::try_from(b.len().clamp(1, budget)).unwrap_or(u32::MAX);
+                        match sem.clone().acquire_many_owned(n).await {
+                            Ok(p) => Some(p),
+                            Err(_) => return,
+                        }
+                    }
+                    Err(_) => None,
+                };
+                let stop = item.is_err();
+                if tx.send((item, permit)).is_err() || stop {
+                    return;
+                }
+            }
+        });
+        Prefetch { rx, task }
+    }
+}
+
+impl Drop for Prefetch {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// One read handle.
 pub struct Download {
     backend: SftpBackend,
     proof: SftpProof,
@@ -482,18 +531,22 @@ pub struct Download {
     pub key: String,
     pub size: u64,
     pos: u64,
-    stream: Option<ByteStream>,
+    prefetch: Option<Prefetch>,
+    read_ahead: usize,
     pending: Bytes,
+    /// The budget held by `pending`, released when it is fully served.
+    pending_permit: Option<OwnedSemaphorePermit>,
     pub bytes_sent: u64,
 }
 
 impl Download {
-    /// Open the stream. `Ok(None)` when the object does not exist.
+    /// Open the stream and start reading ahead. `Ok(None)` when the object does not exist.
     pub async fn open(
         backend: SftpBackend,
         proof: SftpProof,
         bucket: String,
         key: String,
+        read_ahead: usize,
     ) -> Result<Option<Self>, BackendError> {
         match backend.get(&proof, &bucket, &key, 0).await {
             Ok((size, stream)) => Ok(Some(Download {
@@ -503,8 +556,10 @@ impl Download {
                 key,
                 size,
                 pos: 0,
-                stream: Some(stream),
+                prefetch: Some(Prefetch::spawn(stream, read_ahead)),
+                read_ahead,
                 pending: Bytes::new(),
+                pending_permit: None,
                 bytes_sent: 0,
             })),
             Err(BackendError::NotFound) => Ok(None),
@@ -518,26 +573,31 @@ impl Download {
             return Ok(None);
         }
         if offset != self.pos {
-            // Non-sequential: reopen with a Range.
+            // Non-sequential: drop what was read ahead and reopen with a Range.
             let (_, stream) = self
                 .backend
                 .get(&self.proof, &self.bucket, &self.key, offset)
                 .await?;
-            self.stream = Some(stream);
+            self.prefetch = Some(Prefetch::spawn(stream, self.read_ahead));
             self.pending = Bytes::new();
+            self.pending_permit = None;
             self.pos = offset;
         }
         let want = (len as u64).min(self.size - offset) as usize;
         let mut out = BytesMut::with_capacity(want);
         while out.len() < want {
             if self.pending.is_empty() {
-                let next = match self.stream.as_mut() {
-                    Some(s) => s.next().await,
+                self.pending_permit = None;
+                let next = match self.prefetch.as_mut() {
+                    Some(p) => p.rx.recv().await,
                     None => None,
                 };
                 match next {
-                    Some(Ok(b)) => self.pending = b,
-                    Some(Err(e)) => {
+                    Some((Ok(b), permit)) => {
+                        self.pending = b;
+                        self.pending_permit = permit;
+                    }
+                    Some((Err(e), _)) => {
                         return Err(BackendError::Other {
                             status: None,
                             message: e,
@@ -548,6 +608,9 @@ impl Download {
             }
             let take = (want - out.len()).min(self.pending.len());
             out.extend_from_slice(&self.pending.split_to(take));
+        }
+        if self.pending.is_empty() {
+            self.pending_permit = None;
         }
         if out.is_empty() {
             return Ok(None);
@@ -561,6 +624,47 @@ impl Download {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn read_ahead_pulls_ahead_but_never_past_its_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let counter = pulled.clone();
+        // 100 chunks of 1 KiB, budget 4 KiB.
+        let stream: ByteStream = Box::pin(futures_util::stream::iter(0..100).map(move |i| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, String>(Bytes::from(vec![i as u8; 1024]))
+        }));
+        let mut p = Prefetch::spawn(stream, 4 * 1024);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let ahead = pulled.load(Ordering::SeqCst);
+        assert!(ahead >= 4, "it reads ahead without being asked ({ahead})");
+        assert!(
+            ahead <= 5,
+            "but holds at most the budget, plus the one chunk it waits to place ({ahead})"
+        );
+        // Consuming releases budget and lets it continue, in order.
+        for i in 0..100u8 {
+            let (b, permit) = p.rx.recv().await.unwrap();
+            assert_eq!(b.unwrap()[0], i);
+            drop(permit);
+        }
+        assert!(p.rx.recv().await.is_none(), "end of stream");
+    }
+
+    #[tokio::test]
+    async fn a_chunk_larger_than_the_budget_does_not_deadlock() {
+        let stream: ByteStream = Box::pin(futures_util::stream::iter(vec![
+            Ok::<_, String>(Bytes::from(vec![1u8; 10_000])),
+            Ok(Bytes::from(vec![2u8; 10])),
+        ]));
+        let mut p = Prefetch::spawn(stream, 1024);
+        let (a, pa) = p.rx.recv().await.unwrap();
+        assert_eq!(a.unwrap().len(), 10_000);
+        drop(pa);
+        let (b, _) = p.rx.recv().await.unwrap();
+        assert_eq!(b.unwrap().len(), 10);
+    }
 
     #[test]
     fn inflight_keys_are_exclusive_and_released() {
