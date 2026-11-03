@@ -9,9 +9,11 @@ use serde::{Deserialize, Serialize};
 ///
 /// Deliberately coarser than the 99 S3 ops: every enforced op maps onto exactly one of
 /// these (`PutObject` to `write_objects`, `HeadBucket` to `read`), except `CopyObject`,
-/// which maps to two. [`Action::CreateObjects`] is the one verb no enforced S3 op names:
-/// it is asked by the SFTP front (ADR-009 D7). The set is a contract with whatever control
-/// plane projects grants.
+/// which maps to two. [`Action::CreateObjects`] is asked by the SFTP front for every
+/// upload (ADR-009 D7), and by the S3 front for a write that cannot overwrite — a
+/// `PutObject` or `CompleteMultipartUpload` carrying `If-None-Match: *`, and the multipart
+/// steps leading to one — when `write_objects` is denied (ADR-009 F1). The set is a
+/// contract with whatever control plane projects grants.
 ///
 /// **The gateway is data-plane only**, so there is no verb for acting on a bucket as a
 /// *managed resource*: existence, policy, CORS and quota are control-plane concerns, and

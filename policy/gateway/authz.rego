@@ -208,7 +208,9 @@ action_matches(g) if input.action in g.actions
 action_matches(g) if "*" in g.actions
 
 # `write_objects` implies `create_objects` (overwrite ⊇ create). `create_objects` writes a
-# key that does not exist — the drop-box verb the SFTP front asks (ADR-009 D7). The
+# key that does not exist — the drop-box verb. The SFTP front asks it for uploads (ADR-009
+# D7); the S3 front asks it for a write carrying `If-None-Match: *` when `write_objects`
+# is denied, on a backend declared `conditional_create: native` (ADR-009 F1). The
 # implication lives HERE, in the module, because the module is the normative definition
 # of what a grant means: a pushed module must mirror it, and a corpus case pins it.
 action_matches(g) if {
