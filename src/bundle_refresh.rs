@@ -234,7 +234,8 @@ async fn refresh_once(
     pdp.reload(parsed.policy.as_deref(), &parsed.data)
         .await
         .map_err(|e| e.to_string())?;
-    bundles.store(Bundle::new(revision.clone(), parsed.data));
+    let policy_module = parsed.policy.is_some();
+    bundles.store(Bundle::new(revision.clone(), parsed.data).with_policy_module(policy_module));
     tracing::info!(%revision, "bundle reloaded");
     Ok(())
 }

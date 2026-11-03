@@ -21,14 +21,29 @@ use crate::secret::Secret;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GatewayConfig {
-    pub listen: SocketAddr,
+    /// The S3 data-plane listener. Required iff the S3 front is enabled (ADR-009 D1):
+    /// an SFTP-only process binds no S3 port. Read it through [`Self::s3_listen`].
+    #[serde(default)]
+    pub listen: Option<SocketAddr>,
+    /// The S3 front's own section. **Absent ⇒ the S3 front is enabled**, so every config
+    /// written before the SFTP front keeps its behaviour. See [`S3FrontConfig`].
+    #[serde(default)]
+    pub s3: Option<S3FrontConfig>,
+    /// The SFTP front (ADR-009). **No section, no listener** — exactly as with `sts_mint`
+    /// and `internal`. Present, its `enabled` flag is required. See [`SftpConfig`].
+    #[serde(default)]
+    pub sftp: Option<SftpConfig>,
     /// Liveness / readiness / metrics listener. Always on: the runtime image is
     /// distroless, so a probe cannot `exec` anything, and a TCP probe on the S3 port
     /// succeeds on a pod that has never reached the control plane. Unauthenticated by
     /// design (a probe cannot sign SigV4) — keep it off the ingress.
     #[serde(default = "default_admin_listen")]
     pub admin_listen: SocketAddr,
-    pub sts: StsConfig,
+    /// The STS key material. Required iff something in this process mints or verifies
+    /// STS sessions: the S3 front, the mint, or the internal API. An SFTP-only process
+    /// carries none (ADR-009 D1). Read it through [`Self::sts`].
+    #[serde(default)]
+    pub sts: Option<StsConfig>,
     /// Optional key ring for **derived long-lived per-principal keys**. Absent ⇒ the
     /// gateway mints and honours none — but the namespace is not free: `HFSA*` is
     /// refused for static credentials either way (see [`GatewayConfig::validate`]) and
@@ -77,6 +92,221 @@ pub struct GatewayConfig {
     /// endpoint. Absent by default — no listener is bound, nothing is served.
     #[serde(default)]
     pub internal: Option<InternalApiConfig>,
+}
+
+/// The S3 front's section (ADR-009 D1). The switch sits next to the settings it
+/// switches; `listen` stays top-level for compatibility with every existing config.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct S3FrontConfig {
+    /// Required when the section is present: an operator writes `true` or `false`.
+    pub enabled: bool,
+}
+
+/// How a backend closes the create-only check-then-write race (ADR-009 D8).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConditionalCreate {
+    /// The commit carries `If-None-Match: *`. An operator **assertion** that the backend
+    /// honours it — s0 never assumes support.
+    Native,
+    /// Re-issue `HeadObject` just before the commit, plus a per-process registry of
+    /// in-flight keys. Leaves a one-round-trip cross-replica race.
+    #[default]
+    CheckThenWrite,
+}
+
+/// PROXY protocol v2 reception (ADR-009 D12).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyProtocolConfig {
+    /// Peers that MUST send a PROXY v2 header. A trusted peer that does not is
+    /// disconnected; an untrusted peer that does is disconnected.
+    pub trusted_cidrs: Vec<String>,
+}
+
+/// The SFTP front's listener (ADR-009 D1, D3). Only `listen`, `host_keys` and
+/// `proxy_protocol` need a restart; the limits are in [`LimitsConfig::sftp`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SftpConfig {
+    /// Required, no default: whether this process serves SFTP. A section kept with
+    /// `enabled: false` binds nothing.
+    pub enabled: bool,
+    pub listen: SocketAddr,
+    /// Paths to mounted host private keys (OpenSSH format, unencrypted). An ed25519 key is
+    /// required; an ECDSA P-256 key is optional. Never generated: a missing, unreadable,
+    /// group/world-readable, encrypted, RSA or duplicate key refuses startup.
+    pub host_keys: Vec<PathBuf>,
+    #[serde(default)]
+    pub proxy_protocol: Option<ProxyProtocolConfig>,
+    /// Per backend id: how the create-only race is closed. Absent ⇒ `check_then_write`.
+    #[serde(default)]
+    pub conditional_create: BTreeMap<String, ConditionalCreate>,
+    /// On SIGTERM, how long open sessions get to finish in-flight commands before every
+    /// open transfer is aborted.
+    #[serde(default = "default_sftp_drain_secs")]
+    pub drain_secs: u64,
+}
+
+fn default_sftp_drain_secs() -> u64 {
+    20
+}
+
+/// The SFTP front's hot-reloadable limits (ADR-009 D12). Defaults are the ADR's.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SftpLimits {
+    pub max_connections: usize,
+    /// Per IPv4 /32 or IPv6 /64.
+    pub max_connections_per_ip: usize,
+    pub max_sessions_per_subject: usize,
+    /// Pre-authentication connections per IP per minute (token bucket refill rate).
+    pub preauth_rate_per_ip_per_min: u32,
+    pub preauth_burst_per_ip: u32,
+    /// From TCP accept to authentication success, PROXY header included.
+    pub handshake_timeout_secs: u64,
+    /// 1–10.
+    pub max_auth_attempts: usize,
+    /// Public keys offered without a signature, per connection.
+    pub max_key_probes: usize,
+    /// Failures within `auth_failure_window_secs` that trigger a ban.
+    pub auth_failure_ban_threshold: u32,
+    pub auth_failure_window_secs: u64,
+    pub auth_failure_ban_secs: u64,
+    /// LRU bound on the ban table.
+    pub ban_table_size: usize,
+    /// Session idle bound (no SFTP request).
+    pub idle_timeout_secs: u64,
+    /// Transfer idle bound (no WRITE).
+    pub transfer_idle_timeout_secs: u64,
+    pub max_file_size: u64,
+    /// Per session, per direction. 0 ⇒ unlimited.
+    pub bandwidth_bytes_per_sec: u64,
+    /// 5–64 MiB.
+    pub part_size: usize,
+    /// 1–4.
+    pub max_inflight_parts: usize,
+    /// At most `part_size`.
+    pub reorder_window: usize,
+    pub max_write_handles: usize,
+    pub max_transfer_memory: usize,
+    pub max_sftp_packet_len: usize,
+    /// Read-ahead for downloads.
+    pub read_ahead: usize,
+}
+
+impl Default for SftpLimits {
+    fn default() -> Self {
+        SftpLimits {
+            max_connections: 256,
+            max_connections_per_ip: 16,
+            max_sessions_per_subject: 8,
+            preauth_rate_per_ip_per_min: 10,
+            preauth_burst_per_ip: 20,
+            handshake_timeout_secs: 30,
+            max_auth_attempts: 6,
+            max_key_probes: 10,
+            auth_failure_ban_threshold: 10,
+            auth_failure_window_secs: 300,
+            auth_failure_ban_secs: 900,
+            ban_table_size: 65_536,
+            idle_timeout_secs: 300,
+            transfer_idle_timeout_secs: 120,
+            max_file_size: 50 * 1024 * 1024 * 1024,
+            bandwidth_bytes_per_sec: 0,
+            part_size: 8 * 1024 * 1024,
+            max_inflight_parts: 2,
+            reorder_window: 2 * 1024 * 1024,
+            max_write_handles: 2,
+            max_transfer_memory: 1024 * 1024 * 1024,
+            max_sftp_packet_len: 262_144,
+            read_ahead: 1024 * 1024,
+        }
+    }
+}
+
+impl SftpLimits {
+    /// The worst-case memory one upload transfer can hold, reserved up front at OPEN.
+    pub fn transfer_reservation(&self) -> usize {
+        self.part_size * (1 + self.max_inflight_parts) + self.reorder_window
+    }
+
+    fn validate(&self) -> std::result::Result<(), String> {
+        const MIB: usize = 1024 * 1024;
+        let positive: [(&str, u64); 12] = [
+            ("max_connections", self.max_connections as u64),
+            ("max_connections_per_ip", self.max_connections_per_ip as u64),
+            (
+                "max_sessions_per_subject",
+                self.max_sessions_per_subject as u64,
+            ),
+            (
+                "preauth_rate_per_ip_per_min",
+                u64::from(self.preauth_rate_per_ip_per_min),
+            ),
+            ("preauth_burst_per_ip", u64::from(self.preauth_burst_per_ip)),
+            ("handshake_timeout_secs", self.handshake_timeout_secs),
+            ("max_key_probes", self.max_key_probes as u64),
+            ("idle_timeout_secs", self.idle_timeout_secs),
+            (
+                "transfer_idle_timeout_secs",
+                self.transfer_idle_timeout_secs,
+            ),
+            ("max_write_handles", self.max_write_handles as u64),
+            ("ban_table_size", self.ban_table_size as u64),
+            (
+                "auth_failure_ban_threshold",
+                u64::from(self.auth_failure_ban_threshold),
+            ),
+        ];
+        for (name, v) in positive {
+            if v == 0 {
+                return Err(format!(
+                    "limits.sftp.{name} must be > 0; zero is not 'unbounded' here"
+                ));
+            }
+        }
+        if !(1..=10).contains(&self.max_auth_attempts) {
+            return Err("limits.sftp.max_auth_attempts must be within 1..=10".into());
+        }
+        if !(5 * MIB..=64 * MIB).contains(&self.part_size) {
+            return Err("limits.sftp.part_size must be within 5 MiB..=64 MiB".into());
+        }
+        if !(1..=4).contains(&self.max_inflight_parts) {
+            return Err("limits.sftp.max_inflight_parts must be within 1..=4".into());
+        }
+        if self.reorder_window > self.part_size {
+            return Err("limits.sftp.reorder_window must not exceed part_size".into());
+        }
+        if self.max_file_size > (self.part_size as u64) * 10_000 {
+            return Err(format!(
+                "limits.sftp.max_file_size {} exceeds part_size × 10,000 = {}; a multipart \
+                 upload has at most 10,000 parts",
+                self.max_file_size,
+                (self.part_size as u64) * 10_000
+            ));
+        }
+        if self.max_transfer_memory < self.transfer_reservation() {
+            return Err(format!(
+                "limits.sftp.max_transfer_memory {} is below one transfer's reservation {}; \
+                 no upload could ever start",
+                self.max_transfer_memory,
+                self.transfer_reservation()
+            ));
+        }
+        if self.max_sftp_packet_len < 34_000 {
+            return Err(
+                "limits.sftp.max_sftp_packet_len must be ≥ 34000 (RFC: servers must accept \
+                 32768-byte data plus headers)"
+                    .into(),
+            );
+        }
+        if self.read_ahead == 0 {
+            return Err("limits.sftp.read_ahead must be > 0".into());
+        }
+        Ok(())
+    }
 }
 
 /// The authenticated internal control-plane surface (`POST /internal/v1/sts/sessions`).
@@ -410,6 +640,10 @@ pub struct LimitsConfig {
     /// objects known-small.
     #[serde(default)]
     pub backend_read_timeout_secs: u64,
+    /// The SFTP front's limits (ADR-009 D12). Defaulted as a block, so a `limits` section
+    /// written before the SFTP front stays valid.
+    #[serde(default)]
+    pub sftp: SftpLimits,
 }
 
 impl Default for LimitsConfig {
@@ -427,6 +661,7 @@ impl Default for LimitsConfig {
             header_read_timeout_secs: 15,
             backend_connect_timeout_secs: 5,
             backend_read_timeout_secs: 0,
+            sftp: SftpLimits::default(),
         }
     }
 }
@@ -513,6 +748,7 @@ impl GatewayConfig {
     }
 
     fn validate(&self) -> Result<()> {
+        self.validate_fronts()?;
         self.validate_sts_key_ring()?;
         self.validate_derived_key_ring()?;
         let ids: HashMap<&str, &BackendConfig> =
@@ -621,6 +857,147 @@ impl GatewayConfig {
         }
         self.validate_internal_listener()?;
         self.validate_mint_listener()?;
+        self.validate_sftp()?;
+        Ok(())
+    }
+
+    /// Whether this process serves the S3 data plane. An absent `s3` section means yes.
+    pub fn s3_enabled(&self) -> bool {
+        self.s3.as_ref().is_none_or(|s| s.enabled)
+    }
+
+    /// The SFTP section, when it is present **and** enabled.
+    pub fn sftp_enabled(&self) -> Option<&SftpConfig> {
+        self.sftp.as_ref().filter(|s| s.enabled)
+    }
+
+    /// The S3 listener. `None` exactly when the S3 front is disabled — validated at load.
+    pub fn s3_listen(&self) -> Option<SocketAddr> {
+        if self.s3_enabled() { self.listen } else { None }
+    }
+
+    /// The STS key material, when this process needs it. Validated at load: present
+    /// whenever the S3 front, the mint or the internal API is on.
+    pub fn sts(&self) -> Option<&StsConfig> {
+        self.sts.as_ref()
+    }
+
+    /// True when something in this process mints or verifies STS sessions.
+    pub fn needs_sts(&self) -> bool {
+        self.s3_enabled() || self.sts_mint.is_some() || self.internal.is_some()
+    }
+
+    /// Every listener this process binds, by name, for the uniqueness check.
+    fn listeners(&self) -> Vec<(&'static str, SocketAddr)> {
+        let mut v = vec![("admin_listen", self.admin_listen)];
+        if let Some(l) = self.s3_listen() {
+            v.push(("listen", l));
+        }
+        if let Some(m) = &self.sts_mint {
+            v.push(("sts_mint.listen", m.listen));
+        }
+        if let Some(i) = &self.internal {
+            v.push(("internal.listen", i.listen));
+        }
+        if let Some(s) = self.sftp_enabled() {
+            v.push(("sftp.listen", s.listen));
+        }
+        v
+    }
+
+    /// The per-front `enabled` switches (ADR-009 D1), and the fields that became
+    /// conditional on them.
+    fn validate_fronts(&self) -> Result<()> {
+        let s3 = self.s3_enabled();
+        let sftp = self.sftp_enabled().is_some();
+        if !s3 && !sftp {
+            return Err(GatewayError::Config(
+                "both data-plane fronts are disabled (s3.enabled is false and no enabled \
+                 sftp section); this process would serve nothing"
+                    .into(),
+            ));
+        }
+        if s3 && self.listen.is_none() {
+            return Err(GatewayError::Config(
+                "listen is required while the S3 front is enabled (set s3.enabled=false \
+                 for an SFTP-only process)"
+                    .into(),
+            ));
+        }
+        if !s3 && self.listen.is_some() {
+            return Err(GatewayError::Config(
+                "listen is set but s3.enabled is false; a listener that is never bound reads \
+                 exactly like one that is — remove it or enable the S3 front"
+                    .into(),
+            ));
+        }
+        if self.needs_sts() && self.sts.is_none() {
+            return Err(GatewayError::Config(
+                "sts is required: the S3 front, sts_mint and internal all mint or verify STS \
+                 sessions"
+                    .into(),
+            ));
+        }
+        if s3 && sftp {
+            tracing::warn!(
+                "both the S3 and the SFTP fronts are enabled in one process; this is for \
+                 development — production runs SFTP as its own Deployment (ADR-009 D1)"
+            );
+        }
+        Ok(())
+    }
+
+    /// The SFTP section's own rules. Shape is validated even when `enabled` is false, so
+    /// flipping the switch later cannot be the moment a typo is discovered.
+    fn validate_sftp(&self) -> Result<()> {
+        self.limits.sftp.validate().map_err(GatewayError::Config)?;
+        let Some(s) = &self.sftp else {
+            return Ok(());
+        };
+        if s.host_keys.is_empty() {
+            return Err(GatewayError::Config(
+                "sftp.host_keys is empty; host keys are mounted, never generated".into(),
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for k in &s.host_keys {
+            if !seen.insert(k) {
+                return Err(GatewayError::Config(format!(
+                    "sftp.host_keys lists {k:?} twice"
+                )));
+            }
+        }
+        if let Some(p) = &s.proxy_protocol {
+            for c in &p.trusted_cidrs {
+                crate::sftp::limits::Cidr::parse(c).map_err(|e| {
+                    GatewayError::Config(format!("sftp.proxy_protocol.trusted_cidrs: {e}"))
+                })?;
+            }
+        }
+        let backends: std::collections::HashSet<&str> =
+            self.backends.iter().map(|b| b.id.as_str()).collect();
+        for id in s.conditional_create.keys() {
+            if !backends.contains(id.as_str()) {
+                return Err(GatewayError::Config(format!(
+                    "sftp.conditional_create names unknown backend {id}"
+                )));
+            }
+        }
+        if s.drain_secs == 0 {
+            return Err(GatewayError::Config("sftp.drain_secs must be > 0".into()));
+        }
+        // Every bound listener on its own port: whichever binds second loses, and the
+        // loser finds out at runtime.
+        let listeners = self.listeners();
+        for (i, (a, x)) in listeners.iter().enumerate() {
+            for (b, y) in &listeners[i + 1..] {
+                if x.port() == y.port() && (*a == "sftp.listen" || *b == "sftp.listen") {
+                    return Err(GatewayError::Config(format!(
+                        "{a} {x} shares a port with {b} {y}"
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -634,12 +1011,14 @@ impl GatewayConfig {
         let Some(m) = &self.sts_mint else {
             return Ok(());
         };
-        if m.listen.port() == self.listen.port() {
+        if let Some(listen) = self.s3_listen()
+            && m.listen.port() == listen.port()
+        {
             return Err(GatewayError::Config(format!(
                 "sts_mint.listen {} shares a port with the S3 data-plane listener {}; \
                  the mint is a separate, deliberately unauthenticated socket and must \
                  not be a route inside the SigV4-authenticated data plane",
-                m.listen, self.listen
+                m.listen, listen
             )));
         }
         if m.listen.port() == self.admin_listen.port() {
@@ -700,12 +1079,14 @@ impl GatewayConfig {
                 i.listen, self.admin_listen
             )));
         }
-        if i.listen.port() == self.listen.port() {
+        if let Some(listen) = self.s3_listen()
+            && i.listen.port() == listen.port()
+        {
             return Err(GatewayError::Config(format!(
                 "internal.listen {} shares a port with the S3 data-plane listener {}; \
                  the data plane is fronted by an Ingress and a credential-minting \
                  endpoint must never be reachable from it",
-                i.listen, self.listen
+                i.listen, listen
             )));
         }
         if let Some(m) = &self.sts_mint
@@ -733,7 +1114,9 @@ impl GatewayConfig {
     /// comes up unable to mint at all — and the second is only discovered by the first
     /// user who tries to get a credential.
     fn validate_sts_key_ring(&self) -> Result<()> {
-        let s = &self.sts;
+        let Some(s) = &self.sts else {
+            return Ok(());
+        };
         match (&s.master_key_hex, s.master_keys.is_empty()) {
             (None, true) => {
                 return Err(GatewayError::Config(
@@ -826,9 +1209,12 @@ impl GatewayConfig {
             }
         }
         let (derived_ring, _) = d.key_ring();
-        let (sts_ring, _) = self.sts.key_ring();
+        let Some(sts) = &self.sts else {
+            return Ok(());
+        };
+        let (sts_ring, _) = sts.key_ring();
         for (kid, key) in &derived_ring {
-            if key.expose() == self.sts.signing_key_hex.expose() {
+            if key.expose() == sts.signing_key_hex.expose() {
                 return Err(GatewayError::Config(format!(
                     "derived_keys master key {kid} is the same material as sts.signing_key_hex; \
                      the two credential classes must not share a key"
@@ -849,8 +1235,14 @@ impl GatewayConfig {
         Ok(())
     }
 
+    /// The STS session lifetime. Only meaningful where [`Self::needs_sts`]; an SFTP-only
+    /// process falls back to the default and mints nothing with it.
     pub fn session_ttl(&self) -> Duration {
-        Duration::from_secs(self.sts.session_ttl_secs)
+        Duration::from_secs(
+            self.sts
+                .as_ref()
+                .map_or_else(default_session_ttl_secs, |s| s.session_ttl_secs),
+        )
     }
 }
 
@@ -992,6 +1384,168 @@ fn default_true() -> bool {
 mod tests {
     use super::*;
 
+    /// A complete config, with `patch` merged over the top level. `null` removes a key.
+    fn fronts(patch: serde_json::Value) -> Result<GatewayConfig> {
+        let mut v = serde_json::json!({
+            "listen": "127.0.0.1:8014",
+            "sts": { "master_key_hex": "00".repeat(32), "signing_key_hex": "11".repeat(32) },
+            "pdp": { "mode": "embedded" },
+            "backends": [ { "id": "bay-1", "kind": "ceph", "endpoint_url": "http://127.0.0.1:7480" } ],
+            "tenants": [ { "tenant": "acme", "organization_id": "org-acme", "backend_id": "bay-1",
+                           "owner_access_key": "O", "owner_secret_key": "S" } ],
+            "bundle_path": "/dev/null"
+        });
+        for (k, val) in patch.as_object().expect("object patch") {
+            if val.is_null() {
+                v.as_object_mut().unwrap().remove(k);
+            } else {
+                v[k] = val.clone();
+            }
+        }
+        GatewayConfig::from_json(&v.to_string())
+    }
+
+    fn sftp(enabled: bool) -> serde_json::Value {
+        serde_json::json!({
+            "enabled": enabled,
+            "listen": "127.0.0.1:2222",
+            "host_keys": ["/etc/s0/sftp/ssh_host_ed25519_key"],
+            "conditional_create": { "bay-1": "native" }
+        })
+    }
+
+    #[test]
+    fn an_absent_s3_section_means_the_s3_front_is_enabled_as_before() {
+        let c = fronts(serde_json::json!({})).expect("every pre-SFTP config still loads");
+        assert!(c.s3_enabled());
+        assert_eq!(c.s3_listen(), Some("127.0.0.1:8014".parse().unwrap()));
+        assert!(c.sftp_enabled().is_none());
+        let e = fronts(serde_json::json!({ "listen": null })).unwrap_err();
+        assert!(e.to_string().contains("listen is required"), "{e}");
+    }
+
+    #[test]
+    fn each_front_is_switched_in_its_own_section() {
+        // SFTP-only: no S3 listener, no STS key material.
+        let c = fronts(serde_json::json!({
+            "s3": { "enabled": false }, "listen": null, "sts": null, "sftp": sftp(true)
+        }))
+        .expect("an SFTP-only process");
+        assert!(!c.s3_enabled());
+        assert_eq!(c.s3_listen(), None);
+        assert!(c.sts().is_none());
+        assert_eq!(c.sftp_enabled().unwrap().listen.port(), 2222);
+        assert_eq!(
+            c.sftp_enabled().unwrap().conditional_create.get("bay-1"),
+            Some(&ConditionalCreate::Native)
+        );
+
+        // A section kept with `enabled: false` binds nothing.
+        let c = fronts(serde_json::json!({ "sftp": sftp(false) })).unwrap();
+        assert!(c.sftp_enabled().is_none());
+
+        // Both on is allowed (development).
+        let c = fronts(serde_json::json!({ "sftp": sftp(true) })).unwrap();
+        assert!(c.s3_enabled() && c.sftp_enabled().is_some());
+    }
+
+    #[test]
+    fn the_enabled_flag_is_required_and_never_defaulted() {
+        let mut no_flag = sftp(true);
+        no_flag.as_object_mut().unwrap().remove("enabled");
+        let e = fronts(serde_json::json!({ "sftp": no_flag })).unwrap_err();
+        assert!(e.to_string().contains("enabled"), "{e}");
+        let e = fronts(serde_json::json!({ "s3": {} })).unwrap_err();
+        assert!(e.to_string().contains("enabled"), "{e}");
+    }
+
+    #[test]
+    fn degenerate_front_combinations_are_refused_at_load() {
+        let e =
+            fronts(serde_json::json!({ "s3": { "enabled": false }, "listen": null })).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("both data-plane fronts are disabled"),
+            "{e}"
+        );
+        let e = fronts(
+            serde_json::json!({ "s3": { "enabled": false }, "sftp": sftp(false), "listen": null }),
+        )
+        .unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("both data-plane fronts are disabled"),
+            "{e}"
+        );
+        let e = fronts(serde_json::json!({ "s3": { "enabled": false }, "sftp": sftp(true) }))
+            .unwrap_err();
+        assert!(
+            e.to_string().contains("s3.enabled is false"),
+            "a listen nobody binds: {e}"
+        );
+        let e = fronts(serde_json::json!({ "sts": null })).unwrap_err();
+        assert!(e.to_string().contains("sts is required"), "{e}");
+    }
+
+    #[test]
+    fn sftp_shape_is_validated_even_when_disabled() {
+        let mut bad = sftp(false);
+        bad["listen"] = serde_json::json!("127.0.0.1:9090");
+        let e = fronts(serde_json::json!({ "sftp": bad, "admin_listen": "127.0.0.1:9090" }));
+        assert!(
+            e.is_ok(),
+            "a disabled section binds nothing, so it collides with nothing"
+        );
+        let mut bad = sftp(true);
+        bad["listen"] = serde_json::json!("127.0.0.1:9090");
+        let e = fronts(serde_json::json!({ "sftp": bad, "admin_listen": "127.0.0.1:9090" }))
+            .unwrap_err();
+        assert!(e.to_string().contains("shares a port"), "{e}");
+        let mut bad = sftp(false);
+        bad["conditional_create"] = serde_json::json!({ "nope": "native" });
+        assert!(
+            fronts(serde_json::json!({ "sftp": bad }))
+                .unwrap_err()
+                .to_string()
+                .contains("unknown backend")
+        );
+        let mut bad = sftp(false);
+        bad["host_keys"] = serde_json::json!([]);
+        assert!(fronts(serde_json::json!({ "sftp": bad })).is_err());
+        let mut bad = sftp(false);
+        bad["proxy_protocol"] = serde_json::json!({ "trusted_cidrs": ["not-a-cidr"] });
+        assert!(fronts(serde_json::json!({ "sftp": bad })).is_err());
+        let mut bad = sftp(false);
+        bad["typo"] = serde_json::json!(1);
+        assert!(
+            fronts(serde_json::json!({ "sftp": bad })).is_err(),
+            "unknown fields are refused"
+        );
+    }
+
+    #[test]
+    fn sftp_limits_default_to_the_adr_and_are_bounded() {
+        let l = SftpLimits::default();
+        assert_eq!(
+            l.transfer_reservation(),
+            26 * 1024 * 1024,
+            "26 MiB per transfer at the defaults"
+        );
+        assert!(l.validate().is_ok());
+        for (field, value) in [
+            ("part_size", serde_json::json!(1024)),
+            ("max_inflight_parts", serde_json::json!(9)),
+            ("max_auth_attempts", serde_json::json!(0)),
+            ("reorder_window", serde_json::json!(64 * 1024 * 1024)),
+            ("max_file_size", serde_json::json!(1u64 << 50)),
+            ("max_connections", serde_json::json!(0)),
+        ] {
+            let l: SftpLimits =
+                serde_json::from_value(serde_json::json!({ field: value })).unwrap();
+            assert!(l.validate().is_err(), "{field}={value}");
+        }
+    }
+
     #[test]
     fn the_form_upload_buffer_is_bounded_well_below_the_substrate_default() {
         // s3s aggregates a PostObject file into memory before any authorization, so this
@@ -1131,7 +1685,7 @@ mod tests {
         let base = example();
         assert!(GatewayConfig::from_json(&base.to_string()).is_ok());
         let loaded = GatewayConfig::from_json(&base.to_string()).unwrap();
-        let (ring, current) = loaded.sts.key_ring();
+        let (ring, current) = loaded.sts().unwrap().key_ring();
         assert_eq!(current, "k0");
         assert_eq!(ring.keys().collect::<Vec<_>>(), vec!["k0"]);
 
@@ -1184,7 +1738,8 @@ mod tests {
         s.insert("master_key_hex".into(), serde_json::json!("aa"));
         let (ring, current) = GatewayConfig::from_json(&cfg.to_string())
             .unwrap()
-            .sts
+            .sts()
+            .unwrap()
             .key_ring();
         assert_eq!(current, crate::auth::sts::DEFAULT_KID);
         assert_eq!(ring[crate::auth::sts::DEFAULT_KID].expose(), "aa");
@@ -1417,13 +1972,13 @@ mod tests {
         let loaded = GatewayConfig::from_json(&cfg.to_string()).expect("loads");
 
         // The values are really in there — otherwise this test proves nothing.
-        assert_eq!(loaded.sts.signing_key_hex.expose(), SIGNING);
+        assert_eq!(loaded.sts().unwrap().signing_key_hex.expose(), SIGNING);
         assert_eq!(loaded.tenants[0].owner_secret_key.expose(), OWNER);
         assert_eq!(
             loaded.static_credentials[0].secret_access_key.expose(),
             STATIC
         );
-        assert_eq!(loaded.sts.key_ring().0["k0"].expose(), MASTER);
+        assert_eq!(loaded.sts().unwrap().key_ring().0["k0"].expose(), MASTER);
         assert_eq!(
             loaded.bundle_shared_secret.as_ref().map(|s| s.expose()),
             Some(&BUNDLE.to_string())
@@ -1445,7 +2000,7 @@ mod tests {
             format!("{:#?}", loaded.sts),
             format!("{:?}", loaded.tenants),
             format!("{:?}", loaded.static_credentials),
-            format!("{:?}", loaded.sts.key_ring()),
+            format!("{:?}", loaded.sts().unwrap().key_ring()),
             format!("{:?}", loaded.internal),
             format!("{:?}", loaded.bundle_shared_secret),
             // The shape an error type that wraps a config produces.

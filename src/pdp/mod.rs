@@ -13,6 +13,7 @@ pub use bundle::{
     Bundle, BundleStore, DECISION_RULE, GATEWAY_REGO, KEY_EPOCH_FIELD, KEY_EPOCHS_FIELD,
     ParsedBundle, bundle_key_epoch_floor, bundle_knows_service_account, content_revision,
     decision_rule_path, parse_bundle, principal_subject_key, service_account_subject_key,
+    split_subject_key, subject_lookup_key,
 };
 pub use cache::CachingPdp;
 pub use embedded::RegorusPdp;

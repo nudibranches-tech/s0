@@ -36,7 +36,7 @@ use crate::proxy::obligations::{BucketVisibility, ResponseObligations};
 
 pub use enforcer::Enforcer;
 pub use optable::{Coverage, DangerTier, GateDenial, OP_TABLE, OpSpec, ResourceShape};
-pub use proof::AuthzProof;
+pub use proof::{AuthzProof, SftpBackendOp, SftpLicense, SftpProof};
 
 /// The ACL fields of an object-shaped s3s input, as [`headers::AclFields`].
 ///

@@ -46,6 +46,22 @@ impl PendingAudit {
         self.sink.emit(record);
     }
 
+    /// Settle with a last edit to the record — the SFTP front fills in `gateway.session`
+    /// with the transfer outcome (ADR-009 D13). Idempotent like [`Self::settle`].
+    pub fn settle_with(
+        &self,
+        backend: BackendOutcome,
+        backend_status: Option<u16>,
+        edit: impl FnOnce(&mut AuditRecord),
+    ) {
+        let Some(mut record) = self.take() else {
+            return;
+        };
+        record.settle(backend, backend_status);
+        edit(&mut record);
+        self.sink.emit(record);
+    }
+
     fn take(&self) -> Option<AuditRecord> {
         // A poisoned lock here would mean a panic while holding the record; recovering
         // is strictly better than dropping an audit record on the floor.
@@ -128,6 +144,7 @@ mod tests {
                 denied_keys: vec![],
                 backend: BackendOutcome::NotAttempted,
                 backend_status: None,
+                session: None,
             },
             &crate::audit::LabelPolicy::default(),
         )

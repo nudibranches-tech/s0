@@ -16,7 +16,7 @@ use crate::audit::{
 use crate::authz::{Decision, OpaInput};
 use crate::gateway::Gateway;
 
-use super::proof::AuthzProof;
+use super::proof::{AuthzProof, SftpLicense, SftpProof};
 
 /// The decision funnel shared by every protocol front.
 #[derive(Clone)]
@@ -88,6 +88,7 @@ impl Enforcer {
             denied_keys,
             backend: BackendOutcome::NotAttempted,
             backend_status: None,
+            session: None,
         };
         AuditRecord::new(
             new_decision_id(),
@@ -163,6 +164,26 @@ impl Enforcer {
     /// the allow side of an audited decision.
     pub(super) fn prove_s3(&self, operation: Arc<str>) -> AuthzProof {
         AuthzProof::mint(operation)
+    }
+
+    /// Mint an SFTP forward proof licensing exactly `licenses` (ADR-009 D2).
+    ///
+    /// Takes the [`Decision`]s that justify it and refuses unless **every one** is an
+    /// allow carrying no unimplemented obligation: a proof cannot be produced from a
+    /// denial, and cannot be produced from nothing. The SFTP front audits those same
+    /// decisions through [`Self::pending`] / [`Self::audit_denied`] in the same branch.
+    pub fn prove_sftp(
+        &self,
+        decisions: &[&Decision],
+        licenses: Vec<SftpLicense>,
+    ) -> Option<SftpProof> {
+        if decisions.is_empty() {
+            return None;
+        }
+        decisions
+            .iter()
+            .all(|d| d.allow && Self::unimplemented_obligations(d).is_none())
+            .then(|| SftpProof::mint(licenses))
     }
 }
 

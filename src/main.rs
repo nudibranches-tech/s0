@@ -1,6 +1,7 @@
 //! Gateway entrypoint: load config, build the gateway, start its listeners, and serve.
 //!
-//! Four listeners on four ports with three auth postures: the S3 data plane (SigV4), the
+//! Up to five listeners on five ports, four auth postures: the S3 data plane (SigV4), the
+//! SFTP data plane (SSH public key, ADR-009; enabled in its own section), the
 //! admin listener (unauthenticated probes and metrics), the STS mint (unauthenticated by
 //! design — the OIDC/web-identity token IS the credential) and the internal API (shared
 //! secret). Authentication is a property of the socket, never of the path.
@@ -41,7 +42,6 @@ async fn main() -> Result<()> {
         .init();
 
     let config = GatewayConfig::load()?;
-    let listen = config.listen;
     let instance = s0::config::instance_id();
     // `version` rides on the first line this process writes, so "which bytes is this pod
     // running?" is answerable from the log rather than only from the image digest. It is
@@ -219,7 +219,35 @@ async fn main() -> Result<()> {
         None => None,
     };
 
-    server::serve(gateway, listen).await?;
+    // The data-plane fronts. Each is switched on in its own section (ADR-009 D1); both
+    // drain on the same signal, and both are awaited before the audit worker drains.
+    let sftp_task = match config.sftp_enabled() {
+        Some(sftp_cfg) => {
+            let front = s0::sftp::SftpFront::build(gateway.clone(), sftp_cfg)?;
+            admin_state.set_sftp(front.host_key_fingerprints(), front.metrics());
+            Some(tokio::spawn(async move {
+                if let Err(e) = front.serve(shutdown::signal()).await {
+                    tracing::error!(%e, "sftp front exited");
+                }
+            }))
+        }
+        None => None,
+    };
+    match config.s3_listen() {
+        Some(listen) => server::serve(gateway.clone(), listen).await?,
+        None => {
+            tracing::info!("S3 front disabled (s3.enabled=false); no S3 listener bound");
+            shutdown::signal().await;
+        }
+    }
+    if let Some(task) = sftp_task {
+        // The front applies its own drain budget (`sftp.drain_secs`), then aborts every
+        // open transfer; this bound only guards a front that failed to honour it.
+        let budget = Duration::from_secs(config.sftp.as_ref().map_or(20, |s| s.drain_secs) + 5);
+        if tokio::time::timeout(budget, task).await.is_err() {
+            tracing::error!("sftp front drain timed out");
+        }
+    }
 
     // The internal API saw the same signal; let it finish its own drain rather than
     // being aborted with the runtime — an aborted mint looks to its caller like an
