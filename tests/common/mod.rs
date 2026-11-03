@@ -126,7 +126,7 @@ pub fn config_json(dir: &std::path::Path, backend_endpoint: &str) -> String {
 
 /// Counts every `decide` the enforce path issues, from **outside** the decision cache.
 ///
-/// Makes "`GatewayAccess::decide` is the only PDP call site" checkable: a hook calling
+/// Makes "`Enforcer::decide` is the only PDP call site" checkable: a hook calling
 /// `gw.pdp.decide` directly bumps this counter without producing a capture, and
 /// `tests/golden_capture.rs` compares the two.
 struct CountingPdp {

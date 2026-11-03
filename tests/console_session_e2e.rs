@@ -220,7 +220,7 @@ async fn a_console_minted_service_account_session_is_accepted_by_sigv4_and_carri
     );
 
     // 2. THE DECISION DOCUMENT. Read from the capture sink — the tap inside
-    //    `GatewayAccess::decide` — so this is what the PDP was handed, not a reconstruction.
+    //    `Enforcer::decide` — so this is what the PDP was handed, not a reconstruction.
     let input = last_opa_input(&h);
     assert_eq!(
         input["principal"]["type"],

@@ -9,6 +9,7 @@
 //! `write_object_tags`. [`proof`] is the third fail-closed layer: a hook that forgot to
 //! authorize cannot reach the backend.
 
+pub mod enforcer;
 pub mod headers;
 pub mod optable;
 pub mod proof;
@@ -24,9 +25,7 @@ use s3s::{S3Error, S3Request, S3Result, s3_error};
 
 use crate::access::headers::RequestRiders;
 use crate::access::tagging::ReservedTagKeys;
-use crate::audit::{
-    AuditRecord, BackendOutcome, GateContext, GateStage, GatewayMeta, Outcome, PendingAudit,
-};
+use crate::audit::GateStage;
 use crate::auth::SECURITY_TOKEN_HEADER;
 use crate::authz::{Backend, CopySource as AuthzCopySource, Decision, OpaInput, RequestMeta};
 use crate::gateway::Gateway;
@@ -35,6 +34,7 @@ use crate::model::Action;
 use crate::proxy::RouteSnapshot;
 use crate::proxy::obligations::{BucketVisibility, ResponseObligations};
 
+pub use enforcer::Enforcer;
 pub use optable::{Coverage, DangerTier, GateDenial, OP_TABLE, OpSpec, ResourceShape};
 pub use proof::AuthzProof;
 
@@ -158,71 +158,36 @@ impl<'a> ReqCtx<'a> {
     /// Record that this request was authorized. The forward path refuses to touch a
     /// backend without it (`proof::require`), so every allow branch of every enforce
     /// helper must end here — and only an allow branch may.
-    fn prove(&mut self) {
+    fn prove(&mut self, enforcer: &Enforcer) {
         self.extensions
-            .insert(AuthzProof::mint(self.operation.clone()));
+            .insert(enforcer.prove_s3(self.operation.clone()));
     }
 }
 
 pub struct GatewayAccess {
     gw: Arc<Gateway>,
+    /// The protocol-neutral decision funnel (ADR-009 D2). Every PDP question, audit
+    /// record and forward proof of the S3 front goes through it.
+    enforcer: Enforcer,
 }
 
 impl GatewayAccess {
     pub fn new(gw: Arc<Gateway>) -> Self {
-        GatewayAccess { gw }
+        GatewayAccess {
+            enforcer: Enforcer::new(gw.clone()),
+            gw,
+        }
     }
 
-    /// Any PDP error fails closed to a deny — never allow on error.
-    ///
-    /// The single funnel: every `Pdp::decide` on the request path goes through here, so
-    /// the golden-capture tap sees 100% of emitted inputs without instrumenting a hook. A
-    /// second call site would silently make the corpus incomplete;
-    /// `tests/golden_capture.rs::decide_is_the_only_pdp_call_site_on_the_request_path`
-    /// is the guard.
+    /// The S3 front's view of [`Enforcer::decide`], the single PDP funnel shared with
+    /// every other protocol front.
     async fn decide(&self, cx: &ReqCtx<'_>, input: &OpaInput) -> Decision {
-        if let Some(capture) = &self.gw.capture {
-            capture.record(&cx.operation, input);
-        }
-        match self.gw.pdp.decide(input).await {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::error!(%e, "pdp error; failing closed");
-                Decision::deny("pdp evaluation error")
-            }
-        }
-    }
-
-    fn record(
-        &self,
-        input: OpaInput,
-        decision: &Decision,
-        outcome: Outcome,
-        denied_keys: Vec<String>,
-    ) -> AuditRecord {
-        let meta = GatewayMeta {
-            backend_id: input.backend.id.clone(),
-            backend_kind: input.backend.kind.as_str().to_string(),
-            outcome,
-            denied_keys,
-            backend: BackendOutcome::NotAttempted,
-            backend_status: None,
-        };
-        AuditRecord::new(
-            new_decision_id(),
-            now_rfc3339(),
-            input,
-            decision.clone(),
-            meta,
-            self.gw.audit.labels(),
-        )
+        self.enforcer.decide(&cx.operation, input).await
     }
 
     /// Emit now: the request is refused here and there is no forward leg to wait for.
     fn audit_denied(&self, input: OpaInput, decision: &Decision, denied_keys: Vec<String>) {
-        self.gw
-            .audit
-            .emit(self.record(input, decision, Outcome::Denied, denied_keys));
+        self.enforcer.audit_denied(input, decision, denied_keys);
     }
 
     /// Hold the record until the forward leg reports back.
@@ -238,9 +203,8 @@ impl GatewayAccess {
         decision: &Decision,
         denied_keys: Vec<String>,
     ) {
-        let record = self.record(input, decision, Outcome::Allowed, denied_keys);
         cx.extensions
-            .insert(Arc::new(PendingAudit::new(self.gw.audit.clone(), record)));
+            .insert(self.enforcer.pending(input, decision, denied_keys));
     }
 
     /// Record a denial from the pre-policy gate.
@@ -257,20 +221,8 @@ impl GatewayAccess {
         principal_sub: Option<&str>,
         reason: String,
     ) {
-        self.gw.audit.emit_gate_denial(AuditRecord::gate_denial(
-            new_decision_id(),
-            now_rfc3339(),
-            GateContext {
-                operation: op.to_string(),
-                stage,
-                access_key_id: access_key_id.map(str::to_string),
-                tenant: tenant.map(str::to_string),
-                suppressed_since_last: 0,
-            },
-            reason,
-            principal_sub.unwrap_or_default().to_string(),
-            self.gw.audit.labels(),
-        ));
+        self.enforcer
+            .audit_gate_denial(op, stage, access_key_id, tenant, principal_sub, reason);
     }
 
     /// Ask the PDP about one prepared input, then act on the answer: hold the record and
@@ -293,7 +245,7 @@ impl GatewayAccess {
         let (allow, reason) = (decision.allow, decision.reason.clone());
         if allow {
             self.audit_pending(cx, input, &decision, vec![]);
-            cx.prove();
+            cx.prove(&self.enforcer);
             Ok(())
         } else {
             self.audit_denied(input, &decision, vec![]);
@@ -489,7 +441,7 @@ impl GatewayAccess {
             }
             BucketListing::Show(visibility) => {
                 self.audit_pending(cx, input, &decision, vec![]);
-                cx.prove();
+                cx.prove(&self.enforcer);
                 visibility
             }
         }
@@ -554,7 +506,7 @@ impl GatewayAccess {
         };
         if allow {
             self.audit_pending(cx, dst_input, &decision, vec![]);
-            cx.prove();
+            cx.prove(&self.enforcer);
             Ok(())
         } else {
             self.audit_denied(dst_input, &decision, vec![]);
@@ -589,7 +541,7 @@ impl GatewayAccess {
             }
             _ => {
                 self.audit_pending(cx, input, &decision, vec![]);
-                cx.prove();
+                cx.prove(&self.enforcer);
             }
         }
         verdict
@@ -836,7 +788,7 @@ impl S3Access for GatewayAccess {
             denied.len()
         ));
         self.audit_pending(&mut cx, record_input, &decision, denied);
-        cx.prove();
+        cx.prove(&self.enforcer);
         // Per-key filtering: forward only authorized keys.
         req.input
             .delete
@@ -1330,18 +1282,9 @@ fn classify_bucket_listing(decision: &Decision) -> BucketListing {
     ))
 }
 
-/// The deny reason for a decision carrying a `must_understand` this binary cannot
-/// honor, or `None` when every named obligation is implemented.
+/// See [`Enforcer::unimplemented_obligations`].
 fn unimplemented_obligations(decision: &Decision) -> Option<String> {
-    let missing = decision.obligations.unimplemented();
-    if missing.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "deny (gateway): the policy requires obligation(s) {} which this gateway does \
-         not implement; upgrade the gateway before pushing a policy that depends on them",
-        missing.join(", ")
-    ))
+    Enforcer::unimplemented_obligations(decision)
 }
 
 /// Apply a list verdict for ops without fan-out dispatch (v1 list, multipart list).
@@ -1470,14 +1413,6 @@ fn hex_val(b: u8) -> Option<u8> {
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
-}
-
-fn new_decision_id() -> String {
-    uuid::Uuid::new_v4().to_string()
-}
-
-fn now_rfc3339() -> String {
-    chrono::Utc::now().to_rfc3339()
 }
 
 #[cfg(test)]
