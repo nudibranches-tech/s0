@@ -491,7 +491,9 @@ async fn harness(tag: &str, mode: &str) -> Harness {
     let url = serve_backend(mem.clone()).await;
     let drop_key = ed25519();
     let ops_key = ed25519();
-    let fx = common::fixture_with_backend(tag, bundle(&drop_key, &ops_key), &url);
+    let fx = common::fixture_with_config(tag, bundle(&drop_key, &ops_key), &url, |c| {
+        c["backends"][0]["conditional_create"] = serde_json::json!(mode);
+    });
     let host = ed25519();
     let host_path = fx.dir.join("ssh_host_ed25519_key");
     std::fs::write(
@@ -508,7 +510,6 @@ async fn harness(tag: &str, mode: &str) -> Harness {
         "enabled": true,
         "listen": "127.0.0.1:0",
         "host_keys": [host_path],
-        "conditional_create": { "bay-1": mode },
         "drain_secs": 1
     }))
     .unwrap();

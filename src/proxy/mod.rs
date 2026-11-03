@@ -52,6 +52,10 @@ pub struct RouteSnapshot {
     /// The gateway's AUTHORITATIVE tenant→org binding — never the credential's
     /// self-declared org, so audit attribution is not drift-able.
     pub organization_id: String,
+    /// Whether this backend honours `If-None-Match: *` (an operator assertion, ADR-009
+    /// D8). Decides whether a create-only write can be forwarded at all over S3, and how
+    /// the SFTP front closes the create race.
+    pub conditional_create: crate::config::ConditionalCreate,
 }
 
 /// The routing table: one immutable snapshot, swapped wholesale.
@@ -135,6 +139,7 @@ impl BackendRegistry {
             backend_id: BackendId(route.backend.id.clone()),
             backend_kind: route.backend.kind,
             organization_id: route.organization_id.clone(),
+            conditional_create: route.backend.conditional_create,
         })
     }
 
@@ -836,7 +841,12 @@ mod tests {
             backend_id,
             backend_kind,
             organization_id,
+            conditional_create,
         } = registry().route_snapshot("acme").expect("acme is routable");
+        assert_eq!(
+            conditional_create,
+            crate::config::ConditionalCreate::CheckThenWrite
+        );
         assert_eq!(tenant, "acme");
         assert_eq!(backend_id, BackendId("bay-1".into()));
         assert_eq!(backend_kind, BackendKind::Ceph);

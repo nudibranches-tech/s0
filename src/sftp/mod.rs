@@ -26,7 +26,6 @@ pub mod session;
 pub mod transfer;
 pub mod transport;
 
-use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -41,7 +40,7 @@ pub use account::{AuthInfo, CertInfo};
 use crate::access::Enforcer;
 use crate::audit::{AuditRecord, SessionEvent, SessionEventKind};
 use crate::authz::Decision;
-use crate::config::{ConditionalCreate, SftpConfig};
+use crate::config::SftpConfig;
 use crate::error::{GatewayError, Result};
 use crate::gateway::Gateway;
 use account::{Authenticated, Credential, DirectoryCache};
@@ -144,7 +143,6 @@ pub struct Shared {
     pub gw: Arc<Gateway>,
     pub enforcer: Enforcer,
     pub directory: DirectoryCache,
-    pub conditional_create: BTreeMap<String, ConditionalCreate>,
     pub inflight: Arc<InflightKeys>,
     pub memory: MemoryBudget,
     pub connections: Arc<ConnectionTracker>,
@@ -356,7 +354,6 @@ impl SftpFront {
         let shared = Arc::new(Shared {
             enforcer: Enforcer::new(gw.clone()),
             directory: DirectoryCache::default(),
-            conditional_create: cfg.conditional_create.clone(),
             inflight: Arc::new(InflightKeys::default()),
             memory: MemoryBudget::new(limits.max_transfer_memory),
             connections: Arc::new(ConnectionTracker::default()),

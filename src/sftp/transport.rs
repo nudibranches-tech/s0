@@ -129,7 +129,7 @@ pub fn load_host_keys(paths: &[impl AsRef<Path>]) -> GwResult<Vec<HostKey>> {
         .any(|k| k.algorithm == Algorithm::Ed25519.as_str())
     {
         return Err(GatewayError::Config(
-            "sftp.host_keys must include an ed25519 key".into(),
+            "frontends.sftp.host_keys must include an ed25519 key".into(),
         ));
     }
     Ok(out)

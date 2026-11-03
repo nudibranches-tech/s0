@@ -397,11 +397,7 @@ impl SftpSession {
     }
 
     fn mode_for(&self, route: &RouteSnapshot) -> ConditionalCreate {
-        self.shared
-            .conditional_create
-            .get(&route.backend_id.0)
-            .copied()
-            .unwrap_or_default()
+        route.conditional_create
     }
 
     fn map(&self, raw: &[u8]) -> Result<Mapped, PathError> {

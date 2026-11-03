@@ -241,9 +241,9 @@ async fn main() -> Result<()> {
         }
     }
     if let Some(task) = sftp_task {
-        // The front applies its own drain budget (`sftp.drain_secs`), then aborts every
+        // The front applies its own drain budget (`frontends.sftp.drain_secs`), then aborts every
         // open transfer; this bound only guards a front that failed to honour it.
-        let budget = Duration::from_secs(config.sftp.as_ref().map_or(20, |s| s.drain_secs) + 5);
+        let budget = Duration::from_secs(config.sftp_enabled().map_or(20, |s| s.drain_secs) + 5);
         if tokio::time::timeout(budget, task).await.is_err() {
             tracing::error!("sftp front drain timed out");
         }

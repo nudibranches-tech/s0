@@ -21,18 +21,23 @@ use crate::secret::Secret;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GatewayConfig {
-    /// The S3 data-plane listener. Required iff the S3 front is enabled (ADR-009 D1):
-    /// an SFTP-only process binds no S3 port. Read it through [`Self::s3_listen`].
+    /// The S3 data-plane listener, at its historical top-level place. Equivalent to
+    /// `frontends.s3.listen`; setting both is refused. Required iff the S3 front is enabled
+    /// (ADR-009 D1): an SFTP-only process binds no S3 port. Read it through
+    /// [`Self::s3_listen`].
     #[serde(default)]
     pub listen: Option<SocketAddr>,
-    /// The S3 front's own section. **Absent ⇒ the S3 front is enabled**, so every config
-    /// written before the SFTP front keeps its behaviour. See [`S3FrontConfig`].
+    /// The data-plane fronts, each enabled in its own section. Absent ⇒ the S3 front alone,
+    /// so every config written before the SFTP front keeps its behaviour.
     #[serde(default)]
-    pub s3: Option<S3FrontConfig>,
-    /// The SFTP front (ADR-009). **No section, no listener** — exactly as with `sts_mint`
-    /// and `internal`. Present, its `enabled` flag is required. See [`SftpConfig`].
-    #[serde(default)]
-    pub sftp: Option<SftpConfig>,
+    pub frontends: FrontendsConfig,
+    /// Top-level `s3` / `sftp` are refused rather than ignored: this struct tolerates
+    /// unknown keys (the `_note` fields), so a section in the wrong place would otherwise
+    /// load cleanly and switch nothing — an SFTP pod that serves no SFTP.
+    #[serde(default, rename = "s3")]
+    misplaced_s3: Option<serde_json::Value>,
+    #[serde(default, rename = "sftp")]
+    misplaced_sftp: Option<serde_json::Value>,
     /// Liveness / readiness / metrics listener. Always on: the runtime image is
     /// distroless, so a probe cannot `exec` anything, and a TCP probe on the S3 port
     /// succeeds on a pod that has never reached the control plane. Unauthenticated by
@@ -94,13 +99,30 @@ pub struct GatewayConfig {
     pub internal: Option<InternalApiConfig>,
 }
 
-/// The S3 front's section (ADR-009 D1). The switch sits next to the settings it
-/// switches; `listen` stays top-level for compatibility with every existing config.
+/// The data-plane fronts (ADR-009 D1). Each is switched on in its own section, next to
+/// the settings it switches.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrontendsConfig {
+    /// **Absent ⇒ the S3 front is enabled.** See [`S3FrontConfig`].
+    #[serde(default)]
+    pub s3: Option<S3FrontConfig>,
+    /// **Absent ⇒ no SFTP listener** — exactly as with `sts_mint` and `internal`. See
+    /// [`SftpConfig`].
+    #[serde(default)]
+    pub sftp: Option<SftpConfig>,
+}
+
+/// The S3 front's section.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct S3FrontConfig {
     /// Required when the section is present: an operator writes `true` or `false`.
     pub enabled: bool,
+    /// The S3 listener. May instead be given as the top-level `listen` (the historical
+    /// place); setting both is refused.
+    #[serde(default)]
+    pub listen: Option<SocketAddr>,
 }
 
 /// How a backend closes the create-only check-then-write race (ADR-009 D8).
@@ -140,9 +162,6 @@ pub struct SftpConfig {
     pub host_keys: Vec<PathBuf>,
     #[serde(default)]
     pub proxy_protocol: Option<ProxyProtocolConfig>,
-    /// Per backend id: how the create-only race is closed. Absent ⇒ `check_then_write`.
-    #[serde(default)]
-    pub conditional_create: BTreeMap<String, ConditionalCreate>,
     /// On SIGTERM, how long open sessions get to finish in-flight commands before every
     /// open transfer is aborted.
     #[serde(default = "default_sftp_drain_secs")]
@@ -688,6 +707,13 @@ pub struct BackendConfig {
     pub region: String,
     #[serde(default = "default_true")]
     pub force_path_style: bool,
+    /// How a create-only write (`create_objects`) is kept from overwriting on this
+    /// backend (ADR-009 D8). `native` asserts that the backend honours `If-None-Match: *`
+    /// on `PutObject` and `CompleteMultipartUpload`; s0 never assumes it. Absent ⇒
+    /// `check_then_write`. Read by both fronts: the S3 front authorizes a conditional
+    /// write as `create_objects` only on a `native` backend.
+    #[serde(default)]
+    pub conditional_create: ConditionalCreate,
 }
 
 /// Maps a tenant to its Org, its backend, and the per-tenant backend
@@ -863,17 +889,30 @@ impl GatewayConfig {
 
     /// Whether this process serves the S3 data plane. An absent `s3` section means yes.
     pub fn s3_enabled(&self) -> bool {
-        self.s3.as_ref().is_none_or(|s| s.enabled)
+        self.frontends.s3.as_ref().is_none_or(|s| s.enabled)
     }
 
     /// The SFTP section, when it is present **and** enabled.
     pub fn sftp_enabled(&self) -> Option<&SftpConfig> {
-        self.sftp.as_ref().filter(|s| s.enabled)
+        self.frontends.sftp.as_ref().filter(|s| s.enabled)
+    }
+
+    /// Wherever the S3 listener was written: `frontends.s3.listen` or top-level `listen`.
+    fn s3_listen_configured(&self) -> Option<SocketAddr> {
+        self.frontends
+            .s3
+            .as_ref()
+            .and_then(|s| s.listen)
+            .or(self.listen)
     }
 
     /// The S3 listener. `None` exactly when the S3 front is disabled — validated at load.
     pub fn s3_listen(&self) -> Option<SocketAddr> {
-        if self.s3_enabled() { self.listen } else { None }
+        if self.s3_enabled() {
+            self.s3_listen_configured()
+        } else {
+            None
+        }
     }
 
     /// The STS key material, when this process needs it. Validated at load: present
@@ -900,7 +939,7 @@ impl GatewayConfig {
             v.push(("internal.listen", i.listen));
         }
         if let Some(s) = self.sftp_enabled() {
-            v.push(("sftp.listen", s.listen));
+            v.push(("frontends.sftp.listen", s.listen));
         }
         v
     }
@@ -908,25 +947,49 @@ impl GatewayConfig {
     /// The per-front `enabled` switches (ADR-009 D1), and the fields that became
     /// conditional on them.
     fn validate_fronts(&self) -> Result<()> {
+        for (name, present) in [
+            ("s3", self.misplaced_s3.is_some()),
+            ("sftp", self.misplaced_sftp.is_some()),
+        ] {
+            if present {
+                return Err(GatewayError::Config(format!(
+                    "`{name}` must be under `frontends` (frontends.{name}); at the top level \
+                     it would switch nothing"
+                )));
+            }
+        }
         let s3 = self.s3_enabled();
         let sftp = self.sftp_enabled().is_some();
         if !s3 && !sftp {
             return Err(GatewayError::Config(
-                "both data-plane fronts are disabled (s3.enabled is false and no enabled \
-                 sftp section); this process would serve nothing"
+                "both data-plane fronts are disabled (frontends.s3.enabled is false and no \
+                 enabled frontends.sftp section); this process would serve nothing"
                     .into(),
             ));
         }
-        if s3 && self.listen.is_none() {
+        if self.listen.is_some()
+            && self
+                .frontends
+                .s3
+                .as_ref()
+                .is_some_and(|s| s.listen.is_some())
+        {
             return Err(GatewayError::Config(
-                "listen is required while the S3 front is enabled (set s3.enabled=false \
-                 for an SFTP-only process)"
+                "the S3 listener is set twice (top-level listen and frontends.s3.listen); \
+                 keep one"
                     .into(),
             ));
         }
-        if !s3 && self.listen.is_some() {
+        if s3 && self.s3_listen_configured().is_none() {
             return Err(GatewayError::Config(
-                "listen is set but s3.enabled is false; a listener that is never bound reads \
+                "listen (or frontends.s3.listen) is required while the S3 front is enabled \
+                 (set frontends.s3.enabled=false for an SFTP-only process)"
+                    .into(),
+            ));
+        }
+        if !s3 && self.s3_listen_configured().is_some() {
+            return Err(GatewayError::Config(
+                "listen is set but frontends.s3.enabled is false; a listener that is never bound reads \
                  exactly like one that is — remove it or enable the S3 front"
                     .into(),
             ));
@@ -951,47 +1014,44 @@ impl GatewayConfig {
     /// flipping the switch later cannot be the moment a typo is discovered.
     fn validate_sftp(&self) -> Result<()> {
         self.limits.sftp.validate().map_err(GatewayError::Config)?;
-        let Some(s) = &self.sftp else {
+        let Some(s) = &self.frontends.sftp else {
             return Ok(());
         };
         if s.host_keys.is_empty() {
             return Err(GatewayError::Config(
-                "sftp.host_keys is empty; host keys are mounted, never generated".into(),
+                "frontends.sftp.host_keys is empty; host keys are mounted, never generated".into(),
             ));
         }
         let mut seen = std::collections::HashSet::new();
         for k in &s.host_keys {
             if !seen.insert(k) {
                 return Err(GatewayError::Config(format!(
-                    "sftp.host_keys lists {k:?} twice"
+                    "frontends.sftp.host_keys lists {k:?} twice"
                 )));
             }
         }
         if let Some(p) = &s.proxy_protocol {
             for c in &p.trusted_cidrs {
                 crate::sftp::limits::Cidr::parse(c).map_err(|e| {
-                    GatewayError::Config(format!("sftp.proxy_protocol.trusted_cidrs: {e}"))
+                    GatewayError::Config(format!(
+                        "frontends.sftp.proxy_protocol.trusted_cidrs: {e}"
+                    ))
                 })?;
             }
         }
-        let backends: std::collections::HashSet<&str> =
-            self.backends.iter().map(|b| b.id.as_str()).collect();
-        for id in s.conditional_create.keys() {
-            if !backends.contains(id.as_str()) {
-                return Err(GatewayError::Config(format!(
-                    "sftp.conditional_create names unknown backend {id}"
-                )));
-            }
-        }
         if s.drain_secs == 0 {
-            return Err(GatewayError::Config("sftp.drain_secs must be > 0".into()));
+            return Err(GatewayError::Config(
+                "frontends.sftp.drain_secs must be > 0".into(),
+            ));
         }
         // Every bound listener on its own port: whichever binds second loses, and the
         // loser finds out at runtime.
         let listeners = self.listeners();
         for (i, (a, x)) in listeners.iter().enumerate() {
             for (b, y) in &listeners[i + 1..] {
-                if x.port() == y.port() && (*a == "sftp.listen" || *b == "sftp.listen") {
+                if x.port() == y.port()
+                    && (*a == "frontends.sftp.listen" || *b == "frontends.sftp.listen")
+                {
                     return Err(GatewayError::Config(format!(
                         "{a} {x} shares a port with {b} {y}"
                     )));
@@ -1409,76 +1469,96 @@ mod tests {
         serde_json::json!({
             "enabled": enabled,
             "listen": "127.0.0.1:2222",
-            "host_keys": ["/etc/s0/sftp/ssh_host_ed25519_key"],
-            "conditional_create": { "bay-1": "native" }
+            "host_keys": ["/etc/s0/sftp/ssh_host_ed25519_key"]
         })
     }
 
     #[test]
-    fn an_absent_s3_section_means_the_s3_front_is_enabled_as_before() {
+    fn an_absent_frontends_key_means_the_s3_front_alone_as_before() {
         let c = fronts(serde_json::json!({})).expect("every pre-SFTP config still loads");
         assert!(c.s3_enabled());
         assert_eq!(c.s3_listen(), Some("127.0.0.1:8014".parse().unwrap()));
         assert!(c.sftp_enabled().is_none());
         let e = fronts(serde_json::json!({ "listen": null })).unwrap_err();
-        assert!(e.to_string().contains("listen is required"), "{e}");
+        assert!(e.to_string().contains("is required"), "{e}");
+        // `frontends` present without `s3`: still on.
+        let c = fronts(serde_json::json!({ "frontends": { "sftp": sftp(false) } })).unwrap();
+        assert!(c.s3_enabled());
     }
 
     #[test]
-    fn each_front_is_switched_in_its_own_section() {
+    fn each_front_is_switched_in_its_own_section_under_frontends() {
         // SFTP-only: no S3 listener, no STS key material.
         let c = fronts(serde_json::json!({
-            "s3": { "enabled": false }, "listen": null, "sts": null, "sftp": sftp(true)
+            "frontends": { "s3": { "enabled": false }, "sftp": sftp(true) },
+            "listen": null, "sts": null
         }))
         .expect("an SFTP-only process");
         assert!(!c.s3_enabled());
         assert_eq!(c.s3_listen(), None);
         assert!(c.sts().is_none());
         assert_eq!(c.sftp_enabled().unwrap().listen.port(), 2222);
-        assert_eq!(
-            c.sftp_enabled().unwrap().conditional_create.get("bay-1"),
-            Some(&ConditionalCreate::Native)
-        );
 
         // A section kept with `enabled: false` binds nothing.
-        let c = fronts(serde_json::json!({ "sftp": sftp(false) })).unwrap();
+        let c = fronts(serde_json::json!({ "frontends": { "sftp": sftp(false) } })).unwrap();
         assert!(c.sftp_enabled().is_none());
 
         // Both on is allowed (development).
-        let c = fronts(serde_json::json!({ "sftp": sftp(true) })).unwrap();
+        let c = fronts(serde_json::json!({ "frontends": { "sftp": sftp(true) } })).unwrap();
         assert!(c.s3_enabled() && c.sftp_enabled().is_some());
+
+        // The S3 listener may live in its section instead of at the top level…
+        let c = fronts(serde_json::json!({
+            "listen": null,
+            "frontends": { "s3": { "enabled": true, "listen": "127.0.0.1:9014" } }
+        }))
+        .unwrap();
+        assert_eq!(c.s3_listen(), Some("127.0.0.1:9014".parse().unwrap()));
+        // …but not in both places.
+        let e = fronts(serde_json::json!({
+            "frontends": { "s3": { "enabled": true, "listen": "127.0.0.1:9014" } }
+        }))
+        .unwrap_err();
+        assert!(e.to_string().contains("set twice"), "{e}");
+        // The old top-level sections are not silently accepted.
+        assert!(fronts(serde_json::json!({ "sftp": sftp(true) })).is_err());
+        assert!(fronts(serde_json::json!({ "frontends": { "ftp": {} } })).is_err());
     }
 
     #[test]
     fn the_enabled_flag_is_required_and_never_defaulted() {
         let mut no_flag = sftp(true);
         no_flag.as_object_mut().unwrap().remove("enabled");
-        let e = fronts(serde_json::json!({ "sftp": no_flag })).unwrap_err();
+        let e = fronts(serde_json::json!({ "frontends": { "sftp": no_flag } })).unwrap_err();
         assert!(e.to_string().contains("enabled"), "{e}");
-        let e = fronts(serde_json::json!({ "s3": {} })).unwrap_err();
+        let e = fronts(serde_json::json!({ "frontends": { "s3": {} } })).unwrap_err();
         assert!(e.to_string().contains("enabled"), "{e}");
     }
 
     #[test]
     fn degenerate_front_combinations_are_refused_at_load() {
-        let e =
-            fronts(serde_json::json!({ "s3": { "enabled": false }, "listen": null })).unwrap_err();
-        assert!(
-            e.to_string()
-                .contains("both data-plane fronts are disabled"),
-            "{e}"
-        );
-        let e = fronts(
-            serde_json::json!({ "s3": { "enabled": false }, "sftp": sftp(false), "listen": null }),
-        )
+        let e = fronts(serde_json::json!({
+            "frontends": { "s3": { "enabled": false } }, "listen": null
+        }))
         .unwrap_err();
         assert!(
             e.to_string()
                 .contains("both data-plane fronts are disabled"),
             "{e}"
         );
-        let e = fronts(serde_json::json!({ "s3": { "enabled": false }, "sftp": sftp(true) }))
-            .unwrap_err();
+        let e = fronts(serde_json::json!({
+            "frontends": { "s3": { "enabled": false }, "sftp": sftp(false) }, "listen": null
+        }))
+        .unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("both data-plane fronts are disabled"),
+            "{e}"
+        );
+        let e = fronts(serde_json::json!({
+            "frontends": { "s3": { "enabled": false }, "sftp": sftp(true) }
+        }))
+        .unwrap_err();
         assert!(
             e.to_string().contains("s3.enabled is false"),
             "a listen nobody binds: {e}"
@@ -1488,38 +1568,55 @@ mod tests {
     }
 
     #[test]
+    fn conditional_create_is_a_backend_property_and_defaults_to_check_then_write() {
+        let c = fronts(serde_json::json!({})).unwrap();
+        assert_eq!(
+            c.backends[0].conditional_create,
+            ConditionalCreate::CheckThenWrite
+        );
+        let c = fronts(serde_json::json!({ "backends": [
+            { "id": "bay-1", "kind": "ceph", "endpoint_url": "http://127.0.0.1:7480",
+              "conditional_create": "native" } ] }))
+        .unwrap();
+        assert_eq!(c.backends[0].conditional_create, ConditionalCreate::Native);
+        assert!(
+            fronts(serde_json::json!({ "backends": [
+            { "id": "bay-1", "kind": "ceph", "endpoint_url": "http://127.0.0.1:7480",
+              "conditional_create": "maybe" } ] }))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn sftp_shape_is_validated_even_when_disabled() {
+        let with = |sftp: serde_json::Value, extra: serde_json::Value| {
+            let mut patch = serde_json::json!({ "frontends": { "sftp": sftp } });
+            for (k, v) in extra.as_object().unwrap() {
+                patch[k] = v.clone();
+            }
+            fronts(patch)
+        };
         let mut bad = sftp(false);
         bad["listen"] = serde_json::json!("127.0.0.1:9090");
-        let e = fronts(serde_json::json!({ "sftp": bad, "admin_listen": "127.0.0.1:9090" }));
         assert!(
-            e.is_ok(),
+            with(bad, serde_json::json!({ "admin_listen": "127.0.0.1:9090" })).is_ok(),
             "a disabled section binds nothing, so it collides with nothing"
         );
         let mut bad = sftp(true);
         bad["listen"] = serde_json::json!("127.0.0.1:9090");
-        let e = fronts(serde_json::json!({ "sftp": bad, "admin_listen": "127.0.0.1:9090" }))
-            .unwrap_err();
+        let e = with(bad, serde_json::json!({ "admin_listen": "127.0.0.1:9090" })).unwrap_err();
         assert!(e.to_string().contains("shares a port"), "{e}");
         let mut bad = sftp(false);
-        bad["conditional_create"] = serde_json::json!({ "nope": "native" });
-        assert!(
-            fronts(serde_json::json!({ "sftp": bad }))
-                .unwrap_err()
-                .to_string()
-                .contains("unknown backend")
-        );
-        let mut bad = sftp(false);
         bad["host_keys"] = serde_json::json!([]);
-        assert!(fronts(serde_json::json!({ "sftp": bad })).is_err());
+        assert!(with(bad, serde_json::json!({})).is_err());
         let mut bad = sftp(false);
         bad["proxy_protocol"] = serde_json::json!({ "trusted_cidrs": ["not-a-cidr"] });
-        assert!(fronts(serde_json::json!({ "sftp": bad })).is_err());
+        assert!(with(bad, serde_json::json!({})).is_err());
         let mut bad = sftp(false);
-        bad["typo"] = serde_json::json!(1);
+        bad["conditional_create"] = serde_json::json!({ "bay-1": "native" });
         assert!(
-            fronts(serde_json::json!({ "sftp": bad })).is_err(),
-            "unknown fields are refused"
+            with(bad, serde_json::json!({})).is_err(),
+            "conditional_create moved to the backend; the old place is refused, not ignored"
         );
     }
 

@@ -149,10 +149,10 @@ impl<S> StrictKexGuard<S> {
 /// `Err` refuses.
 pub fn inspect_preamble(buf: &[u8]) -> Result<Option<()>, &'static str> {
     if buf.len() >= 4 && PROXY_V2_SIG.starts_with(&buf[..buf.len().min(12)]) {
-        return Err("PROXY header from a peer outside sftp.proxy_protocol.trusted_cidrs");
+        return Err("PROXY header from a peer outside frontends.sftp.proxy_protocol.trusted_cidrs");
     }
     if buf.starts_with(b"PROXY ") {
-        return Err("PROXY header from a peer outside sftp.proxy_protocol.trusted_cidrs");
+        return Err("PROXY header from a peer outside frontends.sftp.proxy_protocol.trusted_cidrs");
     }
     // RFC 4253 §4.2: the client sends exactly its identification line first.
     let Some(nl) = buf.iter().position(|b| *b == b'\n') else {
