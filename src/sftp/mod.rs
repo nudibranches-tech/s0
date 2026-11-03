@@ -678,7 +678,7 @@ pub(crate) async fn run_sftp(
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut last_request = Instant::now();
     let mut draining: Option<Instant> = None;
-    let started = Instant::now();
+    let mut pacer = Pacer::new();
     let reason: &'static str = loop {
         tokio::select! {
             frame = rx.recv() => {
@@ -708,7 +708,7 @@ pub(crate) async fn run_sftp(
                 if let Some(why) = close {
                     break why;
                 }
-                pace(&shared, &conn, started).await;
+                pacer.pace(&shared, &conn).await;
             }
             changed = bundle_rx.changed() => {
                 if changed.is_err() {
@@ -752,19 +752,53 @@ pub(crate) async fn run_sftp(
 }
 
 /// Per-session bandwidth cap, per direction (ADR-009 D12). Unlimited by default.
-async fn pace(shared: &Shared, conn: &ConnState, started: Instant) {
-    let rate = shared.gw.limits().sftp.bandwidth_bytes_per_sec;
-    if rate == 0 {
-        return;
+///
+/// The budget accrues from a baseline that is moved forward whenever the session is more
+/// than [`Pacer::MAX_CREDIT`] under its rate, so an idle or slow stretch cannot bank an
+/// unbounded burst to spend later at full speed.
+struct Pacer {
+    base: Instant,
+    base_moved: u64,
+}
+
+impl Pacer {
+    const MAX_CREDIT: Duration = Duration::from_secs(1);
+
+    fn new() -> Self {
+        Pacer {
+            base: Instant::now(),
+            base_moved: 0,
+        }
     }
-    let moved = conn
-        .counters
-        .bytes_in
-        .load(Ordering::Relaxed)
-        .max(conn.counters.bytes_out.load(Ordering::Relaxed));
-    let due = Duration::from_secs_f64(moved as f64 / rate as f64);
-    let elapsed = started.elapsed();
-    if due > elapsed {
-        tokio::time::sleep(due - elapsed).await;
+
+    async fn pace(&mut self, shared: &Shared, conn: &ConnState) {
+        let rate = shared.gw.limits().sftp.bandwidth_bytes_per_sec;
+        if rate == 0 {
+            return;
+        }
+        let moved = conn
+            .counters
+            .bytes_in
+            .load(Ordering::Relaxed)
+            .max(conn.counters.bytes_out.load(Ordering::Relaxed));
+        if let Some(wait) = self.delay(moved, rate, Instant::now()) {
+            tokio::time::sleep(wait).await;
+        }
+    }
+
+    /// How long to hold the session at `now`, having moved `moved` bytes in total at
+    /// `rate` bytes per second; `None` when it is within its budget.
+    fn delay(&mut self, moved: u64, rate: u64, now: Instant) -> Option<Duration> {
+        let due =
+            Duration::from_secs_f64(moved.saturating_sub(self.base_moved) as f64 / rate as f64);
+        let elapsed = now.saturating_duration_since(self.base);
+        if due > elapsed {
+            return Some(due - elapsed);
+        }
+        if elapsed - due > Self::MAX_CREDIT {
+            self.base = now.checked_sub(Self::MAX_CREDIT).unwrap_or(now);
+            self.base_moved = moved;
+        }
+        None
     }
 }

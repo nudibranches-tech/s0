@@ -249,6 +249,11 @@ impl Upload {
             self.ahead.insert(offset, data);
             return Ok(());
         }
+        if self.overlaps_ahead(offset, end) {
+            // In order, but over bytes already held ahead: accepting it would strand the
+            // held chunk behind `next` and fail the whole transfer at CLOSE.
+            return Err(WriteError::Unsupported("non-sequential write"));
+        }
         self.append(data).await?;
         // Drain anything the gap was holding back.
         while let Some(entry) = self.ahead.first_entry() {

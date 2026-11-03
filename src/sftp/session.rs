@@ -49,6 +49,11 @@ const READDIR_BATCH: usize = 128;
 /// Upper bound on a listing assembled from several granted prefixes (D7 narrowing).
 const MAX_MATERIALIZED_ENTRIES: usize = 100_000;
 
+/// Read and directory handles a session may hold on top of `max_write_handles`. Each
+/// holds memory (a read-ahead budget, a materialized listing), so the table is bounded;
+/// the total is what `limits@openssh.com` advertises as `max-open-handles`.
+const MAX_OTHER_HANDLES: usize = 64;
+
 /// Above this a rename copies in parts; `CopyObject` is limited to 5 GiB.
 const COPY_PART: u64 = 1024 * 1024 * 1024;
 
@@ -83,6 +88,9 @@ enum Handle {
 
 struct DirHandle {
     prefix: String,
+    /// The granted prefixes the listing was opened under (sorted, deduped); a
+    /// re-decision that answers differently refuses the listing.
+    granted: Vec<String>,
     inputs: Vec<OpaInput>,
     decided_rev: String,
     listing: Listing,
@@ -190,6 +198,20 @@ fn flag_names(pflags: u32) -> Vec<String> {
     .collect()
 }
 
+/// The prefixes a list decision scopes the listing to (sorted, deduped); empty when the
+/// listing is unscoped.
+fn granted_prefixes(ob: &crate::authz::Obligations) -> Vec<String> {
+    let mut granted: Vec<String> = ob
+        .narrow_prefix
+        .iter()
+        .cloned()
+        .chain(ob.allowed_prefixes.iter().cloned())
+        .collect();
+    granted.sort();
+    granted.dedup();
+    granted
+}
+
 /// A path error as the SFTP status D6 prescribes: `NO_SUCH_FILE` for a request naming an
 /// existing entry, `FAILURE` ("invalid file name") for one that would create one.
 fn path_error(id: u32, e: PathError, creating: bool) -> Next {
@@ -228,16 +250,18 @@ impl SftpSession {
     /// Re-run the credential check if the bundle revision moved since it last passed.
     pub fn reauth(&mut self) -> Result<(), String> {
         let bundle = self.shared.gw.bundles.current();
-        if bundle.revision == self.checked_rev {
+        let now = now_unix();
+        // A certificate's validity window is a fact about time, not about the bundle: the
+        // per-revision memo must not let a session outlive its certificate.
+        let expired = matches!(
+            &self.id.credential,
+            Credential::Certificate { cert } if now >= cert.valid_before()
+        );
+        if bundle.revision == self.checked_rev && !expired {
             return Ok(());
         }
         let dir = self.shared.directory.get(&bundle);
-        let auth = dir.authenticate(
-            &self.id.login,
-            &self.id.credential,
-            self.id.client_ip,
-            now_unix(),
-        )?;
+        let auth = dir.authenticate(&self.id.login, &self.id.credential, self.id.client_ip, now)?;
         if auth.account.tenant != self.current.account.tenant
             || auth.account.subject_key != self.current.account.subject_key
             || auth.account.home != self.current.account.home
@@ -348,7 +372,8 @@ impl SftpSession {
     /// Ask every question of one request, before any backend call. On a denial the
     /// request is recorded once, against the first denied input, and refused.
     ///
-    /// `labels` name each half for the aggregate reason ("rename source read: …").
+    /// `labels` name each question for the denial reason ("rename source read: …"); a
+    /// single labelled question gets its label too.
     async fn authorize(
         &mut self,
         op: &str,
@@ -367,8 +392,8 @@ impl SftpSession {
             }
             if !decision.allow {
                 let reason = match labels.get(n) {
-                    Some(l) if labels.len() > 1 => format!("{l}: {}", decision.reason),
-                    _ => decision.reason.clone(),
+                    Some(l) => format!("{l}: {}", decision.reason),
+                    None => decision.reason.clone(),
                 };
                 let denial = Decision::deny(reason.clone());
                 // The record carries the primary input (a rename's destination, with its
@@ -409,6 +434,11 @@ impl SftpSession {
         self.next_handle = self.next_handle.wrapping_add(1).max(1);
         self.handles.insert(n, h);
         n.to_be_bytes().to_vec()
+    }
+
+    /// True when a new read or directory handle would exceed [`MAX_OTHER_HANDLES`].
+    fn handle_table_full(&self) -> bool {
+        self.handles.len() - self.write_handles() >= MAX_OTHER_HANDLES
     }
 
     fn handle_id(raw: &[u8]) -> Option<u32> {
@@ -531,7 +561,7 @@ impl SftpSession {
                         l.sftp.max_sftp_packet_len as u64,
                         u64::from(MAX_READ),
                         (l.sftp.max_sftp_packet_len - 1024) as u64,
-                        l.sftp.max_write_handles as u64 + 64,
+                        (l.sftp.max_write_handles + MAX_OTHER_HANDLES) as u64,
                     ),
                 })
             }
@@ -568,19 +598,16 @@ impl SftpSession {
             Ok(d) => d,
             Err(n) => return n,
         };
-        let ob = decided[0].decision.obligations.clone();
-        let granted: Vec<String> = ob
-            .narrow_prefix
-            .iter()
-            .cloned()
-            .chain(ob.allowed_prefixes.iter().cloned())
-            .collect();
+        let granted = granted_prefixes(&decided[0].decision.obligations);
         let audit = self.pending(
             decided[0].input.clone(),
             &decided[0].decision,
             self.block(op, vec![]),
         );
-        if !granted.is_empty() {
+        // A granted prefix equal to the key means the key lies inside a grant (the policy
+        // returns the request itself for that grant): the target is reachable, so it is
+        // resolved on the backend below like an unscoped STAT.
+        if !granted.is_empty() && !granted.iter().any(|q| q == &m.key) {
             // The target is a directory iff some granted prefix lies under it. No backend
             // call: the key itself is outside every grant.
             let dir = format!("{}/", m.key);
@@ -669,6 +696,9 @@ impl SftpSession {
             Ok(m) => m,
             Err(e) => return path_error(id, e, false),
         };
+        if self.handle_table_full() {
+            return status(id, StatusCode::Failure, "too many open handles");
+        }
         let Some(route) = self.route() else {
             return status(id, StatusCode::PermissionDenied, "tenant not routable");
         };
@@ -687,14 +717,7 @@ impl SftpSession {
             self.emit_denied(input, &d, self.block(op, vec![]));
             return status(id, StatusCode::PermissionDenied, d.reason);
         }
-        let mut granted: Vec<String> = ob
-            .narrow_prefix
-            .iter()
-            .cloned()
-            .chain(ob.allowed_prefixes.iter().cloned())
-            .collect();
-        granted.sort();
-        granted.dedup();
+        let granted = granted_prefixes(ob);
         let max_fanout = self.shared.gw.limits().max_list_fanout;
         if granted.len() > max_fanout {
             let d = Decision::deny(format!(
@@ -719,6 +742,7 @@ impl SftpSession {
         );
         let mut handle = DirHandle {
             prefix: prefix.clone(),
+            granted: granted.clone(),
             inputs: vec![input],
             decided_rev: self.checked_rev.clone(),
             listing: Listing::Paged {
@@ -827,10 +851,23 @@ impl SftpSession {
         let Some(Handle::Dir(mut h)) = self.handles.remove(&hid) else {
             unreachable!("checked above");
         };
-        // Re-decided on a revision change.
+        // Re-decided on a revision change. The listing was shaped (and its proof minted)
+        // by the scope of the first decision: a new decision that scopes it differently
+        // cannot be honoured by this handle, so the listing is refused.
         if h.decided_rev != self.checked_rev {
             match self.authorize(op, h.inputs.clone(), &[], vec![], id).await {
-                Ok(_) => h.decided_rev = self.checked_rev.clone(),
+                Ok(d) if granted_prefixes(&d[0].decision.obligations) == h.granted => {
+                    h.decided_rev = self.checked_rev.clone();
+                }
+                Ok(d) => {
+                    let denial = Decision::deny(
+                        "the listing's granted scope changed since OPENDIR; reopen the directory",
+                    );
+                    self.emit_denied(d[0].input.clone(), &denial, self.block(op, vec![]));
+                    self.counters.denied.fetch_add(1, Ordering::Relaxed);
+                    h.audit.settle(BackendOutcome::NotAttempted, None);
+                    return status(id, StatusCode::PermissionDenied, denial.reason);
+                }
                 Err(n) => {
                     h.audit.settle(BackendOutcome::NotAttempted, None);
                     return n;
@@ -971,6 +1008,9 @@ impl SftpSession {
         };
         if m.is_root {
             return status(id, StatusCode::Failure, "is a directory");
+        }
+        if self.handle_table_full() {
+            return status(id, StatusCode::Failure, "too many open handles");
         }
         let Some(route) = self.route() else {
             return status(id, StatusCode::PermissionDenied, "tenant not routable");
@@ -1117,18 +1157,21 @@ impl SftpSession {
             (true, true, false, true) => {
                 // Exists: overwriting needs write_objects. Refused before any byte.
                 let w = self.object_input(&route, op, Action::WriteObjects, &key);
-                let mut d = self.enforcer().decide(op, &w).await;
-                if d.allow
-                    && let Some(r) = Enforcer::unimplemented_obligations(&d)
+                let mut d = match self
+                    .authorize(
+                        op,
+                        vec![w],
+                        &["file exists and overwrite is not granted"],
+                        flags.clone(),
+                        id,
+                    )
+                    .await
                 {
-                    d = Decision::deny(r);
-                }
-                if !d.allow {
-                    let reason = format!("file exists and overwrite is not granted ({})", d.reason);
-                    self.emit_denied(w, &Decision::deny(reason.clone()), self.block(op, flags));
-                    return status(id, StatusCode::PermissionDenied, reason);
-                }
-                (w, d, false)
+                    Ok(d) => d,
+                    Err(n) => return n,
+                };
+                let d = d.remove(0);
+                (d.input, d.decision, false)
             }
             (false, _, _, true) => (first, decided[0].decision.clone(), false),
         };
