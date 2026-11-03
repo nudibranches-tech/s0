@@ -1,6 +1,16 @@
 {
   "listen": "0.0.0.0:8014",
   "admin_listen": "0.0.0.0:8016",
+  "_fronts_note": "Each data-plane front is switched on in its own section (ADR-009 D1). An absent `s3` section means the S3 front is on. The `sftp` section binds nothing unless `enabled` is true; production runs SFTP as its own Deployment from the same image with `s3.enabled: false` (then `listen` and `sts` are omitted).",
+  "s3": { "enabled": true },
+  "sftp": {
+    "enabled": false,
+    "listen": "0.0.0.0:2222",
+    "host_keys": ["/etc/s0/sftp/ssh_host_ed25519_key"],
+    "proxy_protocol": { "trusted_cidrs": ["198.51.100.0/28"] },
+    "conditional_create": { "backend-eu-1": "check_then_write" },
+    "drain_secs": 20
+  },
   "sts": {
     "master_keys": {
       "k0": "REPLACE_ME_openssl_rand_hex_32_0000000000000000000000000000"
