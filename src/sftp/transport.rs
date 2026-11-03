@@ -590,7 +590,8 @@ impl russh::server::Handler for SshHandler {
         let shared = self.shared.clone();
         let conn = self.conn.clone();
         let handle = session.handle();
-        tokio::spawn(super::run_sftp(shared, conn, ch, handle));
+        let task = tokio::spawn(super::run_sftp(shared, conn.clone(), ch, handle));
+        conn.set_sftp_task(task);
         Ok(())
     }
 

@@ -251,6 +251,9 @@ pub struct ConnState {
     authenticated: AtomicBool,
     auth: Mutex<Option<AuthSlot>>,
     close_reason: Mutex<Option<&'static str>>,
+    /// The SFTP subsystem task, awaited before the `disconnected` record so that record
+    /// comes after the transfers it ended were aborted, and carries their reason.
+    sftp_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 struct AuthSlot {
@@ -271,6 +274,7 @@ impl ConnState {
             authenticated: AtomicBool::new(false),
             auth: Mutex::new(None),
             close_reason: Mutex::new(None),
+            sftp_task: Mutex::new(None),
         }
     }
 
@@ -309,6 +313,11 @@ impl ConnState {
                     s.auth.account.tenant.clone(),
                 )
             })
+    }
+
+    /// Record the SFTP subsystem task (one per connection).
+    pub fn set_sftp_task(&self, task: tokio::task::JoinHandle<()>) {
+        *self.sftp_task.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
     }
 
     fn set_close_reason(&self, r: &'static str) {
@@ -546,6 +555,20 @@ async fn handle_connection(
         shared.preauth_reject(&conn, why);
         return;
     }
+    // Let the SFTP session finish first: it aborts open transfers and records why it
+    // ended. Bounded, so a wedged backend call cannot hold the record back forever.
+    let task = conn
+        .sftp_task
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    if let Some(task) = task
+        && tokio::time::timeout(shared.drain + Duration::from_secs(5), task)
+            .await
+            .is_err()
+    {
+        conn.set_close_reason("session teardown timeout");
+    }
     match conn.auth_snapshot() {
         Some((login, auth, tenant)) => {
             let reason = conn
@@ -555,7 +578,7 @@ async fn handle_connection(
                 .unwrap_or(if result.is_ok() {
                     "client close"
                 } else {
-                    "protocol error"
+                    "connection lost"
                 });
             shared.emit_event(
                 &conn,
