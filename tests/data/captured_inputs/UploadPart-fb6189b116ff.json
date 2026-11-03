@@ -1,12 +1,13 @@
 {
   "acl_grants": [],
-  "action": "read",
+  "action": "write_objects",
   "backend": {
     "id": "bay-1",
     "kind": "ceph"
   },
   "bucket": "reports",
   "bypass_governance": false,
+  "object": "2024/x",
   "organization_id": "org-acme",
   "principal": {
     "attributes": {
@@ -16,7 +17,9 @@
     "type": "user"
   },
   "request": {
-    "method": "HEAD"
+    "method": "PUT",
+    "params": "partNumber=1&uploadId=upload-1",
+    "protocol": "s3"
   },
   "tenant": "acme"
 }

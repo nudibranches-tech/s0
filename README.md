@@ -30,7 +30,7 @@ drift from the table.
 
 ### Enforced (23)
 
-Each is authorized against one of six grant verbs. A grant is per-subject, per-bucket,
+Each is authorized against one of seven grant verbs. A grant is per-subject, per-bucket,
 per-verb, with object-prefix scopes.
 
 | Grant verb | Operations |
@@ -41,6 +41,7 @@ per-verb, with object-prefix scopes.
 | `write_objects` | `PutObject`, `PostObject`, `CopyObject`, `CreateMultipartUpload`, `UploadPart`, `UploadPartCopy`, `CompleteMultipartUpload`, `AbortMultipartUpload` |
 | `delete_objects` | `DeleteObject`, `DeleteObjects` |
 | `write_object_tags` | `PutObjectTagging`, `DeleteObjectTagging` |
+| `create_objects` | none over S3 — write a key that does **not** exist. Asked by the SFTP front ([ADR-009](docs/adr/ADR-009-sftp-front.md)) for drop-box uploads, and implied by `write_objects` |
 
 That covers ordinary object storage: get/put/head/delete, multipart upload, server-side
 copy, listing, and object tagging.

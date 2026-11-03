@@ -18,7 +18,8 @@
   },
   "request": {
     "method": "POST",
-    "params": "delete="
+    "params": "delete=",
+    "protocol": "s3"
   },
   "tenant": "acme"
 }

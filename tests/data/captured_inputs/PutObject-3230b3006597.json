@@ -1,5 +1,10 @@
 {
-  "acl_grants": [],
+  "acl_grants": [
+    {
+      "source": "acl",
+      "value": "private"
+    }
+  ],
   "action": "write_objects",
   "backend": {
     "id": "bay-1",
@@ -17,8 +22,11 @@
     "type": "user"
   },
   "request": {
-    "method": "POST",
-    "params": "uploadId=upload-1"
+    "method": "PUT",
+    "protocol": "s3"
+  },
+  "requested_tags": {
+    "tier": "internal"
   },
   "tenant": "acme"
 }

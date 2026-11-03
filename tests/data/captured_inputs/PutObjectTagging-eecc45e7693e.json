@@ -1,6 +1,6 @@
 {
   "acl_grants": [],
-  "action": "read_objects",
+  "action": "write_object_tags",
   "backend": {
     "id": "bay-1",
     "kind": "ceph"
@@ -17,8 +17,12 @@
     "type": "user"
   },
   "request": {
-    "method": "GET",
-    "params": "uploadId=upload-1"
+    "method": "PUT",
+    "params": "tagging=",
+    "protocol": "s3"
+  },
+  "requested_tags": {
+    "tier": "internal"
   },
   "tenant": "acme"
 }

@@ -1343,6 +1343,7 @@ fn parse_tag_set(tag_set: &[Tag], max_tags: usize) -> Result<BTreeMap<String, St
 
 fn request_meta<T>(req: &S3Request<T>) -> RequestMeta {
     RequestMeta {
+        protocol: crate::authz::Protocol::S3,
         method: req.method.to_string(),
         params: req.uri.query().map(redact_query),
         headers_subset: Default::default(),

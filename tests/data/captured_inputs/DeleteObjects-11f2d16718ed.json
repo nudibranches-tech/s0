@@ -1,13 +1,13 @@
 {
   "acl_grants": [],
-  "action": "write_object_tags",
+  "action": "delete_objects",
   "backend": {
     "id": "bay-1",
     "kind": "ceph"
   },
   "bucket": "reports",
   "bypass_governance": false,
-  "object": "2024/x",
+  "object": "2024/a.csv",
   "organization_id": "org-acme",
   "principal": {
     "attributes": {
@@ -17,11 +17,9 @@
     "type": "user"
   },
   "request": {
-    "method": "PUT",
-    "params": "tagging="
-  },
-  "requested_tags": {
-    "tier": "internal"
+    "method": "POST",
+    "params": "delete=",
+    "protocol": "s3"
   },
   "tenant": "acme"
 }

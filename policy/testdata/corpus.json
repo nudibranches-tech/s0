@@ -283,6 +283,41 @@
           "group_grants": {}
         }
       }
+    },
+    "dropbox": {
+      "_comment": "The drop-box posture (ADR-009 D7): `drop` holds ONLY create_objects on inbound/partner-x/. It can write a key that does not exist and nothing else - not overwrite, not read, not list. The SFTP front asks create_objects; write_objects implies it (overwrite contains create), pinned against bob in the default bundle.",
+      "org_settings": {
+        "freeze_writes": false
+      },
+      "tenants": {
+        "acme": {
+          "user_attributes": {
+            "drop": {
+              "groups": [],
+              "attributes": []
+            }
+          },
+          "bucket_attributes": {
+            "inbound": {
+              "denylist": {}
+            }
+          },
+          "s3_grants": {
+            "drop": [
+              {
+                "bucket": "inbound",
+                "actions": [
+                  "create_objects"
+                ],
+                "prefixes": [
+                  "partner-x/"
+                ]
+              }
+            ]
+          },
+          "group_grants": {}
+        }
+      }
     }
   },
   "cases": [
@@ -311,6 +346,7 @@
         "bucket": "reports",
         "object": "2024/q1.csv",
         "request": {
+          "protocol": "s3",
           "method": "GET"
         }
       },
@@ -344,6 +380,7 @@
         "bucket": "reports",
         "object": "2023/old.csv",
         "request": {
+          "protocol": "s3",
           "method": "GET"
         }
       },
@@ -377,6 +414,7 @@
         "bucket": "reports",
         "object": "2024/new.csv",
         "request": {
+          "protocol": "s3",
           "method": "PUT"
         }
       },
@@ -407,6 +445,7 @@
         "bucket": "public",
         "object": "anything/here.txt",
         "request": {
+          "protocol": "s3",
           "method": "GET"
         }
       },
@@ -437,6 +476,7 @@
         "bucket": "reports",
         "object": "2024/q1.csv",
         "request": {
+          "protocol": "s3",
           "method": "GET"
         }
       },
@@ -468,6 +508,7 @@
         "bucket": "public",
         "object": "upload/x.bin",
         "request": {
+          "protocol": "s3",
           "method": "PUT"
         }
       },
@@ -500,6 +541,7 @@
         "bucket": "reports",
         "object": "2024/q1.csv",
         "request": {
+          "protocol": "s3",
           "method": "DELETE"
         }
       },
@@ -530,6 +572,7 @@
         "bucket": "public",
         "object": "x.txt",
         "request": {
+          "protocol": "s3",
           "method": "GET"
         }
       },
@@ -563,6 +606,7 @@
         "bucket": "public",
         "object": "shared/report.csv",
         "request": {
+          "protocol": "s3",
           "method": "GET"
         }
       },
@@ -595,6 +639,7 @@
         "bucket": "public",
         "object": "private/secret.csv",
         "request": {
+          "protocol": "s3",
           "method": "GET"
         }
       },
@@ -627,6 +672,7 @@
         "bucket": "public",
         "object": "shared/report.csv",
         "request": {
+          "protocol": "s3",
           "method": "GET"
         }
       },
@@ -660,6 +706,7 @@
         "bucket": "reports",
         "prefix": "20",
         "request": {
+          "protocol": "s3",
           "method": "GET"
         }
       },
@@ -695,6 +742,7 @@
         "action": "list_objects",
         "bucket": "reports",
         "request": {
+          "protocol": "s3",
           "method": "GET"
         }
       },
@@ -728,6 +776,7 @@
         "bucket": "reports",
         "prefix": "",
         "request": {
+          "protocol": "s3",
           "method": "GET"
         }
       },
@@ -761,6 +810,7 @@
         "bucket": "reports",
         "prefix": "2024/",
         "request": {
+          "protocol": "s3",
           "method": "GET"
         }
       },
@@ -794,6 +844,7 @@
         "bucket": "reports",
         "prefix": "other/",
         "request": {
+          "protocol": "s3",
           "method": "GET"
         }
       },
@@ -824,6 +875,7 @@
         "bucket": "reports",
         "prefix": "lo",
         "request": {
+          "protocol": "s3",
           "method": "GET"
         }
       },
@@ -854,6 +906,7 @@
         "action": "list_objects",
         "bucket": "reports",
         "request": {
+          "protocol": "s3",
           "method": "GET"
         }
       },
@@ -884,6 +937,7 @@
         "action": "list_objects",
         "bucket": "public",
         "request": {
+          "protocol": "s3",
           "method": "GET"
         }
       },
@@ -914,6 +968,7 @@
         "action": "read",
         "bucket": "reports",
         "request": {
+          "protocol": "s3",
           "method": "HEAD"
         }
       },
@@ -944,6 +999,7 @@
         "action": "read_objects",
         "bucket": "reports",
         "request": {
+          "protocol": "s3",
           "method": "HEAD"
         },
         "object": "2024/q1.csv"
@@ -975,6 +1031,7 @@
         "action": "list_objects",
         "bucket": "reports",
         "request": {
+          "protocol": "s3",
           "method": "HEAD"
         }
       },
@@ -1005,6 +1062,7 @@
         "action": "read",
         "bucket": "reports",
         "request": {
+          "protocol": "s3",
           "method": "HEAD"
         }
       },
@@ -1039,6 +1097,7 @@
         "action": "read",
         "bucket": "reports",
         "request": {
+          "protocol": "s3",
           "method": "HEAD"
         }
       },
@@ -1070,6 +1129,7 @@
         "bucket": "reports",
         "object": "2023/outside.csv",
         "request": {
+          "protocol": "s3",
           "method": "PUT"
         }
       },
@@ -1100,6 +1160,7 @@
         "bucket": "public",
         "object": "upload/x.bin",
         "request": {
+          "protocol": "s3",
           "method": "PUT"
         },
         "requested_tags": {
@@ -1137,6 +1198,7 @@
           "tier": "internal"
         },
         "request": {
+          "protocol": "s3",
           "method": "PUT",
           "params": "tagging="
         }
@@ -1171,6 +1233,7 @@
           "tier": "internal"
         },
         "request": {
+          "protocol": "s3",
           "method": "PUT",
           "params": "tagging="
         }
@@ -1203,6 +1266,7 @@
         "action": "read_objects",
         "bucket": "reports",
         "request": {
+          "protocol": "s3",
           "method": "GET"
         }
       },
@@ -1239,6 +1303,7 @@
           "key": "2024/src.csv"
         },
         "request": {
+          "protocol": "s3",
           "method": "PUT"
         }
       },
@@ -1275,6 +1340,7 @@
           "key": "2024/src.csv"
         },
         "request": {
+          "protocol": "s3",
           "method": "PUT"
         }
       },
@@ -1307,6 +1373,7 @@
         "bucket": "reports",
         "object": "2024/a.csv",
         "request": {
+          "protocol": "s3",
           "method": "POST"
         }
       },
@@ -1339,6 +1406,7 @@
         "bucket": "reports",
         "object": "2024/a.csv",
         "request": {
+          "protocol": "s3",
           "method": "POST"
         }
       },
@@ -1369,6 +1437,7 @@
         "bucket": "public",
         "object": "x.bin",
         "request": {
+          "protocol": "s3",
           "method": "PUT"
         }
       },
@@ -1400,6 +1469,7 @@
         "bucket": "public",
         "object": "x.bin",
         "request": {
+          "protocol": "s3",
           "method": "GET"
         }
       },
@@ -1429,6 +1499,7 @@
         "action": "read",
         "bucket": "",
         "request": {
+          "protocol": "s3",
           "method": "GET"
         }
       },
@@ -1459,6 +1530,7 @@
         "action": "read",
         "bucket": "",
         "request": {
+          "protocol": "s3",
           "method": "GET"
         }
       },
@@ -1493,6 +1565,7 @@
         "action": "read",
         "bucket": "",
         "request": {
+          "protocol": "s3",
           "method": "GET"
         }
       },
@@ -1523,6 +1596,7 @@
         "action": "read",
         "bucket": "",
         "request": {
+          "protocol": "s3",
           "method": "GET"
         }
       },
@@ -1554,6 +1628,7 @@
         "action": "read",
         "bucket": "",
         "request": {
+          "protocol": "s3",
           "method": "GET"
         }
       },
@@ -1585,6 +1660,7 @@
         "action": "read",
         "bucket": "",
         "request": {
+          "protocol": "s3",
           "method": "GET"
         }
       },
@@ -1615,6 +1691,7 @@
         "action": "read",
         "bucket": "reports",
         "request": {
+          "protocol": "s3",
           "method": "GET"
         }
       },
@@ -1645,12 +1722,269 @@
         "action": "read",
         "bucket": "secret",
         "request": {
+          "protocol": "s3",
           "method": "GET"
         }
       },
       "expect": {
         "allow": false,
         "reason_contains": "no grant"
+      }
+    },
+    {
+      "name": "create_objects within the drop-box prefix (SFTP OPEN)",
+      "bundle": "dropbox",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "drop",
+          "type": "user",
+          "attributes": {
+            "groups": []
+          }
+        },
+        "backend": {
+          "id": "bay-1",
+          "kind": "ceph"
+        },
+        "tenant": "acme",
+        "organization_id": "org-acme",
+        "action": "create_objects",
+        "bucket": "inbound",
+        "object": "partner-x/2026-11-03.csv",
+        "request": {
+          "protocol": "sftp",
+          "method": "OPEN"
+        }
+      },
+      "expect": {
+        "allow": true,
+        "reason_contains": "grant matched"
+      }
+    },
+    {
+      "name": "create_objects outside the drop-box prefix denied",
+      "bundle": "dropbox",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "drop",
+          "type": "user",
+          "attributes": {
+            "groups": []
+          }
+        },
+        "backend": {
+          "id": "bay-1",
+          "kind": "ceph"
+        },
+        "tenant": "acme",
+        "organization_id": "org-acme",
+        "action": "create_objects",
+        "bucket": "inbound",
+        "object": "partner-y/a.csv",
+        "request": {
+          "protocol": "sftp",
+          "method": "OPEN"
+        }
+      },
+      "expect": {
+        "allow": false,
+        "reason_contains": "no grant"
+      }
+    },
+    {
+      "name": "create_objects does NOT confer write_objects (no overwrite)",
+      "bundle": "dropbox",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "drop",
+          "type": "user",
+          "attributes": {
+            "groups": []
+          }
+        },
+        "backend": {
+          "id": "bay-1",
+          "kind": "ceph"
+        },
+        "tenant": "acme",
+        "organization_id": "org-acme",
+        "action": "write_objects",
+        "bucket": "inbound",
+        "object": "partner-x/a.csv",
+        "request": {
+          "protocol": "sftp",
+          "method": "OPEN"
+        }
+      },
+      "expect": {
+        "allow": false,
+        "reason_contains": "no grant"
+      }
+    },
+    {
+      "name": "create_objects does NOT confer read_objects",
+      "bundle": "dropbox",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "drop",
+          "type": "user",
+          "attributes": {
+            "groups": []
+          }
+        },
+        "backend": {
+          "id": "bay-1",
+          "kind": "ceph"
+        },
+        "tenant": "acme",
+        "organization_id": "org-acme",
+        "action": "read_objects",
+        "bucket": "inbound",
+        "object": "partner-x/a.csv",
+        "request": {
+          "protocol": "sftp",
+          "method": "OPEN"
+        }
+      },
+      "expect": {
+        "allow": false,
+        "reason_contains": "no grant"
+      }
+    },
+    {
+      "name": "create_objects does NOT confer list_objects (stat and readdir are list decisions)",
+      "bundle": "dropbox",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "drop",
+          "type": "user",
+          "attributes": {
+            "groups": []
+          }
+        },
+        "backend": {
+          "id": "bay-1",
+          "kind": "ceph"
+        },
+        "tenant": "acme",
+        "organization_id": "org-acme",
+        "action": "list_objects",
+        "bucket": "inbound",
+        "prefix": "partner-x/a.csv",
+        "request": {
+          "protocol": "sftp",
+          "method": "STAT"
+        }
+      },
+      "expect": {
+        "allow": false,
+        "reason_contains": "no grant"
+      }
+    },
+    {
+      "name": "write_objects implies create_objects (overwrite contains create)",
+      "bundle": "default",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "bob",
+          "type": "user",
+          "attributes": {
+            "groups": []
+          }
+        },
+        "backend": {
+          "id": "bay-1",
+          "kind": "ceph"
+        },
+        "tenant": "acme",
+        "organization_id": "org-acme",
+        "action": "create_objects",
+        "bucket": "public",
+        "object": "drops/new.bin",
+        "request": {
+          "protocol": "sftp",
+          "method": "OPEN"
+        }
+      },
+      "expect": {
+        "allow": true,
+        "reason_contains": "grant matched"
+      }
+    },
+    {
+      "name": "create_objects is not implied by read_objects",
+      "bundle": "default",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "alice",
+          "type": "user",
+          "attributes": {
+            "groups": []
+          }
+        },
+        "backend": {
+          "id": "bay-1",
+          "kind": "ceph"
+        },
+        "tenant": "acme",
+        "organization_id": "org-acme",
+        "action": "create_objects",
+        "bucket": "reports",
+        "object": "2024/new.csv",
+        "request": {
+          "protocol": "sftp",
+          "method": "OPEN"
+        }
+      },
+      "expect": {
+        "allow": false,
+        "reason_contains": "no grant"
+      }
+    },
+    {
+      "name": "create_objects is a write: frozen by the org kill-switch",
+      "bundle": "frozen",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "bob",
+          "type": "user",
+          "attributes": {
+            "groups": []
+          }
+        },
+        "backend": {
+          "id": "bay-1",
+          "kind": "ceph"
+        },
+        "tenant": "acme",
+        "organization_id": "org-acme",
+        "action": "create_objects",
+        "bucket": "public",
+        "object": "x.bin",
+        "request": {
+          "protocol": "sftp",
+          "method": "OPEN"
+        }
+      },
+      "expect": {
+        "allow": false,
+        "reason_contains": "frozen"
       }
     }
   ]

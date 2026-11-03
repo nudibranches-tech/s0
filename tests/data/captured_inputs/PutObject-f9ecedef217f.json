@@ -1,6 +1,11 @@
 {
-  "acl_grants": [],
-  "action": "write_objects",
+  "acl_grants": [
+    {
+      "source": "acl",
+      "value": "private"
+    }
+  ],
+  "action": "write_object_tags",
   "backend": {
     "id": "bay-1",
     "kind": "ceph"
@@ -17,8 +22,11 @@
     "type": "user"
   },
   "request": {
-    "method": "DELETE",
-    "params": "uploadId=upload-1"
+    "method": "PUT",
+    "protocol": "s3"
+  },
+  "requested_tags": {
+    "tier": "internal"
   },
   "tenant": "acme"
 }

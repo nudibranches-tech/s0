@@ -7,11 +7,7 @@
   },
   "bucket": "reports",
   "bypass_governance": false,
-  "copy_source": {
-    "bucket": "reports",
-    "key": "2024/src.csv"
-  },
-  "object": "2024/dst.csv",
+  "object": "2024/x",
   "organization_id": "org-acme",
   "principal": {
     "attributes": {
@@ -21,7 +17,9 @@
     "type": "user"
   },
   "request": {
-    "method": "PUT"
+    "method": "POST",
+    "params": "uploads=",
+    "protocol": "s3"
   },
   "tenant": "acme"
 }

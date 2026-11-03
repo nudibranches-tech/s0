@@ -1,14 +1,18 @@
 {
   "acl_grants": [],
-  "action": "list_objects",
+  "action": "write_objects",
   "backend": {
     "id": "bay-1",
     "kind": "ceph"
   },
   "bucket": "reports",
   "bypass_governance": false,
+  "copy_source": {
+    "bucket": "reports",
+    "key": "2024/src.csv"
+  },
+  "object": "2024/dst.csv",
   "organization_id": "org-acme",
-  "prefix": "2024/",
   "principal": {
     "attributes": {
       "groups": []
@@ -17,8 +21,8 @@
     "type": "user"
   },
   "request": {
-    "method": "GET",
-    "params": "list-type=2"
+    "method": "PUT",
+    "protocol": "s3"
   },
   "tenant": "acme"
 }

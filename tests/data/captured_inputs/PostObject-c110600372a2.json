@@ -1,6 +1,6 @@
 {
   "acl_grants": [],
-  "action": "read_objects",
+  "action": "write_objects",
   "backend": {
     "id": "bay-1",
     "kind": "ceph"
@@ -17,8 +17,8 @@
     "type": "user"
   },
   "request": {
-    "method": "GET",
-    "params": "tagging="
+    "method": "POST",
+    "protocol": "s3"
   },
   "tenant": "acme"
 }
