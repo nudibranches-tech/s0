@@ -90,6 +90,10 @@ pub struct GatewayMeta {
     /// (per-key filtering). Empty for non-multi-delete ops.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub denied_keys: Vec<String>,
+    /// The `(key, version)` pairs of a versioned delete the request carried. Audit only:
+    /// never an input to a decision.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub versions: Vec<VersionedKey>,
     /// What the gateway knows about the backend leg. Filled in post-forward
     /// ([`crate::audit::PendingAudit`]), which is why the record is emitted when the
     /// request finishes rather than when the decision is made.
@@ -109,6 +113,13 @@ pub struct GatewayMeta {
     /// The same, for a copy's source bucket.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copy_source_object_name: Option<String>,
+}
+
+/// One object version a request asked to delete.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionedKey {
+    pub key: String,
+    pub version_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -297,6 +308,7 @@ impl AuditRecord {
                 backend_kind: String::new(),
                 outcome: Outcome::Denied,
                 denied_keys: vec![],
+                versions: vec![],
                 backend: BackendOutcome::NotAttempted,
                 backend_status: None,
                 object_name: None,
@@ -337,6 +349,7 @@ impl AuditRecord {
                 backend_kind,
                 outcome: Outcome::Error,
                 denied_keys: vec![],
+                versions: vec![],
                 backend: BackendOutcome::NotAttempted,
                 backend_status: None,
                 object_name,
@@ -455,6 +468,7 @@ mod tests {
             backend_kind: "ceph".into(),
             outcome,
             denied_keys,
+            versions: vec![],
             backend: BackendOutcome::NotAttempted,
             backend_status: None,
             object_name: None,

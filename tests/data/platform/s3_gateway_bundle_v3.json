@@ -72,6 +72,16 @@
                 "team-a/"
               ],
               "conditions": []
+            },
+            {
+              "bucket": "acme-000000-warehouse",
+              "actions": [
+                "delete_object_versions"
+              ],
+              "prefixes": [
+                "team-a/scratch/"
+              ],
+              "conditions": []
             }
           ],
           "user:sub-a": [

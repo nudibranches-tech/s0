@@ -18,8 +18,9 @@
 # ── input ──────────────────────────────────────────────────────────────────────
 #   input.principal.{sub,type,attributes.groups,attributes.<extra>}
 #   input.backend.{id,kind}   input.tenant   input.organization_id
-#   input.action  ∈ the 6 settled verbs (2026-08-08; was 13):
-#       object-scoped : read_objects write_objects delete_objects write_object_tags
+#   input.action  ∈ the 7 verbs (6 settled 2026-08-08, was 13; delete_object_versions added by ADR-012):
+#       object-scoped : read_objects write_objects delete_objects delete_object_versions
+#                       write_object_tags
 #       listing       : list_objects
 #       bucket/account: read
 #
@@ -192,6 +193,7 @@ placement_refused if bucket_not_placed
 write_actions := {
 	"write_objects",
 	"delete_objects",
+	"delete_object_versions",
 	"write_object_tags",
 }
 

@@ -33,7 +33,7 @@ use crate::access::headers::RequestRiders;
 use crate::access::tagging::ReservedTagKeys;
 use crate::audit::{
     AuditRecord, BackendOutcome, DelegationContext, GateContext, GateStage, GatewayMeta, Outcome,
-    PendingAudit,
+    PendingAudit, VersionedKey,
 };
 use crate::auth::SECURITY_TOKEN_HEADER;
 use crate::authz::{Backend, CopySource as AuthzCopySource, Decision, OpaInput, RequestMeta};
@@ -258,6 +258,7 @@ impl GatewayAccess {
         decision: &Decision,
         outcome: Outcome,
         denied_keys: Vec<String>,
+        versions: Vec<VersionedKey>,
     ) -> AuditRecord {
         // The live revision rather than the request's pinned one: this names, it never
         // decides, and a bucket keeps its object name for as long as it exists.
@@ -268,6 +269,7 @@ impl GatewayAccess {
             backend_kind: input.backend.kind.as_str().to_string(),
             outcome,
             denied_keys,
+            versions,
             backend: BackendOutcome::NotAttempted,
             backend_status: None,
             object_name: object_name(&input.bucket),
@@ -294,7 +296,17 @@ impl GatewayAccess {
         decision: &Decision,
         denied_keys: Vec<String>,
     ) -> String {
-        let record = self.record(input, decision, Outcome::Denied, denied_keys);
+        self.audit_denied_versions(input, decision, denied_keys, vec![])
+    }
+
+    fn audit_denied_versions(
+        &self,
+        input: OpaInput,
+        decision: &Decision,
+        denied_keys: Vec<String>,
+        versions: Vec<VersionedKey>,
+    ) -> String {
+        let record = self.record(input, decision, Outcome::Denied, denied_keys, versions);
         let decision_id = record.decision_id.clone();
         self.gw.audit.emit(record);
         decision_id
@@ -313,7 +325,18 @@ impl GatewayAccess {
         decision: &Decision,
         denied_keys: Vec<String>,
     ) {
-        let record = self.record(input, decision, Outcome::Allowed, denied_keys);
+        self.audit_pending_versions(cx, input, decision, denied_keys, vec![]);
+    }
+
+    fn audit_pending_versions(
+        &self,
+        cx: &mut ReqCtx<'_>,
+        input: OpaInput,
+        decision: &Decision,
+        denied_keys: Vec<String>,
+        versions: Vec<VersionedKey>,
+    ) {
+        let record = self.record(input, decision, Outcome::Allowed, denied_keys, versions);
         cx.extensions
             .insert(Arc::new(PendingAudit::new(self.gw.audit.clone(), record)));
     }
@@ -1108,16 +1131,10 @@ impl S3Access for GatewayAccess {
             bypass_governance: req.input.bypass_governance_retention.unwrap_or(false),
             ..RequestRiders::default()
         });
+        let action = delete_action(req.input.version_id.as_deref());
         let mut cx = ReqCtx::new(req)?;
-        self.enforce_object_write(
-            &mut cx,
-            Action::DeleteObjects,
-            bucket,
-            key,
-            riders,
-            Charge::Nothing,
-        )
-        .await
+        self.enforce_object_write(&mut cx, action, bucket, key, riders, Charge::Nothing)
+            .await
     }
 
     async fn delete_objects(&self, req: &mut S3Request<DeleteObjectsInput>) -> S3Result<()> {
@@ -1129,17 +1146,33 @@ impl S3Access for GatewayAccess {
         let bucket = req.input.bucket.clone();
         let bypass_governance = req.input.bypass_governance_retention.unwrap_or(false);
         let key_count = req.input.delete.objects.len();
-        let all_keys: Vec<String> = req
+        let entries: Vec<(String, Option<String>)> = req
             .input
             .delete
             .objects
             .iter()
-            .map(|o| o.key.clone())
+            .map(|o| (o.key.clone(), o.version_id.clone()))
+            .collect();
+        // The batch is recorded under the stronger verb when any entry names a version.
+        let batch_action = if entries.iter().any(|(_, v)| v.is_some()) {
+            Action::DeleteObjectVersions
+        } else {
+            Action::DeleteObjects
+        };
+        let all_keys: Vec<String> = entries.iter().map(|(k, _)| k.clone()).collect();
+        let versions: Vec<VersionedKey> = entries
+            .iter()
+            .filter_map(|(k, v)| {
+                v.as_ref().map(|v| VersionedKey {
+                    key: k.clone(),
+                    version_id: v.clone(),
+                })
+            })
             .collect();
         let mut cx = ReqCtx::new(req)?;
         // Once for the batch, not per key: every key would be refused for the same
         // reason, and the record would then say only "all delete keys denied".
-        let placement_input = cx.base_input(Action::DeleteObjects, bucket.clone());
+        let placement_input = cx.base_input(batch_action, bucket.clone());
         if let Some(refusal) = cx.placement_refusal(&placement_input) {
             return Err(self.deny_placement(placement_input, &refusal));
         }
@@ -1148,7 +1181,7 @@ impl S3Access for GatewayAccess {
         // NOT recorded here: the request is over the bound precisely because it carries
         // too many, and an audit record is not the place to copy an unbounded list.
         if key_count > max_delete_keys {
-            let input = cx.base_input(Action::DeleteObjects, bucket);
+            let input = cx.base_input(batch_action, bucket);
             return Err(self.refuse(
                 input,
                 format!(
@@ -1160,7 +1193,7 @@ impl S3Access for GatewayAccess {
         // is decided, and refuses the whole request. A partially-honored WORM bypass is
         // not a thing this gateway should be able to produce.
         if bypass_governance {
-            let mut input = cx.base_input(Action::DeleteObjects, bucket);
+            let mut input = cx.base_input(batch_action, bucket);
             input.bypass_governance = true;
             let why = self
                 .screen_riders(&RequestRiders {
@@ -1171,37 +1204,37 @@ impl S3Access for GatewayAccess {
             return Err(self.refuse(input, why));
         }
 
-        let mut allowed: Vec<String> = Vec::new();
+        // Decided per entry, under the entry's own verb, and kept by position: one key may
+        // appear twice, once with a version and once without, under different verbs.
+        let mut keep: Vec<bool> = Vec::with_capacity(entries.len());
         let mut denied: Vec<String> = Vec::new();
-        for key in &all_keys {
-            let mut input = cx.base_input(Action::DeleteObjects, bucket.clone());
+        for (key, version) in &entries {
+            let mut input = cx.base_input(delete_action(version.as_deref()), bucket.clone());
             input.object = Some(key.clone());
-            if self.decide(&cx, &input).await.allow {
-                allowed.push(key.clone());
-            } else {
+            let allow = self.decide(&cx, &input).await.allow;
+            keep.push(allow);
+            if !allow {
                 denied.push(key.clone());
             }
         }
+        let allowed = keep.iter().filter(|k| **k).count();
 
-        let mut record_input = cx.base_input(Action::DeleteObjects, bucket);
+        let mut record_input = cx.base_input(batch_action, bucket);
         record_input.delete_keys = Some(all_keys);
-        if allowed.is_empty() {
+        if allowed == 0 {
             let decision = Decision::deny("all delete keys denied");
-            self.audit_denied(record_input, &decision, denied);
+            self.audit_denied_versions(record_input, &decision, denied, versions);
             return Err(s3_error!(AccessDenied, "all delete keys denied by policy"));
         }
-        let decision = Decision::allow(format!(
-            "{} allowed, {} denied",
-            allowed.len(),
-            denied.len()
-        ));
-        self.audit_pending(&mut cx, record_input, &decision, denied);
+        let decision = Decision::allow(format!("{allowed} allowed, {} denied", denied.len()));
+        self.audit_pending_versions(&mut cx, record_input, &decision, denied, versions);
         cx.prove();
-        // Per-key filtering: forward only authorized keys.
+        // Per-entry filtering: forward only authorized entries.
+        let mut positions = keep.into_iter();
         req.input
             .delete
             .objects
-            .retain(|o| allowed.contains(&o.key));
+            .retain(|_| positions.next().unwrap_or(false));
         Ok(())
     }
 
@@ -1300,6 +1333,34 @@ impl S3Access for GatewayAccess {
             .await
         };
         list_verdict_single(verdict, &mut req.input.prefix)
+    }
+
+    /// Version listing is a single-prefix `list_objects` decision: a multi-prefix grant is
+    /// refused rather than fanned out, because the version markers do not merge across
+    /// prefixes. The response is re-filtered to the decided prefix by the dispatcher, which
+    /// is why the obligation is installed here even when the grant is the whole bucket.
+    async fn list_object_versions(
+        &self,
+        req: &mut S3Request<ListObjectVersionsInput>,
+    ) -> S3Result<()> {
+        // Same s3s comma-list defect as `get_object_attributes`; see `split_comma_list`.
+        if let Some(opt) = req.input.optional_object_attributes.as_mut() {
+            split_comma_list(opt);
+        }
+        let (bucket, prefix) = (req.input.bucket.clone(), req.input.prefix.clone());
+        let verdict = {
+            let mut cx = ReqCtx::new(req)?;
+            self.enforce_list(
+                &mut cx,
+                bucket,
+                prefix,
+                Fanout::Unsupported(NO_FANOUT_ON_THIS_OP),
+            )
+            .await
+        };
+        list_verdict_single(verdict, &mut req.input.prefix)?;
+        ResponseObligations::version_listing(req.input.prefix.clone()).install(&mut req.extensions);
+        Ok(())
     }
 
     // ── Multipart upload lifecycle (write on the key), plus its copy + list ops ──
@@ -1974,6 +2035,16 @@ fn unimplemented_obligations(decision: &Decision) -> Option<String> {
     ))
 }
 
+/// The verb a delete is decided under: naming a version, `"null"` included, is a versioned
+/// delete.
+fn delete_action(version_id: Option<&str>) -> Action {
+    if version_id.is_some() {
+        Action::DeleteObjectVersions
+    } else {
+        Action::DeleteObjects
+    }
+}
+
 /// Apply a list verdict for ops without fan-out dispatch (v1 list, multipart list).
 fn list_verdict_single(verdict: ListVerdict, prefix: &mut Option<String>) -> S3Result<()> {
     match verdict {
@@ -2130,6 +2201,7 @@ mod tests {
             "CopyObject",
             "DeleteObjects",
             "ListObjectsV2",
+            "ListObjectVersions",
             "CreateMultipartUpload",
             "UploadPartCopy",
             "CompleteMultipartUpload",
@@ -2144,18 +2216,35 @@ mod tests {
         assert!(optable::gate_op("ListBuckets").is_ok());
         // Ops with no hook must be refused — they would fail-open at their default
         // typed hook, so check() must reject them.
-        for op in [
-            "PutBucketAcl",
-            "PutObjectAcl",
-            "ListObjectVersions",
-            "RestoreObject",
-        ] {
+        for op in ["PutBucketAcl", "PutObjectAcl", "RestoreObject"] {
             assert_eq!(
                 optable::gate_op(op),
                 Err(GateDenial::NotEnforced),
                 "{op} must be denied by default"
             );
         }
+    }
+
+    #[test]
+    fn a_null_version_id_is_a_versioned_delete() {
+        assert_eq!(delete_action(Some("null")), Action::DeleteObjectVersions);
+        assert_eq!(
+            delete_action(Some("3HL4kqtJ")),
+            Action::DeleteObjectVersions
+        );
+        assert_eq!(delete_action(None), Action::DeleteObjects);
+    }
+
+    #[test]
+    fn a_version_listing_refuses_a_multi_prefix_grant() {
+        let d = allow_with(Obligations {
+            allowed_prefixes: vec!["2024/".into(), "2025/".into()],
+            ..Obligations::default()
+        });
+        assert!(matches!(
+            classify_list(&d, 16, Fanout::Unsupported(NO_FANOUT_ON_THIS_OP)),
+            ListVerdict::Deny(_)
+        ));
     }
 
     #[test]

@@ -96,6 +96,17 @@ pub enum BucketSource {
     Bundle(Vec<Bucket>),
 }
 
+/// What a `ListObjectVersions` response may contain: the keys under one decided prefix.
+///
+/// The prefix is the one the request was forwarded with. "The backend honored it" is not
+/// observable, and the version and delete-marker rows are exactly what a prefix-scoped
+/// principal must not see outside its grant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionScope {
+    /// Empty for a whole-bucket grant: every key starts with it.
+    pub prefix: String,
+}
+
 /// Everything an access hook asks the dispatcher to do to a response.
 ///
 /// `Default` is deliberately *not* implemented: an empty `ResponseObligations` reads as
@@ -111,6 +122,8 @@ pub struct ResponseObligations {
     /// `ListBuckets`: what the visibility is applied to. Only [`Self::buckets`] sets it,
     /// together with `visible_buckets`, so a listing never has one without the other.
     pub bucket_source: Option<BucketSource>,
+    /// `ListObjectVersions`: the prefix the versions and delete markers are re-filtered to.
+    pub version_scope: Option<VersionScope>,
 }
 
 impl ResponseObligations {
@@ -120,6 +133,7 @@ impl ResponseObligations {
             list_fanout: Some(ListFanout { prefixes }),
             visible_buckets: None,
             bucket_source: None,
+            version_scope: None,
         }
     }
 
@@ -129,6 +143,19 @@ impl ResponseObligations {
             list_fanout: None,
             visible_buckets: Some(visibility),
             bucket_source: Some(source),
+            version_scope: None,
+        }
+    }
+
+    #[must_use]
+    pub fn version_listing(prefix: Option<String>) -> Self {
+        ResponseObligations {
+            list_fanout: None,
+            visible_buckets: None,
+            bucket_source: None,
+            version_scope: Some(VersionScope {
+                prefix: prefix.unwrap_or_default(),
+            }),
         }
     }
 

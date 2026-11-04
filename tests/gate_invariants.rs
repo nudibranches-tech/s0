@@ -159,13 +159,6 @@ async fn denied_ops_have_no_dispatch_arm() {
         .unwrap();
     expect_not_implemented(e.code(), "GetBucketReplication");
 
-    let e = s3
-        .list_object_versions(bare_request(ListObjectVersionsInput::default()))
-        .await
-        .err()
-        .unwrap();
-    expect_not_implemented(e.code(), "ListObjectVersions");
-
     // The two structural denials.
     let e = s3
         .create_session(bare_request(CreateSessionInput::default()))

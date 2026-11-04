@@ -1,6 +1,6 @@
 # ADR-004: ListObjects narrowing — single-prefix rewrite and bounded multi-prefix fan-out with a gateway-owned cursor
 
-- **Status**: Accepted — implemented (src/proxy/fanout.rs)
+- **Status**: Accepted — implemented (src/proxy/fanout.rs); amended by ADR-012 (D6.4: `ListObjectVersions` is enforced for a single prefix, a multi-prefix grant refused)
 - **Date**: 2026-07-15
 - **Owners**: gateway team (this repository); grant projection, grant-authoring lint, and corpus adoption are control-plane integration (out of scope for this repository)
 - **Related**: `policy/gateway/authz.rego`; `src/authz/input.rs`; `src/authz/decision.rs`; ADR-001 (corpus / drift control), ADR-002 (audit record shape)

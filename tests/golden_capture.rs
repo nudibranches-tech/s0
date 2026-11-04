@@ -104,6 +104,48 @@ async fn capture_enforced_ops() -> (BTreeMap<String, serde_json::Value>, Vec<&'s
     );
     assert!(access.delete_objects(&mut req).await.is_ok());
 
+    // The versioned delete paths: a single `DeleteObject` naming a version, and a batch that
+    // mixes an unversioned entry with versioned ones. Each is decided under its own verb, so
+    // the corpus carries `delete_object_versions` documents beside the `delete_objects` ones.
+    let mut req = fx.request_on_route(
+        "DeleteObject",
+        s3s::dto::DeleteObjectInput {
+            bucket: "reports".into(),
+            key: "2024/versioned.csv".into(),
+            version_id: Some("3HL4kqtJlcpXroDTDmJ+rmSpXd3dIbrHY".into()),
+            ..Default::default()
+        },
+    );
+    assert!(access.delete_object(&mut req).await.is_ok());
+
+    let identifier = |key: &str, version: Option<&str>| s3s::dto::ObjectIdentifier {
+        key: key.into(),
+        e_tag: None,
+        last_modified_time: None,
+        size: None,
+        version_id: version.map(Into::into),
+    };
+    let mut req = fx.request_on_route(
+        "DeleteObjects",
+        s3s::dto::DeleteObjectsInput {
+            bucket: "reports".into(),
+            bypass_governance_retention: None,
+            checksum_algorithm: None,
+            delete: s3s::dto::Delete {
+                objects: vec![
+                    identifier("2024/plain.csv", None),
+                    identifier("2024/old.csv", Some("null")),
+                    identifier("2023/outside.csv", Some("v1")),
+                ],
+                ..Default::default()
+            },
+            expected_bucket_owner: None,
+            mfa: None,
+            request_payer: None,
+        },
+    );
+    assert!(access.delete_objects(&mut req).await.is_ok());
+
     // A write carrying **riders**. Without this the corpus would contain no document with a
     // non-empty `acl_grants` or a header-derived `requested_tags`, so a policy author would
     // never see either. Deliberately the *allowed* combination — `private` is the one canned

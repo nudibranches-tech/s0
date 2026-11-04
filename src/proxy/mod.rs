@@ -29,7 +29,7 @@ use s3s::header::{X_AMZ_ID_2, X_AMZ_REQUEST_ID};
 use s3s::{S3, S3Error, S3Request, S3Response, S3Result, s3_error};
 use s3s_aws::Proxy;
 
-use crate::access::{OperationName, delegation, proof};
+use crate::access::{OperationName, delegation, percent_decode, proof};
 use crate::audit::{BackendOutcome, PendingAudit};
 use crate::bundle_refresh::{PlacementWait, PlacementWaitOutcome};
 use crate::config::{BackendConfig, GatewayConfig, LimitsConfig};
@@ -801,6 +801,7 @@ answers_without_backend_identifiers!(
     ListBucketsOutput,
     ListMultipartUploadsOutput,
     ListObjectsOutput,
+    ListObjectVersionsOutput,
     ListObjectsV2Output,
     ListPartsOutput,
     PutObjectTaggingOutput,
@@ -1056,6 +1057,33 @@ impl S3 for GatewayS3 {
                 upload.initiator = None;
             }
         }
+        Ok(resp)
+    }
+
+    /// Every version and delete marker under the decided prefix, with the identity fields
+    /// stripped.
+    ///
+    /// The forward is re-signed with the owner credential and the backend lists the whole
+    /// prefix it is given; "the backend honored the narrowing" is not observable here, so
+    /// the rows are re-filtered to the prefix the access hook decided. The obligation is
+    /// checked before the forward: its absence means no hook ran, and nothing is listed.
+    /// `Owner` names the shared tenant-owner credential on both row types and is withheld.
+    async fn list_object_versions(
+        &self,
+        req: S3Request<ListObjectVersionsInput>,
+    ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
+        let Some(scope) = ResponseObligations::of(&req).and_then(|o| o.version_scope.clone())
+        else {
+            return Err(s3_error!(
+                InternalError,
+                "version listing reached the forward path with no prefix obligation, which \
+                 means no authorization decision was applied to it"
+            ));
+        };
+        let mut resp = self
+            .forward(req, |p, r| async move { p.list_object_versions(r).await })
+            .await?;
+        restrict_versions(&mut resp.output, &scope.prefix);
         Ok(resp)
     }
 
@@ -1530,6 +1558,43 @@ fn bucket_listing_page(
     // substituting the caller would invent a canonical user id the backend never issued.
     output.owner = None;
     Ok(S3Response::new(output))
+}
+
+/// Keep the versions, delete markers and common prefixes whose key starts with `prefix`,
+/// and withhold `Owner` from every row.
+///
+/// Keys are compared decoded when the answer is URL-encoded, since `prefix` is the raw
+/// string the request carried. A row with no key was never authorized against anything and
+/// goes.
+fn restrict_versions(output: &mut ListObjectVersionsOutput, prefix: &str) {
+    let encoded = output
+        .encoding_type
+        .as_ref()
+        .is_some_and(|e| e.as_str().eq_ignore_ascii_case("url"));
+    let under = |key: Option<&str>| {
+        key.is_some_and(|k| {
+            if encoded {
+                percent_decode(k).starts_with(prefix)
+            } else {
+                k.starts_with(prefix)
+            }
+        })
+    };
+    if let Some(versions) = output.versions.as_mut() {
+        versions.retain(|v| under(v.key.as_deref()));
+        for v in versions.iter_mut() {
+            v.owner = None;
+        }
+    }
+    if let Some(markers) = output.delete_markers.as_mut() {
+        markers.retain(|m| under(m.key.as_deref()));
+        for m in markers.iter_mut() {
+            m.owner = None;
+        }
+    }
+    if let Some(common) = output.common_prefixes.as_mut() {
+        common.retain(|c| under(c.prefix.as_deref()));
+    }
 }
 
 /// Decode a client-supplied continuation token, or refuse the request.

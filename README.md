@@ -19,8 +19,8 @@ Operations it does not own are denied, not passed through.
 
 ## Supported operations
 
-s0 knows all **99** operations in the `s3s` 0.14.1 surface. **23** are enforced and
-forwarded; the other **76** are refused with `403 AccessDenied`, unless a control backend
+s0 knows all **99** operations in the `s3s` 0.14.1 surface. **24** are enforced and
+forwarded; the other **75** are refused with `403 AccessDenied`, unless a control backend
 is configured: **16** of those can be delegated to it and answered there instead (below).
 An operation with no entry in the table cannot reach a backend, and one that is delegated
 never reaches the storage backend either.
@@ -30,18 +30,19 @@ of truth. `tests/gate_blackbox.rs` drives every refused operation as a signed HT
 request through the real gate, and `tests/readme_optable.rs` fails if the counts below
 drift from the table.
 
-### Enforced (23)
+### Enforced (24)
 
-Each is authorized against one of six grant verbs. A grant is per-subject, per-bucket,
+Each is authorized against one of seven grant verbs. A grant is per-subject, per-bucket,
 per-verb, with object-prefix scopes.
 
 | Grant verb | Operations |
 |---|---|
 | `read` | `HeadBucket`, `GetBucketLocation`, `ListBuckets` |
 | `read_objects` | `GetObject`, `HeadObject`, `GetObjectAttributes`, `GetObjectTagging`, `ListParts` |
-| `list_objects` | `ListObjects`, `ListObjectsV2`, `ListMultipartUploads` |
+| `list_objects` | `ListObjects`, `ListObjectsV2`, `ListObjectVersions`, `ListMultipartUploads` |
 | `write_objects` | `PutObject`, `PostObject`, `CopyObject`, `CreateMultipartUpload`, `UploadPart`, `UploadPartCopy`, `CompleteMultipartUpload`, `AbortMultipartUpload` |
-| `delete_objects` | `DeleteObject`, `DeleteObjects` |
+| `delete_objects` | `DeleteObject`, `DeleteObjects` (entries with no `versionId`) |
+| `delete_object_versions` | `DeleteObject` with a `versionId`, and each `DeleteObjects` entry carrying one |
 | `write_object_tags` | `PutObjectTagging`, `DeleteObjectTagging` |
 
 That covers ordinary object storage: get/put/head/delete, multipart upload, server-side
@@ -96,7 +97,7 @@ minute. The fetches are counted in `s0_bundle_on_demand_refresh_total{trigger,re
 the delegated requests in `s0_delegated_requests_total{operation,status_class}`. See [ADR-011](docs/adr/ADR-011-delegated-operations.md) and `control_backend` in
 [`docs/gateway.example.json`](docs/gateway.example.json).
 
-### Not supported (76)
+### Not supported (75)
 
 **Bucket lifecycle and configuration — 63 operations.** Every `*BucketAcl`, `*BucketPolicy`,
 `*BucketCors`, `*BucketEncryption`, `*BucketVersioning`, `*BucketLifecycle`,
@@ -114,7 +115,7 @@ grantable vocabulary, so flipping one of these operations to enforced does not q
 compile. The 16 operations of the section above are the exception, and only when a
 control backend answers them; without one they are in this list too.
 
-**Object-level operations outside the model — 11 operations.**
+**Object-level operations outside the model — 10 operations.**
 
 | Operation(s) | Why |
 |---|---|
@@ -123,7 +124,6 @@ control backend answers them; without one they are in this list too.
 | `RestoreObject` | Glacier-class restore; no verb, no backend parity. |
 | `SelectObjectContent` | Server-side SQL over object contents — the response is a projection s0 cannot authorize at object granularity. |
 | `GetObjectTorrent` | Legacy. |
-| `ListObjectVersions` | Versioned listing is not modelled; the prefix-scoping rules below apply to the unversioned listing only. |
 | `ListDirectoryBuckets` | S3 Express One Zone directory buckets are out of scope. |
 
 **Structurally unauthorizable — 2 operations.** These are refused *ahead of* the coverage
@@ -136,8 +136,14 @@ table, so no pushed policy can enable them:
 
 ### Other known limits
 
-- **Versioning**: `version_id` rides into the OPA input on the operations that accept it,
-  but there is no version-aware grant shape and no versioned listing.
+- **Versioning**: `ListObjectVersions` is decided under `list_objects` for a single prefix
+  (a multi-prefix grant is refused, not fanned out), its response is re-filtered to the
+  decided prefix and owners are withheld. A delete naming a version is decided under
+  `delete_object_versions`, per entry in a batch; `delete_objects` does not confer it and
+  the reverse holds too. A grant of `["*"]` confers both. `GetObject`, `HeadObject`,
+  `GetObjectAttributes`, `GetObjectTagging` and copy sources naming a `versionId` read an
+  old version under the current key's `read_objects` grant, and tag writes naming one stay
+  `write_object_tags`.
 - **SSE-C / KMS**: encryption headers pass through to the backend; s0 does not authorize
   on them.
 - **Presigned URLs** are supported (the STS session token is resolved from the query
@@ -459,7 +465,7 @@ S0_CAPTURE_REGENERATE=1 cargo test --test golden_capture   # re-record the captu
 | the policy is tested against the *emitted* input, never a hand-written one | every fixture in [`tests/data/captured_inputs/`](tests/data/captured_inputs) is recorded at `GatewayAccess::decide`, the single funnel every PDP question passes through |
 | a renamed or dropped input field fails the build | `OpaInput` carries `deny_unknown_fields`; every capture must round-trip, and adding a field is a compile error until `OPA_INPUT_FIELDS` is updated ([`tests/fixture_drift.rs`](tests/fixture_drift.rs)) |
 | a policy cannot read a field the gateway never sends | every `input.<path>` in the shipped rego must resolve in a captured input — the exact failure that once left 35 rego tests green over a deny-all production |
-| every refused operation is refused over real HTTP | all 76 are driven as signed requests through the real `check`, table-driven off s3s's own route table ([`tests/gate_blackbox.rs`](tests/gate_blackbox.rs)) |
+| every refused operation is refused over real HTTP | all 75 are driven as signed requests through the real `check`, table-driven off s3s's own route table ([`tests/gate_blackbox.rs`](tests/gate_blackbox.rs)) |
 | the embedded engine cannot be licensed by an absent oracle | the parity gate **fails** rather than skips when `opa` is missing, and the oracle version is pinned to production's in CI, docker-compose and the test itself ([`tests/parity.rs`](tests/parity.rs)) |
 | cursors and cache keys survive a rebuild | `content_revision` / `scope_hash` are SHA-256, pinned by [`tests/golden_hash.rs`](tests/golden_hash.rs) — `DefaultHasher` is not stable across toolchains |
 | a configured secret cannot be printed | every plaintext credential is a `Secret<String>` whose `Debug` renders `Secret(<redacted>)`, with no `Display` and no `Serialize` ([`src/secret.rs`](src/secret.rs)) |

@@ -280,6 +280,15 @@ macro_rules! each_enforced_op {
             }
         );
         $probe!(
+            list_object_versions,
+            "ListObjectVersions",
+            s3s::dto::ListObjectVersionsInput {
+                bucket: "reports".into(),
+                prefix: Some("2024/".into()),
+                ..Default::default()
+            }
+        );
+        $probe!(
             list_objects,
             "ListObjects",
             s3s::dto::ListObjectsInput {

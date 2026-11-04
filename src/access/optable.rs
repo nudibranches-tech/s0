@@ -79,7 +79,7 @@ pub enum DangerTier {
     NeverImplement,
 }
 
-/// The grant vocabulary the gateway can actually decide against: the six verbs a control
+/// The grant vocabulary the gateway can actually decide against: the seven verbs a control
 /// plane's grant projection emits.
 ///
 /// Held as strings rather than [`Action`] because the table classifies *denied* ops too;
@@ -90,6 +90,7 @@ pub const GATEWAY_VERBS: &[&str] = &[
     "list_objects",
     "write_objects",
     "delete_objects",
+    "delete_object_versions",
     "write_object_tags",
     "read",
 ];
@@ -134,6 +135,24 @@ pub struct OpSpec {
     /// What an enforced op's hook does **not** inspect: the parts of the request that ride
     /// along unauthorized once bucket+key have been allowed. Empty for denied ops.
     pub blind_spots: &'static [&'static str],
+    /// The verb and tier a request of this op takes when it names an object version, or
+    /// `None` when the op has no versioned path.
+    pub versioned: Option<VersionedPath>,
+}
+
+/// The decision an op takes instead of its own when the request names an object version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VersionedPath {
+    pub verb: &'static str,
+    pub tier: DangerTier,
+}
+
+impl OpSpec {
+    /// Names the decision a request of this op takes when it carries an object version.
+    const fn with_versioned(mut self, verb: &'static str, tier: DangerTier) -> OpSpec {
+        self.versioned = Some(VersionedPath { verb, tier });
+        self
+    }
 }
 
 /// An operation with a typed hook and a dispatch arm.
@@ -151,6 +170,7 @@ const fn enforced(
         shape,
         tier,
         blind_spots,
+        versioned: None,
     }
 }
 
@@ -169,6 +189,7 @@ const fn denied(
         shape,
         tier,
         blind_spots: &[],
+        versioned: None,
     }
 }
 
@@ -188,6 +209,7 @@ const fn delegable(
         shape,
         tier,
         blind_spots: &[],
+        versioned: None,
     }
 }
 
@@ -207,6 +229,7 @@ const fn unauthorizable(name: &'static str, shape: ResourceShape) -> OpSpec {
         shape,
         tier: DangerTier::NeverImplement,
         blind_spots: &[],
+        versioned: None,
     }
 }
 
@@ -368,8 +391,9 @@ pub const OP_TABLE: &[OpSpec] = &[
         "delete_objects",
         ResourceShape::Object,
         DangerTier::Mutating,
-        &["version_id (a versioned delete is not distinguished from a delete marker)"],
-    ),
+        &[],
+    )
+    .with_versioned("delete_object_versions", DangerTier::PostureAltering),
     enforced(
         "DeleteObjectTagging",
         "write_object_tags",
@@ -386,8 +410,9 @@ pub const OP_TABLE: &[OpSpec] = &[
         "delete_objects",
         ResourceShape::ObjectBatch,
         DangerTier::Mutating,
-        &["per-key version_id"],
-    ),
+        &[],
+    )
+    .with_versioned("delete_object_versions", DangerTier::PostureAltering),
     denied(
         "DeletePublicAccessBlock",
         "write_bucket_config",
@@ -674,11 +699,17 @@ pub const OP_TABLE: &[OpSpec] = &[
              owner/initiator (the shared tenant-owner identity) are stripped",
         ],
     ),
-    denied(
+    enforced(
         "ListObjectVersions",
         "list_objects",
         ResourceShape::Listing,
         DangerTier::Routine,
+        &[
+            "a multi-prefix grant is refused, not fanned out or merged",
+            "the response is re-filtered to the decided prefix and owners are withheld; \
+             version ids, sizes, ETags and delete markers ride through as the backend \
+             reported them",
+        ],
     ),
     enforced(
         "ListObjects",
@@ -1141,11 +1172,7 @@ mod tests {
         typed.sort_unstable();
         gateway.sort_unstable();
         assert_eq!(typed, gateway);
-        assert_eq!(
-            gateway.len(),
-            6,
-            "the projected vocabulary is six verbs (settled 2026-08-08)"
-        );
+        assert_eq!(gateway.len(), 7, "the projected vocabulary is seven verbs");
     }
 
     #[test]

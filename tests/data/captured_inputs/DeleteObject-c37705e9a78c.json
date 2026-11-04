@@ -1,0 +1,23 @@
+{
+  "acl_grants": [],
+  "action": "delete_object_versions",
+  "backend": {
+    "id": "bay-1",
+    "kind": "ceph"
+  },
+  "bucket": "reports",
+  "bypass_governance": false,
+  "object": "2024/versioned.csv",
+  "organization_id": "org-acme",
+  "principal": {
+    "attributes": {
+      "groups": []
+    },
+    "sub": "alice",
+    "type": "user"
+  },
+  "request": {
+    "method": "DELETE"
+  },
+  "tenant": "acme"
+}
