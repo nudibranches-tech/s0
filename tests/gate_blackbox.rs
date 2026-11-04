@@ -152,6 +152,22 @@ fn post_object_request_for(key: &str) -> RawRequest {
 }
 
 fn assert_refused_by_the_gate(route: &Route, resp: &Response) {
+    if s0::access::optable::refusal_is_not_implemented(route.op) {
+        assert_eq!(
+            resp.status, 501,
+            "{} must be refused by the gate with 501, got {}: {}",
+            route.op, resp.status, resp.body
+        );
+        if route.method != "HEAD" {
+            assert!(
+                resp.body.contains("<Code>NotImplemented</Code>") && resp.body.contains(route.op),
+                "{}: {}",
+                route.op,
+                resp.body
+            );
+        }
+        return;
+    }
     assert_eq!(
         resp.status, 403,
         "{} must be refused by the gate with 403, got {}: {}",

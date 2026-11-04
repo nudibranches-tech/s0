@@ -1044,7 +1044,10 @@ async fn a_gate_denial_emits_exactly_one_audit_record() {
         Some((common::ACCESS_KEY, common::SECRET_KEY)),
     )
     .await;
-    assert_eq!(status, 403, "GetBucketAcl is not enforced by this build");
+    assert_eq!(
+        status, 501,
+        "GetBucketAcl is a refused read of bucket configuration"
+    );
 
     let records = fx.await_audit_records(1).await;
     assert_eq!(
@@ -1396,8 +1399,9 @@ async fn the_six_control_plane_ops_are_refused_at_the_gate_and_on_the_record() {
             Some((common::ACCESS_KEY, common::SECRET_KEY)),
         )
         .await;
+        let expected = if op == "GetBucketPolicy" { 501 } else { 403 };
         assert_eq!(
-            status, 403,
+            status, expected,
             "{op} reached the backend or answered something other than a refusal"
         );
     }
