@@ -5,11 +5,12 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The grant vocabulary the gateway authorizes against — the **six projected verbs**.
+/// The grant vocabulary the gateway authorizes against — the **seven projected verbs**.
 ///
 /// Deliberately coarser than the 99 S3 ops: every enforced op maps onto exactly one of
 /// these (`PutObject` to `write_objects`, `HeadBucket` to `read`), except `CopyObject`,
-/// which maps to two. The set is a contract with whatever control plane projects grants.
+/// which maps to two, and `DeleteObject`/`DeleteObjects`, decided under
+/// `delete_object_versions` when a version is named. The set is a contract with whatever control plane projects grants.
 ///
 /// **The gateway is data-plane only**, so there is no verb for acting on a bucket as a
 /// *managed resource*: existence, policy, CORS and quota *settings* are control-plane

@@ -18,7 +18,7 @@
 # ── input ──────────────────────────────────────────────────────────────────────
 #   input.principal.{sub,type,attributes.groups,attributes.<extra>}
 #   input.backend.{id,kind}   input.tenant   input.organization_id
-#   input.action  ∈ the 7 verbs (6 settled 2026-08-08, was 13; delete_object_versions added by ADR-012):
+#   input.action  ∈ the 7 verbs (ADR-006, ADR-012):
 #       object-scoped : read_objects write_objects delete_objects delete_object_versions
 #                       write_object_tags
 #       listing       : list_objects

@@ -55,7 +55,7 @@ Grant := {
 | Field | Type | Semantics (as implemented in `authz.rego`) |
 |---|---|---|
 | `bucket` | string | Exact bucket name within the tenant (`bucket_matches`), or the literal `"*"` for all buckets in the tenant. No globbing — `"*"` is a whole-field sentinel, not a pattern. |
-| `actions` | array of string | Values drawn from the closed **7-verb** set (`src/model.rs::Action::as_str`): object-scoped `read_objects \| write_objects \| delete_objects \| delete_object_versions \| write_object_tags`, listing `list_objects`, bucket- **and** account-scoped `read`; or the single-element `["*"]` (`action_matches`). Unknown verbs are a projection bug: they can never match and MUST be rejected at build time, not emitted. |
+| `actions` | array of string | Values drawn from the closed **6-verb** set (`src/model.rs::Action::as_str`): object-scoped `read_objects \| write_objects \| delete_objects \| write_object_tags`, listing `list_objects`, bucket- **and** account-scoped `read`; or the single-element `["*"]` (`action_matches`). Unknown verbs are a projection bug: they can never match and MUST be rejected at build time, not emitted. |
 | `prefixes` | array of string | Raw object-key prefixes matched by `startswith(input.object, p)` (`object_in_scope`). Absent or empty ⇒ the grant scopes the whole bucket (`whole_bucket`). No wildcards, no regex; a `*` inside a prefix is a literal character. |
 
 The vocabulary is data-plane only. There is no verb for creating, deleting or reconfiguring a

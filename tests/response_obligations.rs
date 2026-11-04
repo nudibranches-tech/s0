@@ -925,6 +925,101 @@ async fn the_version_filter_compares_decoded_keys_under_url_encoding() {
 }
 
 #[tokio::test]
+async fn the_version_filter_reads_a_plus_as_a_space_under_url_encoding() {
+    let backend = spawn_fake(|_| {
+        versions_xml(
+            Some("url"),
+            &["my+docs/a.txt", "my%2Bdocs/b.txt"],
+            &["my+docs/m.txt"],
+        )
+    })
+    .await;
+    let fx = common::fixture_with_backend("ov-plus", whole_bucket_bundle(), &backend.url);
+    let mut input = versions_input("my docs/");
+    input.encoding_type = Some(s3s::dto::EncodingType::from_static(
+        s3s::dto::EncodingType::URL,
+    ));
+    let out = list_versions(&fx, input).await.expect("allowed");
+    let kept: Vec<String> = out
+        .versions
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| v.key)
+        .collect();
+    assert_eq!(
+        kept,
+        vec!["my+docs/a.txt"],
+        "`+` is a space and `%2B` a literal plus"
+    );
+    assert_eq!(out.delete_markers.unwrap_or_default().len(), 1);
+}
+
+fn whole_bucket_bundle() -> serde_json::Value {
+    let mut bundle = common::alice_bundle();
+    bundle["tenants"]["acme"]["s3_grants"]["alice"][0]["prefixes"] = serde_json::json!([""]);
+    bundle
+}
+
+fn two_prefix_bundle() -> serde_json::Value {
+    let mut bundle = common::alice_bundle();
+    bundle["tenants"]["acme"]["s3_grants"]["alice"][0]["prefixes"] =
+        serde_json::json!(["2024/", "2025/"]);
+    bundle
+}
+
+async fn refused_version_listing(
+    tag: &str,
+    bundle: serde_json::Value,
+    prefix: Option<&str>,
+) -> (s3s::S3Error, usize) {
+    let backend = spawn_fake(|_| versions_xml(None, &["2024/a.csv"], &[])).await;
+    let fx = common::fixture_with_backend(tag, bundle, &backend.url);
+    let mut input = versions_input("");
+    input.prefix = prefix.map(Into::into);
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request("ListObjectVersions", input, Method::GET);
+    let err = access
+        .list_object_versions(&mut req)
+        .await
+        .expect_err("the listing must be refused");
+    assert!(
+        ResponseObligations::of(&req).is_none(),
+        "a refused listing installs no obligation"
+    );
+    assert!(req.extensions.get::<s0::access::AuthzProof>().is_none());
+    (err, backend.requests.load(Ordering::Relaxed))
+}
+
+#[tokio::test]
+async fn a_multi_prefix_grant_refuses_a_version_listing() {
+    let (err, sent) = refused_version_listing("ov-multi", two_prefix_bundle(), Some("20")).await;
+    assert_eq!(*err.code(), s3s::S3ErrorCode::AccessDenied);
+    assert!(
+        err.message()
+            .is_some_and(|m| m.contains("multi-prefix listing")),
+        "{err:?}"
+    );
+    assert_eq!(sent, 0);
+}
+
+#[tokio::test]
+async fn an_unbounded_version_listing_needs_a_whole_bucket_grant() {
+    for (tag, bundle) in [
+        ("ov-unbounded", common::alice_bundle()),
+        ("ov-unbounded-multi", two_prefix_bundle()),
+    ] {
+        let (err, sent) = refused_version_listing(tag, bundle, None).await;
+        assert_eq!(*err.code(), s3s::S3ErrorCode::AccessDenied);
+        assert!(
+            err.message()
+                .is_some_and(|m| m.contains("unbounded list needs a whole-bucket grant")),
+            "{err:?}"
+        );
+        assert_eq!(sent, 0);
+    }
+}
+
+#[tokio::test]
 async fn a_version_listing_without_its_obligation_fails_closed() {
     let backend = spawn_fake(|_| versions_xml(None, &["2024/a.csv"], &[])).await;
     let fx = common::fixture_with_backend("ov-nohook", common::alice_bundle(), &backend.url);

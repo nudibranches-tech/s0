@@ -1,6 +1,6 @@
 # ADR-012: Versioned listing and the versioned-delete verb
 
-- **Status**: Proposed — amends ADR-004 (D6.4) and ADR-006 (the closed verb set); implemented
+- **Status**: Proposed — amends ADR-002 (the decision record), ADR-004 (D6.4) and ADR-006 (the closed verb set); implemented
   (`src/access/optable.rs`, `src/access/mod.rs`, `src/proxy/mod.rs`, `src/proxy/obligations.rs`,
   `src/audit/record.rs`, `policy/gateway/authz.rego`)
 - **Date**: 2026-11-04
@@ -21,8 +21,9 @@ from a delete marker".
 
 That was harmless while no bucket behind s0 was versioned. ADR-011 delegates `PutBucketVersioning`
 to the control backend, so a versioned bucket is now reachable through s0, and the blind spot
-becomes a real escalation. On a versioned bucket `DeleteObject` without a `versionId` writes a
-delete marker and destroys nothing. With a `versionId` it **permanently destroys one version**.
+becomes a real escalation. On an Enabled versioned bucket `DeleteObject` without a `versionId` writes a
+delete marker and destroys nothing (on a Suspended bucket it removes the null version, as
+`s3:DeleteObject` does on AWS, so a `delete_objects` grant keeps that residual power there). With a `versionId` it **permanently destroys one version**.
 A grant that lets a principal "delete objects" would silently let it destroy history. AWS keeps
 the two apart: `s3:DeleteObject` and `s3:DeleteObjectVersion`.
 
@@ -96,7 +97,9 @@ different verbs, and a filter keyed on the key would forward both or neither.
 
 The batch's audit record carries `input.action = delete_object_versions` when any entry carries a
 version, else `delete_objects`, and `gateway.versions` lists the `(key, version_id)` pairs of the
-batch (omitted when empty). `versions` is audit only and never a policy input. A batch whose
+batch (omitted when empty); `gateway.denied_versions` lists the versioned entries policy refused
+and stripped, so a key named twice is still readable. A single `DeleteObject` naming a version
+records its one pair in `gateway.versions`. Both are audit only and never a policy input. A batch whose
 every entry is refused is `AccessDenied`, as before.
 
 `x-amz-bypass-governance-retention` remains refused in code on both paths (ADR-008): the new verb

@@ -169,6 +169,36 @@ async fn a_mixed_batch_decides_each_entry_under_its_own_verb() {
         record.gateway.denied_keys,
         ["2024/versioned.csv", "2025/plain.csv"]
     );
+    assert_eq!(
+        record.gateway.denied_versions,
+        [VersionedKey {
+            key: "2024/versioned.csv".into(),
+            version_id: "v2".into()
+        }],
+        "the refused versioned entry is told apart from the refused plain one"
+    );
+}
+
+#[tokio::test]
+async fn a_single_versioned_delete_records_the_version_it_names() {
+    for (tag, key, allowed) in [
+        ("vd-rec-ok", "2025/a.csv", true),
+        ("vd-rec-no", "2024/a.csv", false),
+    ] {
+        let fx = common::fixture(tag, split_bundle());
+        let access = GatewayAccess::new(fx.gw.clone());
+        let mut req = fx.request("DeleteObject", single(key, Some("v9")), Method::DELETE);
+        assert_eq!(access.delete_object(&mut req).await.is_ok(), allowed);
+        drop(req);
+        let records = fx.await_audit_records(1).await;
+        assert_eq!(
+            records[0].gateway.versions,
+            [VersionedKey {
+                key: key.into(),
+                version_id: "v9".into()
+            }]
+        );
+    }
 }
 
 #[tokio::test]

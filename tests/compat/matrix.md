@@ -1,9 +1,12 @@
 # Client compatibility matrix
 
 > **Scope of these numbers.** Every row was measured against a 29-op enforced scope. The
-> scope is now 23 ops and the matrix has **not** been re-measured — a measurement you did
+> scope is now 24 ops and the matrix has **not** been re-measured — a measurement you did
 > not take is not a measurement. Read each row as written and apply four deltas:
 >
+> 0. **`ListObjectVersions` is enforced under `list_objects` for a single prefix**; a
+>    multi-prefix or unbounded request is still refused, so the 403 rows below apply only to
+>    those grants.
 > 1. **`CreateBucket`, `DeleteBucket`, `GetBucketPolicy`, `PutBucketPolicy`,
 >    `GetBucketCors`, `PutBucketCors` are refused at the gate unless a control backend
 >    delegates them (`CreateBucket`, `DeleteBucket`, `GetBucketCors` and `PutBucketCors` can be).** Any row
@@ -132,7 +135,7 @@ returning `403 AccessDenied: operation is not permitted by the gateway: <Op>`.
 | `GetBucketTagging`, `GetBucketReplication`, `GetBucketEncryption`, `GetBucketLifecycleConfiguration` | mc | `mc stat <bucket>` only | ignored, fields omitted | no |
 
 **Caveat on the two versioning rows.** rclone's "assuming unversioned" and mc's skipped
-`ListObjectVersions` are only harmless because this gateway does not enable versioning:
+`ListObjectVersions` are only harmless on a bucket that is not versioned:
 `PutBucketVersioning` is denied, so no bucket reachable through s0 can be versioned by an
 s0 client. If a bucket is versioned **out of band**, `rclone purge` will delete current
 versions only and `mc rb --force` will leave versions behind, and both will then report a
