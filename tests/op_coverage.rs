@@ -284,6 +284,23 @@ fn the_two_structural_denials_are_never_implement() {
 }
 
 #[test]
+fn only_the_delete_ops_carry_a_versioned_path_and_it_names_the_versioned_verb() {
+    let with_path: Vec<&str> = OP_TABLE
+        .iter()
+        .filter(|s| s.versioned.is_some())
+        .map(|s| s.name)
+        .collect();
+    assert_eq!(with_path, vec!["DeleteObject", "DeleteObjects"]);
+    for s in OP_TABLE {
+        let Some(v) = s.versioned else { continue };
+        assert_eq!(s.coverage, Coverage::Enforced, "{}", s.name);
+        assert_eq!(v.verb, "delete_object_versions", "{}", s.name);
+        assert!(GATEWAY_VERBS.contains(&v.verb), "{}", s.name);
+        assert_eq!(v.tier, DangerTier::PostureAltering, "{}", s.name);
+    }
+}
+
+#[test]
 fn op_table_verbs_are_grantable_or_explicitly_control_plane() {
     // Every row's verb is one of exactly two things: a verb a grant can carry, or a
     // label saying the authority belongs to the control plane. There is no third

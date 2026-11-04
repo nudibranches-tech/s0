@@ -1574,7 +1574,7 @@ fn restrict_versions(output: &mut ListObjectVersionsOutput, prefix: &str) {
     let under = |key: Option<&str>| {
         key.is_some_and(|k| {
             if encoded {
-                percent_decode(k).starts_with(prefix)
+                percent_decode(&k.replace('+', "%20")).starts_with(prefix)
             } else {
                 k.starts_with(prefix)
             }

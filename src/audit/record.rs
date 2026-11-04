@@ -113,6 +113,10 @@ pub struct GatewayMeta {
     /// never an input to a decision.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub versions: Vec<VersionedKey>,
+    /// The subset of `versions` a multi-delete's policy refused and the PEP stripped from
+    /// the forwarded batch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denied_versions: Vec<VersionedKey>,
     /// What the gateway knows about the backend leg. Filled in post-forward
     /// ([`crate::audit::PendingAudit`]), which is why the record is emitted when the
     /// request finishes rather than when the decision is made.
@@ -347,6 +351,7 @@ impl AuditRecord {
                 outcome: Outcome::Denied,
                 denied_keys: vec![],
                 versions: vec![],
+                denied_versions: vec![],
                 backend: BackendOutcome::NotAttempted,
                 backend_status: None,
                 object_name: None,
@@ -413,6 +418,7 @@ impl AuditRecord {
                 outcome: Outcome::Error,
                 denied_keys: vec![],
                 versions: vec![],
+                denied_versions: vec![],
                 backend: BackendOutcome::NotAttempted,
                 backend_status: None,
                 object_name,
@@ -534,6 +540,7 @@ mod tests {
             outcome,
             denied_keys,
             versions: vec![],
+            denied_versions: vec![],
             backend: BackendOutcome::NotAttempted,
             backend_status: None,
             object_name: None,

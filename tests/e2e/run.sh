@@ -259,6 +259,11 @@ v1="$(aws_open s3api put-object --bucket vault --key pub/v.txt --body /work/repo
   --query VersionId --output text 2>&1)"
 v2="$(aws_open s3api put-object --bucket vault --key pub/v.txt --body /work/greeting.txt \
   --query VersionId --output text 2>&1)"
+for vid in "$v1" "$v2"; do
+  case "$vid" in ""|None|*[!A-Za-z0-9._-]*) fail "vault versioning is enabled" "no usable version id: $vid" ;; esac
+done
+off="$(aws_admin s3api put-object --bucket vault --key private/x.txt --body /work/report.txt \
+  --query VersionId --output text 2>&1)"
 expect ok   "AKIAOPEN LIST VERSIONS vault --prefix pub/ (inside grant)" \
   aws_open s3api list-object-versions --bucket vault --prefix pub/
 expect deny "AKIAOPEN LIST VERSIONS vault (unbounded, no prefix)" \
@@ -281,9 +286,11 @@ expect ok   "the other version survived" \
 expect deny "AKIAOPEN DELETE version off-prefix" \
   aws_open s3api delete-object --bucket vault --key private/x.txt --version-id "$v2"
 aws_open s3api delete-objects --bucket vault \
-  --delete "Objects=[{Key=pub/v.txt,VersionId=$v2},{Key=private/x.txt,VersionId=$v2}]" >/dev/null 2>&1
+  --delete "Objects=[{Key=pub/v.txt,VersionId=$v2},{Key=private/x.txt,VersionId=$off}]" >/dev/null 2>&1
 expect_code "404" "batch: the in-grant version was deleted" \
   aws_admin s3api head-object --bucket vault --key pub/v.txt --version-id "$v2"
+expect ok   "batch: the off-prefix version was filtered out and survived" \
+  aws_admin s3api head-object --bucket vault --key private/x.txt --version-id "$off"
 
 echo ""; echo "-- anonymous / unknown identity ----------------------------"
 anon_code="$(curl -s -o /dev/null -w '%{http_code}' "$GW_ENDPOINT/open/pub/greeting.txt")"
