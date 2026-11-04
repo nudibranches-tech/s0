@@ -75,7 +75,7 @@ pub fn alice_bundle() -> serde_json::Value {
             "s3_grants": { "alice": [
                 { "bucket": "reports",
                   "actions": ["read_objects", "list_objects", "write_objects", "delete_objects",
-                              "write_object_tags"],
+                              "delete_object_versions", "write_object_tags"],
                   "prefixes": ["2024/"] },
                 { "bucket": "reports",
                   "actions": ["read"],

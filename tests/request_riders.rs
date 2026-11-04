@@ -511,6 +511,39 @@ async fn a_delete_with_bypass_governance_retention_is_refused_without_the_verb()
 }
 
 #[tokio::test]
+async fn a_versioned_delete_with_governance_bypass_is_still_refused() {
+    // Destroying a retained version is the case the bypass header exists for. The new verb
+    // must not be a way around the screen: not for a scoped grant, not for a wildcard one.
+    for bundle in [common::alice_bundle(), wildcard_bundle()] {
+        let fx = common::fixture("riders-bypass-versioned", bundle);
+        let access = GatewayAccess::new(fx.gw.clone());
+        let mut req = fx.request(
+            "DeleteObject",
+            DeleteObjectInput {
+                bucket: "reports".into(),
+                key: "2024/x".into(),
+                version_id: Some("3HL4kqtJlcpXroDTDmJ".into()),
+                bypass_governance_retention: Some(true),
+                ..Default::default()
+            },
+            Method::DELETE,
+        );
+        let err = access
+            .delete_object(&mut req)
+            .await
+            .expect_err("a governance bypass must never reach the backend");
+        assert_eq!(*err.code(), S3ErrorCode::AccessDenied);
+        assert!(req.extensions.get::<AuthzProof>().is_none());
+
+        let rec = sole_refusal(&fx).await;
+        assert!(
+            rec.result.reason.contains("bypass-governance-retention"),
+            "{rec:#?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_multi_delete_carrying_the_bypass_header_is_refused_whole() {
     // The header covers the entire batch, so it is screened before any key is decided —
     // a partially-honoured WORM bypass is not something this gateway should be able to

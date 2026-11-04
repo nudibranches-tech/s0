@@ -9,6 +9,7 @@
       },
       "bucket_attributes": {
         "open": { "denylist": {}, "sensitivity": "low" },
+        "vault": { "denylist": {}, "sensitivity": "low" },
         "secret": { "denylist": {}, "sensitivity": "high" }
       },
       "s3_grants": {
@@ -16,6 +17,11 @@
           {
             "bucket": "open",
             "actions": ["read_objects", "list_objects", "write_objects", "delete_objects", "read"],
+            "prefixes": ["pub/"]
+          },
+          {
+            "bucket": "vault",
+            "actions": ["write_objects", "list_objects", "delete_object_versions"],
             "prefixes": ["pub/"]
           }
         ],

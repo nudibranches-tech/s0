@@ -24,6 +24,10 @@ pub enum Action {
     ReadObjects,
     WriteObjects,
     DeleteObjects,
+    /// A delete that names a version (`DeleteObject` with a `versionId`, a `DeleteObjects`
+    /// entry carrying one). Kept separate from [`Action::DeleteObjects`]: a grant of one
+    /// never confers the other (AWS `s3:DeleteObjectVersion` parity).
+    DeleteObjectVersions,
     /// Kept **deliberately separate** from [`Action::WriteObjects`]. `OpaInput::object_tags`
     /// lets a policy key on tags; merging the two would let a principal holding both grant
     /// itself whatever the policy keys on, a trap that springs when tag-driven ABAC is on.
@@ -50,6 +54,7 @@ impl Action {
         Action::ReadObjects,
         Action::WriteObjects,
         Action::DeleteObjects,
+        Action::DeleteObjectVersions,
         Action::WriteObjectTags,
         Action::ListObjects,
         Action::Read,
@@ -60,6 +65,7 @@ impl Action {
             Action::ReadObjects => "read_objects",
             Action::WriteObjects => "write_objects",
             Action::DeleteObjects => "delete_objects",
+            Action::DeleteObjectVersions => "delete_object_versions",
             Action::WriteObjectTags => "write_object_tags",
             Action::ListObjects => "list_objects",
             Action::Read => "read",
@@ -76,7 +82,10 @@ impl Action {
     pub const fn is_write(self) -> bool {
         matches!(
             self,
-            Action::WriteObjects | Action::DeleteObjects | Action::WriteObjectTags
+            Action::WriteObjects
+                | Action::DeleteObjects
+                | Action::DeleteObjectVersions
+                | Action::WriteObjectTags
         )
     }
 

@@ -134,6 +134,9 @@ printf 'PRIVATE material\n'               > "$WORK/private.txt"
 printf 'TOP SECRET classified material\n' > "$WORK/classified.txt"
 aws_backend s3 mb s3://open   >/dev/null 2>&1
 aws_backend s3 mb s3://secret >/dev/null 2>&1
+aws_backend s3 mb s3://vault  >/dev/null 2>&1
+aws_backend s3api put-bucket-versioning --bucket vault \
+  --versioning-configuration Status=Enabled >/dev/null 2>&1
 aws_backend s3 cp /work/greeting.txt   s3://open/pub/greeting.txt    >/dev/null
 aws_backend s3 cp /work/report.txt     s3://open/pub/report.txt      >/dev/null
 aws_backend s3 cp /work/private.txt    s3://open/private/secret.txt  >/dev/null
@@ -247,6 +250,40 @@ expect_code "404" "allowed key pub/report.txt was deleted" \
   aws_admin s3api head-object --bucket open --key pub/report.txt
 expect ok "denied key private/secret.txt survived the multi-delete" \
   aws_admin s3api head-object --bucket open --key private/secret.txt
+
+echo ""; echo "-- versioned bucket: listing and versioned deletes ---------"
+# open-user holds `delete_object_versions` (not `delete_objects`) on vault/pub/. A delete
+# without a version only adds a delete marker and needs the other verb; naming a version
+# destroys it and needs this one.
+v1="$(aws_open s3api put-object --bucket vault --key pub/v.txt --body /work/report.txt \
+  --query VersionId --output text 2>&1)"
+v2="$(aws_open s3api put-object --bucket vault --key pub/v.txt --body /work/greeting.txt \
+  --query VersionId --output text 2>&1)"
+expect ok   "AKIAOPEN LIST VERSIONS vault --prefix pub/ (inside grant)" \
+  aws_open s3api list-object-versions --bucket vault --prefix pub/
+expect deny "AKIAOPEN LIST VERSIONS vault (unbounded, no prefix)" \
+  aws_open s3api list-object-versions --bucket vault
+vlist="$(aws_open s3api list-object-versions --bucket vault --prefix pub/ \
+  --query 'Versions[].VersionId' --output text 2>&1)"
+if echo "$vlist" | grep -q "$v1" && echo "$vlist" | grep -q "$v2"; then
+  pass "version listing carries both versions of pub/v.txt"
+else
+  fail "version listing carries both versions" "v1=$v1 v2=$v2 got: $vlist"
+fi
+expect deny "AKIAOPEN DELETE pub/v.txt without a version (delete_objects not granted)" \
+  aws_open s3api delete-object --bucket vault --key pub/v.txt
+expect ok   "AKIAOPEN DELETE pub/v.txt version v1 (delete_object_versions)" \
+  aws_open s3api delete-object --bucket vault --key pub/v.txt --version-id "$v1"
+expect_code "404" "version v1 is gone" \
+  aws_admin s3api head-object --bucket vault --key pub/v.txt --version-id "$v1"
+expect ok   "the other version survived" \
+  aws_admin s3api head-object --bucket vault --key pub/v.txt --version-id "$v2"
+expect deny "AKIAOPEN DELETE version off-prefix" \
+  aws_open s3api delete-object --bucket vault --key private/x.txt --version-id "$v2"
+aws_open s3api delete-objects --bucket vault \
+  --delete "Objects=[{Key=pub/v.txt,VersionId=$v2},{Key=private/x.txt,VersionId=$v2}]" >/dev/null 2>&1
+expect_code "404" "batch: the in-grant version was deleted" \
+  aws_admin s3api head-object --bucket vault --key pub/v.txt --version-id "$v2"
 
 echo ""; echo "-- anonymous / unknown identity ----------------------------"
 anon_code="$(curl -s -o /dev/null -w '%{http_code}' "$GW_ENDPOINT/open/pub/greeting.txt")"
