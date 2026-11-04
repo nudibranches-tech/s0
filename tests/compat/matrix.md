@@ -6,7 +6,7 @@
 >
 > 1. **`CreateBucket`, `DeleteBucket`, `GetBucketPolicy`, `PutBucketPolicy`,
 >    `GetBucketCors`, `PutBucketCors` are refused at the gate unless a control backend
->    delegates them (`CreateBucket`, `GetBucketCors` and `PutBucketCors` can be).** Any row
+>    delegates them (`CreateBucket`, `DeleteBucket`, `GetBucketCors` and `PutBucketCors` can be).** Any row
 >    showing one of them allowed under some grant is a **gate** 403 under every grant, including the wildcard
 >    **W**. Fatality is unchanged, only the reason: BLOCKER-1 (rclone's pre-upload
 >    `CreateBucket`) is unconditional rather than grant-dependent, so `--s3-no-check-bucket`

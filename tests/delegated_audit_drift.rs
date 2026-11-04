@@ -154,6 +154,50 @@ async fn the_gateway_emits_the_committed_create_bucket_record() {
     check_against_fixture("delegated_audit_record_create_bucket.json", doc).await;
 }
 
+fn placing(buckets: &[&str]) -> serde_json::Value {
+    let mut b = common::alice_bundle();
+    b["grant_schema_version"] = serde_json::json!(3);
+    b["backend"] = serde_json::json!({ "id": "bay-1", "kind": "ceph" });
+    let attributes: serde_json::Map<String, serde_json::Value> = buckets
+        .iter()
+        .map(|name| {
+            (
+                (*name).to_string(),
+                serde_json::json!({ "denylist": {},
+                    "object_name": format!("{name}.bay-1"),
+                    "created_at": "2026-01-01T00:00:00Z" }),
+            )
+        })
+        .collect();
+    b["tenants"]["acme"]["bucket_attributes"] = serde_json::Value::Object(attributes);
+    b
+}
+
+#[tokio::test]
+async fn the_gateway_emits_the_committed_delete_bucket_record() {
+    let stub = ControlStub::start().await;
+    let mut fx = common::fixture_with_control(
+        "drift-delete",
+        placing(&["reports", "other"]),
+        &stub.endpoint,
+    );
+    let bundles = common::bundle_server::BundleServer::start(
+        vec![placing(&["reports", "other"]), placing(&["other"])],
+        std::time::Duration::ZERO,
+    )
+    .await;
+    common::bundle_server::install_refresher(&mut fx, &bundles);
+    let base = serve(&fx).await;
+    send_op(&base, "DeleteBucket", "reports").await;
+    let records = fx.await_audit_records(1).await;
+    assert_eq!(records.len(), 1, "{records:#?}");
+    let mut doc = serde_json::to_value(&records[0]).expect("record serializes");
+    doc["decision_id"] = VOLATILE_ID.into();
+    doc["timestamp"] = VOLATILE_TIME.into();
+    assert_eq!(doc["delegated"]["placement_wait"], "removed");
+    check_against_fixture("delegated_audit_record_delete_bucket.json", doc).await;
+}
+
 fn keys(doc: &serde_json::Value) -> BTreeSet<&str> {
     doc.as_object()
         .expect("object")
@@ -170,6 +214,7 @@ fn the_committed_records_have_the_shape_the_ingest_dispatches_on() {
         "delegated_audit_record_denied.json",
         "delegated_audit_record_unanswered.json",
         "delegated_audit_record_create_bucket.json",
+        "delegated_audit_record_delete_bucket.json",
     ] {
         let doc: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(fixture_path(name)).expect("fixture present"),

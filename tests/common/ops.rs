@@ -362,6 +362,14 @@ macro_rules! each_delegable_op {
             }
         );
         $probe!(
+            delete_bucket,
+            "DeleteBucket",
+            s3s::dto::DeleteBucketInput {
+                bucket: "reports".into(),
+                ..Default::default()
+            }
+        );
+        $probe!(
             get_bucket_cors,
             "GetBucketCors",
             s3s::dto::GetBucketCorsInput {

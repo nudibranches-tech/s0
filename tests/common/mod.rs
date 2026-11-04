@@ -229,7 +229,7 @@ pub fn fixture_with_backend(tag: &str, bundle: serde_json::Value, endpoint: &str
     fixture_from_config(tag, dir.clone(), bundle, &config_json(&dir, endpoint))
 }
 
-/// The control backend section of a config that delegates all 15 operations to `endpoint`,
+/// The control backend section of a config that delegates all 16 operations to `endpoint`,
 /// signed with [`control_stub::CONTROL_ACCESS_KEY`].
 pub fn control_backend_json(endpoint: &str) -> serde_json::Value {
     serde_json::json!({

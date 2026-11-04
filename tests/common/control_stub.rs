@@ -1,4 +1,4 @@
-//! An in-process control backend: an s3s server that implements only the 15 delegable
+//! An in-process control backend: an s3s server that implements only the 16 delegable
 //! operations, verifies SigV4 against the control credential, and records what it saw.
 //!
 //! It records the operation, the `x-s0-*` header values, the raw `SignedHeaders` list and
@@ -124,6 +124,14 @@ impl S3 for StubS3 {
     ) -> S3Result<S3Response<CreateBucketOutput>> {
         self.answer("CreateBucket", &req.headers).await?;
         Ok(S3Response::new(CreateBucketOutput::default()))
+    }
+
+    async fn delete_bucket(
+        &self,
+        req: S3Request<DeleteBucketInput>,
+    ) -> S3Result<S3Response<DeleteBucketOutput>> {
+        self.answer("DeleteBucket", &req.headers).await?;
+        Ok(S3Response::new(DeleteBucketOutput::default()))
     }
 
     async fn get_bucket_cors(

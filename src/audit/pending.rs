@@ -69,7 +69,7 @@ impl PendingAudit {
         }
     }
 
-    /// Note on the held record how the wait for a created bucket's placement ended.
+    /// Note on the held record how the placement wait (CreateBucket) or removal wait (DeleteBucket) ended.
     pub fn note_placement_wait(&self, outcome: crate::bundle_refresh::PlacementWaitOutcome) {
         if let Some(record) = self
             .record

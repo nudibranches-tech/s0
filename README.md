@@ -21,7 +21,7 @@ Operations it does not own are denied, not passed through.
 
 s0 knows all **99** operations in the `s3s` 0.14.1 surface. **23** are enforced and
 forwarded; the other **76** are refused with `403 AccessDenied`, unless a control backend
-is configured: **15** of those can be delegated to it and answered there instead (below).
+is configured: **16** of those can be delegated to it and answered there instead (below).
 An operation with no entry in the table cannot reach a backend, and one that is delegated
 never reaches the storage backend either.
 
@@ -47,16 +47,16 @@ per-verb, with object-prefix scopes.
 That covers ordinary object storage: get/put/head/delete, multipart upload, server-side
 copy, listing, and object tagging.
 
-### Delegated (15)
+### Delegated (16)
 
-Bucket creation and bucket configuration cannot be answered by the storage backend alone:
+Bucket creation, deletion and bucket configuration cannot be answered by the storage backend alone:
 on a platform that owns its buckets through a control plane, a bucket is a declared
 resource. When `control_backend` is configured, s0 hands the operations it lists to that
 S3 endpoint and returns its answer; without it they are refused like any other.
 
 | Group | Operations |
 |---|---|
-| Creation | `CreateBucket` |
+| Creation and deletion | `CreateBucket`, `DeleteBucket` |
 | CORS | `GetBucketCors`, `PutBucketCors`, `DeleteBucketCors` |
 | Lifecycle | `GetBucketLifecycleConfiguration`, `PutBucketLifecycleConfiguration`, `DeleteBucketLifecycle` |
 | Tags | `GetBucketTagging`, `PutBucketTagging`, `DeleteBucketTagging` |
@@ -73,8 +73,7 @@ caller's identity in `x-s0-caller-subject`, `x-s0-caller-tenant`, `x-s0-caller-o
 `SignedHeaders`, does not retry (a delegated write is not known to be idempotent), and passes
 the control backend's S3 error through unchanged except for the request id, which becomes the
 delegated audit record's id. A control backend that cannot be reached answers `503
-ServiceUnavailable`. `GetBucketPolicy`, `PutBucketPolicy` and `DeleteBucket` are never
-delegated. Reads of bucket configuration that s0 neither enforces nor delegates
+ServiceUnavailable`. `GetBucketPolicy` and `PutBucketPolicy` are never delegated. Reads of bucket configuration that s0 neither enforces nor delegates
 (`GetBucketPolicy`, `GetBucketAcl`, `GetBucketWebsite`, `GetBucketLogging`, ...) answer `501
 NotImplemented`, not `AccessDenied`: no grant would open them, and infrastructure tools such as
 the Terraform AWS provider treat `NotImplemented` as "not served" and carry on.
@@ -89,7 +88,8 @@ audit record says `placement_wait: timed_out`. A replica that did not serve the 
 catches up the same way: an authenticated request refused as "not on this backend" makes it
 fetch the bundle once (fetches start at most once a second per replica, concurrent misses share one) and decide
 again on a bundle fetched after the request arrived; without a `control_backend` nothing is
-fetched on a miss. A delegated `PutBucketCors` or `DeleteBucketCors` drops
+fetched on a miss. After a delegated `DeleteBucket` s0 does the same until the bucket is no longer placed
+(`placement_wait: removed`). A delegated `PutBucketCors`, `DeleteBucketCors` or `DeleteBucket` drops
 this replica's cached CORS entry for the bucket; other replicas follow within about a
 minute. The fetches are counted in `s0_bundle_on_demand_refresh_total{trigger,result}`
 (`trigger` is `miss` or `placement_wait`) and
@@ -111,7 +111,7 @@ with nothing upstream knowing. Those five verbs (`create_bucket`, `delete_bucket
 `read_bucket_config`, `write_bucket_config`, `write_object_acl`) are held in
 `NON_GATEWAY_VERBS` as a classification only — three tests hold that set disjoint from the
 grantable vocabulary, so flipping one of these operations to enforced does not quietly
-compile. The 15 operations of the section above are the exception, and only when a
+compile. The 16 operations of the section above are the exception, and only when a
 control backend answers them; without one they are in this list too.
 
 **Object-level operations outside the model — 11 operations.**
