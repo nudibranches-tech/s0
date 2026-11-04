@@ -74,7 +74,10 @@ caller's identity in `x-s0-caller-subject`, `x-s0-caller-tenant`, `x-s0-caller-o
 the control backend's S3 error through unchanged except for the request id, which becomes the
 delegated audit record's id. A control backend that cannot be reached answers `503
 ServiceUnavailable`. `GetBucketPolicy`, `PutBucketPolicy` and `DeleteBucket` are never
-delegated.
+delegated. Reads of bucket configuration that s0 neither enforces nor delegates
+(`GetBucketPolicy`, `GetBucketAcl`, `GetBucketWebsite`, `GetBucketLogging`, ...) answer `501
+NotImplemented`, not `AccessDenied`: no grant would open them, and infrastructure tools such as
+the Terraform AWS provider treat `NotImplemented` as "not served" and carry on.
 
 **Read your writes.** The bucket a delegated `CreateBucket` made reaches s0 through the
 bundle, and the bundle is polled. So after a `2xx` from the control backend s0 fetches the

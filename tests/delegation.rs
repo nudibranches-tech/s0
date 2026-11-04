@@ -598,7 +598,11 @@ async fn the_never_delegable_control_plane_ops_stay_refused_with_delegation_on()
         }
         let answer =
             common::wire::send_raw(&base, &host, req, common::ACCESS_KEY, common::SECRET_KEY).await;
-        assert_eq!(answer.status, 403, "{op}: {}", answer.body);
+        let expected = if op == "GetBucketPolicy" { 501 } else { 403 };
+        assert_eq!(answer.status, expected, "{op}: {}", answer.body);
+        if expected == 501 {
+            assert!(answer.body.contains("NotImplemented"), "{}", answer.body);
+        }
     }
     assert_eq!(
         stub.count(),

@@ -965,6 +965,21 @@ pub fn spec(op: &str) -> Option<&'static OpSpec> {
         .map(|i| &OP_TABLE[i])
 }
 
+/// Whether the gate answers a refusal of `op` with `NotImplemented` rather than
+/// `AccessDenied`: a read of bucket configuration that s0 neither enforces nor delegates
+/// (ACL, policy, website, logging, ...). No right the caller could be granted would open
+/// it, so `AccessDenied` would send them to ask for one; S3 clients and infrastructure
+/// tools read these as "this endpoint does not serve it" only from `NotImplemented`.
+/// A `Delegable` row an unconfigured gateway refuses keeps `AccessDenied`.
+#[must_use]
+pub fn refusal_is_not_implemented(op: &str) -> bool {
+    spec(op).is_some_and(|s| {
+        s.coverage == Coverage::Denied
+            && s.tier != DangerTier::NeverImplement
+            && s.verb == Some("read_bucket_config")
+    })
+}
+
 /// The op half of the deny-by-default backstop with no delegation configured, and the
 /// *only* place the enforced allowlist is derived. [`gate`] is the same decision with a
 /// control backend's operations taken into account.
@@ -1293,6 +1308,36 @@ mod tests {
                 spec(op).unwrap().blind_spots.is_empty(),
                 "{op} is denied but still claims blind spots"
             );
+        }
+    }
+
+    #[test]
+    fn only_refused_reads_of_bucket_configuration_answer_not_implemented() {
+        for op in [
+            "GetBucketPolicy",
+            "GetBucketPolicyStatus",
+            "GetBucketAcl",
+            "GetBucketWebsite",
+            "GetBucketLogging",
+            "GetBucketAccelerateConfiguration",
+            "GetBucketRequestPayment",
+            "GetBucketReplication",
+            "GetObjectLockConfiguration",
+        ] {
+            assert!(refusal_is_not_implemented(op), "{op}");
+        }
+        for op in [
+            "PutBucketPolicy",
+            "DeleteBucketPolicy",
+            "PutBucketAcl",
+            "DeleteBucket",
+            "GetObjectAcl",
+            "GetBucketCors",
+            "CreateBucket",
+            "GetObject",
+            "NoSuchOp",
+        ] {
+            assert!(!refusal_is_not_implemented(op), "{op}");
         }
     }
 

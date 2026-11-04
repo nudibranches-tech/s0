@@ -925,6 +925,9 @@ impl S3Access for GatewayAccess {
                     None,
                     denial.as_str().to_string(),
                 );
+                if optable::refusal_is_not_implemented(&op) {
+                    return Err(s3_error!(NotImplemented, "{}: {op}", denial.as_str()));
+                }
                 return Err(s3_error!(AccessDenied, "{}: {op}", denial.as_str()));
             }
         };

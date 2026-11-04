@@ -65,6 +65,13 @@ cannot know the configuration. Exactly **15** rows qualify:
 `GetBucketPolicy` and `PutBucketPolicy` are never delegable. `DeleteBucket` is not delegable
 under this ADR either: ADR-0056 leaves it open ("Not decided here").
 
+A `Denied` row that reads bucket configuration (`read_bucket_config`: `GetBucketPolicy`,
+`GetBucketAcl`, `GetBucketWebsite`, ...) is refused with `501 NotImplemented`: no grant could
+open it, and a client that probes it (the Terraform AWS provider reads the policy, ACL, website,
+logging, replication and request payment of every `aws_s3_bucket`) aborts on `AccessDenied` but
+carries on after `NotImplemented`. Writes, `DeleteBucket`, the unauthorizable rows and every
+`Delegable` row the configuration does not list keep `AccessDenied`.
+
 Coverage drives behaviour only together with configuration. The gate returns:
 
 - `Gate::Enforced` for an enforced row;
