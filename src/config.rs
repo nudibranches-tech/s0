@@ -110,7 +110,8 @@ pub struct ControlBackendConfig {
     /// 60 s default read timeout of the AWS CLI and boto3.
     #[serde(default = "default_control_call_timeout_secs")]
     pub call_timeout_secs: u64,
-    /// How long `CreateBucket` waits for the new bucket to be placed before answering.
+    /// How long `CreateBucket` waits for the new bucket to be placed, and `DeleteBucket` for
+    /// it to be unplaced, before answering.
     #[serde(default = "default_control_placement_wait_secs")]
     pub create_bucket_placement_wait_secs: u64,
 }
@@ -1875,7 +1876,7 @@ mod tests {
     fn the_shipped_example_loads_its_control_backend() {
         let loaded = GatewayConfig::from_json(&example().to_string()).expect("loads");
         let control = loaded.control_backend.expect("section present");
-        assert_eq!(control.operations.len(), 15);
+        assert_eq!(control.operations.len(), 16);
         assert_eq!(control.call_timeout_secs, 35);
         assert_eq!(control.region, "us-east-1");
     }
@@ -1922,7 +1923,7 @@ mod tests {
             "WriteGetObjectResponse",
             "GetObject",
             "PutBucketPolicy",
-            "DeleteBucket",
+            "GetBucketPolicy",
             "NoSuchOp",
         ] {
             let cfg = with_control(|s| s["operations"] = serde_json::json!(["GetBucketCors", op]));

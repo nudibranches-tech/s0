@@ -868,7 +868,7 @@ async fn a_delegated_cors_write_drops_the_cached_entry() {
     fx.gw.cors.lookup(&fx.gw.registry, &route, "reports").await;
     assert_eq!(lookups(), 1, "the second lookup should have been cached");
 
-    for op in ["PutBucketCors", "DeleteBucketCors"] {
+    for op in ["PutBucketCors", "DeleteBucketCors", "DeleteBucket"] {
         let before = lookups();
         let answer = common::wire::send_op(&base, op, "reports").await;
         assert!(

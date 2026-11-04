@@ -63,14 +63,9 @@ const TARGET_ENFORCED: [&str; 23] = [
 ///
 /// The other half of `DELEGABLE_ADR_0056`: that array says what a control backend may
 /// answer, this one says what stays refused whatever the configuration. Without it,
-/// adding `DeleteBucket` to the delegable set would read as restoring something dropped by
-/// accident.
-const NEVER_DELEGABLE: [(&str, &str); 3] = [
-    (
-        "DeleteBucket",
-        "destroys a bucket the console still believes it manages; ADR-0056 leaves its \
-         delegation undecided",
-    ),
+/// adding a bucket policy operation to the delegable set would read as restoring something
+/// dropped by accident.
+const NEVER_DELEGABLE: [(&str, &str); 2] = [
     (
         "GetBucketPolicy",
         "the document names the tenant-owner ARN and describes a second, backend-side \
@@ -83,10 +78,11 @@ const NEVER_DELEGABLE: [(&str, &str); 3] = [
     ),
 ];
 
-/// The 15 operations ADR-0056 hands to a control backend: refused unless
+/// The 16 operations ADR-0056 hands to a control backend: refused unless
 /// `control_backend.operations` lists them, answered by the control backend when it does.
-const DELEGABLE_ADR_0056: [&str; 15] = [
+const DELEGABLE_ADR_0056: [&str; 16] = [
     "CreateBucket",
+    "DeleteBucket",
     "DeleteBucketCors",
     "DeleteBucketEncryption",
     "DeleteBucketLifecycle",
@@ -197,7 +193,7 @@ fn the_non_delegable_ops_are_not_quietly_enforced_or_delegated() {
 }
 
 #[test]
-fn the_delegable_ops_are_exactly_the_adr_0056_fifteen() {
+fn the_delegable_ops_are_exactly_the_adr_0056_sixteen() {
     let mut named: Vec<&str> = DELEGABLE_ADR_0056.to_vec();
     named.sort_unstable();
     let mut delegable = delegable_ops();

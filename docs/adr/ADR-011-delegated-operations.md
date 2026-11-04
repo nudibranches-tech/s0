@@ -1,17 +1,18 @@
 # ADR-011: Delegated operations — bucket configuration answered by a control backend
 
-- **Status**: Proposed — implemented: D1 to D5 and D7 (`src/access/optable.rs`,
+- **Status**: Proposed — amends ADR-009 (D8); implemented: D1 to D5 and D7 (`src/access/optable.rs`,
   `src/access/delegation.rs`, `src/proxy/control.rs`, `src/config.rs`, `src/audit/record.rs`)
   and D6, read-your-writes (`src/bundle_refresh.rs` for `BundleRefresher` and `PlacementWait`,
   `src/access/mod.rs` for the refresh on miss in `check`, `src/proxy/mod.rs` for
-  `delegate_then`, `src/cors/lookup.rs` for `CorsState::invalidate`)
+  `delegate_then`, `src/cors/lookup.rs` for `CorsState::invalidate`) and D8 (`src/pdp/bundle.rs`
+  `PlacementRefusal::s3_code`, `src/access/mod.rs`)
 - **Date**: 2026-11-02
 - **Owners**: gateway team (this repo); the control backend is the console of the platform that
   deploys s0
 - **Related**: `src/access/optable.rs` (`Coverage`, `gate_op`), `src/access/proof.rs`
   (`AuthzProof`), `src/access/mod.rs` (`check`), `src/proxy/mod.rs` (`forward`, `build_proxy`),
   `src/audit/record.rs`, `src/gateway.rs`, `src/config.rs`; amends ADR-002 (a third record
-  shape) and ADR-008 (rider screening of a delegated `CreateBucket`); relies on ADR-001, ADR-006 and ADR-009. Platform side: ADR-0056 of the Hyperfluid
+  shape) and ADR-008 (rider screening of a delegated `CreateBucket`); amends ADR-009 (D8); relies on ADR-001, ADR-006 and ADR-009. Platform side: ADR-0056 of the Hyperfluid
   repository (bucket creation and configuration over S3, delegated by s0).
 
 ## Context
@@ -51,25 +52,29 @@ backend authorizes.** Object data (keys, contents, versions) is never delegated.
 ### D1. The class: `Delegable`, a static fact; `Delegated`, a runtime verdict
 
 `Coverage` gains a third value, `Delegable`. It is a property of the operation table, which
-cannot know the configuration. Exactly **15** rows qualify:
+cannot know the configuration. Exactly **16** rows qualify:
 
 | Operations |
 |---|
-| `CreateBucket` |
+| `CreateBucket`, `DeleteBucket` |
 | `GetBucketCors`, `PutBucketCors`, `DeleteBucketCors` |
 | `GetBucketLifecycleConfiguration`, `PutBucketLifecycleConfiguration`, `DeleteBucketLifecycle` |
 | `GetBucketTagging`, `PutBucketTagging`, `DeleteBucketTagging` |
 | `GetBucketVersioning`, `PutBucketVersioning` |
 | `GetBucketEncryption`, `PutBucketEncryption`, `DeleteBucketEncryption` |
 
-`GetBucketPolicy` and `PutBucketPolicy` are never delegable. `DeleteBucket` is not delegable
-under this ADR either: ADR-0056 leaves it open ("Not decided here").
+`GetBucketPolicy` and `PutBucketPolicy` are never delegable.
+
+`DeleteBucket` joins the class (amending ADR-0056's "Not decided here"): the control backend
+authorizes it, and the emptiness check is the storage backend's own `DeleteBucket`, issued by the
+control backend, so a write racing the delete is never purged. A non-empty bucket answers
+`BucketNotEmpty`, which s0 passes through like any control-backend answer.
 
 A `Denied` row that reads bucket configuration (`read_bucket_config`: `GetBucketPolicy`,
 `GetBucketAcl`, `GetBucketWebsite`, ...) is refused with `501 NotImplemented`: no grant could
 open it, and a client that probes it (the Terraform AWS provider reads the policy, ACL, website,
 logging, replication and request payment of every `aws_s3_bucket`) aborts on `AccessDenied` but
-carries on after `NotImplemented`. Writes, `DeleteBucket`, the unauthorizable rows and every
+carries on after `NotImplemented`. Writes, the unauthorizable rows and every
 `Delegable` row the configuration does not list keep `AccessDenied`.
 
 Coverage drives behaviour only together with configuration. The gate returns:
@@ -86,7 +91,7 @@ coverage. `CreateSession` and `WriteGetObjectResponse` are table rows built by `
 they are refused by tier, ahead of coverage, and configuration validation (D2) refuses them
 independently. Two tests enforce the rule:
 
-- `exactly_the_fifteen_adr_0056_operations_are_delegable`;
+- `the_delegable_set_is_sixteen`;
 - `no_never_implement_operation_is_delegable`.
 
 ### D2. Configuration and startup validation
@@ -182,7 +187,7 @@ control backend, and has no reach across organizations, because the credential p
 
 ADR-002 fixes two shapes sharing one envelope, exactly one half present: a **decision** record
 (`input`) and a **gate** record (`gate`). A delegated request has neither a policy question nor
-an `Action`: the decision half's `OpaInput.action` is an `Action`, and none exists for these 15
+an `Action`: the decision half's `OpaInput.action` is an `Action`, and none exists for these 16
 operations. Inventing one would put a claim in a regulated record that was never made, the same
 reason ADR-002 gave for the gate record.
 
@@ -198,7 +203,7 @@ A **delegated** record is a third half, `delegated`, under its own path:
 | `delegated.subject` | the caller's subject key, as sent in `x-s0-caller-subject` |
 | `delegated.control_status` | the HTTP status the control backend answered; omitted when none was received |
 | `delegated.control_error` | the error code the control backend answered; omitted on success |
-| `delegated.placement_wait` | the outcome of the `CreateBucket` placement wait (D6); omitted otherwise |
+| `delegated.placement_wait` | the outcome of the `CreateBucket` placement wait or the `DeleteBucket` removal wait (D6): `not_placing`, `placed`, `removed` or `timed_out`; omitted otherwise |
 | `requested_by` | the end-user subject, as for every other shape |
 | `labels` | the same trusted organization label as every other shape |
 | `gateway.outcome` | `allowed` for a 2xx; `denied` for `403 AccessDenied`; `error` otherwise (any other answered status, or no answer) |
@@ -217,8 +222,13 @@ ADR-002's status line records the amendment. Its body is unchanged.
 
 ### D6. Read-your-writes
 
-Three things make a delegated write visible to the next request, each bounded:
+Four things make a delegated write visible to the next request, each bounded:
 
+- **`DeleteBucket` removal wait.** s0 drops the bucket's cached CORS entry whatever the answer
+  (except a `403 AccessDenied`), and after a `2xx` refreshes its bundle until the bucket is no longer placed under the
+  caller's tenant (or is placed under another), for at most `create_bucket_placement_wait_secs`
+  and never past the request's deadline. The outcome is recorded as
+  `delegated.placement_wait: removed`. A timeout is not an error.
 - **`CreateBucket` placement wait.** The control backend answers when the bucket is declared; the
   placement bundle that lets s0 enforce object operations on it (ADR-009) arrives separately. s0
   refreshes its bundle at once and waits up to `create_bucket_placement_wait_secs` for the bucket
@@ -237,13 +247,13 @@ Three things make a delegated write visible to the next request, each bounded:
   with any fetch that starts after the wait began; they use their own 250 ms to 1 s backoff and
   are not subject to the one-per-second miss interval, so one `CreateBucket` costs about 1 to 12
   fetches. They are counted under `trigger="placement_wait"`.
-- **CORS cache drop.** A delegated CORS write or delete drops the replica's cached CORS
+- **CORS cache drop.** A delegated CORS write or delete, and a delegated `DeleteBucket`, drops the replica's cached CORS
   configuration for the bucket. Other replicas follow within the cache TTL (60 s); "at once"
   holds only for the replica that served the write.
 
 ### D7. The two invariants, as tests
 
-- `a_delegated_operation_never_reaches_the_policy_engine`: all 15 operations, under a bundle that
+- `a_delegated_operation_never_reaches_the_policy_engine`: all 16 operations, under a bundle that
   places the bucket under another tenant with `freeze_writes` on, never call the policy engine
   and write no decision record, and each reaches the control backend.
 - `an_enforced_operation_never_reaches_the_control_backend`: every enforced operation through its
@@ -252,18 +262,35 @@ Three things make a delegated write visible to the next request, each bounded:
 Neither is satisfied by inspection of the code; both are black-box assertions that must stay in
 the suite for as long as the class exists.
 
+### D8. A bucket on no tenant answers `NoSuchBucket`
+
+ADR-009 answered both per-bucket placement refusals, a bucket placed under another tenant and a
+bucket no tenant holds on this backend, with `AccessDenied`, so that a caller could not tell them
+apart. This ADR amends that for the second case: a bucket that no tenant holds on the backend
+answers `404 NoSuchBucket` on every bucket-scoped enforced operation, a copy source and the
+listings (`ListObjects`, `ListObjectsV2`, `ListMultipartUploads`) included. A bucket placed under
+another tenant keeps answering `403 AccessDenied`. The audit reasons and the refusal corpus are
+unchanged: only the code the client is answered with changes (`PlacementRefusal::s3_code`).
+
+Delegated operations return before the placement is read, so the control backend answers the 404
+for them.
+
+Consequence: a caller can tell a free name from a name another tenant holds. That is S3's own
+behaviour, and `CreateBucket` already discloses it by refusing a taken name. It supersedes the
+"indistinguishable" rationale of ADR-009's "What the client is told" for these two refusals.
+
 ## Consequences
 
 - **The README's "no third category" is no longer true** and is rewritten with the
   implementation. The six operations listed in the 2026-08-08 conformance test as refused for
-  good are re-split: three stay non-delegable (`GetBucketPolicy`, `PutBucketPolicy` never; `DeleteBucket` under this ADR), the rest are `Delegable`.
+  good are re-split: two stay non-delegable (`GetBucketPolicy`, `PutBucketPolicy`), the rest are `Delegable`.
 - **The control backend becomes a dependency of bucket configuration.** If it is down, these
   operations answer `503`; object operations are unaffected.
 - **s0 stops checking `freeze_writes`, quotas, placement and request riders for delegated
   operations.** The control backend must apply its own equivalents, including the `CreateBucket`
   ACL, grant, ownership and object-lock refusal; that is its half of the contract. ADR-009's
   placement and backend-id refusals sit in `decide()` and do not cover delegated operations.
-- **The 15 new dispatch arms remove the "no arm, s3s `NotImplemented`" backstop** for these
+- **The 16 new dispatch arms remove the "no arm, s3s `NotImplemented`" backstop** for these
   operations (`src/access/optable.rs`); the `DelegationProof` on hook and arm replaces it.
 - **A delegated request has no policy-engine decision to replay.** The conformance corpus covers
   enforced operations only; delegated behaviour is covered by the delegation test suite.

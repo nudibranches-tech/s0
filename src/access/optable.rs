@@ -277,9 +277,9 @@ pub const OP_TABLE: &[OpSpec] = &[
         ],
     ),
     unauthorizable("CreateSession", ResourceShape::Bucket),
-    // The more dangerous half of the pair: it destroys a bucket the control plane still
-    // believes it manages.
-    denied(
+    // Delegated with `CreateBucket`: the control backend authorizes it and the backend's
+    // own `DeleteBucket` is the emptiness check (ADR-011).
+    delegable(
         "DeleteBucket",
         "delete_bucket",
         ResourceShape::Bucket,
@@ -1173,8 +1173,9 @@ mod tests {
         }
     }
 
-    const ADR_0056_OPS: [&str; 15] = [
+    const ADR_0056_OPS: [&str; 16] = [
         "CreateBucket",
+        "DeleteBucket",
         "GetBucketCors",
         "PutBucketCors",
         "DeleteBucketCors",
@@ -1196,7 +1197,7 @@ mod tests {
     }
 
     #[test]
-    fn exactly_the_fifteen_adr_0056_operations_are_delegable() {
+    fn the_delegable_set_is_sixteen() {
         let mut expected = ADR_0056_OPS.to_vec();
         let mut actual = delegable_ops();
         expected.sort_unstable();
@@ -1251,7 +1252,12 @@ mod tests {
 
     #[test]
     fn delegated_operations_refuse_what_is_not_delegable() {
-        for bad in ["GetObject", "PutBucketPolicy", "DeleteBucket", "NoSuchOp"] {
+        for bad in [
+            "GetObject",
+            "PutBucketPolicy",
+            "GetBucketPolicy",
+            "NoSuchOp",
+        ] {
             assert!(
                 DelegatedOps::from_names(&names(&[bad])).is_err(),
                 "{bad} must not be listable"
@@ -1288,12 +1294,21 @@ mod tests {
     }
 
     #[test]
-    fn the_six_control_plane_ops_are_refused_at_the_gate_without_a_control_backend() {
+    fn delete_bucket_is_delegable_and_refused_when_unconfigured() {
+        assert_eq!(spec("DeleteBucket").unwrap().coverage, Coverage::Delegable);
+        assert_eq!(
+            gate("DeleteBucket", &DelegatedOps::none()),
+            Err(GateDenial::NotEnforced)
+        );
+        assert!(DelegatedOps::from_names(&names(&["DeleteBucket"])).is_ok());
+    }
+
+    #[test]
+    fn the_control_plane_ops_are_refused_at_the_gate_without_a_control_backend() {
         // Named one by one rather than counted: a future edit could flip one back on and
         // rebalance the total by denying something else, and a count would still pass.
         for op in [
             "CreateBucket",
-            "DeleteBucket",
             "GetBucketPolicy",
             "PutBucketPolicy",
             "GetBucketCors",

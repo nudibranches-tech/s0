@@ -72,14 +72,14 @@
   "bundle_poll_secs": 30,
   "bundle_timeout_secs": 10,
   "bundle_shared_secret": "REPLACE_WITH_PLATFORM_SHARED_SECRET",
-  "_control_backend_note": "Optional. Hands bucket creation and configuration (ADR-011) to an S3 endpoint served by the control plane, which authorizes them: s0 never asks the policy engine for these. `operations` lists what to delegate, each one of the 15 delegable operations. The credential is dedicated to one (organization, backend), so the tenants above must span exactly one of each. Retries are off. `call_timeout_secs` + `create_bucket_placement_wait_secs` must stay under 60 (the AWS CLI and boto3 read timeout), and `endpoint_url` must differ from every backend's and from `bundle_url`. Restart-only. Omit the section and these operations are refused with 403.",
+  "_control_backend_note": "Optional. Hands bucket creation, deletion and configuration (ADR-011) to an S3 endpoint served by the control plane, which authorizes them: s0 never asks the policy engine for these. `operations` lists what to delegate, each one of the 16 delegable operations. The credential is dedicated to one (organization, backend), so the tenants above must span exactly one of each. Retries are off. `call_timeout_secs` + `create_bucket_placement_wait_secs` must stay under 60 (the AWS CLI and boto3 read timeout), and `endpoint_url` must differ from every backend's and from `bundle_url`. Restart-only. Omit the section and these operations are refused with 403.",
   "control_backend": {
     "endpoint_url": "http://console-s3-control.hyperfluid.svc.cluster.local:8010",
     "region": "us-east-1",
     "access_key_id": "REPLACE_WITH_CONTROL_CREDENTIAL_KEY_ID",
     "secret_access_key": "REPLACE_WITH_CONTROL_CREDENTIAL_SECRET",
     "operations": [
-      "CreateBucket",
+      "CreateBucket", "DeleteBucket",
       "GetBucketCors", "PutBucketCors", "DeleteBucketCors",
       "GetBucketLifecycleConfiguration", "PutBucketLifecycleConfiguration", "DeleteBucketLifecycle",
       "GetBucketTagging", "PutBucketTagging", "DeleteBucketTagging",

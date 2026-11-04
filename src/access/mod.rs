@@ -556,11 +556,12 @@ impl GatewayAccess {
         s3_error!(AccessDenied, "{reason}")
     }
 
-    /// Record a placement refusal with its full reason, and answer 403 with the client's
-    /// version of it ([`PlacementRefusal::client_message`]).
+    /// Record a placement refusal with its full reason, and answer with the client's
+    /// version of it ([`PlacementRefusal::client_message`]), under the code
+    /// [`PlacementRefusal::s3_code`].
     fn deny_placement(&self, input: OpaInput, refusal: &PlacementRefusal) -> S3Error {
         self.audit_denied(input, &Decision::deny(refusal.reason()), vec![]);
-        s3_error!(AccessDenied, "{}", refusal.client_message())
+        S3Error::with_message(refusal.s3_code(), refusal.client_message())
     }
 
     /// The reserved-key list currently published by the control plane.
@@ -863,16 +864,21 @@ impl GatewayAccess {
         // Ahead of `decide`, for the client message; see `enforce_charged`.
         if let Some(refusal) = cx.placement_refusal(&input) {
             self.audit_denied(input, &Decision::deny(refusal.reason()), vec![]);
-            return ListVerdict::Deny(refusal.client_message());
+            return match refusal.s3_code() {
+                s3s::S3ErrorCode::NoSuchBucket => {
+                    ListVerdict::NoSuchBucket(refusal.client_message())
+                }
+                _ => ListVerdict::Deny(refusal.client_message()),
+            };
         }
         let decision = self.decide(cx, &input).await;
         let verdict = classify_list(&decision, self.gw.limits().max_list_fanout, fanout);
         match &verdict {
-            ListVerdict::Deny(reason) => {
+            ListVerdict::Deny(reason) | ListVerdict::NoSuchBucket(reason) => {
                 let d = Decision::deny(reason.clone());
                 self.audit_denied(input, &d, vec![]);
             }
-            _ => {
+            ListVerdict::AllowAsIs | ListVerdict::Narrow(_) | ListVerdict::FanOut(_) => {
                 self.audit_pending(cx, input, &decision, vec![]);
                 cx.prove();
             }
@@ -1264,6 +1270,7 @@ impl S3Access for GatewayAccess {
         };
         match verdict {
             ListVerdict::Deny(reason) => Err(s3_error!(AccessDenied, "{reason}")),
+            ListVerdict::NoSuchBucket(reason) => Err(s3_error!(NoSuchBucket, "{reason}")),
             ListVerdict::AllowAsIs => Ok(()),
             ListVerdict::Narrow(np) => {
                 req.input.prefix = Some(np);
@@ -1446,16 +1453,20 @@ impl S3Access for GatewayAccess {
 
     // ── delegated operations ────────────────────────────────────────────────────
     //
-    // The 15 `Coverage::Delegable` operations. Each hook only demands the
+    // The 16 `Coverage::Delegable` operations. Each hook only demands the
     // `DelegationProof` that `check` mints for a request it admitted as delegated, because
     // the s3s default would answer `Ok(())` and a hook that did nothing would read as an
     // authorization. They never reach the policy engine: the control backend authorizes
-    // (ADR-011). `delete_bucket` and `{get,put}_bucket_policy` stay absent, so the table
+    // (ADR-011). `{get,put}_bucket_policy` stay absent, so the table
     // keeps them `Coverage::Denied`, `check` refuses them before deserialization, and even
     // a bug in `check` lands on s3s's `NotImplemented`;
     // `tests/gate_invariants.rs::denied_ops_have_no_dispatch_arm` holds that.
 
     async fn create_bucket(&self, req: &mut S3Request<CreateBucketInput>) -> S3Result<()> {
+        delegation::require(req)
+    }
+
+    async fn delete_bucket(&self, req: &mut S3Request<DeleteBucketInput>) -> S3Result<()> {
         delegation::require(req)
     }
 
@@ -1708,6 +1719,8 @@ header_list_item!(OptionalObjectAttributes);
 /// What to do with a list request after the PDP decision.
 enum ListVerdict {
     Deny(String),
+    /// The bucket is on no tenant of this backend.
+    NoSuchBucket(String),
     /// Allowed as requested (whole-bucket or already-in-scope prefix).
     AllowAsIs,
     /// Rewrite the request prefix to this single granted prefix.
@@ -1965,6 +1978,7 @@ fn unimplemented_obligations(decision: &Decision) -> Option<String> {
 fn list_verdict_single(verdict: ListVerdict, prefix: &mut Option<String>) -> S3Result<()> {
     match verdict {
         ListVerdict::Deny(reason) => Err(s3_error!(AccessDenied, "{reason}")),
+        ListVerdict::NoSuchBucket(reason) => Err(s3_error!(NoSuchBucket, "{reason}")),
         ListVerdict::AllowAsIs => Ok(()),
         ListVerdict::Narrow(np) => {
             *prefix = Some(np);
@@ -2222,7 +2236,7 @@ mod tests {
                         ListVerdict::FanOut(_) => "FanOut",
                         ListVerdict::AllowAsIs => "AllowAsIs",
                         ListVerdict::Narrow(_) => "Narrow",
-                        ListVerdict::Deny(_) => unreachable!(),
+                        ListVerdict::Deny(_) | ListVerdict::NoSuchBucket(_) => unreachable!(),
                     }
                 ),
             }

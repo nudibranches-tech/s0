@@ -83,11 +83,11 @@ async fn a_delegated_operation_never_reaches_the_policy_engine() {
     );
     let mut seen: Vec<String> = stub.calls().into_iter().map(|c| c.operation).collect();
     seen.sort_unstable();
-    assert_eq!(seen.len(), 15, "{seen:?}");
+    assert_eq!(seen.len(), 16, "{seen:?}");
     assert_matches_delegable_set(seen.iter().map(String::as_str).collect());
 
-    let records = fx.await_audit_records(15).await;
-    assert_eq!(records.len(), 15, "{records:#?}");
+    let records = fx.await_audit_records(16).await;
+    assert_eq!(records.len(), 16, "{records:#?}");
     for rec in &records {
         assert_eq!(rec.path, DELEGATED_PATH);
         assert!(rec.input.is_none() && rec.gate.is_none(), "{rec:#?}");
@@ -588,7 +588,6 @@ async fn the_never_delegable_control_plane_ops_stay_refused_with_delegation_on()
     let host = base.trim_start_matches("http://").to_string();
 
     for (op, method, query) in [
-        ("DeleteBucket", "DELETE", None),
         ("GetBucketPolicy", "GET", Some("policy")),
         ("PutBucketPolicy", "PUT", Some("policy")),
     ] {
@@ -610,8 +609,8 @@ async fn the_never_delegable_control_plane_ops_stay_refused_with_delegation_on()
         "a never-delegable operation reached the control backend"
     );
 
-    let records = fx.await_audit_records(3).await;
-    assert_eq!(records.len(), 3, "{records:#?}");
+    let records = fx.await_audit_records(2).await;
+    assert_eq!(records.len(), 2, "{records:#?}");
     for rec in &records {
         let gate = rec.gate.as_ref().expect("a gate record");
         assert_eq!(gate.stage, GateStage::OperationNotEnforced, "{rec:#?}");
@@ -723,7 +722,7 @@ async fn a_replica_refusing_bucket_not_on_this_backend_refreshes_once_and_decide
 
     let answer = get_object(&base, "reports", "2024/a.txt", ACCESS_KEY).await;
     assert_ne!(
-        answer.status, 403,
+        answer.status, 404,
         "refused as not on this backend after the refresh: {}",
         answer.body
     );
@@ -758,7 +757,7 @@ async fn a_gateway_without_a_control_backend_does_not_refresh_on_a_miss() {
     let base = serve(&fx).await;
 
     let answer = get_object(&base, "reports", "2024/a.txt", ACCESS_KEY).await;
-    assert_eq!(answer.status, 403);
+    assert_eq!(answer.status, 404);
     assert_eq!(bundles.fetches(), 0);
 }
 
@@ -877,7 +876,7 @@ async fn a_burst_of_misses_costs_at_most_two_fetches() {
     )
     .await;
     assert!(
-        answers.iter().all(|a| a.status != 403),
+        answers.iter().all(|a| a.status != 403 && a.status != 404),
         "{:?}",
         answers.iter().map(|a| a.status).collect::<Vec<_>>()
     );
@@ -896,4 +895,127 @@ async fn get_object(base: &str, bucket: &str, key: &str, access_key: &str) -> An
     let host = base.trim_start_matches("http://").to_string();
     let req = RawRequest::new("GET", format!("/{bucket}/{key}"));
     send_raw(base, &host, req, access_key, SECRET_KEY).await
+}
+
+#[tokio::test]
+async fn a_delegated_delete_bucket_never_reaches_the_policy_engine() {
+    let stub = ControlStub::start().await;
+    let fx = common::fixture_with_control("deleg-del-pdp", hostile_bundle(), &stub.endpoint);
+    let base = serve(&fx).await;
+
+    let answer = send_op(&base, "DeleteBucket", "ledger").await;
+    assert_eq!(answer.status, 204, "{}", answer.body);
+    assert_eq!(fx.pdp_calls(), 0);
+    assert!(fx.capture.snapshot().is_empty());
+    assert_eq!(stub.calls().len(), 1);
+    assert_eq!(stub.calls()[0].operation, "DeleteBucket");
+
+    let records = fx.await_audit_records(1).await;
+    assert_eq!(records[0].path, DELEGATED_PATH);
+}
+
+#[tokio::test]
+async fn a_delegated_delete_bucket_passes_bucket_not_empty_through() {
+    let stub = ControlStub::start().await;
+    let mut fx =
+        common::fixture_with_control("deleg-del-ne", placing_bundle(&["reports"]), &stub.endpoint);
+    let bundles = BundleServer::start(vec![placing_bundle(&["reports"])], Duration::ZERO).await;
+    install_refresher(&mut fx, &bundles);
+    stub.fail(
+        "DeleteBucket",
+        S3ErrorCode::BucketNotEmpty,
+        409,
+        "The bucket you tried to delete is not empty",
+    );
+    let base = serve(&fx).await;
+
+    let answer = send_op(&base, "DeleteBucket", "reports").await;
+    assert_eq!(answer.status, 409, "{}", answer.body);
+    assert!(answer.body.contains("BucketNotEmpty"), "{}", answer.body);
+
+    let records = fx.await_audit_records(1).await;
+    let d = delegated(&records)[0].delegated.clone().expect("context");
+    assert_eq!(d.control_status, Some(409));
+    assert_eq!(d.control_error.as_deref(), Some("BucketNotEmpty"));
+    assert!(d.placement_wait.is_none());
+    assert_eq!(bundles.fetches(), 0);
+}
+
+#[tokio::test]
+async fn a_delegated_delete_bucket_waits_until_the_bucket_is_unplaced() {
+    let stub = ControlStub::start().await;
+    let mut fx = common::fixture_with_control(
+        "deleg-del-wait",
+        placing_bundle(&["reports", "fresh"]),
+        &stub.endpoint,
+    );
+    let bundles = BundleServer::start(
+        vec![
+            placing_bundle(&["reports", "fresh"]),
+            placing_bundle(&["reports"]),
+        ],
+        Duration::ZERO,
+    )
+    .await;
+    install_refresher(&mut fx, &bundles);
+    let base = serve(&fx).await;
+
+    let answer = send_op(&base, "DeleteBucket", "fresh").await;
+    assert_eq!(answer.status, 204, "{}", answer.body);
+    assert!(
+        fx.gw
+            .bundles
+            .current()
+            .placement()
+            .refusal(BACKEND, "acme", "fresh")
+            .is_some(),
+        "the answer went out while the bucket was still placed"
+    );
+    let records = fx.await_audit_records(1).await;
+    assert_eq!(
+        placement_wait(&records),
+        Some(s0::bundle_refresh::PlacementWaitOutcome::Removed)
+    );
+}
+
+#[tokio::test]
+async fn a_delegated_delete_bucket_drops_the_cors_entry_even_when_the_call_is_cancelled() {
+    let stub = ControlStub::start().await;
+    let fx = common::fixture_with_control("deleg-del-cors", common::alice_bundle(), &stub.endpoint);
+    stub.delay("DeleteBucket", Duration::from_secs(30));
+    let base = serve(&fx).await;
+    let route = fx.gw.registry.route_snapshot("acme").expect("route");
+    let lookups = || fx.gw.cors.metrics().backend_lookups();
+
+    fx.gw.cors.lookup(&fx.gw.registry, &route, "reports").await;
+    fx.gw.cors.lookup(&fx.gw.registry, &route, "reports").await;
+    let before = lookups();
+
+    let client = tokio::spawn({
+        let base = base.clone();
+        async move { send_op(&base, "DeleteBucket", "reports").await }
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while stub.calls().is_empty() {
+        assert!(std::time::Instant::now() < deadline, "no control call");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    client.abort();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    fx.gw.cors.lookup(&fx.gw.registry, &route, "reports").await;
+    assert_eq!(lookups(), before + 1, "the cancelled delete left the entry");
+}
+
+#[tokio::test]
+async fn a_delete_bucket_the_configuration_does_not_list_is_access_denied() {
+    let stub = ControlStub::start().await;
+    let mut section = common::control_backend_json(&stub.endpoint);
+    section["operations"] = serde_json::json!(["GetBucketCors"]);
+    let fx = common::fixture_with_control_section("deleg-del-unl", common::alice_bundle(), section);
+    let base = serve(&fx).await;
+
+    let answer = send_op(&base, "DeleteBucket", "reports").await;
+    assert_eq!(answer.status, 403, "{}", answer.body);
+    assert_eq!(stub.count(), 0);
 }

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::GatewayConfig;
 use crate::counters::LabeledCounters;
 use crate::error::GatewayError;
-use crate::pdp::{Bundle, BundleStore, Pdp, content_revision, parse_bundle};
+use crate::pdp::{Bundle, BundleStore, Pdp, PlacementRefusal, content_revision, parse_bundle};
 use crate::secret::Secret;
 
 /// The shortest gap between two on-demand fetches triggered by a placement miss.
@@ -224,13 +224,15 @@ pub enum Refreshed {
     Reloaded,
 }
 
-/// How a wait for a bucket to appear in the placement ended.
+/// How a wait for a bucket to appear in, or leave, the placement ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlacementWaitOutcome {
     /// The bundle in force places no buckets, so there is nothing to wait for.
     NotPlacing,
     Placed,
+    /// The bucket is no longer placed under the tenant.
+    Removed,
     TimedOut,
 }
 
@@ -239,16 +241,25 @@ impl PlacementWaitOutcome {
         match self {
             PlacementWaitOutcome::NotPlacing => "not_placing",
             PlacementWaitOutcome::Placed => "placed",
+            PlacementWaitOutcome::Removed => "removed",
             PlacementWaitOutcome::TimedOut => "timed_out",
         }
     }
 }
 
-/// Waits until a bucket is placed under a tenant. The forward layer holds this rather
-/// than the refresher, so it never has a policy handle in reach.
+/// Waits until a bucket is placed under a tenant, or until it no longer is. The forward
+/// layer holds this rather than the refresher, so it never has a policy handle in reach.
 #[async_trait::async_trait]
 pub trait PlacementWait: Send + Sync {
     async fn wait_until_placed(
+        &self,
+        backend: &str,
+        tenant: &str,
+        bucket: &str,
+        budget: Duration,
+    ) -> PlacementWaitOutcome;
+
+    async fn wait_until_removed(
         &self,
         backend: &str,
         tenant: &str,
@@ -432,15 +443,21 @@ impl BundleRefresher {
         let placement = bundle.placement();
         placement.places_buckets() && placement.refusal(backend, tenant, bucket).is_none()
     }
-}
 
-#[async_trait::async_trait]
-impl PlacementWait for Arc<BundleRefresher> {
-    async fn wait_until_placed(
-        &self,
-        backend: &str,
-        tenant: &str,
-        bucket: &str,
+    fn removed(&self, backend: &str, tenant: &str, bucket: &str) -> bool {
+        let bundle = self.bundles.current();
+        let placement = bundle.placement();
+        placement.places_buckets()
+            && matches!(
+                placement.refusal(backend, tenant, bucket),
+                Some(PlacementRefusal::NotOnBackend | PlacementRefusal::AnotherTenant)
+            )
+    }
+
+    async fn wait_for(
+        self: &Arc<Self>,
+        reached: impl Fn(&Self) -> bool,
+        done: PlacementWaitOutcome,
         budget: Duration,
     ) -> PlacementWaitOutcome {
         if !self.bundles.current().placement().places_buckets() {
@@ -449,8 +466,8 @@ impl PlacementWait for Arc<BundleRefresher> {
         let deadline = Instant::now() + budget;
         let mut backoff = WAIT_BACKOFF_START;
         loop {
-            if self.placed(backend, tenant, bucket) {
-                return PlacementWaitOutcome::Placed;
+            if reached(self) {
+                return done;
             }
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 return PlacementWaitOutcome::TimedOut;
@@ -468,13 +485,46 @@ impl PlacementWait for Arc<BundleRefresher> {
                 Err(_) => "timed_out",
             };
             self.on_demand_total.increment("placement_wait", result);
-            if self.placed(backend, tenant, bucket) {
-                return PlacementWaitOutcome::Placed;
+            if reached(self) {
+                return done;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             tokio::time::sleep(backoff.min(remaining)).await;
             backoff = (backoff * 2).min(WAIT_BACKOFF_MAX);
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl PlacementWait for Arc<BundleRefresher> {
+    async fn wait_until_placed(
+        &self,
+        backend: &str,
+        tenant: &str,
+        bucket: &str,
+        budget: Duration,
+    ) -> PlacementWaitOutcome {
+        self.wait_for(
+            |r| r.placed(backend, tenant, bucket),
+            PlacementWaitOutcome::Placed,
+            budget,
+        )
+        .await
+    }
+
+    async fn wait_until_removed(
+        &self,
+        backend: &str,
+        tenant: &str,
+        bucket: &str,
+        budget: Duration,
+    ) -> PlacementWaitOutcome {
+        self.wait_for(
+            |r| r.removed(backend, tenant, bucket),
+            PlacementWaitOutcome::Removed,
+            budget,
+        )
+        .await
     }
 }
 
@@ -869,5 +919,49 @@ mod tests {
             .await;
         assert_eq!(outcome, PlacementWaitOutcome::NotPlacing);
         assert_eq!(served.load(Ordering::SeqCst), 0);
+    }
+
+    fn seed_placing(buckets: &[&str]) -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(&bundle_body(buckets)).expect("json")["data"]
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn wait_until_removed_returns_once_the_bucket_is_gone() {
+        let (url, served) = scripted_server(
+            vec![bundle_body(&["other", "fresh"]), bundle_body(&["other"])],
+            Duration::ZERO,
+        )
+        .await;
+        let refresher = refresher_seeded(url, seed_placing(&["other", "fresh"]));
+        let outcome = refresher
+            .wait_until_removed("bay-1", "acme", "fresh", Duration::from_secs(5))
+            .await;
+        assert_eq!(outcome, PlacementWaitOutcome::Removed);
+        assert_eq!(served.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn wait_until_removed_times_out_while_the_bucket_stays() {
+        let (url, _) =
+            scripted_server(vec![bundle_body(&["other", "fresh"])], Duration::ZERO).await;
+        let refresher = refresher_seeded(url, seed_placing(&["other", "fresh"]));
+        let started = Instant::now();
+        let outcome = refresher
+            .wait_until_removed("bay-1", "acme", "fresh", Duration::from_millis(600))
+            .await;
+        assert_eq!(outcome, PlacementWaitOutcome::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn wait_until_removed_does_not_end_on_a_bundle_for_another_backend() {
+        let other = bundle_body(&["other"]).replace("bay-1", "bay-2");
+        let (url, _) = scripted_server(vec![other], Duration::ZERO).await;
+        let refresher = refresher_seeded(url, seed_placing(&["other", "fresh"]));
+        let outcome = refresher
+            .wait_until_removed("bay-1", "acme", "fresh", Duration::from_millis(600))
+            .await;
+        assert_eq!(outcome, PlacementWaitOutcome::TimedOut);
     }
 }

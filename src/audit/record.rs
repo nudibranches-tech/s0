@@ -198,8 +198,8 @@ pub struct DelegationContext {
     /// The error code the control backend answered; absent on success.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_error: Option<String>,
-    /// How the wait for a created bucket to be placed ended; absent for an operation that
-    /// waits for nothing.
+    /// How the placement wait (CreateBucket) or the removal wait (DeleteBucket) ended;
+    /// absent for an operation that waits for nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement_wait: Option<PlacementWaitOutcome>,
 }
@@ -345,7 +345,7 @@ impl AuditRecord {
         }
     }
 
-    /// Note how the wait for a created bucket to be placed ended.
+    /// Note how the placement wait (CreateBucket) or removal wait (DeleteBucket) ended.
     pub fn note_placement_wait(&mut self, outcome: PlacementWaitOutcome) {
         if let Some(delegated) = self.delegated.as_mut() {
             delegated.placement_wait = Some(outcome);

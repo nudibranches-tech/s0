@@ -1377,7 +1377,7 @@ const RE_DENIED_REQUESTS: [ReDeniedRequest; 6] = [
 #[tokio::test]
 async fn the_six_control_plane_ops_are_refused_at_the_gate_and_on_the_record() {
     // Deliberately black-box, on a gateway with no control backend (with one, CreateBucket,
-    // GetBucketCors and PutBucketCors are delegated and their ACL and grant screening
+    // DeleteBucket, GetBucketCors and PutBucketCors are delegated and their ACL and grant screening
     // belongs to the control backend, ADR-011 D3): a real, correctly-signed S3 request for
     // each of the six is refused by the *gate* — before deserialization, with no policy question asked —
     // and leaves a record saying so. It matters that the refusal is the gate's rather

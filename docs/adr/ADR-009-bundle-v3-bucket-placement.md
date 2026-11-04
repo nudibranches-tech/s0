@@ -1,7 +1,7 @@
 # ADR-009: Bundle v3 — bucket placement, enforced by the gateway
 
 - **Status**: Accepted — implemented (src/pdp/bundle.rs, src/access/mod.rs, src/proxy/mod.rs,
-  policy/gateway/authz.rego)
+  policy/gateway/authz.rego); amended by ADR-011 D8: the per-bucket refusal codes
 - **Date**: 2026-10-02
 - **Owners**: gateway team (this repo); the per-backend projection is control-plane integration
 - **Related**: `src/pdp/bundle.rs` (`BucketPlacement`), `src/access/mod.rs` (`check`, `decide`),

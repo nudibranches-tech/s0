@@ -589,9 +589,10 @@ impl GatewayS3 {
         ));
         pending.mark_delegation_dispatched();
         let cors_guard = match (&after, &self.state.cors) {
-            (AfterDelegation::DropCors { bucket }, Some(cors)) => {
-                DropCorsOnCancel::armed(cors.clone(), route.clone(), bucket.clone())
-            }
+            (
+                AfterDelegation::DropCors { bucket } | AfterDelegation::AwaitRemoval { bucket },
+                Some(cors),
+            ) => DropCorsOnCancel::armed(cors.clone(), route.clone(), bucket.clone()),
             _ => DropCorsOnCancel::disarmed(),
         };
         let result = CALLER
@@ -616,6 +617,31 @@ impl GatewayS3 {
                     }
                 }
                 cors_guard.disarm();
+            }
+            AfterDelegation::AwaitRemoval { bucket } => {
+                if let Some(cors) = &self.state.cors {
+                    if !matches!(&result, Err(e) if status == Some(403)
+                        && e.code().as_str() == "AccessDenied")
+                    {
+                        cors.invalidate(&route, bucket).await;
+                    }
+                }
+                cors_guard.disarm();
+                if let (Ok(_), Some(wait)) = (&result, &self.state.placement_wait) {
+                    let budget = control
+                        .placement_wait()
+                        .min(DELEGATED_DEADLINE.saturating_sub(checked_at.elapsed()));
+                    let outcome = wait
+                        .wait_until_removed(&route.backend_id.0, &route.tenant, bucket, budget)
+                        .await;
+                    if outcome == PlacementWaitOutcome::TimedOut {
+                        tracing::warn!(
+                            tenant = %route.tenant, %bucket,
+                            "the deleted bucket is still in the bundle; answering anyway"
+                        );
+                    }
+                    pending.note_placement_wait(outcome);
+                }
             }
             AfterDelegation::AwaitPlacement { bucket } => {
                 if let (Ok(_), Some(wait)) = (&result, &self.state.placement_wait) {
@@ -707,6 +733,11 @@ enum AfterDelegation {
     /// A created bucket must be in the bundle before the client is answered, or its next
     /// request would be refused as not on this backend.
     AwaitPlacement {
+        bucket: String,
+    },
+    /// A deleted bucket must be out of the bundle before the client is answered, and its
+    /// cached CORS entry is dropped, whatever the answer was.
+    AwaitRemoval {
         bucket: String,
     },
     /// The bucket's cached CORS configuration is stale, whatever the answer was.
@@ -1116,13 +1147,13 @@ impl S3 for GatewayS3 {
 
     // ── delegated operations ────────────────────────────────────────────────────
     //
-    // The 15 `Coverage::Delegable` operations, answered by the control backend under a
+    // The 16 `Coverage::Delegable` operations, answered by the control backend under a
     // `DelegationProof` (`GatewayS3::delegate`). Everything else in the bucket family has
     // no arm rather than an `AccessDenied` stub: a stub still proves the op is routable,
     // and the next person to add a `forward` to it has no gate to trip over. With no arm
     // the rest fall to `s3s`'s `NotImplemented` default, which holds even if `check` is
-    // wrong (`tests/gate_invariants.rs::denied_ops_have_no_dispatch_arm`). Bucket deletion
-    // and policy stay control-plane — see `access::optable::NON_GATEWAY_VERBS`.
+    // wrong (`tests/gate_invariants.rs::denied_ops_have_no_dispatch_arm`). Bucket policy
+    // stays control-plane — see `access::optable::NON_GATEWAY_VERBS`.
 
     async fn create_bucket(
         &self,
@@ -1133,6 +1164,19 @@ impl S3 for GatewayS3 {
             req,
             AfterDelegation::AwaitPlacement { bucket },
             |c, r| async move { c.proxy().create_bucket(r).await },
+        )
+        .await
+    }
+
+    async fn delete_bucket(
+        &self,
+        req: S3Request<DeleteBucketInput>,
+    ) -> S3Result<S3Response<DeleteBucketOutput>> {
+        let bucket = req.input.bucket.clone();
+        self.delegate_then(
+            req,
+            AfterDelegation::AwaitRemoval { bucket },
+            |c, r| async move { c.proxy().delete_bucket(r).await },
         )
         .await
     }
