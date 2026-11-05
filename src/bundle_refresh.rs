@@ -234,7 +234,10 @@ async fn refresh_once(
     pdp.reload(parsed.policy.as_deref(), &parsed.data)
         .await
         .map_err(|e| e.to_string())?;
-    let policy_module = parsed.policy.is_some();
+    // A data-only bundle keeps the module in force (the embedded engine recompiles the
+    // current module with the new data), so a pushed module stays in force — and the
+    // PEP keeps reading subjects in its key space — until another module replaces it.
+    let policy_module = parsed.policy.is_some() || bundles.current().policy_module;
     bundles.store(Bundle::new(revision.clone(), parsed.data).with_policy_module(policy_module));
     tracing::info!(%revision, "bundle reloaded");
     Ok(())
@@ -331,5 +334,37 @@ mod tests {
             !headers.contains_key(&crate::internal::SHARED_SECRET_HEADER.to_ascii_lowercase()),
             "an unconfigured poller sent an auth header: {headers:?}"
         );
+    }
+
+    struct NoPdp;
+    #[async_trait::async_trait]
+    impl Pdp for NoPdp {
+        async fn decide(
+            &self,
+            _input: &crate::authz::OpaInput,
+        ) -> crate::error::Result<crate::authz::Decision> {
+            Ok(crate::authz::Decision::deny("test"))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_data_only_bundle_keeps_the_pushed_module_in_force() {
+        // The embedded engine keeps a pushed module across data-only bundles, so the
+        // flag the PEP reads subjects by must too, or every SFTP login is refused.
+        let path = std::env::temp_dir().join(format!("s0-refresh-{}.json", uuid::Uuid::new_v4()));
+        let pdp: Arc<dyn Pdp> = Arc::new(NoPdp);
+        let bundles = Arc::new(BundleStore::new(Bundle::new("boot", serde_json::json!({}))));
+        let source = BundleSource::File(path.clone());
+        std::fs::write(&path, r#"{"policy": "package x", "data": {"v": 1}}"#).unwrap();
+        refresh_once(&pdp, &bundles, &source).await.unwrap();
+        assert!(bundles.current().policy_module);
+        std::fs::write(&path, r#"{"data": {"v": 2}}"#).unwrap();
+        refresh_once(&pdp, &bundles, &source).await.unwrap();
+        assert_eq!(bundles.current().data["v"], 2);
+        assert!(
+            bundles.current().policy_module,
+            "a data-only bundle does not unload the module"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }
