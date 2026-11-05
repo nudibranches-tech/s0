@@ -1818,6 +1818,25 @@ impl SftpSession {
         };
         let native = self.mode_for(&route) == ConditionalCreate::Native;
         let conditional = !overwrite && native;
+        // Without a native conditional commit, a create-only rename is guarded like a
+        // create-only upload (D8): the target is claimed in the in-flight registry for the
+        // whole copy, and re-checked immediately before the commit.
+        let recheck = !overwrite && !native;
+        let _inflight = if recheck {
+            match self
+                .shared
+                .inflight
+                .claim(&route.backend_id.0, &bucket, &b.key)
+            {
+                Some(g) => Some(g),
+                None => {
+                    audit.settle(BackendOutcome::NotAttempted, None);
+                    return status(id, StatusCode::Failure, "upload in progress");
+                }
+            }
+        } else {
+            None
+        };
         if !overwrite {
             // Early, byte-free refusal; `native` closes the race at the commit.
             match backend.head(&proof, &bucket, &b.key).await {
@@ -1839,8 +1858,17 @@ impl SftpSession {
                 .put(&proof, &bucket, &b.key, Bytes::new(), conditional)
                 .await
         } else {
-            self.multipart_copy(&backend, &proof, &bucket, &a.key, &b.key, size, conditional)
-                .await
+            self.multipart_copy(
+                &backend,
+                &proof,
+                &bucket,
+                &a.key,
+                &b.key,
+                size,
+                conditional,
+                recheck,
+            )
+            .await
         };
         match copied {
             Ok(()) => {}
@@ -1877,6 +1905,10 @@ impl SftpSession {
     /// `CreateMultipartUpload` + `UploadPartCopy`×n + (conditional)
     /// `CompleteMultipartUpload`, because `CopyObject` has no destination condition in
     /// s3s 0.14.1 (E4). Aborted on any error.
+    ///
+    /// `recheck` (create-only under `check_then_write`): the target is HEADed again after
+    /// the parts are copied and immediately before the commit, as an upload's CLOSE does;
+    /// a target that appeared meanwhile is `PreconditionFailed`.
     #[allow(clippy::too_many_arguments)]
     async fn multipart_copy(
         &self,
@@ -1887,6 +1919,7 @@ impl SftpSession {
         dst: &str,
         size: u64,
         conditional: bool,
+        recheck: bool,
     ) -> Result<(), BackendError> {
         let upload = backend.create_multipart(proof, bucket, dst).await?;
         let mut parts = Vec::new();
@@ -1901,6 +1934,9 @@ impl SftpSession {
                 parts.push((n, etag));
                 start = end + 1;
                 n += 1;
+            }
+            if recheck && backend.head(proof, bucket, dst).await?.is_some() {
+                return Err(BackendError::PreconditionFailed);
             }
             backend
                 .complete_multipart(proof, bucket, dst, &upload, parts, conditional)
