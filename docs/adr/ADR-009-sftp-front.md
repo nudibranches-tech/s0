@@ -203,6 +203,10 @@ ships with a release:
   probes. s0 counts them itself:
   - `max_key_probes` per connection, default 10;
   - exceeding it disconnects, and counts as one authentication failure toward the ban (D12).
+  - Failures count toward the ban only when the connection **ends without authenticating**.
+    An agent holding several keys signs with the wrong ones before the right one; each
+    rejection is audited, but a connection that then logs in is a legitimate client, and
+    counting its rejections would ban a NAT'd partner after a few routine connections.
   - A probe for an unknown login and a probe for an unauthorized key get the same answer
     after the same delay.
   - A probe does answer "accepted" for an authorized (login, key) pair, as in every SSH
@@ -585,7 +589,8 @@ results:
 - *Per process*: `max_transfer_memory` (default 1 GiB, about 39 concurrent uploads at the
   defaults). A write OPEN **reserves its transfer's worst case up front**, so a transfer can
   never run out of memory halfway through. If the reservation cannot be made within 10 s, the
-  OPEN fails with `SSH_FX_FAILURE` ("server busy").
+  OPEN fails with `SSH_FX_FAILURE` ("server busy"). A read OPEN reserves its `read_ahead`
+  from the same budget for as long as the handle is open, under the same rule.
 - *Backpressure*: when a transfer's buffers are full, the session stops reading from the
   channel, and SSH flow control stops the client. PR 3 verifies that russh replenishes the
   window only as data is consumed.
@@ -595,9 +600,12 @@ keeps 64 × 32 KiB in flight).
 
 - A WRITE at the next expected offset is appended.
 - A WRITE ahead of it by no more than `reorder_window` (default 2 MiB, at most `part_size`)
-  is held until the gap fills.
+  is held until the gap fills. Each held chunk is charged its length plus a fixed 256-byte
+  overhead against the window, so many tiny writes cannot hold far more than the window.
 - A WRITE that overlaps bytes already accepted, or lands beyond the window, is refused with
-  `SSH_FX_OP_UNSUPPORTED` ("non-sequential write").
+  `SSH_FX_OP_UNSUPPORTED` ("non-sequential write"). The refusal **poisons the transfer**:
+  the next WRITE or the CLOSE aborts it. Stock clients CLOSE after a write error, and
+  committing then would land a file missing the refused bytes.
 - A CLOSE with a gap still open is refused and the transfer aborted.
 - A WRITE's `SSH_FX_OK` means *accepted into the transfer*. Only CLOSE's `SSH_FX_OK` means
   *committed*.
@@ -637,6 +645,9 @@ write (create or overwrite) of the target, and a delete of the source (D7).
 - It is **not atomic**: between the copy and the delete both keys exist, and if the delete
   fails both remain. s0 then answers `SSH_FX_FAILURE` naming the state, and the record says
   so.
+- A create-only RENAME on a `check_then_write` backend is guarded like a create-only upload
+  (D8): the target is claimed in the in-flight registry for the whole copy, and re-checked
+  immediately before the commit.
 - Renaming a non-empty directory is refused in v1. An empty directory (a marker) is renamed
   as its marker.
 
@@ -692,10 +703,10 @@ restart.
 | `max_connections_per_ip` | 16 | process, per IPv4 /32 or IPv6 /64 |
 | `max_sessions_per_subject` | 8 | process |
 | `preauth_rate_per_ip` | 10/min, burst 20 | process, token bucket |
-| `handshake_timeout_secs` | 30 | from TCP accept to authentication success, including the PROXY header |
+| `handshake_timeout_secs` | 30 | from TCP accept to authentication success, including the PROXY header, the version exchange and KEX |
 | `max_auth_attempts` | 6 | connection |
 | `max_key_probes` | 10 | connection, counted separately from attempts (D3) |
-| `auth_failure_ban` | 10 failures in 5 min ⇒ 15 min ban | process, per /32 or /64, LRU-bounded table |
+| `auth_failure_ban` | 10 failures in 5 min ⇒ 15 min ban | process, per /32 or /64, LRU-bounded table; failures count when their connection ends unauthenticated (D3) |
 | `idle_timeout_secs` | 300 | session, no SFTP request |
 | `transfer_idle_timeout_secs` | 120 | transfer |
 | `max_file_size` | 50 GiB | transfer |
