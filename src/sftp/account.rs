@@ -211,22 +211,27 @@ impl Directory {
                 }
             }
         }
-        if let Some(cidrs) = section
-            .get("denied_source_cidrs")
-            .and_then(|c| c.as_array())
-        {
-            for c in cidrs {
-                match c.as_str().map(Cidr::parse) {
-                    Some(Ok(c)) => dir.denied_source_cidrs.push(c),
-                    _ => {
-                        // A denylist entry that does not parse cannot be enforced, and an
-                        // unenforced block is an allow nobody chose. Refuse the section.
-                        dir.gate = Err(format!(
-                            "data.sftp.denied_source_cidrs has an invalid entry {c}"
-                        ));
-                        tracing::error!(revision = %bundle.revision, reason = ?dir.gate, "sftp refused for this bundle");
-                        return dir;
-                    }
+        // Present but not an array is refused like an invalid entry: an unreadable
+        // denylist is not an empty one.
+        let cidrs = match optional_array(section, "denied_source_cidrs") {
+            Ok(c) => c,
+            Err(e) => {
+                dir.gate = Err(format!("data.sftp.{e}"));
+                tracing::error!(revision = %bundle.revision, reason = ?dir.gate, "sftp refused for this bundle");
+                return dir;
+            }
+        };
+        for c in cidrs {
+            match c.as_str().map(Cidr::parse) {
+                Some(Ok(c)) => dir.denied_source_cidrs.push(c),
+                _ => {
+                    // A denylist entry that does not parse cannot be enforced, and an
+                    // unenforced block is an allow nobody chose. Refuse the section.
+                    dir.gate = Err(format!(
+                        "data.sftp.denied_source_cidrs has an invalid entry {c}"
+                    ));
+                    tracing::error!(revision = %bundle.revision, reason = ?dir.gate, "sftp refused for this bundle");
+                    return dir;
                 }
             }
         }
@@ -445,6 +450,19 @@ fn str_field<'a>(v: &'a serde_json::Value, k: &str) -> Result<&'a str, String> {
         .ok_or_else(|| format!("missing or non-string {k}"))
 }
 
+/// An optional array field: absent or `null` is empty (as for `allowed_source_cidrs`);
+/// present and not an array is an error.
+fn optional_array<'a>(
+    v: &'a serde_json::Value,
+    k: &str,
+) -> Result<&'a [serde_json::Value], String> {
+    match v.get(k) {
+        None | Some(serde_json::Value::Null) => Ok(&[]),
+        Some(serde_json::Value::Array(a)) => Ok(a),
+        Some(_) => Err(format!("{k} must be an array")),
+    }
+}
+
 fn parse_key_ref(v: &serde_json::Value) -> Result<KeyRef, String> {
     let key_type = str_field(v, "key_type")?.to_string();
     let fingerprint = str_field(v, "fingerprint")?.to_string();
@@ -479,26 +497,20 @@ fn parse_ca(id: &str, v: &serde_json::Value) -> Result<UserCa, String> {
     } else {
         Some(tenants.into_iter().collect())
     };
-    let revoked_serials = v
-        .get("revoked_serials")
-        .and_then(|s| s.as_array())
-        .map(|a| {
-            a.iter()
-                .map(|x| x.as_u64().ok_or("non-integer serial"))
-                .collect()
+    // A revocation list that is present but not an array is refused with the CA, never
+    // read as "nothing revoked".
+    let revoked_serials = optional_array(v, "revoked_serials")?
+        .iter()
+        .map(|x| x.as_u64().ok_or_else(|| "non-integer serial".to_string()))
+        .collect::<Result<HashSet<_>, _>>()?;
+    let revoked_key_ids = optional_array(v, "revoked_key_ids")?
+        .iter()
+        .map(|x| {
+            x.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| "non-string key id".to_string())
         })
-        .transpose()?
-        .unwrap_or_default();
-    let revoked_key_ids = v
-        .get("revoked_key_ids")
-        .and_then(|s| s.as_array())
-        .map(|a| {
-            a.iter()
-                .map(|x| x.as_str().map(str::to_string).ok_or("non-string key id"))
-                .collect()
-        })
-        .transpose()?
-        .unwrap_or_default();
+        .collect::<Result<HashSet<_>, _>>()?;
     Ok(UserCa {
         id: id.to_string(),
         key,
@@ -1002,5 +1014,36 @@ mod tests {
                 )
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn a_revocation_field_that_is_not_an_array_fails_closed() {
+        let ca = ed25519();
+        let user = ed25519();
+        for field in ["revoked_serials", "revoked_key_ids"] {
+            let mut b = ca_bundle(&ca, serde_json::json!(["acme"]));
+            b.data["sftp"]["user_cas"]["partner-ca"][field] = serde_json::json!("17");
+            let dir = Directory::from_bundle(&b);
+            let r = dir.authenticate(
+                "acme-partner-drop",
+                &Credential::Certificate {
+                    cert: Box::new(cert(&ca, &user, &["acme-partner-drop"], 42, "a", &[])),
+                },
+                ip(),
+                1_000,
+            );
+            assert!(
+                r.is_err(),
+                "{field}: the CA is refused, not read as revoking nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn a_denylist_that_is_not_an_array_refuses_the_section() {
+        let mut s = section("SHA256:x", serde_json::json!({}));
+        s["denied_source_cidrs"] = serde_json::json!("198.51.100.0/24");
+        let dir = Directory::from_bundle(&bundle(s, true));
+        assert!(dir.gate().is_err());
     }
 }
