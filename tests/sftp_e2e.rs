@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use russh::keys::{Algorithm, PrivateKey, PrivateKeyWithHashAlg, ssh_key};
-use s0::audit::{AuditRecord, SessionEventKind};
+use s0::audit::{AuditRecord, Outcome, SessionEventKind};
 use s0::authz::Protocol;
 use s0::config::SftpConfig;
 use s0::sftp::SftpFront;
@@ -487,12 +487,43 @@ struct Harness {
 }
 
 async fn harness(tag: &str, mode: &str) -> Harness {
+    harness_with(tag, mode, |_| {}).await
+}
+
+/// Set `limits.sftp` fields in a gateway config, adding the required S3 limits the
+/// fixture otherwise leaves to their defaults.
+fn sftp_limits(c: &mut serde_json::Value, fields: serde_json::Value) {
+    if c["limits"].is_null() {
+        c["limits"] = serde_json::json!({
+            "xml_max_body_size": 20971520,
+            "presigned_url_max_skew_time_secs": 900,
+            "max_delete_keys": 1000,
+            "max_list_fanout": 16,
+            "max_connections": 1024,
+            "header_read_timeout_secs": 15
+        });
+    }
+    if let (Some(dst), Some(src)) = (
+        c["limits"]
+            .as_object_mut()
+            .map(|l| l.entry("sftp").or_insert_with(|| serde_json::json!({}))),
+        fields.as_object(),
+    ) {
+        for (k, v) in src {
+            dst[k] = v.clone();
+        }
+    }
+}
+
+/// [`harness`], with `edit` applied to the gateway config (e.g. `limits.sftp`).
+async fn harness_with(tag: &str, mode: &str, edit: impl FnOnce(&mut serde_json::Value)) -> Harness {
     let mem = Arc::new(Mem::default());
     let url = serve_backend(mem.clone()).await;
     let drop_key = ed25519();
     let ops_key = ed25519();
     let fx = common::fixture_with_config(tag, bundle(&drop_key, &ops_key), &url, |c| {
         c["backends"][0]["conditional_create"] = serde_json::json!(mode);
+        edit(c);
     });
     let host = ed25519();
     let host_path = fx.dir.join("ssh_host_ed25519_key");
@@ -610,7 +641,7 @@ impl Sftp {
 
     async fn recv_raw(&mut self) -> Option<(u8, Bytes)> {
         let mut len = [0u8; 4];
-        tokio::time::timeout(Duration::from_secs(10), self.stream.read_exact(&mut len))
+        tokio::time::timeout(Duration::from_secs(20), self.stream.read_exact(&mut len))
             .await
             .ok()?
             .ok()?;
@@ -1026,15 +1057,26 @@ async fn sequential_writes_only_and_the_gap_aborts_at_close() {
     };
     assert_eq!(code(&c.write(&hd, 0, b"abc").await), OK);
     assert_eq!(
-        code(&c.write(&hd, 0, b"abc").await),
-        OP_UNSUPPORTED,
-        "overlap"
-    );
-    assert_eq!(
         code(&c.write(&hd, 10, b"xyz").await),
         OK,
         "ahead within the reorder window is held"
     );
+    assert_eq!(
+        code(&c.write(&hd, 3, b"defghij").await),
+        OK,
+        "the gap fills"
+    );
+    assert_eq!(code(&c.close(&hd).await), OK);
+    assert_eq!(
+        h.mem.get("inbound", "partner-x/gap.bin").as_deref(),
+        Some(&b"abcdefghijxyz"[..])
+    );
+    let Reply::Handle(hd) = c
+        .open("/big.bin", SSH_FXF_WRITE | SSH_FXF_CREAT | SSH_FXF_TRUNC)
+        .await
+    else {
+        panic!()
+    };
     assert_eq!(
         code(&c.write(&hd, 1 << 40, b"x").await),
         FAILURE,
@@ -1054,6 +1096,30 @@ async fn sequential_writes_only_and_the_gap_aborts_at_close() {
         "a CLOSE with a gap is refused"
     );
     assert!(h.mem.get("inbound", "partner-x/gap2.bin").is_none());
+    // A refused WRITE poisons the transfer: the CLOSE a stock client sends after the
+    // error must not commit the file without the refused bytes.
+    for (name, refused_at) in [
+        ("/overlap.bin", 0u64),
+        ("/beyond-window.bin", 64 * 1024 * 1024),
+    ] {
+        let Reply::Handle(hd) = c
+            .open(name, SSH_FXF_WRITE | SSH_FXF_CREAT | SSH_FXF_TRUNC)
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(code(&c.write(&hd, 0, b"abc").await), OK);
+        assert_eq!(
+            code(&c.write(&hd, refused_at, b"abc").await),
+            OP_UNSUPPORTED,
+            "{name}: refused"
+        );
+        assert_eq!(code(&c.close(&hd).await), FAILURE, "{name}: CLOSE aborts");
+        assert!(
+            h.mem.get("inbound", &format!("partner-x{name}")).is_none(),
+            "{name}: nothing committed"
+        );
+    }
     // Append, resume and read-write opens are refused.
     for f in [
         SSH_FXF_WRITE | SSH_FXF_APPEND | SSH_FXF_CREAT,
@@ -1263,6 +1329,10 @@ async fn authentication_is_by_listed_key_only_and_failures_are_unattributed() {
     for f in failures {
         assert_eq!(f.path, "sftp/session");
         assert!(!f.result.allow);
+        assert!(
+            matches!(f.gateway.outcome, Outcome::Denied),
+            "a failed login is a denial, not an allowed event"
+        );
         assert!(
             f.result.reason.starts_with("deny (gateway): "),
             "{}",
@@ -1637,7 +1707,7 @@ async fn read_and_directory_handles_are_capped() {
 }
 
 #[tokio::test]
-async fn an_in_order_write_over_a_held_chunk_is_refused() {
+async fn an_in_order_write_over_a_held_chunk_is_refused_and_aborts() {
     let h = harness("sftp-overlap-ahead", "native").await;
     let mut c = connect(h.addr, "acme-partner-drop", &h.drop_key)
         .await
@@ -1654,12 +1724,11 @@ async fn an_in_order_write_over_a_held_chunk_is_refused() {
         OP_UNSUPPORTED,
         "covers the held chunk"
     );
-    // The transfer is intact: the bytes that do fit complete it.
-    assert_eq!(code(&c.write(&hd, 0, &[1u8; 100]).await), OK);
-    assert_eq!(code(&c.close(&hd).await), OK);
-    let got = h.mem.get("inbound", "partner-x/o.bin").unwrap();
-    assert_eq!(&got[..100], &[1u8; 100][..]);
-    assert_eq!(&got[100..], &[2u8; 50][..]);
+    // The refusal poisons the transfer: nothing that follows can commit it, so the file
+    // never lands without the refused bytes.
+    assert_eq!(code(&c.write(&hd, 0, &[1u8; 100]).await), FAILURE);
+    assert_eq!(code(&c.close(&hd).await), FAILURE);
+    assert!(h.mem.get("inbound", "partner-x/o.bin").is_none());
 }
 
 #[tokio::test]
@@ -1733,4 +1802,264 @@ async fn a_session_does_not_outlive_its_certificate() {
     }
     let r = c.path_op(SSH_FXP_STAT, "/f.csv").await;
     assert!(r.is_none(), "the session must be closed, got {r:?}");
+}
+
+/// Like an agent holding several keys: a wrong key is tried (and rejected) before the
+/// right one, on the same connection.
+async fn connect_after_wrong_key(
+    addr: SocketAddr,
+    login: &str,
+    wrong: &PrivateKey,
+    right: &PrivateKey,
+) -> Result<russh::client::Handle<Client>, String> {
+    let cfg = Arc::new(russh::client::Config::default());
+    let mut session = russh::client::connect(cfg, addr, Client)
+        .await
+        .map_err(|e| e.to_string())?;
+    for (key, want) in [(wrong, false), (right, true)] {
+        let ok = session
+            .authenticate_publickey(
+                login,
+                PrivateKeyWithHashAlg::new(Arc::new(key.clone()), None),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        if ok.success() != want {
+            return Err(format!(
+                "authentication with the {} key: {ok:?}",
+                if want { "right" } else { "wrong" }
+            ));
+        }
+    }
+    Ok(session)
+}
+
+#[tokio::test]
+async fn a_wrong_key_before_the_right_one_does_not_ban_and_failed_connections_still_do() {
+    let h = harness("sftp-ban-agent", "native").await;
+    let stranger = ed25519();
+    // Past the ban threshold (10 in 5 min) of connections that each reject one key and
+    // then log in: a NAT'd partner whose agent offers a wrong key first stays welcome.
+    for i in 0..12 {
+        let s = connect_after_wrong_key(h.addr, "acme-partner-drop", &stranger, &h.drop_key)
+            .await
+            .unwrap_or_else(|e| panic!("connection {i}: {e}"));
+        drop(s);
+    }
+    // Connections that never authenticate do count, and ban.
+    for _ in 0..10 {
+        assert!(
+            connect(h.addr, "acme-partner-drop", &stranger)
+                .await
+                .is_err()
+        );
+    }
+    let mut banned = false;
+    for _ in 0..50 {
+        if connect(h.addr, "acme-partner-drop", &h.drop_key)
+            .await
+            .is_err()
+        {
+            banned = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        banned,
+        "ten unauthenticated connections with failures ban the address"
+    );
+}
+
+#[tokio::test]
+async fn the_handshake_timeout_covers_a_client_that_never_sends_its_version() {
+    let h = harness_with("sftp-silent-client", "native", |c| {
+        sftp_limits(c, serde_json::json!({ "handshake_timeout_secs": 1 }));
+    })
+    .await;
+    let mut tcp = tokio::net::TcpStream::connect(h.addr).await.unwrap();
+    // Say nothing at all. The connection must be closed by the handshake deadline, not
+    // held until russh's inactivity timeout.
+    let mut buf = [0u8; 256];
+    let closed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match tcp.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "a silent client is disconnected at the handshake deadline"
+    );
+}
+
+#[tokio::test]
+async fn a_create_only_rename_under_check_then_write_respects_an_upload_in_flight() {
+    let h = harness("sftp-rename-ctw", "check_then_write").await;
+    let mut c = connect(h.addr, "acme-ops", &h.ops_key)
+        .await
+        .expect("connect");
+    assert_eq!(code(&c.upload("/src.bin", b"payload").await), OK);
+    let Reply::Handle(hd) = c
+        .open("/dst.bin", SSH_FXF_WRITE | SSH_FXF_CREAT | SSH_FXF_EXCL)
+        .await
+    else {
+        panic!()
+    };
+    let r = c.rename("/src.bin", "/dst.bin").await;
+    assert_eq!(code(&r), FAILURE, "{r:?}");
+    assert!(
+        matches!(&r, Reply::Status(_, m) if m.contains("upload in progress")),
+        "{r:?}"
+    );
+    assert_eq!(code(&c.write(&hd, 0, b"upload").await), OK);
+    assert_eq!(code(&c.close(&hd).await), OK);
+    assert_eq!(
+        h.mem.get("inbound", "dst.bin").as_deref(),
+        Some(&b"upload"[..]),
+        "the upload is not overwritten by the rename"
+    );
+    let r = c.rename("/src.bin", "/dst.bin").await;
+    assert_eq!(code(&r), FAILURE, "file exists: {r:?}");
+    assert!(h.mem.get("inbound", "src.bin").is_some());
+}
+
+fn read_req(b: &mut BytesMut, id: u32, handle: &[u8], offset: u64, len: u32) {
+    b.put_u8(SSH_FXP_READ);
+    b.put_u32(id);
+    s(b, handle);
+    b.put_u64(offset);
+    b.put_u32(len);
+}
+
+#[tokio::test]
+async fn the_reorder_window_charges_each_held_chunk_not_just_its_bytes() {
+    // 64 KiB of window. Counted in payload bytes, one-byte writes ahead of the gap would
+    // be held ~32,000 at a time, each costing far more than its byte; charged per chunk
+    // they stop after a few hundred.
+    let window = 64 * 1024;
+    let h = harness_with("sftp-reorder-cost", "native", |c| {
+        sftp_limits(c, serde_json::json!({ "reorder_window": window }));
+    })
+    .await;
+    let mut c = connect(h.addr, "acme-partner-drop", &h.drop_key)
+        .await
+        .expect("connect");
+    let Reply::Handle(hd) = c
+        .open("/tiny.bin", SSH_FXF_WRITE | SSH_FXF_CREAT | SSH_FXF_TRUNC)
+        .await
+    else {
+        panic!()
+    };
+    let mut held = 0;
+    for i in 0..2_000u64 {
+        // Offset 0 is never written: every chunk is held ahead of the gap.
+        match code(&c.write(&hd, 2 + 2 * i, b"x").await) {
+            OK => held += 1,
+            OP_UNSUPPORTED => break,
+            other => panic!("write {i}: status {other}"),
+        }
+    }
+    assert!(
+        held > 0 && held < window / 200,
+        "one-byte chunks held ahead before the window refused: {held}"
+    );
+    assert_eq!(code(&c.close(&hd).await), FAILURE, "the refusal aborts");
+}
+
+#[tokio::test]
+async fn read_handles_reserve_their_read_ahead_from_the_memory_budget() {
+    // A budget of exactly one upload's reservation (5 MiB × 2 + 64 KiB) holds two 4 MiB
+    // read-aheads, not three.
+    let reservation = 5 * 1024 * 1024 * 2 + 64 * 1024;
+    let h = harness_with("sftp-read-budget", "native", |c| {
+        sftp_limits(
+            c,
+            serde_json::json!({
+                "part_size": 5 * 1024 * 1024,
+                "max_inflight_parts": 1,
+                "reorder_window": 64 * 1024,
+                "max_file_size": 1024 * 1024 * 1024,
+                "max_transfer_memory": reservation,
+                "read_ahead": 4 * 1024 * 1024
+            }),
+        );
+    })
+    .await;
+    let mut c = connect(h.addr, "acme-ops", &h.ops_key)
+        .await
+        .expect("connect");
+    assert_eq!(code(&c.upload("/r.bin", b"data").await), OK);
+    let mut open = Vec::new();
+    for _ in 0..2 {
+        let Reply::Handle(hd) = c.open("/r.bin", SSH_FXF_READ).await else {
+            panic!("the first two read handles fit the budget")
+        };
+        open.push(hd);
+    }
+    let r = c.open("/r.bin", SSH_FXF_READ).await;
+    assert!(
+        matches!(&r, Reply::Status(FAILURE, m) if m.contains("server busy")),
+        "a third read-ahead does not fit: {r:?}"
+    );
+    assert_eq!(code(&c.close(&open.pop().unwrap()).await), OK);
+    assert!(
+        matches!(c.open("/r.bin", SSH_FXF_READ).await, Reply::Handle(_)),
+        "closing a read handle returns its read-ahead"
+    );
+}
+
+#[tokio::test]
+async fn a_client_that_stops_reading_replies_does_not_freeze_its_session() {
+    let h = harness("sftp-stalled-reader", "native").await;
+    let mut c = connect(h.addr, "acme-ops", &h.ops_key)
+        .await
+        .expect("connect");
+    assert_eq!(
+        code(&c.upload("/big.bin", &vec![7u8; 1024 * 1024]).await),
+        OK
+    );
+    let Reply::Handle(hd) = c.open("/big.bin", SSH_FXF_READ).await else {
+        panic!()
+    };
+    // Ask for ~100 MB of replies and never read one: the client's buffers and the SSH
+    // window fill, and the server's reply write blocks.
+    let pipeline = tokio::spawn(async move {
+        for id in 0..400u32 {
+            let mut b = BytesMut::new();
+            read_req(&mut b, 10_000 + id, &hd, 0, 255 * 1024);
+            if !c.send_raw(b).await {
+                break;
+            }
+        }
+        // Keep the connection (and the unread replies) alive.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        drop(c);
+    });
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    // The revocation sweep must still run while the reply is stuck.
+    let mut b = bundle(&h.drop_key, &h.ops_key);
+    b["sftp"]["accounts"]["acme-ops"]["authorized_keys"] = serde_json::json!([]);
+    h.fx.gw.bundles.store(s0::pdp::Bundle::new("rev-2", b));
+    let mut closed = false;
+    for _ in 0..150 {
+        if h.fx.audit_log.all().iter().any(|x| {
+            x.session_event
+                .as_ref()
+                .is_some_and(|e| e.event == SessionEventKind::Disconnected)
+                && x.result.reason.contains("credential_revoked")
+        }) {
+            closed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    pipeline.abort();
+    assert!(
+        closed,
+        "a session blocked on an unread reply is still closed by the revocation sweep"
+    );
 }
