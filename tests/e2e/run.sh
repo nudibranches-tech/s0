@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Real-stack end-to-end: real S3 clients (aws-cli) -> s0 gateway -> MinIO backend,
-# with a pushed policy bundle. Proves the security properties against a real S3 stack
+# Real-stack end-to-end: real S3 clients (aws-cli) and a stock OpenSSH sftp client ->
+# s0 gateway (S3 and SFTP fronts) -> MinIO backend, with a pushed policy bundle. Proves the security properties against a real S3 stack
 # rather than mocks — most importantly that a server-side copy whose SOURCE is denied is
 # blocked, enforced through an off-the-shelf client.
 #
@@ -22,6 +22,8 @@ E2E="$ROOT/tests/e2e"
 STATE="/tmp/s0-e2e"
 
 GW_ENDPOINT="${GW_ENDPOINT:-http://127.0.0.1:8014}"
+# Fixed by gateway.e2e.json (frontends.sftp.listen).
+SFTP_HOST=127.0.0.1; SFTP_PORT=2222
 MINIO_ENDPOINT="${MINIO_ENDPOINT:-http://127.0.0.1:9000}"
 # pgsty/silo, a maintained MinIO fork: MinIO no longer publishes public images
 # (docker.io/minio/minio is gone, quay.io/minio/minio answers 401), which kills the job
@@ -114,8 +116,45 @@ expect_code() {
   fi
 }
 
+# sftp_as <key> <login> [ssh options...] — run the sftp batch read from stdin as <login>.
+# A batch stops at its first failing command and exits non-zero.
+sftp_as() {
+  local key=$1 login=$2; shift 2
+  sftp -q -b - -P "$SFTP_PORT" -i "$WORK/${key}_key" \
+    -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 \
+    -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$WORK/known_hosts" \
+    "$@" "$login@$SFTP_HOST"
+}
+
+# sftp_expect ok|fail "label" <key> <login> [ssh options...] <<< "batch"
+sftp_expect() {
+  local mode=$1 label=$2; shift 2
+  local out rc
+  out=$(sftp_as "$@" 2>&1); rc=$?
+  if [ "$mode" = ok ]; then
+    [ $rc -eq 0 ] && pass "$label" || fail "$label" "expected success, rc=$rc: $out"
+  else
+    [ $rc -ne 0 ] && pass "$label" || fail "$label" "expected failure, rc=0: $out"
+  fi
+}
+
+# same_object <bucket/key> <local file> — the backend holds exactly these bytes.
+same_object() {
+  rm -f "$WORK/.check"
+  aws_backend s3 cp "s3://$1" /work/.check >/dev/null 2>&1 && cmp -s "$WORK/.check" "$2"
+}
+
+wait_tcp() { # host port name tries
+  local i
+  for i in $(seq 1 "${4:-40}"); do
+    (exec 3<>"/dev/tcp/$1/$2") 2>/dev/null && { info "$3 up (${i}s)"; return 0; }
+    sleep 1
+  done
+  echo "${c_red}$3 did not come up at $1:$2${c_rst}"; return 1
+}
+
 echo "============================================================"
-echo " s0 end-to-end: aws-cli -> gateway -> MinIO (PDP: $PDP_MODE)"
+echo " s0 end-to-end: aws-cli + OpenSSH sftp -> gateway -> MinIO (PDP: $PDP_MODE)"
 echo "============================================================"
 
 # --- 1. backend ------------------------------------------------------------
@@ -148,6 +187,40 @@ fi
 info "seeding pushed policy bundle -> $STATE/bundle.json"
 mkdir -p "$STATE"
 cp "$E2E/bundle.e2e.json" "$STATE/bundle.json"
+
+# SFTP: a host key for the gateway and three client keys. `drop` is a create-only
+# partner, `ops` an operator on the same prefix, `stranger` a key no account lists.
+command -v sftp >/dev/null && command -v ssh-keygen >/dev/null \
+  || { echo "the SFTP scenarios need the OpenSSH client (sftp, ssh-keygen)"; exit 1; }
+info "OpenSSH client: $(ssh -V 2>&1)"
+ssh-keygen -q -t ed25519 -N '' -C s0-e2e-host -f "$STATE/ssh_host_ed25519_key"
+for k in drop ops stranger; do ssh-keygen -q -t ed25519 -N '' -C "$k" -f "$WORK/${k}_key"; done
+# Pin the host key, as partners are told to.
+echo "[$SFTP_HOST]:$SFTP_PORT $(cut -d' ' -f1,2 "$STATE/ssh_host_ed25519_key.pub")" > "$WORK/known_hosts"
+fpr() { ssh-keygen -lf "$1" | awk '{print $2}'; }
+python3 - "$STATE/bundle.json" "$(fpr "$WORK/drop_key.pub")" "$(fpr "$WORK/ops_key.pub")" <<'PY'
+import json, sys
+path, drop_fp, ops_fp = sys.argv[1:]
+b = json.load(open(path))
+def account(sub, fp):
+    return {"tenant": "acme", "subject_key": "sa:" + sub,
+            "home": {"bucket": "open", "prefix": "drop/"},
+            "authorized_keys": [{"key_type": "ssh-ed25519", "fingerprint": fp}]}
+b["sftp"] = {"version": 1, "accounts": {
+    "acme-drop": account("partner-drop", drop_fp),
+    "acme-ops": account("sftp-ops", ops_fp)}}
+t = b["tenants"]["acme"]
+for sub in ("partner-drop", "sftp-ops"):
+    t["user_attributes"][sub] = {"groups": [], "attributes": []}
+# The drop partner can only create; the operator can read, list, create and delete but
+# not overwrite, so its renames are create-only too.
+t["s3_grants"]["partner-drop"] = [
+    {"bucket": "open", "actions": ["create_objects"], "prefixes": ["drop/"]}]
+t["s3_grants"]["sftp-ops"] = [
+    {"bucket": "open", "actions": ["read_objects", "list_objects", "create_objects", "delete_objects"],
+     "prefixes": ["drop/"]}]
+json.dump(b, open(path, "w"), indent=2)
+PY
 
 # In sidecar mode OPA is the engine, so it needs the same document s0 polls. s0's bundle
 # is `{policy, data}`; OPA wants them as two files. Re-run after any bundle rewrite, or
@@ -199,6 +272,7 @@ GATEWAY_CONFIG="$GW_CONFIG" RUST_LOG="${RUST_LOG:-s0=info,warn}" \
   "$GW_BIN" > "$WORK/gateway.log" 2>&1 &
 GW_PID=$!
 wait_http "$GW_ENDPOINT/" gateway || { echo "gateway failed to start"; tail -n 20 "$WORK/gateway.log"; exit 1; }
+wait_tcp "$SFTP_HOST" "$SFTP_PORT" "sftp front" || { tail -n 20 "$WORK/gateway.log"; exit 1; }
 
 # --- 4. scenarios through the gateway (virtual creds, real client) --------
 echo ""; echo "-- object read / list / write ------------------------------"
@@ -253,6 +327,98 @@ anon_code="$(curl -s -o /dev/null -w '%{http_code}' "$GW_ENDPOINT/open/pub/greet
 [ "$anon_code" = "403" ] && pass "anonymous GET (no creds) rejected (403)" || fail "anonymous GET rejected" "got HTTP $anon_code"
 expect_code InvalidAccessKeyId "unknown access key rejected" \
   aws_id AKIABOGUS bogus-secret s3api get-object --bucket open --key pub/greeting.txt /work/dl4.txt
+
+echo ""; echo "-- SFTP: stock OpenSSH client -> SFTP front -> MinIO --------"
+printf 'id,amount\n1,10\n' > "$WORK/small.csv"
+head -c $((20 * 1024 * 1024)) /dev/urandom > "$WORK/big.bin"   # > part_size: multipart
+cp "$WORK/small.csv" "$WORK/other.csv"; printf '2,20\n' >> "$WORK/other.csv"
+sftp_expect ok   "drop partner uploads a file" drop acme-drop <<EOF
+put $WORK/small.csv small.csv
+EOF
+same_object open/drop/small.csv "$WORK/small.csv" \
+  && pass "the upload landed byte for byte under the home prefix" \
+  || fail "the upload landed byte for byte under the home prefix"
+sftp_expect ok   "drop partner uploads 20 MiB (multipart, pipelined writes)" drop acme-drop <<EOF
+put $WORK/big.bin big.bin
+EOF
+same_object open/drop/big.bin "$WORK/big.bin" \
+  && pass "the multipart upload is intact" || fail "the multipart upload is intact"
+sftp_expect fail "drop partner cannot overwrite (create-only)" drop acme-drop <<EOF
+put $WORK/other.csv small.csv
+EOF
+same_object open/drop/small.csv "$WORK/small.csv" \
+  && pass "the original survived the refused overwrite" \
+  || fail "the original survived the refused overwrite"
+sftp_expect fail "drop partner cannot read" drop acme-drop <<EOF
+get small.csv $WORK/should-not-exist.csv
+EOF
+rm -f "$WORK/big.dl"
+sftp_expect ok   "operator lists and downloads" ops acme-ops <<EOF
+ls
+get big.bin $WORK/big.dl
+EOF
+cmp -s "$WORK/big.dl" "$WORK/big.bin" \
+  && pass "the download matches the upload" || fail "the download matches the upload"
+# OpenSSH's `rename` sends posix-rename@openssh.com, which overwrites, so it needs
+# write_objects; `rename -l` sends the legacy SSH_FXP_RENAME, whose target is
+# create-only. The backend is check_then_write (the default), so a create-only rename is
+# guarded by the in-flight claim and a re-check before its commit.
+sftp_expect fail "operator's overwriting rename is refused (no write_objects)" ops acme-ops <<EOF
+put $WORK/other.csv other.csv
+rename other.csv renamed.csv
+EOF
+sftp_expect ok   "operator's create-only rename to a fresh name" ops acme-ops <<EOF
+rename -l other.csv renamed.csv
+EOF
+same_object open/drop/renamed.csv "$WORK/other.csv" \
+  && pass "the renamed object holds the source bytes" \
+  || fail "the renamed object holds the source bytes"
+out=$(sftp_as ops acme-ops <<<"rename -l renamed.csv small.csv" 2>&1); rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -q "Failure"; then
+  pass "a create-only rename onto an existing file is refused (file exists)"
+else
+  fail "a create-only rename onto an existing file is refused (file exists)" "rc=$rc: $out"
+fi
+same_object open/drop/small.csv "$WORK/small.csv" \
+  && pass "the rename target was not overwritten" \
+  || fail "the rename target was not overwritten"
+same_object open/drop/renamed.csv "$WORK/other.csv" \
+  && pass "the rename source is still there" \
+  || fail "the rename source is still there"
+
+# A client that connects and says nothing is cut off at handshake_timeout_secs (5 in
+# gateway.e2e.json), not held until the transport's much longer inactivity timeout.
+start=$SECONDS
+timeout 60 bash -c "exec 3<>/dev/tcp/$SFTP_HOST/$SFTP_PORT; cat <&3 >/dev/null" 2>/dev/null
+took=$((SECONDS - start))
+[ "$took" -le 10 ] && pass "a silent client is disconnected at the handshake timeout (${took}s)" \
+  || fail "a silent client is disconnected at the handshake timeout" "held for ${took}s"
+
+# The ban. Last among the SFTP scenarios: it bans this address on the SFTP front for
+# 15 minutes. An agent-style client offers a key no account lists before the right one;
+# that connection logs in, so its rejected key must not count toward the ban (10
+# failures in 5 minutes).
+ok_logins=0
+for i in $(seq 1 12); do
+  sftp_as stranger acme-drop -i "$WORK/drop_key" <<<"pwd" >/dev/null 2>&1 && ok_logins=$((ok_logins + 1))
+done
+[ "$ok_logins" -eq 12 ] && pass "12 logins that try a wrong key first are not banned" \
+  || fail "12 logins that try a wrong key first are not banned" "only $ok_logins/12 logged in"
+for i in $(seq 1 10); do sftp_as stranger acme-drop <<<"pwd" >/dev/null 2>&1; done
+sleep 1
+sftp_expect fail "10 failed connections ban the address; the right key is then refused" drop acme-drop <<EOF
+pwd
+EOF
+
+# Session records: a refused login is a denial on the audit stream, not an allowed event.
+python3 - "$STATE/audit-spill.ndjson" <<'PY' && pass "auth_failed records are denials (outcome=denied)" || fail "auth_failed records are denials (outcome=denied)" "see $STATE/audit-spill.ndjson"
+import json, sys
+recs = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+failed = [r for r in recs if (r.get("session_event") or {}).get("event") == "auth_failed"]
+assert failed, "no auth_failed record"
+bad = [r for r in failed if r["gateway"]["outcome"] != "denied" or r["result"]["allow"]]
+assert not bad, bad[:1]
+PY
 
 echo ""; echo "-- live revocation (policy is live, not baked in creds) ----"
 expect ok "AKIAOPEN GET open/pub/greeting.txt (still granted)" \
