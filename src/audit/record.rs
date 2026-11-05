@@ -322,6 +322,13 @@ impl AuditRecord {
         labels: &LabelPolicy,
     ) -> Self {
         let labels = labels.labels(organization_id);
+        // The outcome follows the decision: an auth failure, a ban or a pre-auth refusal
+        // is a denial, not an allowed event.
+        let outcome = if result.allow {
+            Outcome::Allowed
+        } else {
+            Outcome::Denied
+        };
         AuditRecord {
             decision_id,
             path: SESSION_PATH.to_string(),
@@ -335,7 +342,7 @@ impl AuditRecord {
             gateway: GatewayMeta {
                 backend_id: String::new(),
                 backend_kind: String::new(),
-                outcome: Outcome::Allowed,
+                outcome,
                 denied_keys: vec![],
                 backend: BackendOutcome::NotAttempted,
                 backend_status: None,
@@ -569,5 +576,43 @@ mod tests {
             json["gateway"].get("backend_status").is_none(),
             "a 200 nobody observed must not be synthesized: {json}"
         );
+    }
+
+    #[test]
+    fn a_session_record_outcome_follows_its_decision() {
+        let event = || SessionEvent {
+            event: SessionEventKind::AuthFailed,
+            protocol: "sftp".into(),
+            session_id: "s".into(),
+            client_ip: "192.0.2.1".into(),
+            login: None,
+            auth: None,
+            tenant: None,
+            duration_secs: None,
+            operations: None,
+            bytes_in: None,
+            bytes_out: None,
+            suppressed_since_last: 0,
+        };
+        let denied = AuditRecord::session_event(
+            "d".into(),
+            "2026-07-15T00:00:00Z".into(),
+            event(),
+            Decision::deny("deny (gateway): bad key"),
+            String::new(),
+            None,
+            &labels(),
+        );
+        assert_eq!(denied.gateway.outcome, Outcome::Denied);
+        let allowed = AuditRecord::session_event(
+            "a".into(),
+            "2026-07-15T00:00:00Z".into(),
+            event(),
+            Decision::allow("allow (gateway): publickey"),
+            String::new(),
+            None,
+            &labels(),
+        );
+        assert_eq!(allowed.gateway.outcome, Outcome::Allowed);
     }
 }
