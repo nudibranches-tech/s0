@@ -208,7 +208,10 @@ impl SshHandler {
         }
     }
 
-    /// A failed authentication: audited (no org label), counted toward the ban.
+    /// A failed authentication: audited (no org label), and noted on the connection. It
+    /// counts toward the ban only if the connection ends without authenticating
+    /// (`Shared::settle_auth_failures`), so a wrong key offered before the right one
+    /// does not count against a client that then logs in.
     fn fail(&mut self, login: &str, reason: String) -> Result<Auth, HandlerError> {
         tracing::info!(session = %self.conn.session_id, client_ip = %self.conn.client_ip, %login, %reason, "sftp authentication failed");
         self.shared
@@ -223,18 +226,7 @@ impl SshHandler {
             false,
             format!("deny (gateway): {reason}"),
         );
-        if self.shared.record_auth_failure(self.conn.client_ip) {
-            self.shared.emit_event(
-                &self.conn,
-                SessionEventKind::Banned,
-                None,
-                None,
-                false,
-                "deny (gateway): too many authentication failures; address banned".into(),
-            );
-            self.shared.metrics.banned.fetch_add(1, Ordering::Relaxed);
-            return Err(HandlerError::Refused("banned"));
-        }
+        self.conn.note_auth_failure();
         Ok(reject_publickey_only())
     }
 

@@ -27,7 +27,7 @@ pub mod transfer;
 pub mod transport;
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -167,10 +167,35 @@ impl Shared {
         }
     }
 
-    /// Count one authentication failure. True when it triggered a ban.
-    pub fn record_auth_failure(&self, ip: IpAddr) -> bool {
-        self.bans
-            .record_failure(ip, Instant::now(), self.ban_policy())
+    /// Count a finished connection's authentication failures toward the ban — only if it
+    /// never authenticated.
+    ///
+    /// Counting at the end rather than as each attempt fails is what keeps ordinary
+    /// clients unbanned: every offered key is answered uniformly (no probe oracle), so an
+    /// agent holding several keys signs with the wrong ones before the right one. Those
+    /// rejections are audited, but a connection that then logs in is a legitimate client,
+    /// and counting them would ban a NAT'd partner after a few routine connections.
+    fn settle_auth_failures(&self, conn: &ConnState) {
+        if conn.is_authenticated() {
+            return;
+        }
+        let failures = conn.auth_failures.load(Ordering::Relaxed);
+        let now = Instant::now();
+        let policy = self.ban_policy();
+        for _ in 0..failures {
+            if self.bans.record_failure(conn.client_ip, now, policy) {
+                self.emit_event(
+                    conn,
+                    SessionEventKind::Banned,
+                    None,
+                    None,
+                    false,
+                    "deny (gateway): too many authentication failures; address banned".into(),
+                );
+                self.metrics.banned.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
     }
 
     /// Emit an `sftp/session` record (ADR-009 D13).
@@ -249,6 +274,9 @@ pub struct ConnState {
     pub started: Instant,
     pub counters: Arc<SessionCounters>,
     authenticated: AtomicBool,
+    /// Authentication failures on this connection, counted toward the ban when the
+    /// connection ends unauthenticated ([`Shared::settle_auth_failures`]).
+    auth_failures: AtomicU32,
     auth: Mutex<Option<AuthSlot>>,
     close_reason: Mutex<Option<&'static str>>,
     /// The SFTP subsystem task, awaited before the `disconnected` record so that record
@@ -272,10 +300,16 @@ impl ConnState {
             started: Instant::now(),
             counters: Arc::new(SessionCounters::default()),
             authenticated: AtomicBool::new(false),
+            auth_failures: AtomicU32::new(0),
             auth: Mutex::new(None),
             close_reason: Mutex::new(None),
             sftp_task: Mutex::new(None),
         }
+    }
+
+    /// Note one authentication failure; see [`Shared::settle_auth_failures`].
+    pub fn note_auth_failure(&self) {
+        self.auth_failures.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn is_authenticated(&self) -> bool {
@@ -554,6 +588,7 @@ async fn handle_connection(
         .metrics
         .connections_active
         .fetch_sub(1, Ordering::Relaxed);
+    shared.settle_auth_failures(&conn);
     if let Some(why) = refusal.get() {
         shared.preauth_reject(&conn, why);
         return;
