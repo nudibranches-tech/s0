@@ -282,6 +282,9 @@ pub struct ConnState {
     /// The SFTP subsystem task, awaited before the `disconnected` record so that record
     /// comes after the transfers it ended were aborted, and carries their reason.
     sftp_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Signalled by the SFTP teardown when the SSH session could not take its disconnect:
+    /// the connection task then drops the session and with it the socket.
+    kill: tokio::sync::Notify,
 }
 
 struct AuthSlot {
@@ -304,6 +307,7 @@ impl ConnState {
             auth: Mutex::new(None),
             close_reason: Mutex::new(None),
             sftp_task: Mutex::new(None),
+            kill: tokio::sync::Notify::new(),
         }
     }
 
@@ -591,9 +595,14 @@ async fn handle_connection(
                         .await;
                 }
             });
-            let r = running.await;
+            // The session ends when the client goes, or when the SFTP teardown could not
+            // send its disconnect (a stalled client): dropping `running` closes the socket.
+            let r = tokio::select! {
+                r = running => r.map_err(|e| e.to_string()),
+                _ = conn.kill.notified() => Err("connection dropped: the client stopped reading".to_string()),
+            };
             watcher.abort();
-            r.map_err(|e| e.to_string())
+            r
         }
     };
     shared
@@ -676,7 +685,7 @@ pub(crate) async fn run_sftp(
         return;
     };
     let stream = channel.into_stream();
-    let (mut rd, mut wr) = tokio::io::split(stream);
+    let (mut rd, wr) = tokio::io::split(stream);
     let max_packet = shared.gw.limits().sftp.max_sftp_packet_len;
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Frame>(4);
     // The reader is the only place bytes leave the channel. The bounded hand-off means a
@@ -725,16 +734,38 @@ pub(crate) async fn run_sftp(
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut last_request = Instant::now();
     let mut draining: Option<Instant> = None;
-    let mut pacer = Pacer::new();
+    // The reply in flight. Writing it (and pacing after it) is a future the loop polls
+    // beside the revocation sweep, the drain and the idle checks, never awaited inline:
+    // a client that stops reopening its SSH window would otherwise freeze all of them
+    // and pin the session's reservations. While a reply is in flight no request is read,
+    // so the client is still flow-controlled; a reply stuck past `idle_timeout_secs`
+    // ends the session as idle (no request is read meanwhile).
+    let mut writer: Option<(ReplyWriter, Pacer)> = Some((wr, Pacer::new()));
+    let mut sending: Option<Sending> = None;
     let reason: &'static str = loop {
         tokio::select! {
-            frame = rx.recv() => {
+            sent = async {
+                match sending.as_mut() {
+                    Some(f) => f.await,
+                    None => std::future::pending().await,
+                }
+            }, if sending.is_some() => {
+                sending = None;
+                let Sent { wr, pacer, ok, close } = sent;
+                writer = Some((wr, pacer));
+                if !ok {
+                    break "client close";
+                }
+                if let Some(why) = close {
+                    break why;
+                }
+            }
+            frame = rx.recv(), if sending.is_none() => {
                 let body = match frame {
                     None => break "client close",
                     Some(Frame::TooLarge) => break "protocol error: packet length out of bounds",
                     Some(Frame::Packet(b)) => b,
                 };
-                last_request = Instant::now();
                 let next = match codec::parse(body) {
                     Ok(req) => sess.handle(req).await,
                     Err(e) => match e.id {
@@ -742,20 +773,27 @@ pub(crate) async fn run_sftp(
                         None => Next::Close("protocol error: malformed packet"),
                     },
                 };
+                // A long request (a commit, a large rename) is not idle time.
+                last_request = Instant::now();
                 let (reply, close) = match next {
                     Next::Reply(r) => (Some(r), None),
                     Next::ReplyAndClose(r) => (Some(r), Some("protocol error: malformed packet")),
                     Next::Close(why) => (None, Some(why)),
                 };
-                if let Some(r) = reply {
-                    if wr.write_all(&r.encode()).await.is_err() {
-                        break "client close";
+                let Some(r) = reply else {
+                    break close.unwrap_or("protocol error");
+                };
+                let Some((mut wr, mut pacer)) = writer.take() else {
+                    break "internal error: no writer";
+                };
+                let (shared, conn) = (shared.clone(), conn.clone());
+                sending = Some(Box::pin(async move {
+                    let ok = wr.write_all(&r.encode()).await.is_ok();
+                    if ok && close.is_none() {
+                        pacer.pace(&shared, &conn).await;
                     }
-                }
-                if let Some(why) = close {
-                    break why;
-                }
-                pacer.pace(&shared, &conn).await;
+                    Sent { wr, pacer, ok, close }
+                }));
             }
             changed = bundle_rx.changed() => {
                 if changed.is_err() {
@@ -791,11 +829,48 @@ pub(crate) async fn run_sftp(
     sess.abort_all(reason).await;
     reader.abort();
     conn.set_close_reason(reason);
-    let _ = wr.shutdown().await;
-    let _ = handle.close(channel_id).await;
-    let _ = handle
-        .disconnect(russh::Disconnect::ByApplication, reason.into(), "en".into())
-        .await;
+    // A reply already in flight (say, the OK of a CLOSE that just committed, when the
+    // drain or a revocation ends the session) still goes out. Bounded: on a stalled client
+    // it is dropped with its half of the stream.
+    if let Some(f) = sending.take()
+        && let Ok(Sent { wr, pacer, .. }) = tokio::time::timeout(Duration::from_secs(1), f).await
+    {
+        writer = Some((wr, pacer));
+    }
+    if let Some((mut wr, _)) = writer {
+        let _ = tokio::time::timeout(Duration::from_secs(1), wr.shutdown()).await;
+    }
+    // Bounded: on a connection the client has stalled, the SSH session cannot take these
+    // messages, and the teardown must not wait on it. If the disconnect cannot be sent,
+    // the connection is dropped instead.
+    let sent = tokio::time::timeout(TEARDOWN_SEND, async {
+        let _ = handle.close(channel_id).await;
+        handle
+            .disconnect(russh::Disconnect::ByApplication, reason.into(), "en".into())
+            .await
+    })
+    .await;
+    if !matches!(sent, Ok(Ok(()))) {
+        conn.kill.notify_one();
+    }
+}
+
+/// How long the teardown waits to hand the channel close and the disconnect to the SSH
+/// session before dropping the connection.
+const TEARDOWN_SEND: Duration = Duration::from_secs(2);
+
+/// The write half of the SFTP channel.
+type ReplyWriter = tokio::io::WriteHalf<russh::ChannelStream<russh::server::Msg>>;
+
+/// A reply being written (then paced), owning the writer until it is done.
+type Sending = std::pin::Pin<Box<dyn std::future::Future<Output = Sent> + Send>>;
+
+/// A finished [`Sending`]: the writer handed back, and whether the write succeeded.
+struct Sent {
+    wr: ReplyWriter,
+    pacer: Pacer,
+    ok: bool,
+    close: Option<&'static str>,
 }
 
 /// Per-session bandwidth cap, per direction (ADR-009 D12). Unlimited by default.
