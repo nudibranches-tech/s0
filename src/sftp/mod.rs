@@ -496,14 +496,17 @@ async fn handle_connection(
         .connections_accepted
         .fetch_add(1, Ordering::Relaxed);
     let limits = shared.gw.limits().sftp.clone();
-    let handshake = Duration::from_secs(limits.handshake_timeout_secs);
+    // One deadline from accept to authentication, covering the PROXY header, the version
+    // exchange and KEX (which `StrictKexGuard` holds back until the client's KEXINIT, so
+    // russh's own wait for the version line never starts its clock) and authentication.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(limits.handshake_timeout_secs);
     let _ = stream.set_nodelay(true);
 
     // The client address: the peer, or what a trusted load balancer's PROXY v2 header
     // says. A trusted peer that does not send one is disconnected; an untrusted peer that
     // sends one is caught by the strict-KEX guard below.
     let client_ip = if limits::any_contains(&shared.trusted_proxies, peer.ip()) {
-        match tokio::time::timeout(handshake, preauth::read_proxy_v2(&mut stream)).await {
+        match tokio::time::timeout_at(deadline, preauth::read_proxy_v2(&mut stream)).await {
             Ok(Ok(ProxyHeader::Local)) => return,
             Ok(Ok(ProxyHeader::Proxied { source })) => source.ip(),
             Ok(Err(e)) => {
@@ -561,12 +564,22 @@ async fn handle_connection(
     let refusal: Arc<OnceLock<&'static str>> = Arc::new(OnceLock::new());
     let guarded = StrictKexGuard::new(stream).with_refusal_slot(refusal.clone());
     let handler = transport::SshHandler::new(shared.clone(), conn.clone());
-    let result = match russh::server::run_stream(config, guarded, handler).await {
-        Ok(running) => {
+    let started = tokio::time::timeout_at(
+        deadline,
+        russh::server::run_stream(config, guarded, handler),
+    )
+    .await;
+    let result = match started {
+        Err(_) => {
+            conn.set_close_reason("handshake timeout");
+            Err("handshake timeout before the SSH session started".to_string())
+        }
+        Ok(Err(e)) => Err(e.to_string()),
+        Ok(Ok(running)) => {
             let handle = running.handle();
             let watcher_conn = conn.clone();
             let watcher = tokio::spawn(async move {
-                tokio::time::sleep(handshake).await;
+                tokio::time::sleep_until(deadline).await;
                 if !watcher_conn.is_authenticated() {
                     watcher_conn.set_close_reason("handshake timeout");
                     let _ = handle
@@ -582,7 +595,6 @@ async fn handle_connection(
             watcher.abort();
             r.map_err(|e| e.to_string())
         }
-        Err(e) => Err(e.to_string()),
     };
     shared
         .metrics
