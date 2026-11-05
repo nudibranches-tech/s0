@@ -142,6 +142,11 @@ pub struct UploadLimits {
     pub max_file_size: u64,
 }
 
+/// What one chunk held ahead of the gap is charged against `reorder_window` on top of its
+/// length: the map node, the `Bytes` handle and the packet allocation it keeps alive. A
+/// window counted in payload bytes alone would let one-byte writes hold ~150× the window.
+const AHEAD_ENTRY_OVERHEAD: usize = 256;
+
 /// One write handle's state machine.
 pub struct Upload {
     backend: SftpBackend,
@@ -155,9 +160,9 @@ pub struct Upload {
     /// The next byte offset expected.
     next: u64,
     /// Bytes accepted ahead of `next`, held until the gap fills. Bounded by
-    /// `reorder_window`.
+    /// `reorder_window`, charged per entry ([`AHEAD_ENTRY_OVERHEAD`]).
     ahead: BTreeMap<u64, Bytes>,
-    ahead_bytes: usize,
+    ahead_cost: usize,
     buf: BytesMut,
     upload_id: Option<String>,
     parts: Vec<(i32, ETag)>,
@@ -194,7 +199,7 @@ impl Upload {
             limits,
             next: 0,
             ahead: BTreeMap::new(),
-            ahead_bytes: 0,
+            ahead_cost: 0,
             buf: BytesMut::new(),
             upload_id: None,
             parts: Vec::new(),
@@ -219,14 +224,18 @@ impl Upload {
     }
 
     /// Accept one WRITE. `Ok` means *accepted into the transfer*, not committed.
+    ///
+    /// A refused WRITE poisons the transfer: its bytes are missing from the object, so
+    /// the CLOSE that follows (stock clients CLOSE after a write error) must abort, not
+    /// commit a truncated file.
     pub async fn write(&mut self, offset: u64, data: Bytes) -> Result<(), WriteError> {
         self.last_write = Instant::now();
         if let Some(f) = &self.failed {
             return Err(WriteError::Failure(f.clone()));
         }
-        let end = offset
-            .checked_add(data.len() as u64)
-            .ok_or(WriteError::Unsupported("non-sequential write"))?;
+        let Some(end) = offset.checked_add(data.len() as u64) else {
+            return Err(self.refuse(offset));
+        };
         if end > self.limits.max_file_size {
             return Err(WriteError::Failure("file too large".into()));
         }
@@ -235,24 +244,25 @@ impl Upload {
         }
         if offset < self.next {
             // Overlaps bytes already accepted.
-            return Err(WriteError::Unsupported("non-sequential write"));
+            return Err(self.refuse(offset));
         }
         if offset > self.next {
             let ahead_end = end - self.next;
+            let cost = data.len() + AHEAD_ENTRY_OVERHEAD;
             if ahead_end > self.limits.reorder_window as u64
-                || self.ahead_bytes + data.len() > self.limits.reorder_window
+                || self.ahead_cost + cost > self.limits.reorder_window
                 || self.overlaps_ahead(offset, end)
             {
-                return Err(WriteError::Unsupported("non-sequential write"));
+                return Err(self.refuse(offset));
             }
-            self.ahead_bytes += data.len();
+            self.ahead_cost += cost;
             self.ahead.insert(offset, data);
             return Ok(());
         }
         if self.overlaps_ahead(offset, end) {
             // In order, but over bytes already held ahead: accepting it would strand the
             // held chunk behind `next` and fail the whole transfer at CLOSE.
-            return Err(WriteError::Unsupported("non-sequential write"));
+            return Err(self.refuse(offset));
         }
         self.append(data).await?;
         // Drain anything the gap was holding back.
@@ -261,7 +271,7 @@ impl Upload {
                 break;
             }
             let d = entry.remove();
-            self.ahead_bytes -= d.len();
+            self.ahead_cost -= d.len() + AHEAD_ENTRY_OVERHEAD;
             self.append(d).await?;
         }
         Ok(())
@@ -330,6 +340,15 @@ impl Upload {
             Some(Err(e)) => Err(self.fail(format!("part upload task failed: {e}"))),
             None => Ok(()),
         }
+    }
+
+    /// Refuse a non-sequential WRITE and poison the transfer: the client sees
+    /// `SSH_FX_OP_UNSUPPORTED` for this WRITE, and the next WRITE or the CLOSE aborts.
+    fn refuse(&mut self, offset: u64) -> WriteError {
+        self.failed = Some(format!(
+            "a non-sequential write at byte offset {offset} was refused; nothing was committed"
+        ));
+        WriteError::Unsupported("non-sequential write")
     }
 
     fn fail(&mut self, why: String) -> WriteError {

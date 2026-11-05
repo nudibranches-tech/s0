@@ -1361,8 +1361,9 @@ impl SftpSession {
                 status(id, StatusCode::Ok, "")
             }
             Err(WriteError::Unsupported(why)) => {
-                // Refused, but the transfer stays open: the client may still CLOSE and
-                // be told about the gap there.
+                // Refused, and the transfer is poisoned: the handle stays open so the
+                // client's CLOSE is answered, but that CLOSE aborts — the refused bytes
+                // are missing, and committing without them would truncate the file.
                 self.handles.insert(hid, Handle::Write(h));
                 status(id, StatusCode::OpUnsupported, why)
             }
