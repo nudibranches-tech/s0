@@ -115,6 +115,9 @@ struct ReadHandle {
     inputs: Vec<OpaInput>,
     decided_rev: String,
     audit: Arc<PendingAudit>,
+    /// The read-ahead budget, reserved from `max_transfer_memory` for the handle's
+    /// lifetime: released on drop.
+    _memory: tokio::sync::OwnedSemaphorePermit,
 }
 
 struct WriteHandle {
@@ -1031,8 +1034,20 @@ impl SftpSession {
         ) else {
             return status(id, StatusCode::Failure, "internal error: no proof");
         };
-        let audit = self.pending(input.clone(), &decided[0].decision, self.block(op, flags));
         let read_ahead = self.shared.gw.limits().sftp.read_ahead;
+        // The read-ahead counts against the same budget as uploads: 64 read handles per
+        // session must not hold memory nothing accounts for.
+        let Some(memory) = self
+            .shared
+            .memory
+            .reserve(read_ahead, std::time::Duration::from_secs(10))
+            .await
+        else {
+            let rec = self.pending(input, &decided[0].decision, self.block(op, flags));
+            rec.settle(BackendOutcome::NotAttempted, None);
+            return status(id, StatusCode::Failure, "server busy");
+        };
+        let audit = self.pending(input.clone(), &decided[0].decision, self.block(op, flags));
         match Download::open(
             self.backend(route),
             proof,
@@ -1048,6 +1063,7 @@ impl SftpSession {
                     inputs: vec![input],
                     decided_rev: self.checked_rev.clone(),
                     audit,
+                    _memory: memory,
                 }));
                 Next::Reply(Response::Handle { id, handle: h })
             }

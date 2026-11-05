@@ -209,10 +209,12 @@ pub struct SftpLimits {
     /// At most `part_size`.
     pub reorder_window: usize,
     pub max_write_handles: usize,
+    /// Process-wide: every upload's reservation and every read handle's read-ahead.
     pub max_transfer_memory: usize,
     pub max_sftp_packet_len: usize,
     /// Bytes a download prefetches from the backend ahead of the client's READs, per
     /// open read handle. Bounded: a slow client stops the prefetch, never grows it.
+    /// Reserved from `max_transfer_memory` for as long as the handle is open.
     pub read_ahead: usize,
 }
 
@@ -324,6 +326,13 @@ impl SftpLimits {
         }
         if self.read_ahead == 0 {
             return Err("limits.sftp.read_ahead must be > 0".into());
+        }
+        if self.read_ahead > self.max_transfer_memory {
+            return Err(format!(
+                "limits.sftp.read_ahead {} exceeds max_transfer_memory {}; a read handle \
+                 reserves its read-ahead from that budget, so no download could ever start",
+                self.read_ahead, self.max_transfer_memory
+            ));
         }
         Ok(())
     }
