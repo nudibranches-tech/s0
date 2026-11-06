@@ -170,6 +170,12 @@ pub struct SessionEvent {
     pub bytes_in: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes_out: Option<u64>,
+    /// `auth_failed` only: whether the client presented a credential that did not match
+    /// (`true`), which counts toward the address's ban if the connection ends
+    /// unauthenticated, or was refused for a reason that never counts (`false`): a bundle
+    /// the gateway refuses, or a matched credential refused admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_mismatch: Option<bool>,
     /// Budgeted events this replica did not record since the last one it did.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub suppressed_since_last: u64,
@@ -592,6 +598,7 @@ mod tests {
             operations: None,
             bytes_in: None,
             bytes_out: None,
+            credential_mismatch: None,
             suppressed_since_last: 0,
         };
         let denied = AuditRecord::session_event(

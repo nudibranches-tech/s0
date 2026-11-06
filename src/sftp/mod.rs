@@ -59,6 +59,7 @@ pub struct SftpMetrics {
     pub connections_active: AtomicU64,
     pub preauth_rejected: AtomicU64,
     pub auth_failed: AtomicU64,
+    pub auth_credential_mismatch: AtomicU64,
     pub auth_succeeded: AtomicU64,
     pub banned: AtomicU64,
     pub transfers_started: AtomicU64,
@@ -94,6 +95,12 @@ impl SftpMetrics {
                 "counter",
                 "Failed SFTP authentications.",
                 g(&self.auth_failed),
+            ),
+            (
+                "s0_sftp_auth_credential_mismatch_total",
+                "counter",
+                "Failed SFTP authentications where the credential did not match (the subset of s0_sftp_auth_failed_total that can count toward a ban).",
+                g(&self.auth_credential_mismatch),
             ),
             (
                 "s0_sftp_auth_succeeded_total",
@@ -211,6 +218,40 @@ impl Shared {
         allow: bool,
         reason: String,
     ) {
+        self.emit_event_inner(conn, kind, login, authed, allow, reason, None);
+    }
+
+    /// An `auth_failed` record, saying whether the credential did not match (see
+    /// [`SessionEvent::credential_mismatch`]).
+    pub fn emit_auth_failed(
+        &self,
+        conn: &ConnState,
+        login: &str,
+        reason: String,
+        credential_mismatch: bool,
+    ) {
+        self.emit_event_inner(
+            conn,
+            SessionEventKind::AuthFailed,
+            Some(login),
+            None,
+            false,
+            reason,
+            Some(credential_mismatch),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_event_inner(
+        &self,
+        conn: &ConnState,
+        kind: SessionEventKind,
+        login: Option<&str>,
+        authed: Option<(&Authenticated, &str)>,
+        allow: bool,
+        reason: String,
+        credential_mismatch: Option<bool>,
+    ) {
         let org = authed.and_then(|(_, tenant)| {
             self.gw
                 .registry
@@ -230,6 +271,7 @@ impl Shared {
             operations: counters.map(|c| c.operations.load(Ordering::Relaxed)),
             bytes_in: counters.map(|c| c.bytes_in.load(Ordering::Relaxed)),
             bytes_out: counters.map(|c| c.bytes_out.load(Ordering::Relaxed)),
+            credential_mismatch,
             suppressed_since_last: 0,
         };
         let result = Decision {
@@ -282,10 +324,11 @@ pub struct ConnState {
     /// The SFTP subsystem task, awaited before the `disconnected` record so that record
     /// comes after the transfers it ended were aborted, and carries their reason.
     sftp_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// Signalled by the SFTP teardown when the SSH session could not take its disconnect,
-    /// after it fired `kill_switch`: the connection task then waits, bounded, for russh's
-    /// task to end and release the socket.
-    kill: tokio::sync::Notify,
+    /// Signalled once a disconnect has been handed to the SSH session (the SFTP teardown,
+    /// the handshake watcher). That only queues it: russh's task may be stuck writing to
+    /// a client that stopped reading, so the connection task gives it [`DISCONNECT_GRACE`]
+    /// to end, then fires `kill_switch`.
+    teardown: tokio::sync::Notify,
     /// Fails every read and write on the connection's socket (`StrictKexGuard`), so a
     /// russh task stuck writing to a client that stopped reading ends, and drops it.
     kill_switch: KillSwitch,
@@ -311,7 +354,7 @@ impl ConnState {
             auth: Mutex::new(None),
             close_reason: Mutex::new(None),
             sftp_task: Mutex::new(None),
-            kill: tokio::sync::Notify::new(),
+            teardown: tokio::sync::Notify::new(),
             kill_switch: KillSwitch::default(),
         }
     }
@@ -319,6 +362,13 @@ impl ConnState {
     /// Note one authentication failure; see [`Shared::settle_auth_failures`].
     pub fn note_auth_failure(&self) {
         self.auth_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Forget this connection's failures so far: the client has just presented a
+    /// credential that matched, so the mismatches before it (an agent's other keys) are a
+    /// legitimate client's, even if the gateway then refuses to admit it.
+    pub fn forgive_auth_failures(&self) {
+        self.auth_failures.store(0, Ordering::Relaxed);
     }
 
     pub fn is_authenticated(&self) -> bool {
@@ -361,6 +411,13 @@ impl ConnState {
     /// Record the SFTP subsystem task (one per connection).
     pub fn set_sftp_task(&self, task: tokio::task::JoinHandle<()>) {
         *self.sftp_task.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
+    }
+
+    fn sftp_started(&self) -> bool {
+        self.sftp_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
 
     fn set_close_reason(&self, r: &'static str) {
@@ -589,33 +646,49 @@ async fn handle_connection(
         Ok(Ok(running)) => {
             let handle = running.handle();
             let watcher_conn = conn.clone();
+            let subsystem_wait = Duration::from_secs(limits.handshake_timeout_secs);
+            // Ends a connection that has not authenticated by the deadline, or that has
+            // authenticated but not started the SFTP subsystem one handshake timeout
+            // later: neither has an SFTP teardown to end it.
             let watcher = tokio::spawn(async move {
                 tokio::time::sleep_until(deadline).await;
-                if !watcher_conn.is_authenticated() {
+                let reason = if !watcher_conn.is_authenticated() {
                     watcher_conn.set_close_reason("handshake timeout");
-                    let _ = handle
-                        .disconnect(
-                            russh::Disconnect::ByApplication,
-                            "authentication timeout".into(),
-                            "en".into(),
-                        )
-                        .await;
-                }
+                    "authentication timeout"
+                } else {
+                    tokio::time::sleep(subsystem_wait).await;
+                    if watcher_conn.sftp_started() {
+                        return;
+                    }
+                    watcher_conn.set_close_reason("no sftp subsystem");
+                    "sftp subsystem not requested"
+                };
+                request_disconnect(&watcher_conn, &handle, None, reason).await;
             });
-            // The session ends when the client goes, or when the SFTP teardown could not
-            // send its disconnect (a stalled client). Dropping `running` alone would only
-            // detach russh's task, still stuck writing, with the socket open and no longer
-            // counted; the teardown has fired the kill switch, so that task's write fails
-            // and it ends. Wait for it, so the connection stays counted until it does.
+            // The session ends when the client goes, or after a disconnect was requested.
+            // That disconnect is only queued: a russh task stuck writing to a client that
+            // stopped reading never takes it. Dropping `running` would only detach that
+            // task, with the socket open and no longer counted; firing the kill switch
+            // fails its write so it ends. Wait for it, so the connection stays counted
+            // until it does.
             let mut running = running;
             let r = tokio::select! {
                 r = &mut running => r.map_err(|e| e.to_string()),
-                _ = conn.kill.notified() => {
-                    conn.kill_switch.fire();
-                    if tokio::time::timeout(KILL_GRACE, &mut running).await.is_err() {
-                        tracing::warn!(session = %conn.session_id, "sftp connection task did not end after the kill switch");
+                _ = conn.teardown.notified() => {
+                    match tokio::time::timeout(DISCONNECT_GRACE, &mut running).await {
+                        Ok(r) => r.map_err(|e| e.to_string()),
+                        Err(_) => {
+                            conn.kill_switch.fire();
+                            if tokio::time::timeout(KILL_GRACE, &mut running).await.is_err() {
+                                // Keep waiting: russh's task still holds the socket, so the
+                                // connection stays counted until it ends. Drain aborts this
+                                // task if it never does.
+                                tracing::warn!(session = %conn.session_id, "sftp connection task did not end after the kill switch; still waiting");
+                                let _ = (&mut running).await;
+                            }
+                            Err("connection dropped: the client stopped reading".to_string())
+                        }
                     }
-                    Err("connection dropped: the client stopped reading".to_string())
                 }
             };
             watcher.abort();
@@ -857,11 +930,26 @@ pub(crate) async fn run_sftp(
     if let Some((mut wr, _)) = writer {
         let _ = tokio::time::timeout(Duration::from_secs(1), wr.shutdown()).await;
     }
-    // Bounded: on a connection the client has stalled, the SSH session cannot take these
-    // messages, and the teardown must not wait on it. If the disconnect cannot be sent,
-    // the connection is dropped instead.
+    request_disconnect(&conn, &handle, Some(channel_id), reason).await;
+}
+
+/// Hand a disconnect (after closing `channel`, if any) to the SSH session, then signal
+/// the connection task, which ends the connection if russh's task does not.
+///
+/// Bounded: on a connection the client has stalled, the SSH session cannot take these
+/// messages, and the caller must not wait on it. If they cannot even be queued, russh's
+/// task is certainly stuck, so the kill switch fires at once rather than after
+/// [`DISCONNECT_GRACE`].
+async fn request_disconnect(
+    conn: &ConnState,
+    handle: &russh::server::Handle,
+    channel: Option<russh::ChannelId>,
+    reason: &str,
+) {
     let sent = tokio::time::timeout(TEARDOWN_SEND, async {
-        let _ = handle.close(channel_id).await;
+        if let Some(channel) = channel {
+            let _ = handle.close(channel).await;
+        }
         handle
             .disconnect(russh::Disconnect::ByApplication, reason.into(), "en".into())
             .await
@@ -869,16 +957,23 @@ pub(crate) async fn run_sftp(
     .await;
     if !matches!(sent, Ok(Ok(()))) {
         conn.kill_switch.fire();
-        conn.kill.notify_one();
     }
+    conn.teardown.notify_one();
 }
 
-/// How long the teardown waits to hand the channel close and the disconnect to the SSH
-/// session before dropping the connection.
+/// How long [`request_disconnect`] waits to hand the channel close and the disconnect to
+/// the SSH session before dropping the connection.
 const TEARDOWN_SEND: Duration = Duration::from_secs(2);
 
-/// How long the connection task waits for russh's task to end once the kill switch fired.
-/// It ends at its next poll; this only bounds a task that is somehow never polled.
+/// How long the connection task waits, once a disconnect was queued, for russh's task to
+/// send it and end before firing the kill switch. A responsive session ends well within
+/// it; one that does not is stuck writing to a client that stopped reading.
+const DISCONNECT_GRACE: Duration = Duration::from_secs(5);
+
+/// How long the connection task waits for russh's task to end once the kill switch fired
+/// before logging a warning. It ends at its next poll; past this the task is somehow not
+/// being polled, and the connection task keeps waiting (still counted) rather than
+/// releasing the slot of a socket that is still open.
 const KILL_GRACE: Duration = Duration::from_secs(5);
 
 /// The write half of the SFTP channel.

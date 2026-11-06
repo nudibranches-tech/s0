@@ -215,6 +215,9 @@ ships with a release:
     refuses (its gate, the fleet-wide denylist, an unresolvable membership). Counting them
     would ban an address — and every partner behind its NAT — for logging in correctly
     while the subject is at its cap or the bundle is bad.
+    When the refused credential did match (session cap, unroutable tenant, unresolvable
+    membership), the connection's earlier mismatches are forgiven as well: an agent that
+    signed with its other keys first is a legitimate client.
   - A probe for an unknown login and a probe for an unauthorized key get the same answer
     after the same delay.
   - A probe does answer "accepted" for an authorized (login, key) pair, as in every SSH
@@ -609,6 +612,11 @@ results:
   uncounted. The client stream is therefore wrapped (`StrictKexGuard`) with a kill switch
   that fails the stuck write and every later read and write, so russh's task ends and
   releases the socket. The connection stays counted toward `max_connections` until it does.
+  Handing russh a disconnect only queues it, so success says nothing about a stall: every
+  gateway-initiated disconnect (the SFTP teardown, the handshake timeout, and a connection
+  that authenticated but has not started the `sftp` subsystem one `handshake_timeout_secs`
+  after the deadline) gives russh's task 5 s to end, then fires the kill switch. If the
+  disconnect cannot even be queued, it fires at once.
 
 **Pipelined writes and the reorder window.** Clients keep many WRITEs outstanding (OpenSSH
 keeps 64 × 32 KiB in flight).
@@ -804,7 +812,7 @@ Exactly one of `input`, `gate` or `session_event` is present, and `path` is `sft
 | `auth_failed` (unknown login, unknown key, revoked certificate, CIDR mismatch, …) | none; `login` recorded, org label **omitted** | yes |
 | `banned` | none | no — bounded by the ban rate itself |
 | `auth_succeeded` | principal and org label | no |
-| `disconnected` (client close, idle, credential revoked, shutdown, protocol error) with duration, operation count and bytes in each direction | principal and org label | no |
+| `disconnected` (client close, idle, credential revoked, shutdown, no `sftp` subsystem, protocol error) with duration, operation count and bytes in each direction | principal and org label | no |
 
 Every record still carries the required `result: Decision`. For a session event it states
 what happened rather than a PDP answer, and `obligations` is always empty:
@@ -817,6 +825,12 @@ what happened rather than a PDP answer, and `obligations` is always empty:
 
 The `(gateway)` prefix follows `GatewayAccess::refuse`: no policy was asked, and the reason
 must not read as a policy verdict.
+
+An `auth_failed` record also carries `credential_mismatch`: `true` when the credential did
+not match, which counts toward the ban if the connection ends unauthenticated; `false` for a
+refusal that never counts (a refused bundle, a matched credential refused admission). The
+`s0_sftp_auth_credential_mismatch_total` metric counts the `true` subset of
+`s0_sftp_auth_failed_total`.
 
 **Consumer impact.** `sftp/session` is a new `path`, and `gateway.session` a new block.
 ADR-002 I4 freezes path values per deployment, and I6 requires consumers to ignore unknown

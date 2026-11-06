@@ -120,20 +120,20 @@ pub enum Refusal {
     /// toward the address's ban.
     Credential(String),
     /// The gateway cannot admit this login right now, whatever the client presents: the
-    /// bundle gate, the fleet-wide denylist, a membership the bundle does not resolve.
-    /// Audited, never counted: a correct credential must not ban the address.
+    /// bundle gate, the fleet-wide denylist. Audited, never counted: a correct credential
+    /// must not ban the address.
     Gateway(String),
+    /// The credential matched, but the bundle does not resolve the account's membership.
+    /// Never counted, and since the client proved it holds the credential, the
+    /// connection's earlier mismatches (an agent's other keys) are forgiven too.
+    Admission(String),
 }
 
 impl Refusal {
     pub fn into_reason(self) -> String {
         match self {
-            Refusal::Credential(r) | Refusal::Gateway(r) => r,
+            Refusal::Credential(r) | Refusal::Gateway(r) | Refusal::Admission(r) => r,
         }
-    }
-
-    pub fn counts_toward_ban(&self) -> bool {
-        matches!(self, Refusal::Credential(_))
     }
 }
 
@@ -363,7 +363,7 @@ impl Directory {
         };
         // The credential matched: a membership the bundle cannot resolve is the bundle's
         // problem, and must not ban the client for it.
-        let groups = self.membership(account).map_err(Refusal::Gateway)?;
+        let groups = self.membership(account).map_err(Refusal::Admission)?;
         Ok(Authenticated {
             account: account.clone(),
             groups,
@@ -880,13 +880,16 @@ mod tests {
         let mut b = bundle(section(&fp, serde_json::json!({})), true);
         b.data["tenants"]["acme"]["user_attributes"] = serde_json::json!({});
         let non_member = Directory::from_bundle(&b);
-        for (what, dir) in [("bundle gate", &gated), ("membership", &non_member)] {
-            let r = dir.authenticate_classified("acme-partner-drop", &cred, ip(), 0);
-            assert!(
-                matches!(r, Err(Refusal::Gateway(_))),
-                "{what}: not counted, got {r:?}"
-            );
-        }
+        let r = gated.authenticate_classified("acme-partner-drop", &cred, ip(), 0);
+        assert!(
+            matches!(r, Err(Refusal::Gateway(_))),
+            "bundle gate: not counted, got {r:?}"
+        );
+        let r = non_member.authenticate_classified("acme-partner-drop", &cred, ip(), 0);
+        assert!(
+            matches!(r, Err(Refusal::Admission(_))),
+            "membership: not counted, got {r:?}"
+        );
     }
 
     #[test]

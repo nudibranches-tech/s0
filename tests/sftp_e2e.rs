@@ -1342,6 +1342,12 @@ async fn authentication_is_by_listed_key_only_and_failures_are_unattributed() {
             !f.labels.contains_key("s0/organization-id"),
             "a failed login is a client claim and must not be attributed to an organization"
         );
+        assert_eq!(
+            f.session_event.as_ref().unwrap().credential_mismatch,
+            Some(true),
+            "a wrong key is a credential mismatch: {}",
+            f.result.reason
+        );
     }
 }
 
@@ -1932,6 +1938,67 @@ async fn refusals_a_correct_key_also_gets_do_not_ban() {
             .is_some_and(|e| e.event == SessionEventKind::Banned)),
         "no ban was recorded"
     );
+    // Every refusal is on the audit stream, marked as one that never counts.
+    let refused: Vec<_> =
+        h.fx.audit_log
+            .all()
+            .into_iter()
+            .filter_map(|x| x.session_event)
+            .filter(|e| e.event == SessionEventKind::AuthFailed)
+            .collect();
+    assert!(refused.len() >= 24, "{} refusals recorded", refused.len());
+    assert!(
+        refused.iter().all(|e| e.credential_mismatch == Some(false)),
+        "a refusal of a correct key is not a credential mismatch"
+    );
+}
+
+#[tokio::test]
+async fn an_authenticated_connection_that_never_starts_sftp_is_closed() {
+    let h = harness_with("sftp-no-subsystem", "native", |c| {
+        sftp_limits(c, serde_json::json!({ "handshake_timeout_secs": 1 }));
+    })
+    .await;
+    let cfg = Arc::new(russh::client::Config::default());
+    let mut session = russh::client::connect(cfg, h.addr, Client).await.unwrap();
+    let ok = session
+        .authenticate_publickey(
+            "acme-partner-drop",
+            PrivateKeyWithHashAlg::new(Arc::new(h.drop_key.clone()), None),
+        )
+        .await
+        .unwrap();
+    assert!(ok.success());
+    // A session channel, but no subsystem: there is no SFTP teardown to end it, so the
+    // gateway must, one handshake timeout after the deadline, not at russh's inactivity
+    // timeout. It would otherwise hold the subject's session slot.
+    let _ch = session.channel_open_session().await.unwrap();
+    let mut closed = false;
+    for _ in 0..80 {
+        if session.is_closed() {
+            closed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(closed, "the connection was closed");
+    let recs = records(&h.fx, |r| {
+        r.iter().any(|x| {
+            x.session_event
+                .as_ref()
+                .is_some_and(|e| e.event == SessionEventKind::Disconnected)
+        })
+    })
+    .await;
+    let disc = recs
+        .iter()
+        .find(|x| {
+            x.session_event
+                .as_ref()
+                .is_some_and(|e| e.event == SessionEventKind::Disconnected)
+        })
+        .unwrap();
+    assert_eq!(disc.result.reason, "disconnect: no sftp subsystem");
 }
 
 #[tokio::test]
@@ -2242,7 +2309,14 @@ async fn a_client_stalled_at_the_tcp_level_has_its_socket_closed() {
     // buffered by a socket that a detached, stuck task still holds open.
     let mut closed = false;
     for _ in 0..100 {
-        let mut g = relay.upstream.lock().await;
+        // Bounded: the relay's client-to-gateway copy holds this lock while its write is
+        // blocked on a gateway that stopped reading. A socket that is never released then
+        // fails the assertion below instead of hanging the test.
+        let Ok(mut g) =
+            tokio::time::timeout(Duration::from_millis(100), relay.upstream.lock()).await
+        else {
+            continue;
+        };
         let w = g.as_mut().unwrap();
         let r = tokio::time::timeout(Duration::from_millis(100), w.write_all(b"x")).await;
         drop(g);

@@ -18,7 +18,7 @@ use russh::keys::{Algorithm, Certificate, EcdsaCurve, HashAlg, PrivateKey, Publi
 use russh::server::{Auth, Msg, Session};
 use russh::{Channel, ChannelId, ChannelOpenFailure, MethodKind, MethodSet, Preferred};
 
-use super::account::{Credential, client_key_allowed};
+use super::account::{Credential, Refusal, client_key_allowed};
 use super::{ConnState, Shared};
 use crate::audit::SessionEventKind;
 use crate::error::GatewayError;
@@ -216,12 +216,20 @@ impl SshHandler {
         self.reject(login, reason, true)
     }
 
-    /// A refusal that is not the client's fault (the subject's session cap, a tenant
-    /// that cannot be routed, a bundle the gateway refuses): audited like a failure, but
-    /// never counted toward the ban. Counting it would ban an address for presenting a
-    /// correct credential — every partner behind the same NAT with it.
+    /// A refusal that is not the client's fault (a bundle the gateway refuses): audited
+    /// like a failure, but never counted toward the ban. Counting it would ban an address
+    /// for presenting a correct credential — every partner behind the same NAT with it.
     fn refuse(&mut self, login: &str, reason: String) -> Result<Auth, HandlerError> {
         self.reject(login, reason, false)
+    }
+
+    /// A credential that matched, refused admission (an unresolvable membership, a tenant
+    /// that cannot be routed, the subject's session cap): not counted, and the
+    /// connection's earlier mismatches are forgiven, so an agent that signed with its
+    /// other keys first is not banned for retrying while the subject is at its cap.
+    fn refuse_matched(&mut self, login: &str, reason: String) -> Result<Auth, HandlerError> {
+        self.conn.forgive_auth_failures();
+        self.refuse(login, reason)
     }
 
     fn reject(&mut self, login: &str, reason: String, counted: bool) -> Result<Auth, HandlerError> {
@@ -230,15 +238,17 @@ impl SshHandler {
             .metrics
             .auth_failed
             .fetch_add(1, Ordering::Relaxed);
-        self.shared.emit_event(
+        self.shared.emit_auth_failed(
             &self.conn,
-            SessionEventKind::AuthFailed,
-            Some(login),
-            None,
-            false,
+            login,
             format!("deny (gateway): {reason}"),
+            counted,
         );
         if counted {
+            self.shared
+                .metrics
+                .auth_credential_mismatch
+                .fetch_add(1, Ordering::Relaxed);
             self.conn.note_auth_failure();
         }
         Ok(reject_publickey_only())
@@ -253,10 +263,9 @@ impl SshHandler {
             .unwrap_or(0);
         let auth = match dir.authenticate_classified(login, &credential, self.conn.client_ip, now) {
             Ok(a) => a,
-            Err(r) => {
-                let counted = r.counts_toward_ban();
-                return self.reject(login, r.into_reason(), counted);
-            }
+            Err(Refusal::Credential(r)) => return self.fail(login, r),
+            Err(Refusal::Gateway(r)) => return self.refuse(login, r),
+            Err(Refusal::Admission(r)) => return self.refuse_matched(login, r),
         };
         if self
             .shared
@@ -265,7 +274,7 @@ impl SshHandler {
             .route_snapshot(&auth.account.tenant)
             .is_none()
         {
-            return self.refuse(
+            return self.refuse_matched(
                 login,
                 format!("tenant {} is not routable", auth.account.tenant),
             );
@@ -273,7 +282,7 @@ impl SshHandler {
         let max = self.shared.gw.limits().sftp.max_sessions_per_subject;
         let subject = format!("{}/{}", auth.account.tenant, auth.account.subject_key);
         let Some(guard) = self.shared.subjects.admit(&subject, max) else {
-            return self.refuse(
+            return self.refuse_matched(
                 login,
                 "too many concurrent sessions for this subject".into(),
             );
