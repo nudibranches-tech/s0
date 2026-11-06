@@ -58,6 +58,23 @@ pub async fn read_proxy_v2<R: AsyncRead + Unpin>(stream: &mut R) -> io::Result<P
     parse_proxy_v2_body(cmd, fam, &body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+/// [`read_proxy_v2`] over a buffer instead of a stream, for the `proxy_v2_header` fuzz
+/// target: the same head and body parsers in the same order, with no I/O.
+///
+/// `Ok(None)` means `buf` ends before the header does (where `read_proxy_v2` would fail
+/// with `UnexpectedEof`); `Ok(Some((header, n)))` means the header is `buf[..n]`.
+#[doc(hidden)]
+pub fn parse_proxy_v2(buf: &[u8]) -> Result<Option<(ProxyHeader, usize)>, &'static str> {
+    let Some(head) = buf.first_chunk::<16>() else {
+        return Ok(None);
+    };
+    let (cmd, fam, len) = parse_proxy_v2_head(head)?;
+    let Some(body) = buf.get(16..16 + len) else {
+        return Ok(None);
+    };
+    parse_proxy_v2_body(cmd, fam, body).map(|h| Some((h, 16 + len)))
+}
+
 /// `(command, family, address-block length)` from the 16-byte fixed head.
 pub fn parse_proxy_v2_head(head: &[u8; 16]) -> Result<(u8, u8, usize), &'static str> {
     if head[..12] != PROXY_V2_SIG {
@@ -428,6 +445,37 @@ mod tests {
             parse_proxy_v2_head(&h).is_err(),
             "oversized block refused before allocation"
         );
+    }
+
+    #[tokio::test]
+    async fn the_buffer_parser_agrees_with_the_stream_reader() {
+        let mut v4 = PROXY_V2_SIG.to_vec();
+        v4.extend_from_slice(&[
+            0x21, 0x11, 0, 12, 203, 0, 113, 10, 10, 0, 0, 1, 0x30, 0x39, 0, 22,
+        ]);
+        let mut local = PROXY_V2_SIG.to_vec();
+        local.extend_from_slice(&[0x20, 0x00, 0, 0]);
+        let mut bad_fam = PROXY_V2_SIG.to_vec();
+        bad_fam.extend_from_slice(&[0x21, 0x31, 0, 0]);
+        for input in [
+            v4.clone(),
+            v4[..20].to_vec(),
+            local,
+            bad_fam,
+            b"SSH-2.0-x".to_vec(),
+        ] {
+            let pure = parse_proxy_v2(&input);
+            let streamed = read_proxy_v2(&mut input.as_slice()).await;
+            match (pure, streamed) {
+                (Ok(Some((h, n))), Ok(s)) => {
+                    assert_eq!(h, s);
+                    assert!(n <= input.len());
+                }
+                (Ok(None), Err(e)) => assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof),
+                (Err(p), Err(e)) => assert_eq!(e.to_string(), p),
+                (p, s) => panic!("disagreement on {input:?}: {p:?} vs {s:?}"),
+            }
+        }
     }
 
     #[tokio::test]

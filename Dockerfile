@@ -5,13 +5,28 @@ FROM rust:1.94-bookworm AS builder
 
 WORKDIR /build
 
+# cargo-about writes THIRD_PARTY_NOTICES (below). Pinned and installed before the source
+# is copied, so this layer survives every source change.
+RUN cargo install --locked --features cli cargo-about@0.9.3
+
 # Copy the full tree and build a release binary with a locked dependency graph.
 # The cache mounts keep the registry and target dir warm across rebuilds.
+#
+# Then collect the licence texts and copyright notices of every crate in the binary
+# (ADR-009: the BSD-3-Clause and ISC notices ship with the image). `--frozen` reads only
+# Cargo.lock and the crate sources the build just fetched: no network lookups, so a given
+# lockfile always yields the same file (`cargo fetch` first: cargo-about reads the
+# manifest of every package in the lockfile, not only those built for this target). See
+# about.toml.
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
+    cargo fetch --locked && \
     cargo build --release --locked --bin s0 && \
-    cp target/release/s0 /usr/local/bin/s0
+    cp target/release/s0 /usr/local/bin/s0 && \
+    mkdir -p /usr/local/share/doc/s0 && \
+    cargo about generate --frozen --fail -o /usr/local/share/doc/s0/THIRD_PARTY_NOTICES about.hbs && \
+    cp LICENSE /usr/local/share/doc/s0/LICENSE
 
 # ---- Runtime stage -----------------------------------------------------------
 # distroless "cc" carries glibc + libgcc for the dynamically linked gnu binary.
@@ -19,6 +34,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 
 COPY --from=builder /usr/local/bin/s0 /usr/local/bin/s0
+COPY --from=builder /usr/local/share/doc/s0/ /usr/share/doc/s0/
 
 # Four listeners with three different authentication postures. Which posture applies is a
 # property of the socket, never of the path, so they are four ports on purpose and

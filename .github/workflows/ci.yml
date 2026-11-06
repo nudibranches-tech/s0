@@ -62,3 +62,57 @@ jobs:
 
   # S3 protocol conformance against a live backend is scaffolded in conformance.yml
   # (manual trigger, harness not yet wired). Fold it in here once it is.
+
+  # ADR-009: "PR 1 adds a `cargo deny` licence check". Every crate in Cargo.lock must be
+  # under a licence `deny.toml` allows. Only the licences check gates here: advisories
+  # depend on a database that changes under a fixed lockfile, so they are not a merge gate.
+  licenses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: EmbarkStudios/cargo-deny-action@v2.1.1
+        with:
+          command: check licenses
+
+  # ADR-009 T2: the SFTP codec and the PROXY v2 parser are fuzzed in CI. libFuzzer needs
+  # nightly; the fuzz crate is its own workspace (fuzz/Cargo.toml), so the stable jobs
+  # above never build it. Each target runs for a bounded time from an empty corpus; a
+  # crash fails the job and its reproducer is uploaded.
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [sftp_codec, proxy_v2_header]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          key: ${{ matrix.target }}
+
+      - name: install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz@0.13.2
+
+      # RUSTFLAGS is cleared: the workflow's `-D warnings` would turn a nightly-only lint
+      # into a fuzz failure. Lints are the stable clippy job's business; this job finds
+      # crashes.
+      - name: fuzz ${{ matrix.target }} (60 s)
+        env:
+          RUSTFLAGS: ""
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=60
+
+      - name: upload crash reproducer
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore

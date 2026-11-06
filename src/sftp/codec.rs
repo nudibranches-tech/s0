@@ -838,7 +838,8 @@ mod tests {
 
     #[test]
     fn arbitrary_bytes_never_panic() {
-        // A tiny deterministic fuzz pass; the cargo-fuzz target runs the same function.
+        // A tiny deterministic fuzz pass; the cargo-fuzz target `sftp_codec`
+        // (fuzz/fuzz_targets/sftp_codec.rs) runs the same function, unbiased, in CI.
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;
         for _ in 0..20_000 {
             seed ^= seed << 13;
