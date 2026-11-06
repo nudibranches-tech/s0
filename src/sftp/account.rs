@@ -112,6 +112,31 @@ pub struct Directory {
     user_attributes: HashMap<String, serde_json::Map<String, serde_json::Value>>,
 }
 
+/// Why [`Directory::authenticate_classified`] refused a login.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// The credential does not match: an unknown login, a key not authorized for it, a
+    /// rejected certificate, a key type or source the account does not accept. Counted
+    /// toward the address's ban.
+    Credential(String),
+    /// The gateway cannot admit this login right now, whatever the client presents: the
+    /// bundle gate, the fleet-wide denylist, a membership the bundle does not resolve.
+    /// Audited, never counted: a correct credential must not ban the address.
+    Gateway(String),
+}
+
+impl Refusal {
+    pub fn into_reason(self) -> String {
+        match self {
+            Refusal::Credential(r) | Refusal::Gateway(r) => r,
+        }
+    }
+
+    pub fn counts_toward_ban(&self) -> bool {
+        matches!(self, Refusal::Credential(_))
+    }
+}
+
 /// How a session authenticated, re-checkable against any later directory.
 #[derive(Debug, Clone)]
 pub enum Credential {
@@ -278,24 +303,43 @@ impl Directory {
         client_ip: IpAddr,
         now_unix: u64,
     ) -> Result<Authenticated, String> {
-        self.gate().map_err(str::to_string)?;
+        self.authenticate_classified(login, credential, client_ip, now_unix)
+            .map_err(Refusal::into_reason)
+    }
+
+    /// [`Directory::authenticate`], with the refusal classified by whether the client
+    /// presented a credential that does not match ([`Refusal::Credential`], counted
+    /// toward the ban) or the gateway could not admit anyone with it right now
+    /// ([`Refusal::Gateway`], audited only).
+    pub fn authenticate_classified(
+        &self,
+        login: &str,
+        credential: &Credential,
+        client_ip: IpAddr,
+        now_unix: u64,
+    ) -> Result<Authenticated, Refusal> {
+        self.gate().map_err(|e| Refusal::Gateway(e.to_string()))?;
         if self.is_source_denied(client_ip) {
-            return Err("source address is on the bundle denylist".into());
+            return Err(Refusal::Gateway(
+                "source address is on the bundle denylist".into(),
+            ));
         }
         let account = self
             .accounts
             .get(login)
-            .ok_or_else(|| "unknown login".to_string())?;
+            .ok_or_else(|| Refusal::Credential("unknown login".into()))?;
         if let Some(allowed) = &account.allowed_source_cidrs
             && !any_contains(allowed, client_ip)
         {
-            return Err("source address not allowed for this account".into());
+            return Err(Refusal::Credential(
+                "source address not allowed for this account".into(),
+            ));
         }
         if !client_key_allowed(credential.key()) {
-            return Err(format!(
+            return Err(Refusal::Credential(format!(
                 "client key type {} is not accepted (ed25519 and ECDSA only)",
                 key_type(credential.key())
-            ));
+            )));
         }
         let auth = match credential {
             Credential::PublicKey { key } => {
@@ -304,7 +348,7 @@ impl Directory {
                     fingerprint: fingerprint(key),
                 };
                 if !account.authorized_keys.contains(&want) {
-                    return Err("key not authorized for login".into());
+                    return Err(Refusal::Credential("key not authorized for login".into()));
                 }
                 AuthInfo {
                     method: "publickey".into(),
@@ -313,11 +357,13 @@ impl Directory {
                     cert: None,
                 }
             }
-            Credential::Certificate { cert } => {
-                self.check_certificate(account, cert, client_ip, now_unix)?
-            }
+            Credential::Certificate { cert } => self
+                .check_certificate(account, cert, client_ip, now_unix)
+                .map_err(Refusal::Credential)?,
         };
-        let groups = self.membership(account)?;
+        // The credential matched: a membership the bundle cannot resolve is the bundle's
+        // problem, and must not ban the client for it.
+        let groups = self.membership(account).map_err(Refusal::Gateway)?;
         Ok(Authenticated {
             account: account.clone(),
             groups,
@@ -800,6 +846,47 @@ mod tests {
                 .authenticate("acme-partner-drop", &cred, ip(), 0)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn only_a_credential_mismatch_counts_toward_the_ban() {
+        let k = ed25519();
+        let fp = fingerprint(k.public_key().key_data());
+        let cred = Credential::PublicKey {
+            key: k.public_key().key_data().clone(),
+        };
+        let ok = Directory::from_bundle(&bundle(section(&fp, serde_json::json!({})), true));
+        let other = ed25519();
+        let wrong = Credential::PublicKey {
+            key: other.public_key().key_data().clone(),
+        };
+        for (what, r) in [
+            (
+                "unknown login",
+                ok.authenticate_classified("acme-nobody", &cred, ip(), 0),
+            ),
+            (
+                "wrong key",
+                ok.authenticate_classified("acme-partner-drop", &wrong, ip(), 0),
+            ),
+        ] {
+            assert!(
+                matches!(r, Err(Refusal::Credential(_))),
+                "{what}: counted, got {r:?}"
+            );
+        }
+        // The right key, refused for reasons that are not the client's: never counted.
+        let gated = Directory::from_bundle(&Bundle::new("r", serde_json::json!({})));
+        let mut b = bundle(section(&fp, serde_json::json!({})), true);
+        b.data["tenants"]["acme"]["user_attributes"] = serde_json::json!({});
+        let non_member = Directory::from_bundle(&b);
+        for (what, dir) in [("bundle gate", &gated), ("membership", &non_member)] {
+            let r = dir.authenticate_classified("acme-partner-drop", &cred, ip(), 0);
+            assert!(
+                matches!(r, Err(Refusal::Gateway(_))),
+                "{what}: not counted, got {r:?}"
+            );
+        }
     }
 
     #[test]

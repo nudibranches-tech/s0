@@ -179,6 +179,8 @@ pub struct SftpLimits {
     pub max_connections: usize,
     /// Per IPv4 /32 or IPv6 /64.
     pub max_connections_per_ip: usize,
+    /// Concurrent sessions per (tenant, subject). 16 by default, so a client that opens
+    /// a dozen connections (rclone's defaults: 4 transfers + 8 checkers) works unchanged.
     pub max_sessions_per_subject: usize,
     /// Pre-authentication connections per IP per minute (token bucket refill rate).
     pub preauth_rate_per_ip_per_min: u32,
@@ -223,7 +225,7 @@ impl Default for SftpLimits {
         SftpLimits {
             max_connections: 256,
             max_connections_per_ip: 16,
-            max_sessions_per_subject: 8,
+            max_sessions_per_subject: 16,
             preauth_rate_per_ip_per_min: 10,
             preauth_burst_per_ip: 20,
             handshake_timeout_secs: 30,

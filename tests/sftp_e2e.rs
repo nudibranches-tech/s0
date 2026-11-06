@@ -1872,6 +1872,69 @@ async fn a_wrong_key_before_the_right_one_does_not_ban_and_failed_connections_st
 }
 
 #[tokio::test]
+async fn refusals_a_correct_key_also_gets_do_not_ban() {
+    let h = harness_with("sftp-ban-cap", "native", |c| {
+        sftp_limits(
+            c,
+            serde_json::json!({
+                "max_sessions_per_subject": 1,
+                "preauth_burst_per_ip": 100,
+                "preauth_rate_per_ip_per_min": 600
+            }),
+        );
+    })
+    .await;
+    // The subject at its cap: past the ban threshold (10 in 5 min) of over-cap
+    // connections with the right key, like rclone's ~13 parallel connections.
+    let held = connect(h.addr, "acme-partner-drop", &h.drop_key)
+        .await
+        .expect("first session");
+    for i in 0..12 {
+        assert!(
+            connect(h.addr, "acme-partner-drop", &h.drop_key)
+                .await
+                .is_err(),
+            "connection {i} is over the subject's cap"
+        );
+    }
+    drop(held);
+    // A bundle the gateway refuses: every login fails, none of them is counted.
+    let good = bundle(&h.drop_key, &h.ops_key);
+    let mut bad = good.clone();
+    bad["sftp"]["version"] = serde_json::json!(2);
+    h.fx.gw.bundles.store(s0::pdp::Bundle::new("rev-bad", bad));
+    for i in 0..12 {
+        assert!(
+            connect(h.addr, "acme-ops", &h.ops_key).await.is_err(),
+            "connection {i} under a refused bundle"
+        );
+    }
+    h.fx.gw
+        .bundles
+        .store(s0::pdp::Bundle::new("rev-good", good));
+    // Neither burst banned the address: the right key logs in as soon as it can.
+    let mut ok = false;
+    for _ in 0..50 {
+        if connect(h.addr, "acme-partner-drop", &h.drop_key)
+            .await
+            .is_ok()
+        {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(ok, "the address is not banned");
+    assert!(
+        !h.fx.audit_log.all().iter().any(|x| x
+            .session_event
+            .as_ref()
+            .is_some_and(|e| e.event == SessionEventKind::Banned)),
+        "no ban was recorded"
+    );
+}
+
+#[tokio::test]
 async fn the_handshake_timeout_covers_a_client_that_never_sends_its_version() {
     let h = harness_with("sftp-silent-client", "native", |c| {
         sftp_limits(c, serde_json::json!({ "handshake_timeout_secs": 1 }));

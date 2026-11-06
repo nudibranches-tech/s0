@@ -213,7 +213,19 @@ impl SshHandler {
     /// (`Shared::settle_auth_failures`), so a wrong key offered before the right one
     /// does not count against a client that then logs in.
     fn fail(&mut self, login: &str, reason: String) -> Result<Auth, HandlerError> {
-        tracing::info!(session = %self.conn.session_id, client_ip = %self.conn.client_ip, %login, %reason, "sftp authentication failed");
+        self.reject(login, reason, true)
+    }
+
+    /// A refusal that is not the client's fault (the subject's session cap, a tenant
+    /// that cannot be routed, a bundle the gateway refuses): audited like a failure, but
+    /// never counted toward the ban. Counting it would ban an address for presenting a
+    /// correct credential — every partner behind the same NAT with it.
+    fn refuse(&mut self, login: &str, reason: String) -> Result<Auth, HandlerError> {
+        self.reject(login, reason, false)
+    }
+
+    fn reject(&mut self, login: &str, reason: String, counted: bool) -> Result<Auth, HandlerError> {
+        tracing::info!(session = %self.conn.session_id, client_ip = %self.conn.client_ip, %login, %reason, counted, "sftp authentication failed");
         self.shared
             .metrics
             .auth_failed
@@ -226,7 +238,9 @@ impl SshHandler {
             false,
             format!("deny (gateway): {reason}"),
         );
-        self.conn.note_auth_failure();
+        if counted {
+            self.conn.note_auth_failure();
+        }
         Ok(reject_publickey_only())
     }
 
@@ -237,9 +251,12 @@ impl SshHandler {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let auth = match dir.authenticate(login, &credential, self.conn.client_ip, now) {
+        let auth = match dir.authenticate_classified(login, &credential, self.conn.client_ip, now) {
             Ok(a) => a,
-            Err(reason) => return self.fail(login, reason),
+            Err(r) => {
+                let counted = r.counts_toward_ban();
+                return self.reject(login, r.into_reason(), counted);
+            }
         };
         if self
             .shared
@@ -248,7 +265,7 @@ impl SshHandler {
             .route_snapshot(&auth.account.tenant)
             .is_none()
         {
-            return self.fail(
+            return self.refuse(
                 login,
                 format!("tenant {} is not routable", auth.account.tenant),
             );
@@ -256,7 +273,7 @@ impl SshHandler {
         let max = self.shared.gw.limits().sftp.max_sessions_per_subject;
         let subject = format!("{}/{}", auth.account.tenant, auth.account.subject_key);
         let Some(guard) = self.shared.subjects.admit(&subject, max) else {
-            return self.fail(
+            return self.refuse(
                 login,
                 "too many concurrent sessions for this subject".into(),
             );

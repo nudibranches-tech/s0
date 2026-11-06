@@ -207,6 +207,14 @@ ships with a release:
     An agent holding several keys signs with the wrong ones before the right one; each
     rejection is audited, but a connection that then logs in is a legitimate client, and
     counting its rejections would ban a NAT'd partner after a few routine connections.
+  - Only **credential mismatches** count: an unknown login, a key not authorized for it, a
+    rejected certificate, a key type or source address the account does not accept, a
+    refused method (`password`, `keyboard-interactive`), and the key-probe cap. Refusals
+    that a correct credential also gets are audited as `auth_failed` but never counted:
+    the subject's session cap, a tenant that cannot be routed, a bundle the gateway
+    refuses (its gate, the fleet-wide denylist, an unresolvable membership). Counting them
+    would ban an address — and every partner behind its NAT — for logging in correctly
+    while the subject is at its cap or the bundle is bad.
   - A probe for an unknown login and a probe for an unauthorized key get the same answer
     after the same delay.
   - A probe does answer "accepted" for an authorized (login, key) pair, as in every SSH
@@ -701,12 +709,12 @@ restart.
 |---|---|---|
 | `max_connections` | 256 | process |
 | `max_connections_per_ip` | 16 | process, per IPv4 /32 or IPv6 /64 |
-| `max_sessions_per_subject` | 8 | process |
+| `max_sessions_per_subject` | 16 | process; rclone's defaults (4 transfers + 8 checkers) open about 13 connections |
 | `preauth_rate_per_ip` | 10/min, burst 20 | process, token bucket |
 | `handshake_timeout_secs` | 30 | from TCP accept to authentication success, including the PROXY header, the version exchange and KEX |
 | `max_auth_attempts` | 6 | connection |
 | `max_key_probes` | 10 | connection, counted separately from attempts (D3) |
-| `auth_failure_ban` | 10 failures in 5 min ⇒ 15 min ban | process, per /32 or /64, LRU-bounded table; failures count when their connection ends unauthenticated (D3) |
+| `auth_failure_ban` | 10 failures in 5 min ⇒ 15 min ban | process, per /32 or /64, LRU-bounded table; only credential mismatches count, and only when their connection ends unauthenticated (D3) |
 | `idle_timeout_secs` | 300 | session, no SFTP request |
 | `transfer_idle_timeout_secs` | 120 | transfer |
 | `max_file_size` | 50 GiB | transfer |
