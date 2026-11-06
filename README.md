@@ -380,7 +380,7 @@ S0_CAPTURE_REGENERATE=1 cargo test --test golden_capture   # re-record the captu
 
 | Property | How |
 |---|---|
-| the policy is tested against the *emitted* input, never a hand-written one | every fixture in [`tests/data/captured_inputs/`](tests/data/captured_inputs) is recorded at `GatewayAccess::decide`, the single funnel every PDP question passes through |
+| the policy is tested against the *emitted* input, never a hand-written one | every fixture in [`tests/data/captured_inputs/`](tests/data/captured_inputs) is recorded at `Enforcer::decide`, the single funnel every PDP question from either front passes through |
 | a renamed or dropped input field fails the build | `OpaInput` carries `deny_unknown_fields`; every capture must round-trip, and adding a field is a compile error until `OPA_INPUT_FIELDS` is updated ([`tests/fixture_drift.rs`](tests/fixture_drift.rs)) |
 | a policy cannot read a field the gateway never sends | every `input.<path>` in the shipped rego must resolve in a captured input — the exact failure that once left 35 rego tests green over a deny-all production |
 | every refused operation is refused over real HTTP | all 76 are driven as signed requests through the real `check`, table-driven off s3s's own route table ([`tests/gate_blackbox.rs`](tests/gate_blackbox.rs)) |

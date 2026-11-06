@@ -634,7 +634,7 @@ results:
 |---|---|---|---|---|
 | s3s / s3s-aws 0.14.1 (the forward path) | carried | carried | **not expressible** | yes (E4) |
 | AWS S3 | documented by AWS | documented by AWS | — | no (no AWS in CI) |
-| MinIO (e2e image `pgsty/silo`) | reported | unverified | — | `run.sh` probe |
+| MinIO (e2e image `pgsty/silo`) | **verified** (412 on the second write) | **verified** (412 on the second commit) | — | yes — the `run.sh` probe, and SFTP create-only uploads against a backend declared `native` |
 | Ceph RGW | reported | unverified, version-dependent | — | conformance harness (scaffolded, not yet wired) |
 | any other S3 backend | unknown | unknown | — | run the probe before declaring `native` |
 
@@ -767,6 +767,7 @@ write (create or overwrite) of the target, and a delete of the source (D7).
 |---|---|---|
 | `SETSTAT` / `FSETSTAT` with any attribute (mode, uid/gid, times, size) | `SSH_FX_OP_UNSUPPORTED` | An object store cannot honour it, and answering OK would be the strip ADR-008 rejects. `truncate` arrives here as a size change and is refused. |
 | `SETSTAT` / `FSETSTAT` with an empty attribute set | `SSH_FX_OK` | Nothing was requested, so nothing is dishonoured. |
+| `FSETSTAT` on a handle the session does not hold | `SSH_FX_FAILURE` ("invalid handle"), whatever the attributes | The handle is checked first. |
 | `SYMLINK`, `READLINK` | `SSH_FX_OP_UNSUPPORTED` | No links in an object store, so no link can be followed out of the root. |
 | `hardlink@openssh.com`, `copy-data`, `lsetstat@openssh.com`, `users-groups-by-id@openssh.com`, `expand-path@openssh.com`, `home-directory` | `SSH_FX_OP_UNSUPPORTED` | Not needed by any client in the matrix. |
 | `statvfs@openssh.com`, `fstatvfs@openssh.com` | `SSH_FX_OP_UNSUPPORTED` | No meaningful answer, and the backend's capacity is not the client's business. |
@@ -803,7 +804,8 @@ need a restart.
 | `idle_timeout_secs` | 300 | session, no SFTP request |
 | `transfer_idle_timeout_secs` | 120 | transfer |
 | `max_file_size` | 50 GiB | transfer |
-| `bandwidth_bytes_per_sec` | unlimited | per session, per direction; optional process-wide cap |
+| `bandwidth_bytes_per_sec` | 0 (unlimited) | per session, each direction held to the rate, at most 1 s of banked burst |
+| `process_bandwidth_bytes_per_sec` | 0 (unlimited) | process, per direction, shared by every session: a session waits for the longer of its own and the process hold; at most 1 s of burst; a non-zero value must be ≥ `max_sftp_packet_len`. Time held is `s0_sftp_process_bandwidth_wait_milliseconds_total` |
 | `part_size`, `max_inflight_parts`, `reorder_window`, `max_write_handles`, `max_transfer_memory` | D9 | transfer / session / process |
 | `read_ahead` | 1 MiB | read handle; reserved from `max_transfer_memory`, which it must not exceed |
 | `max_sftp_packet_len` | 262,144 | packet |
@@ -1064,7 +1066,10 @@ against client timeouts.
 
 ## Client matrix and partner settings
 
-Every client is exercised in PR 8 against the real stack. The expected settings are:
+OpenSSH `sftp`, lftp and paramiko are exercised against the real stack by `tests/e2e/run.sh`
+(login, put, get, ls, host key pinned); paramiko negotiates `aes128-gcm@openssh.com`, within
+D3's floor. WinSCP, FileZilla and the JVM clients cannot run headless in CI: their rows are
+expected behaviour, to be checked by hand. The expected settings are:
 
 | Client | Upload behaviour | Settings a create-only partner must use |
 |---|---|---|
@@ -1072,7 +1077,7 @@ Every client is exercised in PR 8 against the real stack. The expected settings 
 | WinSCP | Temporary name then rename, preserves timestamps | Turn off *Transfer to temporary filename* and *Preserve timestamp* (or enable *Ignore permission errors*). The rename needs `read_objects` and `delete_objects`, which a drop-box does not hold. |
 | FileZilla | Lists the directory, then `OPEN(WRITE\|CREAT\|TRUNC)` | Grant `list_objects` if the partner uses the GUI, or upload with a CLI instead. |
 | lftp (`sftp://`) | `OPEN(WRITE\|CREAT\|TRUNC)`, optional stat | Leave `xfer:use-temp-file` off (its default); a temporary name needs rename rights. |
-| paramiko | `open(path, "w")` → `WRITE\|CREAT\|TRUNC` | Call `put(..., confirm=False)`: the default `confirm=True` stats after upload and needs `list_objects`. PR 8 checks that its AEAD support meets D3; if it does not, that is recorded here and not patched around. |
+| paramiko | `open(path, "w")` → `WRITE\|CREAT\|TRUNC` | Call `put(..., confirm=False)`: the default `confirm=True` stats after upload and needs `list_objects`. Its AEAD support meets D3 (`aes128-gcm@openssh.com` negotiated in `run.sh`). |
 | JVM (JSch fork ≥ 0.2.15, Apache MINA SSHD ≥ 2.12) | `OPEN(WRITE\|CREAT\|TRUNC)` | ed25519 or ECDSA keys; strict KEX support required. |
 
 ---
@@ -1099,7 +1104,9 @@ Every client is exercised in PR 8 against the real stack. The expected settings 
   - a write after a key is revoked mid-session;
   - a bundle without `sftp`, with the wrong version, and with `grant_schema_version: 2`;
   - oversized packets, malformed length fields, truncated strings;
-  - a non-strict-KEX client, an RSA client key, an SHA-1 signature attempt, a key-probe flood;
+  - a non-strict-KEX client, an RSA client key, an SHA-1 signature attempt (refused at the
+    probe; server-sig-algs advertises no RSA algorithm, so no SHA-1 signature is ever
+    verified), a key-probe flood (counted toward the ban);
   - a login and an operation against a bundle with a pushed module (prefixed keys) and one on
     the compiled-in default (raw `sub`), both succeeding;
   - certificates with empty principals, a foreign-tenant CA, an unknown critical option, and a
@@ -1108,12 +1115,14 @@ Every client is exercised in PR 8 against the real stack. The expected settings 
   in CI.
 - **Real-stack e2e** (`tests/e2e/run.sh`, MinIO) covers:
   - upload (small and multipart);
-  - create-only refusal, including the concurrent-create probe for `native`;
-  - list filtering and narrowing;
+  - create-only refusal, the `If-None-Match: *` conformance probe, and create-only uploads
+    on a backend declared `native`, including a concurrent create during the upload;
+  - list narrowing to granted prefixes;
   - rename;
-  - revocation mid-session;
-  - `freeze_writes`;
-  - abort on disconnect (no orphaned upload left).
+  - revocation mid-session (an idle session is closed by the bundle push);
+  - `freeze_writes`, over SFTP and S3;
+  - abort on disconnect (no object and no multipart upload left);
+  - the client matrix (OpenSSH, lftp, paramiko).
 
 ## Implementation slicing
 
