@@ -770,6 +770,42 @@ mod tests {
         }
     }
 
+    /// D3 / E6: RSA is refused at authentication too, not only at the probe — even a
+    /// 3072-bit key (the size floor the requirement named) that the bundle lists, in
+    /// either key space. A refusal at this layer is a credential mismatch.
+    #[test]
+    fn a_listed_rsa_key_is_refused_as_a_credential_mismatch() {
+        let k = PrivateKey::from_openssh(include_str!("../../tests/data/sftp-rsa-3072-client-key"))
+            .expect("the RSA test key parses");
+        let key = k.public_key().key_data();
+        assert!(key.algorithm().is_rsa());
+        assert!(!client_key_allowed(key));
+        let fp = fingerprint(key);
+        let s = section(
+            &fp,
+            serde_json::json!({
+                "authorized_keys": [ { "key_type": key_type(key), "fingerprint": fp } ]
+            }),
+        );
+        for module in [true, false] {
+            let dir = Directory::from_bundle(&bundle(s.clone(), module));
+            let r = dir.authenticate_classified(
+                "acme-partner-drop",
+                &Credential::PublicKey { key: key.clone() },
+                ip(),
+                0,
+            );
+            match r {
+                Err(Refusal::Credential(reason)) => assert!(
+                    reason.contains("client key type ssh-rsa is not accepted"),
+                    "module={module}: {reason}"
+                ),
+                Err(other) => panic!("module={module}: refused for another reason: {other:?}"),
+                Ok(_) => panic!("module={module}: an RSA key authenticated"),
+            }
+        }
+    }
+
     #[test]
     fn every_degenerate_bundle_rejects_every_login() {
         let k = ed25519();
