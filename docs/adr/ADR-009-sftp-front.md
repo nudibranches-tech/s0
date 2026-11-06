@@ -75,8 +75,13 @@ permissive licences: Apache-2.0, MIT, BSD-3-Clause (`curve25519-dalek`, `ed25519
 `Unicode-3.0` only as alternatives or additions to MIT/Apache. `aws-lc-sys` is
 `ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND …`. None is copyleft,
 so all are compatible with distributing s0 under BUSL-1.1 and, after the change date, under
-Apache-2.0. The BSD-3-Clause and ISC notices must ship with the image; PR 1 adds a
-`cargo deny` licence check so a later bump cannot introduce a copyleft crate unnoticed.
+Apache-2.0. (That count was taken with `russh-sftp`, which D4 then dropped; the shipped set
+is whatever `Cargo.lock` resolves.) The notices ship with the image and the release
+archives: cargo-about generates `THIRD_PARTY_NOTICES` from `Cargo.lock` and the fetched
+sources only (`--frozen`), and the image carries it under `/usr/share/doc/s0/`. A
+`cargo deny check licenses` CI job (`deny.toml`, an explicit allow-list of permissive
+licences) fails on any other licence, so a later bump cannot introduce a copyleft crate
+unnoticed.
 
 ---
 
@@ -300,7 +305,9 @@ bounded by the bytes remaining, and trailing bytes are an error. A malformed pac
 `SSH_FX_BAD_MESSAGE` if its request id could be read, and then the channel closes. The
 session is never resynchronized. `SSH_FXP_INIT` must be the first packet. The server answers
 version 3 whatever higher version the client offers, and closes on a version below 3. The
-cargo-fuzz target `sftp_codec` runs in CI for a bounded time per push (PR 8).
+cargo-fuzz targets `sftp_codec` (over `codec::parse`) and `proxy_v2_header` (the PROXY v2
+parser, cross-checked against the stream reader) live in `fuzz/` and run for 60 s each in
+the CI `fuzz` job.
 
 ### D5 — Identity and the bundle contract
 
