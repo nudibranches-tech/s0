@@ -108,6 +108,21 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked --bin "$BINARY" --target ${{ matrix.target }}
 
+      - name: Install cargo-about
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.3
+
+      # The licence texts and copyright notices of every crate in the binary (ADR-009:
+      # the BSD-3-Clause and ISC notices ship with s0). Offline (`--frozen`) over the
+      # crates fetched for Cargo.lock, so the same lockfile yields the same file as the
+      # image's /usr/share/doc/s0/THIRD_PARTY_NOTICES. See about.toml.
+      - name: Generate third-party notices
+        run: |
+          set -euo pipefail
+          cargo fetch --locked
+          cargo about generate --frozen --fail -o THIRD_PARTY_NOTICES about.hbs
+
       - name: Package artifact
         run: |
           set -euo pipefail
@@ -115,6 +130,7 @@ jobs:
           mkdir -p "$staging"
           cp "target/${{ matrix.target }}/release/${BINARY}" "$staging/"
           cp README.md LICENSE LICENSE-APACHE-2.0.txt "$staging/" 2>/dev/null || true
+          cp THIRD_PARTY_NOTICES "$staging/"
           tar czf "${staging}.tar.gz" "$staging"
           sha256sum "${staging}.tar.gz" > "${staging}.tar.gz.sha256"
 
