@@ -8,11 +8,21 @@
 //! reads it on its way in and closes the connection unless the client advertises
 //! `kex-strict-c-v00@openssh.com`. No byte of the client's stream reaches russh until that
 //! verdict is in. This enforces the requirement in-tree rather than as an upstream patch.
+//!
+//! **Kill switch.** The same wrapper is how a connection is closed when russh cannot close
+//! it: a client that stops reading at the TCP level leaves russh's task stuck in a write,
+//! and dropping russh's `RunningSession` only detaches that task, so the socket would stay
+//! open. Firing the guard's [`KillSwitch`] wakes the stuck read or write and fails it, and
+//! every later one; russh's task then ends and drops the socket.
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
+
+use futures_util::task::AtomicWaker;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 
@@ -104,6 +114,42 @@ pub fn parse_proxy_v2_body(cmd: u8, fam: u8, body: &[u8]) -> Result<ProxyHeader,
 /// plus one KEXINIT. A client KEXINIT is a few kilobytes.
 const MAX_PREAMBLE: usize = 64 * 1024;
 
+/// Fails every read and write on a [`StrictKexGuard`] once fired, including one already
+/// pending (see the module doc). Cloned handles share one switch.
+#[derive(Clone, Default)]
+pub struct KillSwitch(Arc<KillState>);
+
+#[derive(Default)]
+struct KillState {
+    fired: AtomicBool,
+    read: AtomicWaker,
+    write: AtomicWaker,
+}
+
+impl KillSwitch {
+    pub fn fire(&self) {
+        self.0.fired.store(true, Ordering::Release);
+        self.0.read.wake();
+        self.0.write.wake();
+    }
+
+    pub fn is_fired(&self) -> bool {
+        self.0.fired.load(Ordering::Acquire)
+    }
+
+    /// Register the polling task, then check: a `fire` between the two still wakes it.
+    fn check(&self, waker: &AtomicWaker, cx: &Context<'_>) -> io::Result<()> {
+        waker.register(cx.waker());
+        if self.is_fired() {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "connection killed by the gateway",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Verdict {
     Pending,
@@ -122,6 +168,7 @@ pub struct StrictKexGuard<S> {
     /// Where a refusal is reported, so the connection task can audit it after russh has
     /// consumed the stream.
     refusal: Option<std::sync::Arc<std::sync::OnceLock<&'static str>>>,
+    kill: Option<KillSwitch>,
 }
 
 impl<S> StrictKexGuard<S> {
@@ -132,6 +179,7 @@ impl<S> StrictKexGuard<S> {
             released: 0,
             verdict: Verdict::Pending,
             refusal: None,
+            kill: None,
         }
     }
 
@@ -141,6 +189,12 @@ impl<S> StrictKexGuard<S> {
         slot: std::sync::Arc<std::sync::OnceLock<&'static str>>,
     ) -> Self {
         self.refusal = Some(slot);
+        self
+    }
+
+    #[must_use]
+    pub fn with_kill_switch(mut self, kill: KillSwitch) -> Self {
+        self.kill = Some(kill);
         self
     }
 }
@@ -211,6 +265,11 @@ impl<S: AsyncRead + Unpin> AsyncRead for StrictKexGuard<S> {
         out: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if let Some(k) = &this.kill
+            && let Err(e) = k.check(&k.0.read, cx)
+        {
+            return Poll::Ready(Err(e));
+        }
         loop {
             match this.verdict {
                 Verdict::Pass => {
@@ -272,13 +331,31 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for StrictKexGuard<S> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+        let this = self.get_mut();
+        if let Some(k) = &this.kill
+            && let Err(e) = k.check(&k.0.write, cx)
+        {
+            return Poll::Ready(Err(e));
+        }
+        Pin::new(&mut this.inner).poll_write(cx, buf)
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        let this = self.get_mut();
+        if let Some(k) = &this.kill
+            && let Err(e) = k.check(&k.0.write, cx)
+        {
+            return Poll::Ready(Err(e));
+        }
+        Pin::new(&mut this.inner).poll_flush(cx)
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        let this = self.get_mut();
+        // A killed connection is not flushed: its peer is not reading. Report the
+        // shutdown done so whoever closes the stream drops it at once.
+        if this.kill.as_ref().is_some_and(KillSwitch::is_fired) {
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.inner).poll_shutdown(cx)
     }
 }
 
@@ -382,5 +459,28 @@ mod tests {
             .unwrap();
         let mut b = [0u8; 8];
         assert!(guard.read(&mut b).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_kill_switch_fails_a_write_stuck_on_a_peer_that_stopped_reading() {
+        use tokio::io::AsyncWriteExt;
+        let (_client, server) = tokio::io::duplex(1024);
+        let kill = KillSwitch::default();
+        let mut guard = StrictKexGuard::new(server).with_kill_switch(kill.clone());
+        let writer = tokio::spawn(async move {
+            // The peer never reads: this blocks once the 1 KiB pipe is full.
+            let r = guard.write_all(&[0u8; 64 * 1024]).await;
+            let mut b = [0u8; 1];
+            (r, guard.read(&mut b).await.map(|_| ()))
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!writer.is_finished(), "the write is stuck");
+        kill.fire();
+        let (w, r) = tokio::time::timeout(std::time::Duration::from_secs(1), writer)
+            .await
+            .expect("the stuck write is woken")
+            .unwrap();
+        assert_eq!(w.unwrap_err().kind(), io::ErrorKind::ConnectionAborted);
+        assert_eq!(r.unwrap_err().kind(), io::ErrorKind::ConnectionAborted);
     }
 }

@@ -48,7 +48,7 @@ use limits::{
     BanPolicy, BanTable, Cidr, ConnectionTracker, MemoryBudget, PreauthRate, SubjectGuard,
     SubjectSessions,
 };
-use preauth::{ProxyHeader, StrictKexGuard};
+use preauth::{KillSwitch, ProxyHeader, StrictKexGuard};
 use session::{Next, SessionIdentity, SftpSession};
 use transfer::{AlwaysCommit, CommitGate, InflightKeys};
 
@@ -282,9 +282,13 @@ pub struct ConnState {
     /// The SFTP subsystem task, awaited before the `disconnected` record so that record
     /// comes after the transfers it ended were aborted, and carries their reason.
     sftp_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// Signalled by the SFTP teardown when the SSH session could not take its disconnect:
-    /// the connection task then drops the session and with it the socket.
+    /// Signalled by the SFTP teardown when the SSH session could not take its disconnect,
+    /// after it fired `kill_switch`: the connection task then waits, bounded, for russh's
+    /// task to end and release the socket.
     kill: tokio::sync::Notify,
+    /// Fails every read and write on the connection's socket (`StrictKexGuard`), so a
+    /// russh task stuck writing to a client that stopped reading ends, and drops it.
+    kill_switch: KillSwitch,
 }
 
 struct AuthSlot {
@@ -308,6 +312,7 @@ impl ConnState {
             close_reason: Mutex::new(None),
             sftp_task: Mutex::new(None),
             kill: tokio::sync::Notify::new(),
+            kill_switch: KillSwitch::default(),
         }
     }
 
@@ -566,7 +571,9 @@ async fn handle_connection(
         .connections_active
         .fetch_add(1, Ordering::Relaxed);
     let refusal: Arc<OnceLock<&'static str>> = Arc::new(OnceLock::new());
-    let guarded = StrictKexGuard::new(stream).with_refusal_slot(refusal.clone());
+    let guarded = StrictKexGuard::new(stream)
+        .with_refusal_slot(refusal.clone())
+        .with_kill_switch(conn.kill_switch.clone());
     let handler = transport::SshHandler::new(shared.clone(), conn.clone());
     let started = tokio::time::timeout_at(
         deadline,
@@ -596,10 +603,20 @@ async fn handle_connection(
                 }
             });
             // The session ends when the client goes, or when the SFTP teardown could not
-            // send its disconnect (a stalled client): dropping `running` closes the socket.
+            // send its disconnect (a stalled client). Dropping `running` alone would only
+            // detach russh's task, still stuck writing, with the socket open and no longer
+            // counted; the teardown has fired the kill switch, so that task's write fails
+            // and it ends. Wait for it, so the connection stays counted until it does.
+            let mut running = running;
             let r = tokio::select! {
-                r = running => r.map_err(|e| e.to_string()),
-                _ = conn.kill.notified() => Err("connection dropped: the client stopped reading".to_string()),
+                r = &mut running => r.map_err(|e| e.to_string()),
+                _ = conn.kill.notified() => {
+                    conn.kill_switch.fire();
+                    if tokio::time::timeout(KILL_GRACE, &mut running).await.is_err() {
+                        tracing::warn!(session = %conn.session_id, "sftp connection task did not end after the kill switch");
+                    }
+                    Err("connection dropped: the client stopped reading".to_string())
+                }
             };
             watcher.abort();
             r
@@ -851,6 +868,7 @@ pub(crate) async fn run_sftp(
     })
     .await;
     if !matches!(sent, Ok(Ok(()))) {
+        conn.kill_switch.fire();
         conn.kill.notify_one();
     }
 }
@@ -858,6 +876,10 @@ pub(crate) async fn run_sftp(
 /// How long the teardown waits to hand the channel close and the disconnect to the SSH
 /// session before dropping the connection.
 const TEARDOWN_SEND: Duration = Duration::from_secs(2);
+
+/// How long the connection task waits for russh's task to end once the kill switch fired.
+/// It ends at its next poll; this only bounds a task that is somehow never polled.
+const KILL_GRACE: Duration = Duration::from_secs(5);
 
 /// The write half of the SFTP channel.
 type ReplyWriter = tokio::io::WriteHalf<russh::ChannelStream<russh::server::Msg>>;

@@ -602,6 +602,13 @@ results:
 - *Backpressure*: when a transfer's buffers are full, the session stops reading from the
   channel, and SSH flow control stops the client. PR 3 verifies that russh replenishes the
   window only as data is consumed.
+- *A client that stops reading replies* cannot freeze its session: the idle check, the
+  revocation sweep and drain still run, and tear it down. If it has stopped reading at the
+  TCP level, russh's task is stuck in a socket write and cannot send the disconnect, and
+  dropping russh's session handle would only detach that task, leaving the socket open and
+  uncounted. The client stream is therefore wrapped (`StrictKexGuard`) with a kill switch
+  that fails the stuck write and every later read and write, so russh's task ends and
+  releases the socket. The connection stays counted toward `max_connections` until it does.
 
 **Pipelined writes and the reorder window.** Clients keep many WRITEs outstanding (OpenSSH
 keeps 64 × 32 KiB in flight).

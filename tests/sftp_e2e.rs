@@ -2126,3 +2126,132 @@ async fn a_client_that_stops_reading_replies_does_not_freeze_its_session() {
         "a session blocked on an unread reply is still closed by the revocation sweep"
     );
 }
+
+/// A TCP relay to the gateway whose server→client direction can be frozen: once frozen,
+/// nothing reads the gateway's socket, as with a client that stopped reading at the TCP
+/// level. The relay's own receive buffer is small, so the gateway's writes block soon.
+struct StallingRelay {
+    addr: SocketAddr,
+    frozen: Arc<std::sync::atomic::AtomicBool>,
+    upstream: Arc<tokio::sync::Mutex<Option<tokio::net::tcp::OwnedWriteHalf>>>,
+}
+
+impl StallingRelay {
+    async fn start(gateway: SocketAddr) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let frozen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let upstream = Arc::new(tokio::sync::Mutex::new(None));
+        let (f, up) = (frozen.clone(), upstream.clone());
+        tokio::spawn(async move {
+            let (client, _) = listener.accept().await.unwrap();
+            let sock = tokio::net::TcpSocket::new_v4().unwrap();
+            sock.set_recv_buffer_size(4096).unwrap();
+            let server = sock.connect(gateway).await.unwrap();
+            let (mut cr, mut cw) = client.into_split();
+            let (mut sr, sw) = server.into_split();
+            *up.lock().await = Some(sw);
+            let up2 = up.clone();
+            tokio::spawn(async move {
+                let mut b = vec![0u8; 16 * 1024];
+                while let Ok(n) = cr.read(&mut b).await {
+                    if n == 0 {
+                        return;
+                    }
+                    let mut g = up2.lock().await;
+                    let Some(w) = g.as_mut() else { return };
+                    if w.write_all(&b[..n]).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            let mut b = vec![0u8; 1024];
+            loop {
+                if f.load(Ordering::Acquire) {
+                    // Keep the socket open, and never read it again.
+                    std::future::pending::<()>().await;
+                }
+                match sr.read(&mut b).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => {
+                        if cw.write_all(&b[..n]).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        StallingRelay {
+            addr,
+            frozen,
+            upstream,
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_client_stalled_at_the_tcp_level_has_its_socket_closed() {
+    let h = harness("sftp-tcp-stall", "native").await;
+    let relay = StallingRelay::start(h.addr).await;
+    let mut c = connect(relay.addr, "acme-ops", &h.ops_key)
+        .await
+        .expect("connect");
+    assert_eq!(
+        code(&c.upload("/big.bin", &vec![7u8; 1024 * 1024]).await),
+        OK
+    );
+    let Reply::Handle(hd) = c.open("/big.bin", SSH_FXF_READ).await else {
+        panic!()
+    };
+    relay.frozen.store(true, Ordering::Release);
+    // Replies the client will never receive: the gateway's socket send buffer fills and
+    // russh's task blocks in a write.
+    let pipeline = tokio::spawn(async move {
+        for id in 0..64u32 {
+            let mut b = BytesMut::new();
+            read_req(&mut b, 20_000 + id, &hd, 0, 255 * 1024);
+            if !c.send_raw(b).await {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        drop(c);
+    });
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Revoke the key: the sweep tears the session down, and the disconnect cannot be sent.
+    let mut b = bundle(&h.drop_key, &h.ops_key);
+    b["sftp"]["accounts"]["acme-ops"]["authorized_keys"] = serde_json::json!([]);
+    h.fx.gw.bundles.store(s0::pdp::Bundle::new("rev-2", b));
+    let disconnected = |all: &[AuditRecord]| {
+        all.iter().any(|x| {
+            x.session_event
+                .as_ref()
+                .is_some_and(|e| e.event == SessionEventKind::Disconnected)
+        })
+    };
+    let mut torn_down = false;
+    for _ in 0..100 {
+        if disconnected(&h.fx.audit_log.all()) {
+            torn_down = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(torn_down, "the session is torn down");
+    // The gateway's socket must now be closed: writes to it fail (RST) rather than being
+    // buffered by a socket that a detached, stuck task still holds open.
+    let mut closed = false;
+    for _ in 0..100 {
+        let mut g = relay.upstream.lock().await;
+        let w = g.as_mut().unwrap();
+        let r = tokio::time::timeout(Duration::from_millis(100), w.write_all(b"x")).await;
+        drop(g);
+        if matches!(r, Ok(Err(_))) {
+            closed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    pipeline.abort();
+    assert!(closed, "the stalled connection's socket is released");
+}
