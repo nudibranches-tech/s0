@@ -2515,3 +2515,130 @@ async fn a_key_probe_flood_is_disconnected_and_counts_toward_the_ban() {
     );
 }
 
+// ── ADR-009 D2: a login and an operation in both key spaces ──────────────────
+
+/// The fixture bundle's tenant data re-keyed the way a control plane projects it:
+/// `sa:<client id>` / `user:<sub>`.
+fn prefixed(mut b: serde_json::Value) -> serde_json::Value {
+    let rekey = |k: &str| match k {
+        "partner-drop" => "sa:partner-drop".to_string(),
+        "ops" => "user:ops".to_string(),
+        other => panic!("unexpected subject {other}"),
+    };
+    for field in ["user_attributes", "s3_grants"] {
+        let old = b["tenants"]["acme"][field].as_object().unwrap().clone();
+        b["tenants"]["acme"][field] = old.into_iter().map(|(k, v)| (rekey(&k), v)).collect();
+    }
+    b
+}
+
+/// A pushed module: the compiled-in policy, keyed on the prefixed subject key the way a
+/// control plane's module derives it (`sprintf` over `principal.type`).
+fn prefixed_module() -> String {
+    let m = s0::pdp::GATEWAY_REGO
+        .replace(
+            "user_attributes[input.principal.sub]",
+            "user_attributes[subject_key]",
+        )
+        .replace("s3_grants[input.principal.sub]", "s3_grants[subject_key]");
+    assert_eq!(
+        m.matches("[subject_key]").count(),
+        3,
+        "the compiled-in policy's subject lookups moved; update this rewrite"
+    );
+    format!(
+        "{m}\n\
+         subject_key := sprintf(\"sa:%s\", [input.principal.sub]) if {{\n\
+         \tinput.principal.type == \"service_account\"\n\
+         }} else := sprintf(\"user:%s\", [input.principal.sub]) if {{\n\
+         \tinput.principal.type == \"user\"\n\
+         }}\n"
+    )
+}
+
+/// ADR-009 D2: the login check reads the key space the PDP reads — prefixed under a
+/// pushed module, raw `sub` under the compiled-in default — so a login **and** an
+/// allowed operation succeed under both. The crossed combinations are refused, which is
+/// what makes the two passes discriminating.
+#[tokio::test]
+async fn a_login_and_an_operation_succeed_in_both_key_spaces() {
+    for module in [false, true] {
+        let h = harness(&format!("sftp-keyspace-{module}"), "native").await;
+        let raw = bundle(&h.drop_key, &h.ops_key);
+        if module {
+            // Crossed: the module's key space over raw-keyed data. No login.
+            h.fx.gw.bundles.store(
+                s0::pdp::Bundle::new("rev-crossed-module", raw.clone()).with_policy_module(true),
+            );
+            assert!(
+                connect(h.addr, "acme-ops", &h.ops_key).await.is_err(),
+                "prefixed lookup over raw-keyed data must not log in"
+            );
+            let b = prefixed(raw);
+            h.fx.gw
+                .pdp
+                .reload(Some(&prefixed_module()), &b)
+                .await
+                .expect("the pushed module loads");
+            h.fx.gw
+                .bundles
+                .store(s0::pdp::Bundle::new("rev-module", b).with_policy_module(true));
+        } else {
+            // Crossed: the compiled-in default's key space over prefixed data. No login.
+            h.fx.gw.bundles.store(s0::pdp::Bundle::new(
+                "rev-crossed-raw",
+                prefixed(raw.clone()),
+            ));
+            assert!(
+                connect(h.addr, "acme-ops", &h.ops_key).await.is_err(),
+                "raw lookup over prefixed data must not log in"
+            );
+            h.fx.gw.bundles.store(s0::pdp::Bundle::new("rev-raw", raw));
+        }
+
+        let mut drop = connect(h.addr, "acme-partner-drop", &h.drop_key)
+            .await
+            .unwrap_or_else(|e| panic!("module={module}: drop-box login: {e}"));
+        let r = drop.upload("/k.csv", b"drop").await;
+        assert_eq!(code(&r), OK, "module={module}: drop-box create: {r:?}");
+        assert_eq!(
+            h.mem.get("inbound", "partner-x/k.csv").as_deref(),
+            Some(&b"drop"[..])
+        );
+
+        let mut ops = connect(h.addr, "acme-ops", &h.ops_key)
+            .await
+            .unwrap_or_else(|e| panic!("module={module}: ops login: {e}"));
+        let r = ops.upload("/in/k.csv", b"ops").await;
+        assert_eq!(code(&r), OK, "module={module}: ops upload: {r:?}");
+        assert!(
+            matches!(ops.path_op(SSH_FXP_STAT, "/in/k.csv").await.unwrap(), Reply::Attrs(m) if m & 0o100000 != 0),
+            "module={module}: stat"
+        );
+        assert_eq!(
+            ops.listdir("/in").await.unwrap(),
+            [".", "..", "k.csv"],
+            "module={module}: listing"
+        );
+
+        // Each allow came from the PDP, on the subject as the module reads it.
+        let recs = records(&h.fx, |r| {
+            r.iter()
+                .filter(|x| x.path == "s3/authz/decision" && x.result.allow)
+                .count()
+                >= 4
+        })
+        .await;
+        let subs: std::collections::BTreeSet<_> = recs
+            .iter()
+            .filter(|x| x.path == "s3/authz/decision" && x.result.allow)
+            .map(|x| x.input.as_ref().unwrap().principal.sub.clone())
+            .collect();
+        assert_eq!(
+            subs.into_iter().collect::<Vec<_>>(),
+            ["ops", "partner-drop"],
+            "module={module}: the PDP always sees the raw sub; only the lookup key differs"
+        );
+    }
+}
+
