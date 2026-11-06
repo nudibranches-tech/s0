@@ -7,7 +7,7 @@ WORKDIR /build
 
 # cargo-about writes THIRD_PARTY_NOTICES (below). Pinned and installed before the source
 # is copied, so this layer survives every source change.
-RUN cargo install --locked cargo-about@0.9.3
+RUN cargo install --locked --features cli cargo-about@0.9.3
 
 # Copy the full tree and build a release binary with a locked dependency graph.
 # The cache mounts keep the registry and target dir warm across rebuilds.
