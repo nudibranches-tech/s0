@@ -2642,3 +2642,227 @@ async fn a_login_and_an_operation_succeed_in_both_key_spaces() {
     }
 }
 
+// ── ADR-009 D11: the rows `every_unsupported_request_gets_its_documented_answer`
+//    does not reach ─────────────────────────────────────────────────────────────
+
+fn attrs(b: &mut BytesMut, which: &str) {
+    match which {
+        "size" => {
+            b.put_u32(SSH_FILEXFER_ATTR_SIZE);
+            b.put_u64(0);
+        }
+        "uidgid" => {
+            b.put_u32(SSH_FILEXFER_ATTR_UIDGID);
+            b.put_u32(1000);
+            b.put_u32(1000);
+        }
+        "mode" => {
+            b.put_u32(SSH_FILEXFER_ATTR_PERMISSIONS);
+            b.put_u32(0o600);
+        }
+        "times" => {
+            b.put_u32(SSH_FILEXFER_ATTR_ACMODTIME);
+            b.put_u32(1);
+            b.put_u32(2);
+        }
+        "none" => b.put_u32(0),
+        other => panic!("{other}"),
+    }
+}
+
+fn posix_rename(b: &mut BytesMut, from: &str, to: &str) {
+    s(b, b"posix-rename@openssh.com");
+    s(b, from.as_bytes());
+    s(b, to.as_bytes());
+}
+
+#[tokio::test]
+async fn the_remaining_d11_rows_get_their_documented_answers() {
+    let h = harness("sftp-d11-rest", "native").await;
+    let mut c = connect(h.addr, "acme-ops", &h.ops_key)
+        .await
+        .expect("connect");
+
+    // Extended requests the table answers OP_UNSUPPORTED, each with the payload a real
+    // client sends.
+    let Reply::Handle(dir) = c.path_op(SSH_FXP_OPENDIR, "/").await.unwrap() else {
+        panic!("opendir")
+    };
+    type Payload<'a> = Box<dyn FnOnce(&mut BytesMut) + 'a>;
+    let cases: Vec<(&str, Payload)> = vec![
+        (
+            "lsetstat@openssh.com",
+            Box::new(|b| {
+                s(b, b"/a");
+                attrs(b, "mode");
+            }),
+        ),
+        (
+            "users-groups-by-id@openssh.com",
+            Box::new(|b| {
+                s(b, &1000u32.to_be_bytes());
+                s(b, &1000u32.to_be_bytes());
+            }),
+        ),
+        ("expand-path@openssh.com", Box::new(|b| s(b, b"~/a"))),
+        ("home-directory", Box::new(|b| s(b, b"acme-ops"))),
+        ("fstatvfs@openssh.com", Box::new(|b| s(b, &dir))),
+    ];
+    for (ext, payload) in cases {
+        let r = c
+            .call(SSH_FXP_EXTENDED, |b| {
+                s(b, ext.as_bytes());
+                payload(b);
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(&r, Reply::Status(OP_UNSUPPORTED, m) if m == "unsupported extension"),
+            "{ext}: {r:?}"
+        );
+    }
+    assert_eq!(code(&c.close(&dir).await), OK);
+
+    // SETSTAT: a size change is how `truncate` arrives, and it is refused like any other.
+    let r = c
+        .call(SSH_FXP_SETSTAT, |b| {
+            s(b, b"/a");
+            attrs(b, "size");
+        })
+        .await
+        .unwrap();
+    assert_eq!(code(&r), OP_UNSUPPORTED, "truncate through SETSTAT");
+
+    // FSETSTAT on an open upload: every attribute refused, the empty set answered OK,
+    // and the transfer is unaffected by any of it.
+    let Reply::Handle(fh) = c
+        .open(
+            "/fsetstat.csv",
+            SSH_FXF_WRITE | SSH_FXF_CREAT | SSH_FXF_TRUNC,
+        )
+        .await
+    else {
+        panic!("open")
+    };
+    assert_eq!(code(&c.write(&fh, 0, b"payload").await), OK);
+    for which in ["size", "uidgid", "mode", "times"] {
+        let r = c
+            .call(SSH_FXP_FSETSTAT, |b| {
+                s(b, &fh);
+                attrs(b, which);
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(&r, Reply::Status(OP_UNSUPPORTED, m) if m.contains("cannot honour")),
+            "FSETSTAT {which}: {r:?}"
+        );
+    }
+    let r = c
+        .call(SSH_FXP_FSETSTAT, |b| {
+            s(b, &fh);
+            attrs(b, "none");
+        })
+        .await
+        .unwrap();
+    assert_eq!(code(&r), OK, "an empty FSETSTAT asks for nothing");
+    // Not in the D11 table: FSETSTAT on a handle the session does not hold is a FAILURE
+    // ("invalid handle"), checked before the attributes, like every handle operation.
+    for which in ["mode", "none"] {
+        let r = c
+            .call(SSH_FXP_FSETSTAT, |b| {
+                s(b, b"no-such-handle");
+                attrs(b, which);
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(&r, Reply::Status(FAILURE, m) if m == "invalid handle"),
+            "FSETSTAT {which} on an unknown handle: {r:?}"
+        );
+    }
+    assert_eq!(code(&c.close(&fh).await), OK);
+    assert_eq!(
+        h.mem.get("inbound", "fsetstat.csv").as_deref(),
+        Some(&b"payload"[..]),
+        "a refused FSETSTAT changes nothing in the upload"
+    );
+
+    // posix-rename@openssh.com is served: an overwrite rename (D7).
+    assert_eq!(code(&c.upload("/p/a.csv", b"alpha").await), OK);
+    assert_eq!(code(&c.upload("/p/b.csv", b"beta").await), OK);
+    let r = c
+        .call(SSH_FXP_EXTENDED, |b| {
+            posix_rename(b, "/p/a.csv", "/p/b.csv")
+        })
+        .await
+        .unwrap();
+    assert_eq!(code(&r), OK, "posix-rename overwrites: {r:?}");
+    assert!(h.mem.get("inbound", "p/a.csv").is_none());
+    assert_eq!(
+        h.mem.get("inbound", "p/b.csv").as_deref(),
+        Some(&b"alpha"[..])
+    );
+    let r = c
+        .call(SSH_FXP_EXTENDED, |b| {
+            posix_rename(b, "/p/b.csv", "/p/c.csv")
+        })
+        .await
+        .unwrap();
+    assert_eq!(code(&r), OK, "posix-rename to a free name: {r:?}");
+    assert_eq!(
+        h.mem.get("inbound", "p/c.csv").as_deref(),
+        Some(&b"alpha"[..])
+    );
+    let r = c
+        .call(SSH_FXP_EXTENDED, |b| {
+            posix_rename(b, "/p/nope.csv", "/p/d.csv")
+        })
+        .await
+        .unwrap();
+    assert_eq!(code(&r), NO_SUCH_FILE, "{r:?}");
+    // It decides `write_objects` on the target, with the source as `copy_source`.
+    let recs = records(&h.fx, |r| {
+        r.iter().any(|x| {
+            x.input.as_ref().is_some_and(|i| {
+                i.request.method == "posix-rename@openssh.com"
+                    && i.object.as_deref() == Some("p/b.csv")
+            })
+        })
+    })
+    .await;
+    let rec = recs
+        .iter()
+        .find(|x| {
+            x.input.as_ref().is_some_and(|i| {
+                i.request.method == "posix-rename@openssh.com"
+                    && i.object.as_deref() == Some("p/b.csv")
+            })
+        })
+        .expect("the overwrite rename is on the record");
+    let input = rec.input.as_ref().unwrap();
+    assert_eq!(input.action.as_str(), "write_objects");
+    assert_eq!(
+        input.copy_source.as_ref().map(|c| c.key.as_str()),
+        Some("p/a.csv")
+    );
+
+    // An overwrite needs write_objects: a create-only drop box is refused.
+    let mut d = connect(h.addr, "acme-partner-drop", &h.drop_key)
+        .await
+        .expect("connect");
+    assert_eq!(code(&d.upload("/x.csv", b"x").await), OK);
+    let r = d
+        .call(SSH_FXP_EXTENDED, |b| posix_rename(b, "/x.csv", "/y.csv"))
+        .await
+        .unwrap();
+    assert_eq!(code(&r), PERMISSION_DENIED, "{r:?}");
+    assert!(h.mem.get("inbound", "partner-x/x.csv").is_some());
+    assert!(h.mem.get("inbound", "partner-x/y.csv").is_none());
+
+    // The session survived every refusal.
+    assert!(matches!(
+        c.path_op(SSH_FXP_STAT, "/").await.unwrap(),
+        Reply::Attrs(_)
+    ));
+}
