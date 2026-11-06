@@ -126,7 +126,7 @@ pub fn config_json(dir: &std::path::Path, backend_endpoint: &str) -> String {
 
 /// Counts every `decide` the enforce path issues, from **outside** the decision cache.
 ///
-/// Makes "`GatewayAccess::decide` is the only PDP call site" checkable: a hook calling
+/// Makes "`Enforcer::decide` is the only PDP call site" checkable: a hook calling
 /// `gw.pdp.decide` directly bumps this counter without producing a capture, and
 /// `tests/golden_capture.rs` compares the two.
 struct CountingPdp {
@@ -207,8 +207,22 @@ pub fn fixture(tag: &str, bundle: serde_json::Value) -> Fixture {
 /// [`fixture`] pointed at a backend that answers — for the tests that must observe what
 /// the gateway does to a *response*.
 pub fn fixture_with_backend(tag: &str, bundle: serde_json::Value, endpoint: &str) -> Fixture {
+    fixture_with_config(tag, bundle, endpoint, |_| {})
+}
+
+/// [`fixture_with_backend`], with the gateway config edited before it is loaded — e.g. to
+/// declare the backend `conditional_create: native`.
+pub fn fixture_with_config(
+    tag: &str,
+    bundle: serde_json::Value,
+    endpoint: &str,
+    edit: impl FnOnce(&mut serde_json::Value),
+) -> Fixture {
     let dir = scratch(tag);
-    let cfg = GatewayConfig::from_json(&config_json(&dir, endpoint)).expect("config");
+    let mut raw: serde_json::Value =
+        serde_json::from_str(&config_json(&dir, endpoint)).expect("config json");
+    edit(&mut raw);
+    let cfg = GatewayConfig::from_json(&raw.to_string()).expect("config");
     let bundles = Arc::new(BundleStore::new(Bundle::new("rev-1", bundle.clone())));
     let engine = RegorusPdp::new(GATEWAY_REGO, &bundle).expect("regorus");
     let pdp_calls = Arc::new(AtomicUsize::new(0));

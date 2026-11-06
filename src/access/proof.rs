@@ -81,3 +81,96 @@ pub fn require<T>(req: &S3Request<T>) -> S3Result<()> {
     }
     Ok(())
 }
+
+/// A backend operation the SFTP front may issue under an [`SftpProof`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SftpBackendOp {
+    HeadObject,
+    GetObject,
+    PutObject,
+    CreateMultipartUpload,
+    UploadPart,
+    UploadPartCopy,
+    CompleteMultipartUpload,
+    AbortMultipartUpload,
+    ListObjectsV2,
+    DeleteObject,
+    CopyObject,
+}
+
+/// One licensed backend call: an operation on one key (or, for `ListObjectsV2`, one
+/// prefix) of one bucket. A copy names its source too.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SftpLicense {
+    pub op: SftpBackendOp,
+    pub bucket: String,
+    /// The object key, or the list prefix.
+    pub key: String,
+    /// `(bucket, key)` of a copy's source.
+    pub source: Option<(String, String)>,
+}
+
+impl SftpLicense {
+    pub fn on(op: SftpBackendOp, bucket: &str, key: &str) -> Self {
+        SftpLicense {
+            op,
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            source: None,
+        }
+    }
+
+    pub fn copy(
+        op: SftpBackendOp,
+        bucket: &str,
+        key: &str,
+        src_bucket: &str,
+        src_key: &str,
+    ) -> Self {
+        SftpLicense {
+            op,
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            source: Some((src_bucket.to_string(), src_key.to_string())),
+        }
+    }
+}
+
+/// Evidence that the enforce path allowed an SFTP request, and **which backend calls it
+/// licenses** (ADR-009 D2). A create-only upload's proof licenses `HeadObject`,
+/// `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`,
+/// `AbortMultipartUpload` and `PutObject` on one key, and nothing else.
+///
+/// Minted only by [`crate::access::Enforcer::prove_sftp`], which refuses unless every
+/// decision it is handed is an allow. The SFTP backend client calls [`Self::require`]
+/// before every backend call; a call the proof does not license is an internal error,
+/// exactly as a forward without an [`AuthzProof`] is on the S3 front.
+#[derive(Debug, Clone)]
+pub struct SftpProof {
+    licenses: Vec<SftpLicense>,
+}
+
+impl SftpProof {
+    pub(super) fn mint(licenses: Vec<SftpLicense>) -> Self {
+        SftpProof { licenses }
+    }
+
+    /// Fail closed unless this proof licenses exactly `want`.
+    pub fn require(&self, want: &SftpLicense) -> Result<(), String> {
+        if self.licenses.contains(want) {
+            return Ok(());
+        }
+        tracing::error!(
+            ?want,
+            "sftp backend call refused: the authorization proof does not license it"
+        );
+        Err(format!(
+            "internal error: {:?} on {}/{} was not licensed by the authorization decision",
+            want.op, want.bucket, want.key
+        ))
+    }
+
+    pub fn licenses(&self) -> &[SftpLicense] {
+        &self.licenses
+    }
+}

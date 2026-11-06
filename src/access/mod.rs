@@ -9,6 +9,7 @@
 //! `write_object_tags`. [`proof`] is the third fail-closed layer: a hook that forgot to
 //! authorize cannot reach the backend.
 
+pub mod enforcer;
 pub mod headers;
 pub mod optable;
 pub mod proof;
@@ -24,19 +25,19 @@ use s3s::{S3Error, S3Request, S3Result, s3_error};
 
 use crate::access::headers::RequestRiders;
 use crate::access::tagging::ReservedTagKeys;
-use crate::audit::{
-    AuditRecord, BackendOutcome, GateContext, GateStage, GatewayMeta, Outcome, PendingAudit,
-};
+use crate::audit::GateStage;
 use crate::auth::SECURITY_TOKEN_HEADER;
 use crate::authz::{Backend, CopySource as AuthzCopySource, Decision, OpaInput, RequestMeta};
+use crate::config::ConditionalCreate;
 use crate::gateway::Gateway;
 use crate::identity::ResolvedPrincipal;
 use crate::model::Action;
 use crate::proxy::RouteSnapshot;
 use crate::proxy::obligations::{BucketVisibility, ResponseObligations};
 
+pub use enforcer::Enforcer;
 pub use optable::{Coverage, DangerTier, GateDenial, OP_TABLE, OpSpec, ResourceShape};
-pub use proof::AuthzProof;
+pub use proof::{AuthzProof, SftpBackendOp, SftpLicense, SftpProof};
 
 /// The ACL fields of an object-shaped s3s input, as [`headers::AclFields`].
 ///
@@ -155,74 +156,46 @@ impl<'a> ReqCtx<'a> {
         input
     }
 
+    /// An object-shaped input with no riders.
+    fn object_input(&self, action: Action, bucket: String, object: String) -> OpaInput {
+        let mut input = self.base_input(action, bucket);
+        input.object = Some(object);
+        input
+    }
+
     /// Record that this request was authorized. The forward path refuses to touch a
     /// backend without it (`proof::require`), so every allow branch of every enforce
     /// helper must end here — and only an allow branch may.
-    fn prove(&mut self) {
+    fn prove(&mut self, enforcer: &Enforcer) {
         self.extensions
-            .insert(AuthzProof::mint(self.operation.clone()));
+            .insert(enforcer.prove_s3(self.operation.clone()));
     }
 }
 
 pub struct GatewayAccess {
     gw: Arc<Gateway>,
+    /// The protocol-neutral decision funnel (ADR-009 D2). Every PDP question, audit
+    /// record and forward proof of the S3 front goes through it.
+    enforcer: Enforcer,
 }
 
 impl GatewayAccess {
     pub fn new(gw: Arc<Gateway>) -> Self {
-        GatewayAccess { gw }
+        GatewayAccess {
+            enforcer: Enforcer::new(gw.clone()),
+            gw,
+        }
     }
 
-    /// Any PDP error fails closed to a deny — never allow on error.
-    ///
-    /// The single funnel: every `Pdp::decide` on the request path goes through here, so
-    /// the golden-capture tap sees 100% of emitted inputs without instrumenting a hook. A
-    /// second call site would silently make the corpus incomplete;
-    /// `tests/golden_capture.rs::decide_is_the_only_pdp_call_site_on_the_request_path`
-    /// is the guard.
+    /// The S3 front's view of [`Enforcer::decide`], the single PDP funnel shared with
+    /// every other protocol front.
     async fn decide(&self, cx: &ReqCtx<'_>, input: &OpaInput) -> Decision {
-        if let Some(capture) = &self.gw.capture {
-            capture.record(&cx.operation, input);
-        }
-        match self.gw.pdp.decide(input).await {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::error!(%e, "pdp error; failing closed");
-                Decision::deny("pdp evaluation error")
-            }
-        }
-    }
-
-    fn record(
-        &self,
-        input: OpaInput,
-        decision: &Decision,
-        outcome: Outcome,
-        denied_keys: Vec<String>,
-    ) -> AuditRecord {
-        let meta = GatewayMeta {
-            backend_id: input.backend.id.clone(),
-            backend_kind: input.backend.kind.as_str().to_string(),
-            outcome,
-            denied_keys,
-            backend: BackendOutcome::NotAttempted,
-            backend_status: None,
-        };
-        AuditRecord::new(
-            new_decision_id(),
-            now_rfc3339(),
-            input,
-            decision.clone(),
-            meta,
-            self.gw.audit.labels(),
-        )
+        self.enforcer.decide(&cx.operation, input).await
     }
 
     /// Emit now: the request is refused here and there is no forward leg to wait for.
     fn audit_denied(&self, input: OpaInput, decision: &Decision, denied_keys: Vec<String>) {
-        self.gw
-            .audit
-            .emit(self.record(input, decision, Outcome::Denied, denied_keys));
+        self.enforcer.audit_denied(input, decision, denied_keys);
     }
 
     /// Hold the record until the forward leg reports back.
@@ -238,9 +211,8 @@ impl GatewayAccess {
         decision: &Decision,
         denied_keys: Vec<String>,
     ) {
-        let record = self.record(input, decision, Outcome::Allowed, denied_keys);
         cx.extensions
-            .insert(Arc::new(PendingAudit::new(self.gw.audit.clone(), record)));
+            .insert(self.enforcer.pending(input, decision, denied_keys));
     }
 
     /// Record a denial from the pre-policy gate.
@@ -257,20 +229,8 @@ impl GatewayAccess {
         principal_sub: Option<&str>,
         reason: String,
     ) {
-        self.gw.audit.emit_gate_denial(AuditRecord::gate_denial(
-            new_decision_id(),
-            now_rfc3339(),
-            GateContext {
-                operation: op.to_string(),
-                stage,
-                access_key_id: access_key_id.map(str::to_string),
-                tenant: tenant.map(str::to_string),
-                suppressed_since_last: 0,
-            },
-            reason,
-            principal_sub.unwrap_or_default().to_string(),
-            self.gw.audit.labels(),
-        ));
+        self.enforcer
+            .audit_gate_denial(op, stage, access_key_id, tenant, principal_sub, reason);
     }
 
     /// Ask the PDP about one prepared input, then act on the answer: hold the record and
@@ -279,6 +239,12 @@ impl GatewayAccess {
     /// allow side" is one branch to read rather than one per op.
     async fn enforce(&self, cx: &mut ReqCtx<'_>, input: OpaInput) -> S3Result<()> {
         let decision = self.decide(cx, &input).await;
+        self.settle(cx, input, decision)
+    }
+
+    /// Act on one decision: hold the record and mint the proof on allow, emit the record
+    /// and refuse on deny.
+    fn settle(&self, cx: &mut ReqCtx<'_>, input: OpaInput, decision: Decision) -> S3Result<()> {
         // An obligation the policy declared mandatory and this binary cannot apply is a
         // denial, not a warning: a restriction that silently did not happen is the
         // fail-open shape this project exists to avoid. Gated on `allow` so a request the
@@ -293,12 +259,53 @@ impl GatewayAccess {
         let (allow, reason) = (decision.allow, decision.reason.clone());
         if allow {
             self.audit_pending(cx, input, &decision, vec![]);
-            cx.prove();
+            cx.prove(&self.enforcer);
             Ok(())
         } else {
             self.audit_denied(input, &decision, vec![]);
             Err(s3_error!(AccessDenied, "{reason}"))
         }
+    }
+
+    /// The write decision for a request that **cannot overwrite** — a `PutObject` or
+    /// `CompleteMultipartUpload` carrying `If-None-Match: *`, or a multipart step whose
+    /// object only becomes visible through such a commit (ADR-009 F1).
+    ///
+    /// `write_objects` is asked first, so a writer's request asks exactly the question it
+    /// always did. Only when that is denied is `create_objects` asked — the drop-box verb,
+    /// which `write_objects` implies. A create-only allow is honoured **only on a backend
+    /// declared `native`** (`backends[].conditional_create`): `If-None-Match` is the one
+    /// thing that stops the commit from overwriting, and a backend that silently ignores
+    /// it would turn create-only into overwrite with no error anywhere.
+    ///
+    /// One request, one record: the record carries the input that decided it.
+    async fn enforce_write_or_create(
+        &self,
+        cx: &mut ReqCtx<'_>,
+        input: OpaInput,
+        create_capable: bool,
+    ) -> S3Result<()> {
+        if !create_capable {
+            return self.enforce(cx, input).await;
+        }
+        let decision = self.decide(cx, &input).await;
+        if decision.allow {
+            return self.settle(cx, input, decision);
+        }
+        let mut create = input;
+        create.action = Action::CreateObjects;
+        let decision = self.decide(cx, &create).await;
+        if decision.allow && cx.route.conditional_create != ConditionalCreate::Native {
+            return Err(self.refuse(
+                create,
+                format!(
+                    "a create-only write needs a backend that honours If-None-Match; backend \
+                     {} is not declared conditional_create: native",
+                    cx.route.backend_id
+                ),
+            ));
+        }
+        self.settle(cx, create, decision)
     }
 
     /// A refusal the **gateway** decided rather than the PDP: a semantic cap, a body it
@@ -407,6 +414,7 @@ impl GatewayAccess {
         bucket: String,
         object: String,
         riders: Result<RequestRiders, String>,
+        create_capable: bool,
     ) -> S3Result<()> {
         // The riders are parsed from `&req.input` *before* the `ReqCtx` takes its mutable
         // borrow, so a malformed one arrives here as an `Err` rather than as an early
@@ -427,7 +435,8 @@ impl GatewayAccess {
         if let Some(why) = self.authorize_riders(cx, &input, &riders).await {
             return Err(self.deny(input, why));
         }
-        self.enforce(cx, input).await
+        self.enforce_write_or_create(cx, input, create_capable)
+            .await
     }
 
     /// The single-object path (get/head/put/delete-one/post-form/tagging). One
@@ -489,7 +498,7 @@ impl GatewayAccess {
             }
             BucketListing::Show(visibility) => {
                 self.audit_pending(cx, input, &decision, vec![]);
-                cx.prove();
+                cx.prove(&self.enforcer);
                 visibility
             }
         }
@@ -509,6 +518,7 @@ impl GatewayAccess {
         dest_bucket: String,
         dest_key: String,
         riders: RequestRiders,
+        create_capable: bool,
     ) -> S3Result<()> {
         let (src_bucket, src_key) = match source {
             CopySource::Bucket { bucket, key, .. } => (bucket.to_string(), key.to_string()),
@@ -535,7 +545,18 @@ impl GatewayAccess {
         src_input.object = Some(src_key);
         let src_allow = self.decide(cx, &src_input).await.allow;
 
-        let dst_allow = self.decide(cx, &dst_input).await.allow;
+        let mut dst_allow = self.decide(cx, &dst_input).await.allow;
+        // A part copy creates nothing visible: only a conditional commit can, so a
+        // create-only principal may write it (see `enforce_write_or_create`).
+        if !dst_allow && create_capable && cx.route.conditional_create == ConditionalCreate::Native
+        {
+            let mut create = dst_input.clone();
+            create.action = Action::CreateObjects;
+            if self.decide(cx, &create).await.allow {
+                dst_input = create;
+                dst_allow = true;
+            }
+        }
 
         if src_allow
             && dst_allow
@@ -554,7 +575,7 @@ impl GatewayAccess {
         };
         if allow {
             self.audit_pending(cx, dst_input, &decision, vec![]);
-            cx.prove();
+            cx.prove(&self.enforcer);
             Ok(())
         } else {
             self.audit_denied(dst_input, &decision, vec![]);
@@ -589,7 +610,7 @@ impl GatewayAccess {
             }
             _ => {
                 self.audit_pending(cx, input, &decision, vec![]);
-                cx.prove();
+                cx.prove(&self.enforcer);
             }
         }
         verdict
@@ -720,9 +741,19 @@ impl S3Access for GatewayAccess {
             false,
             max_tags,
         );
+        // `If-None-Match: *` makes the write unable to overwrite, so `create_objects`
+        // can authorize it (ADR-009 F1).
+        let create_capable = if_none_match_any(req.input.if_none_match.as_ref());
         let mut cx = ReqCtx::new(req)?;
-        self.enforce_object_write(&mut cx, Action::WriteObjects, bucket, key, riders)
-            .await
+        self.enforce_object_write(
+            &mut cx,
+            Action::WriteObjects,
+            bucket,
+            key,
+            riders,
+            create_capable,
+        )
+        .await
     }
 
     /// Browser form upload: the key is in the parsed multipart body, not in the path, so
@@ -746,7 +777,8 @@ impl S3Access for GatewayAccess {
             max_tags,
         );
         let mut cx = ReqCtx::new(req)?;
-        self.enforce_object_write(&mut cx, Action::WriteObjects, bucket, key, riders)
+        // A form upload carries no `If-None-Match`, so it can always overwrite.
+        self.enforce_object_write(&mut cx, Action::WriteObjects, bucket, key, riders, false)
             .await
     }
 
@@ -762,7 +794,7 @@ impl S3Access for GatewayAccess {
             ..RequestRiders::default()
         });
         let mut cx = ReqCtx::new(req)?;
-        self.enforce_object_write(&mut cx, Action::DeleteObjects, bucket, key, riders)
+        self.enforce_object_write(&mut cx, Action::DeleteObjects, bucket, key, riders, false)
             .await
     }
 
@@ -836,7 +868,7 @@ impl S3Access for GatewayAccess {
             denied.len()
         ));
         self.audit_pending(&mut cx, record_input, &decision, denied);
-        cx.prove();
+        cx.prove(&self.enforcer);
         // Per-key filtering: forward only authorized keys.
         req.input
             .delete
@@ -877,7 +909,8 @@ impl S3Access for GatewayAccess {
                 return Err(self.refuse(input, why));
             }
         };
-        self.enforce_copy(&mut cx, &source, bucket, key, riders)
+        // No destination condition exists on `CopyObject` (E4), so it is never create-only.
+        self.enforce_copy(&mut cx, &source, bucket, key, riders, false)
             .await
     }
 
@@ -954,35 +987,44 @@ impl S3Access for GatewayAccess {
             max_tags,
         );
         let mut cx = ReqCtx::new(req)?;
-        self.enforce_object_write(&mut cx, Action::WriteObjects, bucket, key, riders)
+        // Creates nothing visible: only a conditional `CompleteMultipartUpload` can, so a
+        // create-only principal may start the upload.
+        self.enforce_object_write(&mut cx, Action::WriteObjects, bucket, key, riders, true)
             .await
     }
 
+    /// A part is invisible until a commit, so a create-only principal may send it.
     async fn upload_part(&self, req: &mut S3Request<UploadPartInput>) -> S3Result<()> {
         let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
         let mut cx = ReqCtx::new(req)?;
-        self.enforce_object(&mut cx, Action::WriteObjects, bucket, key)
-            .await
+        let input = cx.object_input(Action::WriteObjects, bucket, key);
+        self.enforce_write_or_create(&mut cx, input, true).await
     }
 
+    /// The commit. Create-only exactly when it carries `If-None-Match: *` (ADR-009 F1);
+    /// without it the commit may overwrite and needs `write_objects`.
     async fn complete_multipart_upload(
         &self,
         req: &mut S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<()> {
         let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
+        let create_capable = if_none_match_any(req.input.if_none_match.as_ref());
         let mut cx = ReqCtx::new(req)?;
-        self.enforce_object(&mut cx, Action::WriteObjects, bucket, key)
+        let input = cx.object_input(Action::WriteObjects, bucket, key);
+        self.enforce_write_or_create(&mut cx, input, create_capable)
             .await
     }
 
+    /// Abandoning an upload discards invisible parts and makes nothing visible, so a
+    /// create-only principal may clean up after itself.
     async fn abort_multipart_upload(
         &self,
         req: &mut S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<()> {
         let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
         let mut cx = ReqCtx::new(req)?;
-        self.enforce_object(&mut cx, Action::WriteObjects, bucket, key)
-            .await
+        let input = cx.object_input(Action::WriteObjects, bucket, key);
+        self.enforce_write_or_create(&mut cx, input, true).await
     }
 
     async fn list_parts(&self, req: &mut S3Request<ListPartsInput>) -> S3Result<()> {
@@ -999,8 +1041,15 @@ impl S3Access for GatewayAccess {
         let mut cx = ReqCtx::new(req)?;
         // No riders: `UploadPartCopy` carries no ACL, tag or retention fields — the part's
         // destination object was created (and its ACL fixed) by `CreateMultipartUpload`.
-        self.enforce_copy(&mut cx, &source, bucket, key, RequestRiders::default())
-            .await
+        self.enforce_copy(
+            &mut cx,
+            &source,
+            bucket,
+            key,
+            RequestRiders::default(),
+            true,
+        )
+        .await
     }
 
     async fn list_multipart_uploads(
@@ -1330,18 +1379,16 @@ fn classify_bucket_listing(decision: &Decision) -> BucketListing {
     ))
 }
 
-/// The deny reason for a decision carrying a `must_understand` this binary cannot
-/// honor, or `None` when every named obligation is implemented.
+/// True for `If-None-Match: *` — the condition that makes a write unable to overwrite.
+/// An entity-tag `If-None-Match` still overwrites any other version, so only the wildcard
+/// counts.
+fn if_none_match_any(cond: Option<&ETagCondition>) -> bool {
+    cond.is_some_and(ETagCondition::is_any)
+}
+
+/// See [`Enforcer::unimplemented_obligations`].
 fn unimplemented_obligations(decision: &Decision) -> Option<String> {
-    let missing = decision.obligations.unimplemented();
-    if missing.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "deny (gateway): the policy requires obligation(s) {} which this gateway does \
-         not implement; upgrade the gateway before pushing a policy that depends on them",
-        missing.join(", ")
-    ))
+    Enforcer::unimplemented_obligations(decision)
 }
 
 /// Apply a list verdict for ops without fan-out dispatch (v1 list, multipart list).
@@ -1400,6 +1447,7 @@ fn parse_tag_set(tag_set: &[Tag], max_tags: usize) -> Result<BTreeMap<String, St
 
 fn request_meta<T>(req: &S3Request<T>) -> RequestMeta {
     RequestMeta {
+        protocol: crate::authz::Protocol::S3,
         method: req.method.to_string(),
         params: req.uri.query().map(redact_query),
         headers_subset: Default::default(),
@@ -1470,14 +1518,6 @@ fn hex_val(b: u8) -> Option<u8> {
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
-}
-
-fn new_decision_id() -> String {
-    uuid::Uuid::new_v4().to_string()
-}
-
-fn now_rfc3339() -> String {
-    chrono::Utc::now().to_rfc3339()
 }
 
 #[cfg(test)]

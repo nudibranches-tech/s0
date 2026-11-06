@@ -18,7 +18,8 @@ pub use backend::{AuditBackend, ControlPlaneBackend, EVENT_KIND, StdoutNdjsonBac
 pub use pending::PendingAudit;
 pub use record::{
     AuditRecord, BackendOutcome, DECISION_PATH, DEFAULT_ORG_LABEL_KEY, GATE_PATH, GateContext,
-    GateStage, GatewayMeta, LabelPolicy, Outcome,
+    GateStage, GatewayMeta, LabelPolicy, Outcome, SESSION_PATH, SessionBlock, SessionEvent,
+    SessionEventKind, TransferBlock,
 };
 pub use sink::{
     AuditBackendKind, AuditConfig, AuditHandle, AuditMetrics, AuditSink, spawn, spawn_with_backend,

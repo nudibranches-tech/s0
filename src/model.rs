@@ -5,11 +5,15 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The grant vocabulary the gateway authorizes against — the **six projected verbs**.
+/// The grant vocabulary the gateway authorizes against — the **seven projected verbs**.
 ///
 /// Deliberately coarser than the 99 S3 ops: every enforced op maps onto exactly one of
 /// these (`PutObject` to `write_objects`, `HeadBucket` to `read`), except `CopyObject`,
-/// which maps to two. The set is a contract with whatever control plane projects grants.
+/// which maps to two. [`Action::CreateObjects`] is asked by the SFTP front for every
+/// upload (ADR-009 D7), and by the S3 front for a write that cannot overwrite — a
+/// `PutObject` or `CompleteMultipartUpload` carrying `If-None-Match: *`, and the multipart
+/// steps leading to one — when `write_objects` is denied (ADR-009 F1). The set is a
+/// contract with whatever control plane projects grants.
 ///
 /// **The gateway is data-plane only**, so there is no verb for acting on a bucket as a
 /// *managed resource*: existence, policy, CORS and quota are control-plane concerns, and
@@ -20,6 +24,12 @@ pub enum Action {
     // object-scoped: the decision is made against a bucket + one key
     ReadObjects,
     WriteObjects,
+    /// Write a key **that does not exist** — the drop-box verb (ADR-009 D7).
+    ///
+    /// `write_objects` implies it (overwrite ⊇ create); the implication lives in the
+    /// policy module, which is the normative definition of what a grant means. A
+    /// principal holding only `create_objects` can drop files and cannot overwrite them.
+    CreateObjects,
     DeleteObjects,
     /// Kept **deliberately separate** from [`Action::WriteObjects`]. `OpaInput::object_tags`
     /// lets a policy key on tags; merging the two would let a principal holding both grant
@@ -46,6 +56,7 @@ impl Action {
     pub const ALL: &'static [Action] = &[
         Action::ReadObjects,
         Action::WriteObjects,
+        Action::CreateObjects,
         Action::DeleteObjects,
         Action::WriteObjectTags,
         Action::ListObjects,
@@ -56,6 +67,7 @@ impl Action {
         match self {
             Action::ReadObjects => "read_objects",
             Action::WriteObjects => "write_objects",
+            Action::CreateObjects => "create_objects",
             Action::DeleteObjects => "delete_objects",
             Action::WriteObjectTags => "write_object_tags",
             Action::ListObjects => "list_objects",
@@ -73,7 +85,10 @@ impl Action {
     pub const fn is_write(self) -> bool {
         matches!(
             self,
-            Action::WriteObjects | Action::DeleteObjects | Action::WriteObjectTags
+            Action::WriteObjects
+                | Action::CreateObjects
+                | Action::DeleteObjects
+                | Action::WriteObjectTags
         )
     }
 

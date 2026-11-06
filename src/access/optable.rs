@@ -77,6 +77,7 @@ pub const GATEWAY_VERBS: &[&str] = &[
     "read_objects",
     "list_objects",
     "write_objects",
+    "create_objects",
     "delete_objects",
     "write_object_tags",
     "read",
@@ -1010,8 +1011,9 @@ mod tests {
         assert_eq!(typed, gateway);
         assert_eq!(
             gateway.len(),
-            6,
-            "the projected vocabulary is six verbs (settled 2026-08-08)"
+            7,
+            "the projected vocabulary is seven verbs (six settled 2026-08-08, plus \
+             create_objects for the SFTP front, ADR-009 D7)"
         );
     }
 

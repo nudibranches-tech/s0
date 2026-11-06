@@ -1,7 +1,7 @@
 //! The golden-capture harness: the corpus in `tests/data/captured_inputs/` is a
 //! **recording** of what the gateway emits, not a description of it. Hand-written
 //! fixtures make the policy correct about a request that does not exist. So every fixture
-//! comes out of `GatewayAccess::decide` — the single funnel every PDP question passes
+//! comes out of `Enforcer::decide` — the single funnel every PDP question passes
 //! through — driven by the real typed hooks; every captured document must survive the
 //! round-trip gate (`to_value(from_value::<OpaInput>(raw)?) == raw`), which catches a
 //! renamed or dropped field; and every `Coverage::Enforced` op contributes a capture.
@@ -140,7 +140,7 @@ async fn capture_enforced_ops() -> (BTreeMap<String, serde_json::Value>, Vec<&'s
     );
 
     // THE structural invariant: the number of questions the PDP was asked equals the number
-    // of documents captured. `GatewayAccess::decide` is the only place a capture is taken,
+    // of documents captured. `Enforcer::decide` is the only place a capture is taken,
     // so a second `pdp.decide` call site anywhere on the request path shows up here as a
     // shortfall. The counter sits OUTSIDE the decision cache, so cache hits count too.
     let captured = fx.capture.snapshot();
@@ -148,7 +148,7 @@ async fn capture_enforced_ops() -> (BTreeMap<String, serde_json::Value>, Vec<&'s
         captured.len(),
         fx.pdp_calls(),
         "the PDP was asked {} questions but only {} were captured — \
-         `GatewayAccess::decide` is no longer the only call site",
+         `Enforcer::decide` is no longer the only call site",
         fx.pdp_calls(),
         captured.len()
     );

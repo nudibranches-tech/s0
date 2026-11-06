@@ -30,7 +30,7 @@ drift from the table.
 
 ### Enforced (23)
 
-Each is authorized against one of six grant verbs. A grant is per-subject, per-bucket,
+Each is authorized against one of seven grant verbs. A grant is per-subject, per-bucket,
 per-verb, with object-prefix scopes.
 
 | Grant verb | Operations |
@@ -41,6 +41,7 @@ per-verb, with object-prefix scopes.
 | `write_objects` | `PutObject`, `PostObject`, `CopyObject`, `CreateMultipartUpload`, `UploadPart`, `UploadPartCopy`, `CompleteMultipartUpload`, `AbortMultipartUpload` |
 | `delete_objects` | `DeleteObject`, `DeleteObjects` |
 | `write_object_tags` | `PutObjectTagging`, `DeleteObjectTagging` |
+| `create_objects` | write a key that does **not** exist, implied by `write_objects`. Over S3: `PutObject` and `CompleteMultipartUpload` carrying `If-None-Match: *`, plus `CreateMultipartUpload`, `UploadPart`, `UploadPartCopy` and `AbortMultipartUpload`, which make nothing visible on their own — asked only when `write_objects` is denied, and only on a backend declared `conditional_create: native`. Over SFTP: every upload ([ADR-009](docs/adr/ADR-009-sftp-front.md)) |
 
 That covers ordinary object storage: get/put/head/delete, multipart upload, server-side
 copy, listing, and object tagging.
@@ -176,7 +177,7 @@ Two engines sit behind one `Pdp` trait:
 
 ## Listeners
 
-Four listeners on four ports, with three different authentication postures. **Which
+Up to five listeners on five ports, with four different authentication postures. **Which
 posture applies is a property of the socket, never of the path** — a port where "is this
 authenticated?" is answered by a route match is how a credential mint ends up answering
 anonymously. `GatewayConfig::validate` refuses a config in which any two share a port.
@@ -187,6 +188,42 @@ anonymously. `GatewayConfig::validate` refuses a config in which any two share a
 | `admin_listen` (8016) | `/healthz` `/readyz` `/metrics` | **none, by construction** — a kubelet probe cannot present a secret | probes and scraping only; never the ingress |
 | `sts_mint.listen` (8015) | `AssumeRoleWithWebIdentity` (AWS STS wire protocol) + a legacy bearer-OIDC exchange | **none, by design** — a valid web identity token *is* the credential, exactly as at `sts.amazonaws.com` | optional; absent unless configured. Own hostname when present. |
 | `internal.listen` (8017) | `POST /internal/v1/sts/sessions` | `X-Shared-Secret`, constant-time | control plane only; never the ingress, never the data plane |
+| `frontends.sftp.listen` (2222) | the SFTP data plane ([ADR-009](docs/adr/ADR-009-sftp-front.md)) | SSH public key or OpenSSH user certificate, matched against the bundle's `data.sftp`; per-operation authorization | optional; its own Deployment in production |
+
+Each data-plane front is switched on **in its own section under `frontends`**. An absent
+`frontends.s3` means the S3 front is on, so every existing config is unchanged;
+`"frontends": { "s3": { "enabled": false } }` turns it off, and then `listen` and `sts` are
+no longer required. The S3 listener may be written as the top-level `listen` or as
+`frontends.s3.listen`, not both. `frontends.sftp` binds nothing unless it says
+`"enabled": true` — the flag is required, never defaulted. A config with both fronts off
+is refused at load, and so is an `s3` or `sftp` section left at the top level.
+
+Whether a backend honours `If-None-Match: *` is declared on the backend itself,
+`backends[].conditional_create` (`native` or the default `check_then_write`), because both
+fronts depend on it.
+
+### The SFTP front
+
+The client holds an SSH key and nothing else. s0 issues the stat an upload needs itself,
+under a decision for the SFTP operation, and enforces create-only **in policy** with the
+`create_objects` verb: a partner granted only `create_objects` on `partner-x/` can drop
+files and cannot read, list, overwrite or delete them. Every SFTP request goes through the
+same PDP, cache, obligations and audit sink as S3; decision records keep `path =
+s3/authz/decision` and carry `input.request.protocol = "sftp"` plus a `gateway.session`
+block, and connection-level events are a third record shape, `path = sftp/session`.
+
+- **Transport**: russh, pinned exactly; AEAD ciphers only, no SHA-1, no RSA keys (host or
+  client), strict KEX **required** of the client (Terrapin), every `Handler` method
+  overridden (`tests/sftp_transport.rs`).
+- **Protocol**: an in-tree SFTP v3 codec — paths stay bytes until they are validated, any
+  framing error ends the session.
+- **Data path**: uploads stream to multipart with no local disk and bounded memory; the
+  object is visible only when the commit succeeds; disconnect, timeout, revocation and
+  shutdown abort, never commit. Every SFTP home bucket needs an
+  `AbortIncompleteMultipartUpload` lifecycle rule for the one leak s0 cannot close, a hard
+  kill.
+- **Revocation**: removing a key or account from the bundle refuses the next login and
+  closes open sessions on the next bundle swap.
 
 Two of these mint credentials, and they are deliberately not the same socket. 8017 accepts
 *assertions* about a caller the control plane has already authenticated, and is
@@ -267,6 +304,7 @@ key, so replacing it invalidates live sessions. Rotate it in a window.
 | [`admin`](src/admin.rs) / [`shutdown`](src/shutdown.rs) | `/healthz` `/readyz` `/metrics`; one signal, ordered drain |
 | [`internal`](src/internal.rs) | the authenticated control-plane surface |
 | [`mint`](src/mint.rs) / [`webidentity`](src/webidentity.rs) | the credential doors |
+| [`sftp`](src/sftp) | the SFTP front: SSH transport, bundle-driven accounts, v3 codec, virtual root, transfers |
 
 ---
 
@@ -374,6 +412,11 @@ pinned to the **exact** version (`s3s = "=0.14.1"`) so upgrades are deliberate e
 "an operation with no hook falls through to `NotImplemented`" — is a claim about which
 methods `s3s-aws`'s generated `Proxy` overrides. A patch bump that overrode one more would
 open a forwarding path with no test failing. Guarded by `tests/op_coverage.rs`.
+
+`russh` is pinned exactly too (`russh = "=0.63.3"`): the SFTP front's safety argument is
+a claim about which `Handler` methods exist and what their defaults do, and several
+defaults accept a channel request without replying. `tests/sftp_transport.rs` holds the
+pinned method list against the overrides in `src/sftp/transport.rs`.
 
 A conformance suite against a live backend is scaffolded in
 [`.github/workflows/conformance.yml`](.github/workflows/conformance.yml). **It is not yet

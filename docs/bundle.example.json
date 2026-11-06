@@ -1,6 +1,22 @@
 {
   "_note": "Projected per-tenant policy data: user_attributes / bucket_attributes / org_settings.freeze_writes, plus the s3_grants / group_grants grant superset the control plane projects. The gateway's rego reads these by name. This object is the 'data'. To push the policy module alongside it, wrap it as { \"policy\": \"<rego source>\", \"data\": { ... } }; a bare object (this file) uses the gateway's compiled-in default policy.",
   "org_settings": { "freeze_writes": false },
+  "sftp": {
+    "_note": "SFTP accounts (ADR-009 D5). An account reaches an EXISTING subject and confers nothing: authority still comes only from grants. Keyed by the SSH login. On the compiled-in default policy (this bare file) subjects are looked up by raw `sub`; with a pushed module, by the prefixed key. `subject_key` is always prefixed. Fingerprints are `SHA256:` base64 as OpenSSH prints them; the bundle never carries key blobs. A drop-box grant is `create_objects` on the home prefix.",
+    "version": 1,
+    "user_cas": {},
+    "accounts": {
+      "acme-partner-drop": {
+        "tenant": "acme",
+        "subject_key": "user:9c21...oidc-sub-bob",
+        "home": { "bucket": "inbound", "prefix": "partner-x/" },
+        "authorized_keys": [ { "key_type": "ssh-ed25519", "fingerprint": "SHA256:REPLACE_WITH_THE_PARTNER_KEY_FINGERPRINT" } ],
+        "certificate_authorities": [],
+        "allowed_source_cidrs": ["203.0.113.0/24"]
+      }
+    },
+    "denied_source_cidrs": []
+  },
   "tenants": {
     "acme": {
       "_s3_key_epoch_note": "Revocation for long-lived derived per-principal keys (src/auth/derived.rs). `s3_key_epoch` is the lowest epoch such a key may carry and still be honoured; raising it revokes every outstanding key for the tenant at the next bundle poll. `s3_key_epochs` optionally raises the floor for ONE subject (keyed `sa:<client id>` / `user:<sub>`), so one compromised consumer can be cut off without touching the others; it can only ever tighten. ABSENCE OF `s3_key_epoch` DENIES every derived key for this tenant — so publishing it is the opt-in, and losing it fails closed.",

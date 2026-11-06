@@ -203,11 +203,29 @@ ships with a release:
   probes. s0 counts them itself:
   - `max_key_probes` per connection, default 10;
   - exceeding it disconnects, and counts as one authentication failure toward the ban (D12).
-  - A probe for an unknown login and a probe for an unauthorized key get the same answer
-    after the same delay.
-  - A probe does answer "accepted" for an authorized (login, key) pair, as in every SSH
-    server. That confirms an account to someone who already holds its public key, which is
-    accepted: possession of the private key is what authenticates.
+  - Failures count toward the ban only when the connection **ends without authenticating**.
+    An agent holding several keys signs with the wrong ones before the right one; each
+    rejection is audited, but a connection that then logs in is a legitimate client, and
+    counting its rejections would ban a NAT'd partner after a few routine connections.
+  - Only **credential mismatches** count: an unknown login, a key not authorized for it, a
+    rejected certificate, a key type or source address the account does not accept, a
+    refused method (`password`, `keyboard-interactive`), and the key-probe cap. Refusals
+    that a correct credential also gets are audited as `auth_failed` but never counted:
+    a bundle the gateway refuses (its gate, the fleet-wide denylist), and a matched
+    credential refused admission (the subject is not a member of its tenant, the tenant
+    cannot be routed, the subject is at its session cap). Counting them would ban an
+    address — and every partner behind its NAT — for logging in correctly while the
+    subject is at its cap or the bundle is bad.
+    When the refused credential did match (admission), the connection's earlier
+    mismatches are forgiven as well: an agent that signed with its other keys first is a
+    legitimate client. The same holds for a subject removed from its tenant whose keys
+    are still listed: its retries are refused every time, but never banned.
+  - Probes are answered **uniformly**: any offered key of an accepted type (ed25519,
+    ECDSA) is told to proceed to the signature, and the login is decided only once the
+    signature verifies. A probe for an unknown login, an unauthorized key and an
+    authorized (login, key) pair get the same answer, so a probe confirms no account,
+    even to someone holding its public key. The cost is a signature verification per
+    offered key. An RSA key is refused at the probe, as a credential mismatch.
 - **Channels.** One `session` channel per connection, carrying one `subsystem` request whose
   name is exactly `sftp`. Every other channel type (`direct-tcpip`, `forwarded-tcpip`, `x11`,
   `direct-streamlocal@openssh.com`, `auth-agent@openssh.com`, …) is rejected with
@@ -585,19 +603,35 @@ results:
 - *Per process*: `max_transfer_memory` (default 1 GiB, about 39 concurrent uploads at the
   defaults). A write OPEN **reserves its transfer's worst case up front**, so a transfer can
   never run out of memory halfway through. If the reservation cannot be made within 10 s, the
-  OPEN fails with `SSH_FX_FAILURE` ("server busy").
+  OPEN fails with `SSH_FX_FAILURE` ("server busy"). A read OPEN reserves its `read_ahead`
+  from the same budget for as long as the handle is open, under the same rule.
 - *Backpressure*: when a transfer's buffers are full, the session stops reading from the
   channel, and SSH flow control stops the client. PR 3 verifies that russh replenishes the
   window only as data is consumed.
+- *A client that stops reading replies* cannot freeze its session: the idle check, the
+  revocation sweep and drain still run, and tear it down. If it has stopped reading at the
+  TCP level, russh's task is stuck in a socket write and cannot send the disconnect, and
+  dropping russh's session handle would only detach that task, leaving the socket open and
+  uncounted. The client stream is therefore wrapped (`StrictKexGuard`) with a kill switch
+  that fails the stuck write and every later read and write, so russh's task ends and
+  releases the socket. The connection stays counted toward `max_connections` until it does.
+  Handing russh a disconnect only queues it, so success says nothing about a stall: every
+  gateway-initiated disconnect (the SFTP teardown, the handshake timeout, and a connection
+  that authenticated but has not started the `sftp` subsystem one `handshake_timeout_secs`
+  after the deadline) gives russh's task 5 s to end, then fires the kill switch. If the
+  disconnect cannot even be queued, it fires at once.
 
 **Pipelined writes and the reorder window.** Clients keep many WRITEs outstanding (OpenSSH
 keeps 64 × 32 KiB in flight).
 
 - A WRITE at the next expected offset is appended.
 - A WRITE ahead of it by no more than `reorder_window` (default 2 MiB, at most `part_size`)
-  is held until the gap fills.
+  is held until the gap fills. Each held chunk is charged its length plus a fixed 256-byte
+  overhead against the window, so many tiny writes cannot hold far more than the window.
 - A WRITE that overlaps bytes already accepted, or lands beyond the window, is refused with
-  `SSH_FX_OP_UNSUPPORTED` ("non-sequential write").
+  `SSH_FX_OP_UNSUPPORTED` ("non-sequential write"). The refusal **poisons the transfer**:
+  the next WRITE or the CLOSE aborts it. Stock clients CLOSE after a write error, and
+  committing then would land a file missing the refused bytes.
 - A CLOSE with a gap still open is refused and the transfer aborted.
 - A WRITE's `SSH_FX_OK` means *accepted into the transfer*. Only CLOSE's `SSH_FX_OK` means
   *committed*.
@@ -637,6 +671,9 @@ write (create or overwrite) of the target, and a delete of the source (D7).
 - It is **not atomic**: between the copy and the delete both keys exist, and if the delete
   fails both remain. s0 then answers `SSH_FX_FAILURE` naming the state, and the record says
   so.
+- A create-only RENAME on a `check_then_write` backend is guarded like a create-only upload
+  (D8): the target is claimed in the in-flight registry for the whole copy, and re-checked
+  immediately before the commit.
 - Renaming a non-empty directory is refused in v1. An empty directory (a marker) is renamed
   as its marker.
 
@@ -690,12 +727,12 @@ restart.
 |---|---|---|
 | `max_connections` | 256 | process |
 | `max_connections_per_ip` | 16 | process, per IPv4 /32 or IPv6 /64 |
-| `max_sessions_per_subject` | 8 | process |
+| `max_sessions_per_subject` | 16 | process; rclone's defaults (4 transfers + 8 checkers) open about 13 connections |
 | `preauth_rate_per_ip` | 10/min, burst 20 | process, token bucket |
-| `handshake_timeout_secs` | 30 | from TCP accept to authentication success, including the PROXY header |
+| `handshake_timeout_secs` | 30 | from TCP accept to authentication success, including the PROXY header, the version exchange and KEX; an authenticated connection that has not started the `sftp` subsystem one more timeout later is disconnected (D9) |
 | `max_auth_attempts` | 6 | connection |
 | `max_key_probes` | 10 | connection, counted separately from attempts (D3) |
-| `auth_failure_ban` | 10 failures in 5 min ⇒ 15 min ban | process, per /32 or /64, LRU-bounded table |
+| `auth_failure_ban` | 10 failures in 5 min ⇒ 15 min ban | process, per /32 or /64, LRU-bounded table; only credential mismatches count, and only when their connection ends unauthenticated (D3) |
 | `idle_timeout_secs` | 300 | session, no SFTP request |
 | `transfer_idle_timeout_secs` | 120 | transfer |
 | `max_file_size` | 50 GiB | transfer |
@@ -778,7 +815,7 @@ Exactly one of `input`, `gate` or `session_event` is present, and `path` is `sft
 | `auth_failed` (unknown login, unknown key, revoked certificate, CIDR mismatch, …) | none; `login` recorded, org label **omitted** | yes |
 | `banned` | none | no — bounded by the ban rate itself |
 | `auth_succeeded` | principal and org label | no |
-| `disconnected` (client close, idle, credential revoked, shutdown, protocol error) with duration, operation count and bytes in each direction | principal and org label | no |
+| `disconnected` (client close, connection lost, idle, credential revoked, shutdown, no `sftp` subsystem, session teardown timeout, protocol error) with duration, operation count and bytes in each direction | principal and org label | no |
 
 Every record still carries the required `result: Decision`. For a session event it states
 what happened rather than a PDP answer, and `obligations` is always empty:
@@ -791,6 +828,12 @@ what happened rather than a PDP answer, and `obligations` is always empty:
 
 The `(gateway)` prefix follows `GatewayAccess::refuse`: no policy was asked, and the reason
 must not read as a policy verdict.
+
+An `auth_failed` record also carries `credential_mismatch`: `true` when the credential did
+not match, which counts toward the ban if the connection ends unauthenticated; `false` for a
+refusal that never counts (a refused bundle, a matched credential refused admission). The
+`s0_sftp_auth_credential_mismatch_total` metric counts the `true` subset of
+`s0_sftp_auth_failed_total`.
 
 **Consumer impact.** `sftp/session` is a new `path`, and `gateway.session` a new block.
 ADR-002 I4 freezes path values per deployment, and I6 requires consumers to ignore unknown

@@ -31,6 +31,9 @@ pub const DECISION_PATH: &str = "s3/authz/decision";
 /// evaluated, so claiming the decision entrypoint ran would be false.
 pub const GATE_PATH: &str = "s3/authz/gate";
 
+/// The `path` of an SFTP connection-level event (ADR-009 D13): the third record shape.
+pub const SESSION_PATH: &str = "sftp/session";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditRecord {
     pub decision_id: String,
@@ -45,6 +48,10 @@ pub struct AuditRecord {
     /// the little it knew when it did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<GateContext>,
+    /// Present exactly when neither `input` nor `gate` is: an SFTP connection-level event
+    /// (ADR-009 D13). Exactly one of the three is present on every record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_event: Option<SessionEvent>,
     /// The verdict. For a gate record this is the gate's own deny, not a PDP answer.
     pub result: Decision,
     /// Principal subject — the end-user identity, never a service identity. Empty on a
@@ -81,6 +88,97 @@ pub struct GatewayMeta {
     /// why the success path cannot fill this in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_status: Option<u16>,
+    /// The SFTP session this decision belongs to. Absent on S3 records (ADR-009 D13).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionBlock>,
+}
+
+/// `gateway.session` on an SFTP decision record (ADR-009 D13).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionBlock {
+    pub protocol: String,
+    /// Gateway-generated, not the SSH exchange hash.
+    pub session_id: String,
+    pub client_ip: String,
+    pub login: String,
+    pub auth: crate::sftp::AuthInfo,
+    /// The SFTP request, next to the verb in `input.action`.
+    pub sftp_op: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_flags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer: Option<TransferBlock>,
+    /// Listing entries omitted because no path could reach them (ADR-009 D6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omitted_entries: Option<u64>,
+}
+
+/// One file transfer, OPEN to CLOSE: settled once with what happened.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferBlock {
+    pub bytes: u64,
+    pub parts: u32,
+    /// `committed`, `aborted`, `rejected`, `denied`, or `read` for a download.
+    pub commit: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// The connection-level event kinds (ADR-009 D13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionEventKind {
+    PreauthRejected,
+    AuthFailed,
+    Banned,
+    AuthSucceeded,
+    Disconnected,
+}
+
+impl SessionEventKind {
+    /// Unauthenticated events share the gate budget, so a pre-authentication flood cannot
+    /// evict decision records.
+    pub fn is_budgeted(self) -> bool {
+        matches!(
+            self,
+            SessionEventKind::PreauthRejected | SessionEventKind::AuthFailed
+        )
+    }
+}
+
+/// An SFTP connection-level event: `path = sftp/session`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionEvent {
+    pub event: SessionEventKind,
+    pub protocol: String,
+    pub session_id: String,
+    pub client_ip: String,
+    /// The login the client claimed. On a failure this is a client claim, which is why
+    /// such records carry no org label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<crate::sftp::AuthInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
+    /// `disconnected` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operations: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_in: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_out: Option<u64>,
+    /// `auth_failed` only: whether the client presented a credential that did not match
+    /// (`true`), which counts toward the address's ban if the connection ends
+    /// unauthenticated, or was refused for a reason that never counts (`false`): a bundle
+    /// the gateway refuses, or a matched credential refused admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_mismatch: Option<bool>,
+    /// Budgeted events this replica did not record since the last one it did.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub suppressed_since_last: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,7 +306,54 @@ impl AuditRecord {
             gateway,
             input: Some(input),
             gate: None,
+            session_event: None,
             result,
+        }
+    }
+
+    /// Build an SFTP connection-level record (ADR-009 D13).
+    ///
+    /// `organization_id` is `Some` only for an authenticated session: a failed
+    /// authentication is attributed to no organization, as gate records are, because the
+    /// login is a client claim and a scanner must not be able to write into a chosen
+    /// organization's trail. `result` states what happened rather than a PDP answer, and
+    /// carries no obligations.
+    pub fn session_event(
+        decision_id: String,
+        timestamp: String,
+        event: SessionEvent,
+        result: Decision,
+        requested_by: String,
+        organization_id: Option<&str>,
+        labels: &LabelPolicy,
+    ) -> Self {
+        let labels = labels.labels(organization_id);
+        // The outcome follows the decision: an auth failure, a ban or a pre-auth refusal
+        // is a denial, not an allowed event.
+        let outcome = if result.allow {
+            Outcome::Allowed
+        } else {
+            Outcome::Denied
+        };
+        AuditRecord {
+            decision_id,
+            path: SESSION_PATH.to_string(),
+            input: None,
+            gate: None,
+            session_event: Some(event),
+            result,
+            requested_by,
+            timestamp,
+            labels,
+            gateway: GatewayMeta {
+                backend_id: String::new(),
+                backend_kind: String::new(),
+                outcome,
+                denied_keys: vec![],
+                backend: BackendOutcome::NotAttempted,
+                backend_status: None,
+                session: None,
+            },
         }
     }
 
@@ -232,6 +377,7 @@ impl AuditRecord {
             path: GATE_PATH.to_string(),
             input: None,
             gate: Some(gate),
+            session_event: None,
             result: Decision::deny(reason),
             requested_by,
             timestamp,
@@ -245,6 +391,7 @@ impl AuditRecord {
                 denied_keys: vec![],
                 backend: BackendOutcome::NotAttempted,
                 backend_status: None,
+                session: None,
             },
         }
     }
@@ -304,6 +451,7 @@ mod tests {
             denied_keys,
             backend: BackendOutcome::NotAttempted,
             backend_status: None,
+            session: None,
         }
     }
 
@@ -434,5 +582,44 @@ mod tests {
             json["gateway"].get("backend_status").is_none(),
             "a 200 nobody observed must not be synthesized: {json}"
         );
+    }
+
+    #[test]
+    fn a_session_record_outcome_follows_its_decision() {
+        let event = || SessionEvent {
+            event: SessionEventKind::AuthFailed,
+            protocol: "sftp".into(),
+            session_id: "s".into(),
+            client_ip: "192.0.2.1".into(),
+            login: None,
+            auth: None,
+            tenant: None,
+            duration_secs: None,
+            operations: None,
+            bytes_in: None,
+            bytes_out: None,
+            credential_mismatch: None,
+            suppressed_since_last: 0,
+        };
+        let denied = AuditRecord::session_event(
+            "d".into(),
+            "2026-07-15T00:00:00Z".into(),
+            event(),
+            Decision::deny("deny (gateway): bad key"),
+            String::new(),
+            None,
+            &labels(),
+        );
+        assert_eq!(denied.gateway.outcome, Outcome::Denied);
+        let allowed = AuditRecord::session_event(
+            "a".into(),
+            "2026-07-15T00:00:00Z".into(),
+            event(),
+            Decision::allow("allow (gateway): publickey"),
+            String::new(),
+            None,
+            &labels(),
+        );
+        assert_eq!(allowed.gateway.outcome, Outcome::Allowed);
     }
 }

@@ -45,8 +45,19 @@ pub struct AdminState {
     /// no mint port, and a structurally-0 `s0_mint_*` series would put a flat line on a
     /// dashboard where the honest answer is "this pod has no mint".
     mint: Option<Arc<MintMetrics>>,
+    /// The SFTP front's host-key fingerprints and counters, when this process serves
+    /// SFTP (ADR-009 D1: published as a metric series, no new route). Set once, after
+    /// the front has loaded its host keys.
+    sftp: std::sync::OnceLock<SftpAdmin>,
     instance: String,
     shutting_down: AtomicBool,
+}
+
+/// What the admin listener publishes about the SFTP front.
+struct SftpAdmin {
+    /// `(algorithm, "SHA256:…")`, one per mounted host key.
+    host_keys: Vec<(String, String)>,
+    metrics: Arc<crate::sftp::SftpMetrics>,
 }
 
 impl AdminState {
@@ -56,6 +67,7 @@ impl AdminState {
             health,
             bundles,
             mint: None,
+            sftp: std::sync::OnceLock::new(),
             instance: crate::config::instance_id(),
             shutting_down: AtomicBool::new(false),
         }
@@ -67,6 +79,16 @@ impl AdminState {
     pub fn with_mint_metrics(mut self, metrics: Arc<MintMetrics>) -> Self {
         self.mint = Some(metrics);
         self
+    }
+
+    /// Publish the SFTP front's host-key fingerprints and counters. Called once, by
+    /// `main`, when an enabled `sftp` section built a front; a second call is ignored.
+    pub fn set_sftp(
+        &self,
+        host_keys: Vec<(String, String)>,
+        metrics: Arc<crate::sftp::SftpMetrics>,
+    ) {
+        let _ = self.sftp.set(SftpAdmin { host_keys, metrics });
     }
 
     /// Start failing readiness. Call on the shutdown signal, *before* the data plane
@@ -347,6 +369,25 @@ fn prometheus(state: &AdminState) -> Response<Full<Bytes>> {
              bytes were never read off the socket.",
             m.bodies_too_large.load(Ordering::Relaxed),
         );
+    }
+
+    // The SFTP front. Present only on a pod that serves one.
+    if let Some(sftp) = state.sftp.get() {
+        out.push_str(
+            "# HELP s0_sftp_host_key_info The SFTP host keys this pod presents; publish the \
+             fingerprints to partners for pinning.\n",
+        );
+        out.push_str("# TYPE s0_sftp_host_key_info gauge\n");
+        for (algorithm, fingerprint) in &sftp.host_keys {
+            out.push_str(&format!(
+                "s0_sftp_host_key_info{{algorithm=\"{}\",fingerprint=\"{}\"}} 1\n",
+                escape_label(algorithm),
+                escape_label(fingerprint),
+            ));
+        }
+        for (name, kind, help, value) in sftp.metrics.series() {
+            metric(&mut out, name, kind, help, value);
+        }
     }
 
     out.push_str("# HELP s0_build_info Build and instance identity.\n");
