@@ -105,19 +105,22 @@ Apache-2.0. The BSD-3-Clause and ISC notices must ship with the image; PR 1 adds
   place) or `frontends.s3.listen`, never both — is required iff the S3 front is enabled, and
   refused when it is disabled, since a listener that is never bound reads exactly like one
   that is. `sts` is required iff the process serves S3 or the mint or internal listeners,
-  which mint or verify STS sessions. An SFTP pod therefore carries no STS key material.
+  which mint or verify STS sessions. An SFTP pod therefore carries no STS key material:
+  `Gateway::build` gives it an authority keyed with ephemeral, process-local random keys,
+  which no client can use.
   Every existing config has no `frontends`, so it still serves S3 alone, and its required
-  fields do not change. This lands with the refactor in D2, behind the existing suite. The
-  production shape is **two Deployments from one image**: a crash, a resource exhaustion or
+  fields do not change. The production shape is **two Deployments from one image**: a crash, a resource exhaustion or
   a memory-safety bug in SSH parsing takes down SFTP pods and never the S3 front.
 - `frontends.sftp.listen` joins the listener-uniqueness check in `GatewayConfig::validate`.
 - **The admin listener is unchanged**: no new route. Host-key fingerprints are published as a
   metric series, `s0_sftp_host_key_info{algorithm="ssh-ed25519",fingerprint="SHA256:…"} 1`,
   and logged once at startup at `info`. Operators publish them for client pinning.
-- **Shutdown**: on SIGTERM readiness fails first (unchanged), the SFTP listener stops
-  accepting, open sessions get `frontends.sftp.drain_secs` (default 20) to finish in-flight commands;
-  after that every open transfer is **aborted** (never committed), each session is closed with
-  a `disconnected{reason: "shutdown"}` record, and only then is the audit worker drained. The
+- **Shutdown**: on SIGTERM readiness fails first (unchanged) and the SFTP listener stops
+  accepting. A session with no open upload is closed at once; open read and directory
+  handles are settled and cut. A session with open uploads gets up to
+  `frontends.sftp.drain_secs` (default 20, read at startup) to CLOSE them; after that every
+  open transfer is **aborted** (never committed). Each session is closed with a
+  `disconnected{reason: "shutdown"}` record, and only then is the audit worker drained. The
   documented `terminationGracePeriodSeconds: 60` still covers it.
 
 ```jsonc
@@ -144,31 +147,38 @@ E1 rules out driving the S3 hooks from SFTP. It also rules out a loopback design
 SFTP front calls the S3 front over HTTP: that needs a credential, which is the design this ADR
 exists to avoid.
 
-1. **A refactor PR first, with no behaviour change.** The protocol-neutral part of
+1. **Extract the funnel, with no behaviour change for S3.** The protocol-neutral part of
    `GatewayAccess` — the `decide` funnel (the single PDP call site with the golden-capture
-   tap), the `must_understand` check, audit-record assembly, `PendingAudit`, and
-   `AuthzProof` minting — moves into an `Enforcer` that takes `(principal, route, operation,
-   OpaInput)` rather than an `S3Request`. `GatewayAccess` becomes its first caller. The whole
-   existing suite, unmodified, is the proof;
+   tap), the `must_understand` check, audit-record assembly, `PendingAudit`, and proof
+   minting — moves into an `Enforcer` (`src/access/enforcer.rs`). Its
+   `decide(operation, &OpaInput)` is the single PDP call site; principal and route travel
+   inside the `OpaInput`. It mints proofs only from allow decisions (`prove_s3`,
+   `prove_sftp`), refusing any decision that carries an obligation the gateway does not
+   implement. `GatewayAccess` is its first caller. The extraction landed together with the
+   SFTP front (#42); the existing suite passes with only references renamed, and
    `tests/golden_capture.rs::decide_is_the_only_pdp_call_site_and_every_capture_round_trips`
-   keeps holding exactly one call site.
+   still holds exactly one call site, `Enforcer::decide`.
 2. **The SFTP front is a second caller.** Modules: `sftp::transport` (russh), `sftp::codec`
    (the v3 wire format, pure and fuzzable), `sftp::session` (request dispatch),
    `sftp::paths` (the virtual root), `sftp::transfer` (the upload and download state
-   machines), `sftp::account` (bundle-driven authentication) and `sftp::limits`.
-3. **Decide and forward from the same value.** Each SFTP request is turned into a *plan*: the
-   typed s3s inputs it will send to the backend (`PutObjectInput`, `UploadPartInput`, …). The
-   `OpaInput` for each decision is derived from those typed values by the same helpers the S3
-   hooks use, never from the SFTP path string a second time. The backend is reached only
-   through `BackendRegistry::proxy_for(route)` under an `SftpProof` that the `Enforcer` mints
-   on allow and that **enumerates the backend operations it licenses**. For example, a
-   create-only upload's proof licenses `HeadObject`, `CreateMultipartUpload`, `UploadPart`,
-   `CompleteMultipartUpload` and `AbortMultipartUpload` on one key, and nothing else. A
-   forward without a matching proof is an internal error, as it is for S3 (`src/access/proof.rs`).
-4. SFTP keeps its **own closed operation table**, the analogue of `OP_TABLE`: every SFTP
-   packet type and extended request has exactly one entry, `Enforced` or `Refused`, and
-   `check`'s deny-by-default role is played by the dispatcher, which answers every
-   unlisted type with `SSH_FX_OP_UNSUPPORTED`.
+   machines), `sftp::account` (bundle-driven authentication), `sftp::limits`,
+   `sftp::preauth` (the PROXY v2 reader, the strict-KEX guard and the connection kill
+   switch) and `sftp::backend` (`SftpBackend`, the proof-checked backend client).
+3. **Decide and forward from the same value.** Each SFTP request is mapped once to
+   (bucket, key), never re-derived from the SFTP path string. The `OpaInput`s for its
+   decisions are built from that mapping (`Session::input`, `object_input`, `list_input`).
+   The backend is reached only through `BackendRegistry::proxy_for(route)`, by
+   `SftpBackend`, under an `SftpProof` that the `Enforcer` mints on allow and that
+   **enumerates the (operation, bucket, key) triples it licenses**; `SftpBackend` builds
+   each typed s3s input from the licensed triple and checks `SftpProof::require` before
+   every call. For example, a create-only upload's proof licenses `HeadObject`, `PutObject`
+   (a small file), `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload` and
+   `AbortMultipartUpload` on one key, and nothing else. A forward without a matching proof
+   is an internal error, as it is for S3 (`src/access/proof.rs`).
+4. SFTP's **closed set of operations** is the `codec::Request` enum, dispatched by an
+   exhaustive `match` in `Session::handle`, which plays `check`'s deny-by-default role: a
+   packet type or extension the enum does not name is parsed as `Unknown` or `Extended`
+   and answered `SSH_FX_OP_UNSUPPORTED` (with id 0 if no id can be read).
 
 ### D3 — SSH transport: russh, pinned, with a code-constant algorithm floor
 
@@ -178,10 +188,13 @@ argument depends on which `Handler` methods exist and what their defaults do (E5
 Rust cannot reject a default method that was left in place, so the guarantee is a test, in
 the style of `tests/op_coverage.rs`:
 
-- one assertion compares the list against the `Handler` trait in the pinned russh source;
-- another compares it against the method names in s0's `impl Handler` source;
-- a method with no override fails the suite, and so does a version bump that adds a method
-  with a permissive default, instead of opening a channel type.
+- `russh_is_pinned_exactly` asserts the `=0.63.3` pin in `Cargo.toml`, and the list holds
+  exactly 34 methods;
+- the list is compared against the `Handler` trait in the pinned russh source when that
+  source is in the local cargo registry (the comparison is skipped otherwise);
+- every listed method must appear as an `fn` in s0's `impl Handler`;
+- a method with no override fails the suite, and so does a version bump, instead of
+  silently opening a channel type.
 
 **Algorithms** are `const` lists in `sftp::transport`, not configuration, so tightening them
 ships with a release:
@@ -197,9 +210,11 @@ ships with a release:
 
 - **Terrapin.** Strict KEX is **required**: a client that does not advertise
   `kex-strict-c-v00@openssh.com` is disconnected before authentication. Every client in the
-  matrix below has shipped strict KEX since the 2023-12 disclosure. PR 1 verifies that russh
-  lets a server refuse a non-strict peer. If it does not, that is an upstream patch before
-  merge, not a documented exception.
+  matrix below has shipped strict KEX since the 2023-12 disclosure. russh 0.63.3 gives a
+  server no way to require it, so s0 enforces it in-tree: `sftp::preauth::StrictKexGuard`
+  reads the client's cleartext KEXINIT before any byte reaches russh and closes the
+  connection unless `kex-strict-c-v00@openssh.com` is advertised, recording
+  `preauth_rejected`.
 - **RSA client keys are refused in v1** (E6). The requirement was "RSA-SHA2 only, minimum 3072
   bits". The minimum size is checkable, but the SHA-1 exclusion is not, because the handler
   never sees the signature algorithm. Accepting RSA would therefore accept `ssh-rsa` SHA-1
@@ -209,14 +224,15 @@ ships with a release:
 - **No RSA host keys** (E8). s0 performs no RSA private-key operation.
 - **Authentication** is `publickey` only, with certificates arriving through the same method.
   `none` is answered with the method list and counts as an attempt. `password`,
-  `keyboard-interactive`, `hostbased` and `gssapi-*` are rejected. `max_auth_attempts` is
-  6 by default and configurable from 1 to 10. russh's `auth_rejection_time` gives failures a
+  `keyboard-interactive`, `hostbased` and `gssapi-*` are rejected.
+  `limits.sftp.max_auth_attempts` is 6 by default and configurable from 1 to 10; unlike
+  most limits it is fixed when the listener starts (D12). russh's `auth_rejection_time` gives failures a
   constant delay, so an unknown login and a known login with a wrong key take the same time.
 - **Key probes are capped separately.** russh does not count a probe — a public key offered
   without a signature — toward `max_auth_attempts` (its test
   `publickey_probes_do_not_burn_auth_attempts`), so the attempt cap alone does not bound
   probes. s0 counts them itself:
-  - `max_key_probes` per connection, default 10;
+  - `limits.sftp.max_key_probes` per connection, default 10;
   - exceeding it disconnects, and counts as one authentication failure toward the ban (D12).
   - Failures count toward the ban only when the connection **ends without authenticating**.
     An agent holding several keys signs with the wrong ones before the right one; each
@@ -242,15 +258,26 @@ ships with a release:
     even to someone holding its public key. The cost is a signature verification per
     offered key. An RSA key is refused at the probe, as a credential mismatch.
 - **Channels.** One `session` channel per connection, carrying one `subsystem` request whose
-  name is exactly `sftp`. Every other channel type (`direct-tcpip`, `forwarded-tcpip`, `x11`,
-  `direct-streamlocal@openssh.com`, `auth-agent@openssh.com`, …) is rejected with
-  `ADMINISTRATIVELY_PROHIBITED`. Every other channel request (`exec`, `shell`, `pty-req`,
-  `env`, `x11-req`, `auth-agent-req@openssh.com`, `signal`, `break`, a second `subsystem`, …)
-  gets an explicit `SSH_MSG_CHANNEL_FAILURE` and the channel is closed. Every global request
-  (`tcpip-forward`, `streamlocal-forward@openssh.com`, …) gets `SSH_MSG_REQUEST_FAILURE`.
-  Nothing relies on a russh default (E5).
+  name is exactly `sftp`.
+  - Every other channel type that has a `Handler` method (`direct-tcpip`, `forwarded-tcpip`,
+    `x11`, `direct-streamlocal@openssh.com`, a second `session`) is rejected with
+    `ADMINISTRATIVELY_PROHIBITED`. Types with no `Handler` method in the pinned russh
+    (`auth-agent@openssh.com`, `forwarded-streamlocal@openssh.com`, unknown types) are
+    refused by russh itself, unknown types with `UNKNOWN_CHANNEL_TYPE`.
+  - Every other channel request with a `Handler` method (`exec`, `shell`, `pty-req`,
+    `x11-req`, `signal`, a second `subsystem`, …) gets `SSH_MSG_CHANNEL_FAILURE` and the
+    channel is closed. Two exceptions: `env` is refused but **leaves the channel open**,
+    because stock OpenSSH sends `SendEnv LANG LC_*` before `subsystem sftp`
+    (`env_then_sftp_works_like_stock_openssh`); `auth-agent-req@openssh.com` closes the
+    channel and russh answers it `SSH_MSG_REQUEST_FAILURE`. Requests with no `Handler`
+    method (`break`, unknown names) get russh's own `CHANNEL_FAILURE`, channel left open.
+  - The four forwarding global requests are refused by s0's handler; every other global
+    request gets russh's own `SSH_MSG_REQUEST_FAILURE`.
+  - Every `Handler` method is overridden (E5); what russh answers on its own is limited to
+    requests it has no `Handler` method for, and each of those is a refusal.
 - **Host keys** come from `frontends.sftp.host_keys`, which are paths to a mounted secret. A missing,
-  unreadable, world-readable, encrypted, RSA or duplicate key refuses startup. There is no
+  unreadable, world-readable, encrypted, RSA or ECDSA P-384/P-521 key refuses startup, as
+  does a key listed twice (by path or by fingerprint) or a set with no ed25519 key. There is no
   silent generation: a pod that regenerates its host key on restart teaches every partner to
   accept key changes, which is the MITM this pinning exists to stop. Rotation is additive:
   publish the new fingerprint, add the key, then remove the old one in a later release.
@@ -263,7 +290,7 @@ is about twenty packet types, and the v3 draft has not changed since 2001.
 | | russh-sftp 3.0.1 | In-tree v3 codec |
 |---|---|---|
 | Correctness | Lossy UTF-8 decoding (E7): two byte strings, one key. Continues reading after a parse error: stream desync. | Paths stay bytes until `sftp::paths` validates them. Any framing error ends the session. |
-| Attack surface | Parses v3–v6 structures s0 will never serve, in a spawned task s0 does not control. | Parses exactly the requests in D7 and D11, as a pure `&[u8] → Result<Request, CodecError>` function, fuzzed. |
+| Attack surface | Parses v3–v6 structures s0 will never serve, in a spawned task s0 does not control. | Parses exactly the requests in D7 and D11, as a pure `Bytes → Result<Request, CodecError>` function, fuzzed. |
 | Maintenance | Single-maintainer crate on the critical path, a second pin to track. | About 1,000 lines against a frozen spec, owned here, and tested like the rest of the gateway. |
 | Concurrency | One request at a time, reply before the next read. | Same ordering for requests, but WRITE data is accepted into a bounded transfer buffer so uploads pipeline (D9). |
 
@@ -373,12 +400,13 @@ account would be refused at login, or denied on every operation. So the login ch
 (membership, and the groups placed on the principal) reads **the same key the PDP will
 read**:
 
-- the prefixed key when the bundle carries a `policy` module;
+- the prefixed key when a pushed `policy` module is in force;
 - the raw `sub` when the compiled-in default is in force.
 
-The two cases are already told apart by the predicate behind
-`is_platform_data_missing_its_module`. One function, next to `principal_subject_key`, makes
-this choice, and a test runs a login and an operation against both bundle kinds.
+Which one is in force is `Bundle::policy_module`, set when a pushed bundle carries a module
+and kept by a data-only refresh, so a later data push does not flip the key space. One
+function, `subject_lookup_key`, makes this choice, and a test runs a login and an operation
+against both bundle kinds.
 `accounts[L].subject_key` is always written in prefixed form, because it is the identity
 contract; only the lookup follows the module. The STS door's membership check
 (`bundle_knows_service_account`) always reads the prefixed key whatever module is in force.
@@ -394,8 +422,11 @@ PEP gate, which fails closed on every degenerate input:
 | no `sftp` section | every login rejected |
 | `sftp.version` absent or `≠ 1` | every login rejected; `error` log once per revision |
 | `grant_schema_version` present and `< 3` | every login rejected (a v2 module predates `create_objects`) |
-| `grant_schema_version` absent (a hand-written bundle on the compiled-in module) | governed by `sftp.version` alone; subjects looked up by raw `sub` (D5, key spaces) |
-| account present but malformed (bad login, unknown tenant, bad `subject_key`, `home.prefix` not `/`-terminated) | that account rejected, others unaffected; `error` log |
+| `grant_schema_version` absent (a hand-written bundle on the compiled-in module) | governed by `sftp.version` alone; the key space still follows the module in force (D5, key spaces) |
+| account present but malformed (bad login, bad `subject_key`, empty or `/`-containing `home.bucket`, `home.prefix` not `/`-terminated or not canonical — a leading `/`, `//`, `.` or `..` —, a fingerprint without `SHA256:`, a non-array `allowed_source_cidrs`) | that account rejected, others unaffected; `error` log |
+| account naming a tenant s0 does not know or the subject is not a member of | loads; every login refused at authentication (audited, not counted toward the ban, D3) |
+| `denied_source_cidrs` not an array, or holding an invalid CIDR | the whole `sftp` section refused: every login rejected |
+| a CA entry malformed | that CA dropped; `error` log |
 | `authorized_keys` absent or `[]` and no usable CA | that account cannot authenticate |
 | `allowed_source_cidrs` absent | no source restriction for that account |
 | `allowed_source_cidrs: []` | no source allowed (explicit) |
@@ -410,21 +441,21 @@ because it is an additional restriction on top of key possession, not a grant.
   the bundle refresh.
 - *Open sessions* — **re-authorize every operation against the current bundle**:
   - The credential check is re-run whenever the bundle revision has moved since it last
-    passed. The result is memoized per revision, so a steady-state operation costs one string
-    compare.
+    passed, and whenever a certificate has passed its `valid_before`. The result is memoized
+    per revision, so a steady-state operation costs one string compare. The re-check also
+    fails if the account now maps to a different tenant, subject or home.
   - Every operation takes a fresh PDP decision. The revision-keyed cache (ADR-005) makes a
     revision change a miss by construction.
-  - A transfer in progress re-decides at the next WRITE or READ after a revision change and
-    again at CLOSE (D9).
-  - A failed credential re-check denies the operation (audited), aborts any open transfer,
-    and closes the connection with `disconnected{reason: "credential_revoked"}`.
-  - On every bundle swap the session registry also re-validates the credentials of all
-    sessions in the process. An idle session with a revoked key is therefore closed within
-    one poll interval, not left open until its next request.
-  - `bundle_refresh` has no swap notification today. It gains a `tokio::sync::watch` of the
-    installed revision, published after the engine reload and the `BundleStore` swap, in
-    that order. The registry subscribes to it, and the S3 front ignores it. This lands with
-    SFTP authentication (slice 3).
+  - A transfer in progress re-decides at the next WRITE or READ after a revision change, and
+    an upload again at CLOSE (D9).
+  - A failed credential re-check aborts any open transfer and closes the connection without
+    answering the request; the `disconnected{reason: "credential_revoked"}` record is the
+    audit trail.
+  - Each session also subscribes to the `BundleStore` revision watch (`subscribe()`, sent in
+    `store()` after the swap; `bundle_refresh` reloads the engine before storing) and
+    re-validates its credential on every change. An idle session with a revoked key is
+    therefore closed within one poll interval, not left open until its next request. The
+    S3 front ignores the watch.
   - The revocation-latency bound is the one ADR-006 already documents: build + poll interval.
 
 ### D6 — The virtual root, and paths that cannot escape it
@@ -436,11 +467,9 @@ pitfall — `partner-x` also matching `partner-x-old/` — is refused at bundle 
 
 Normalization, applied to every path argument before anything else:
 
-1. the bytes must be valid UTF-8. Otherwise the answer is `SSH_FX_NO_SUCH_FILE` for a
-   request that names an existing entry (STAT, OPEN for read, REMOVE, RMDIR, OPENDIR, a
-   RENAME source), because no key can match it. A request that would create one (OPEN for
-   write, MKDIR, a RENAME target) gets `SSH_FX_FAILURE` ("invalid file name");
-2. reject NUL, any control character (U+0000–U+001F, U+007F) and `\`;
+1. the bytes must be valid UTF-8;
+2. reject NUL, any control character (`char::is_control`: U+0000–U+001F and U+007F–U+009F)
+   and `\`;
 3. relative paths are resolved against `/`: the working directory lives in the client, and
    the server has none;
 4. collapse runs of `/`, drop `.` components, drop a trailing `/`;
@@ -451,6 +480,12 @@ Normalization, applied to every path argument before anything else:
 6. the key is `home.prefix + relative`, and must be at most 1,024 bytes;
 7. an assertion that the key starts with `home.prefix` runs **after** mapping, as defence in
    depth. The PDP's grant scope is the independent second layer.
+
+Any path refused by these rules (bad UTF-8, a refused character, too long) is answered
+`SSH_FX_NO_SUCH_FILE` for a request that names an existing entry (STAT, OPEN without
+`CREAT`, REMOVE, RMDIR, OPENDIR, a RENAME source), because no key can match it, and
+`SSH_FX_FAILURE` ("invalid file name") for one that would create it (OPEN with `CREAT`,
+MKDIR, a RENAME target). A path containing `..` is always `SSH_FX_FAILURE`.
 
 No Unicode normalization is applied (NFC and NFD forms of one name are two keys), matching the
 backend. Names read back from a listing are held to the same rules. An object whose name
@@ -481,16 +516,17 @@ read it.
 - `create_objects` joins `write_actions` in the rego and `Action::is_write` in the PEP, so
   `freeze_writes` covers it. `the_write_set_matches_the_shipped_rego` enforces the equality.
 - It joins `GATEWAY_VERBS`, `Action::ALL`, the README verb table and
-  `tests/readme_optable.rs`. The verb count is also pinned to six elsewhere, and each place
-  moves to seven in the same PR:
-  - `tests/op_coverage.rs::the_gateway_vocabulary_is_the_six_projected_verbs`;
-  - the README's "one of six grant verbs";
-  - the doc comment on `Action` in `src/model.rs`.
+  `tests/readme_optable.rs`. The verb count is pinned to seven in
+  `tests/op_coverage.rs::the_gateway_vocabulary_is_the_seven_projected_verbs`, the README's
+  "one of seven grant verbs" and the doc comment on `Action` in `src/model.rs`.
 
   `create_objects` is the first verb no enforced S3 operation names. Any test assuming every
-  verb has an operation is amended to say so explicitly, rather than weakened. It is asked only by the SFTP front in this ADR. Mapping an S3
-  `PutObject` or `CompleteMultipartUpload` that carries `If-None-Match: *` onto it is a
-  follow-up (F1), with its own corpus cases.
+  verb has an operation is amended to say so explicitly, rather than weakened. Both fronts
+  ask it. SFTP asks it for every create. S3 asks it for a `PutObject` or
+  `CompleteMultipartUpload` carrying `If-None-Match: *` (and the multipart steps leading to
+  such a commit) when `write_objects` is denied, and only on a backend declared
+  `conditional_create: native`, since elsewhere the condition would not be honoured (F1,
+  implemented; `tests/s3_create_objects.rs`, with its own corpus cases).
 
 **No new verb for metadata.** STAT and READDIR are decided as **`list_objects`** on a prefix
 equal to the target key (or `dir/` for a listing), not as `read_objects`. A `list_objects`
@@ -502,21 +538,23 @@ posture.
 
 **Operation → decisions.** Every SFTP request that touches storage takes at least one decision
 through the same `Enforcer`, PDP, cache and obligations as S3. All decisions of one request
-are taken **before** its first backend call.
+are taken **before** its first backend call, with one exception: OPEN for create-or-replace
+decides `create_objects`, then issues the existence `HeadObject` that decision licenses, and
+only then decides `write_objects` if the key exists (D8).
 
 | SFTP request | Decision(s) | Backend calls the proof licenses |
 |---|---|---|
 | `INIT`, `REALPATH`, `STAT("/")` | none — they touch no object and reveal only the account's own configuration; counted on the disconnect record | none |
 | `STAT` / `LSTAT` `p` | `list_objects`, `prefix = key(p)` | `HeadObject(key)` (metadata only), `ListObjectsV2(prefix = key/, max-keys = 1)` |
 | `FSTAT h` | none — answered from the handle's own state | none |
-| `OPENDIR p` | `list_objects`, `prefix = dir(p)` | none at open |
-| `READDIR h` | re-decided on a revision change | `ListObjectsV2(prefix, delimiter = "/", continuation)` |
+| `OPENDIR p` | `list_objects`, `prefix = dir(p)`; a decision carrying both `narrow_prefix` and `allowed_prefixes` is denied | none at open, unless the decision narrows the listing: then the whole listing is assembled at OPENDIR (`ListObjectsV2` per granted prefix, at most 100,000 entries, `SSH_FX_FAILURE` above) |
+| `READDIR h` | re-decided on a revision change; a re-decision that changes the granted scope refuses the handle | `ListObjectsV2(prefix, delimiter = "/", continuation)` |
 | `OPEN p` read | `read_objects`, `object = key` | `GetObject` (ranged on a non-sequential READ) |
 | `OPEN p` write | `create_objects` or `write_objects` (D8) | `HeadObject`, `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`, `AbortMultipartUpload`, `PutObject` |
 | `REMOVE p` | `delete_objects`, `object = key` | `HeadObject` (for `NO_SUCH_FILE`), `DeleteObject` |
-| `MKDIR p` | `create_objects`, `object = key/` | `PutObject(key/, empty, If-None-Match: *)` |
-| `RMDIR p` | `delete_objects` on `key/` **and** `list_objects` on `key/` | `ListObjectsV2(max-keys = 2)`, `DeleteObject(key/)` |
-| `RENAME a b` | `read_objects` on `a`, `create_objects` on `b`, `delete_objects` on `a` | `HeadObject`, `CreateMultipartUpload`, `UploadPartCopy`×n, `CompleteMultipartUpload(If-None-Match: *)`, `DeleteObject` |
+| `MKDIR p` | `create_objects`, `object = key/` | `native`: `PutObject(key/, empty, If-None-Match: *)`; `check_then_write`: `HeadObject(key/)` then a plain `PutObject` |
+| `RMDIR p` | `delete_objects` on `key/` **and** `list_objects` on `key/`; a `list_objects` decision that comes back narrowed is denied (emptiness must be judged on the whole directory) | `ListObjectsV2(max-keys = 2)`, `DeleteObject(key/)`; a missing marker is `SSH_FX_NO_SUCH_FILE`, and `/` cannot be removed |
+| `RENAME a b` | `read_objects` on `a`, `create_objects` on `b`, `delete_objects` on `a`; `a == b` is answered OK with no decision | `HeadObject`, `CreateMultipartUpload`, `UploadPartCopy`×n, `CompleteMultipartUpload` (`If-None-Match: *` on `native`; on `check_then_write`, the in-flight claim and a re-HEAD instead), `DeleteObject`; a zero-byte source is written with `PutObject`; a directory source is `SSH_FX_NO_SUCH_FILE` (D10) |
 | `posix-rename@openssh.com a b` | `read_objects` on `a`, `write_objects` on `b`, `delete_objects` on `a` | `CopyObject` (or multipart copy above 5 GiB), `DeleteObject` |
 
 RMDIR takes a `list_objects` decision because emptiness is a fact about the prefix, and every
@@ -539,7 +577,8 @@ same rule builds the `key/` forms in this table (MKDIR, RMDIR) and in D10.
   bounded by `max_list_fanout` (fail closed above, as in ADR-004). This is how a principal
   scoped to `in/a/` can `cd in` and see `a`.
 - On a STAT carrying such an obligation, the target is a directory iff some `Q` starts with
-  `key/`. No backend call is made.
+  `key/`, and no backend call is made — unless a granted prefix equals the key itself, which
+  is then resolved on the backend like an unscoped STAT.
 - `excluded_prefixes` with `must_understand` is **denied**, on SFTP as on S3 (E2). Neither
   front filters today. When s0 implements the obligation it applies to both through the
   shared `Enforcer`.
@@ -553,7 +592,7 @@ same rule builds the `key/` forms in this table (MKDIR, RMDIR) and in D10.
 
 | `pflags` (v3) | Meaning | Decision and behaviour |
 |---|---|---|
-| `READ` | download | `read_objects`. |
+| `READ` | download | `read_objects`. `READ` with `CREAT`, `TRUNC` or `EXCL` is `SSH_FX_OP_UNSUPPORTED`; `READ` on `/` is `SSH_FX_FAILURE` ("is a directory"). |
 | `WRITE\|CREAT\|TRUNC` | create or replace (OpenSSH `put`, WinSCP, FileZilla, lftp, paramiko `"w"`, JSch/MINA default) | Decide `create_objects`; if allowed, `HeadObject`. **Absent** ⇒ create path. **Present** ⇒ decide `write_objects`: allowed ⇒ overwrite path; denied ⇒ `SSH_FX_PERMISSION_DENIED` ("file exists and overwrite is not granted") at OPEN, **before any byte is written**. |
 | `WRITE\|CREAT\|EXCL` (± `TRUNC`) | must not exist | `create_objects` only; present ⇒ `SSH_FX_FAILURE` ("file exists"; v3 has no `FILE_ALREADY_EXISTS`). |
 | `WRITE\|TRUNC` | replace an existing file | `write_objects`; absent ⇒ `SSH_FX_NO_SUCH_FILE`. |
@@ -579,21 +618,23 @@ fronts; the old `sftp.conditional_create` map is refused, not ignored):
 - **`check_then_write`** (the default): s0 re-issues `HeadObject` immediately before the commit
   and refuses if the key appeared. **Residual race**: the window between that final HEAD and
   the commit (one backend round trip). A create that loses the race overwrites. It is
-  narrowed further by a per-process registry of in-flight target keys: a second OPEN on a key
-  already being uploaded in the same replica is refused with `SSH_FX_FAILURE` ("upload in
-  progress"). Across replicas, only `native` closes it.
+  narrowed further by a per-process registry of in-flight create-only targets: a second
+  create-only OPEN or rename onto a key a create-only transfer already holds in the same
+  replica is refused with `SSH_FX_FAILURE` ("upload in progress"). The registry is used in
+  both modes, `native` included; an OPEN that overwrites an existing key (`write_objects`)
+  neither claims nor checks it. Across replicas, only `native` closes the race.
 
 `native` is an operator **assertion**. A backend that silently ignores `If-None-Match` turns
 create-only into overwrite with no error anywhere, so s0 never assumes support. The
 conformance probe — two conditional writes to one fresh key, where the second must fail with
-412 — is part of `tests/e2e/run.sh` from PR 4, and the ADR's matrix is updated with its
+412 — is part of `tests/e2e/run.sh`, and the ADR's matrix is updated with its
 results:
 
 | Backend | `PutObject` + `If-None-Match: *` | `CompleteMultipartUpload` + `If-None-Match: *` | Destination condition on `CopyObject` | Verified in this repository |
 |---|---|---|---|---|
 | s3s / s3s-aws 0.14.1 (the forward path) | carried | carried | **not expressible** | yes (E4) |
 | AWS S3 | documented by AWS | documented by AWS | — | no (no AWS in CI) |
-| MinIO (e2e image `pgsty/silo`) | reported | unverified | — | PR 4 probe |
+| MinIO (e2e image `pgsty/silo`) | reported | unverified | — | `run.sh` probe |
 | Ceph RGW | reported | unverified, version-dependent | — | conformance harness (scaffolded, not yet wired) |
 | any other S3 backend | unknown | unknown | — | run the probe before declaring `native` |
 
@@ -622,7 +663,7 @@ results:
   OPEN fails with `SSH_FX_FAILURE` ("server busy"). A read OPEN reserves its `read_ahead`
   from the same budget for as long as the handle is open, under the same rule.
 - *Backpressure*: when a transfer's buffers are full, the session stops reading from the
-  channel, and SSH flow control stops the client. PR 3 verifies that russh replenishes the
+  channel, and SSH flow control stops the client. This relies on russh replenishing the
   window only as data is consumed.
 - *A client that stops reading replies* cannot freeze its session: the idle check, the
   revocation sweep and drain still run, and tear it down. If it has stopped reading at the
@@ -677,7 +718,8 @@ non-zero offset, is `SSH_FX_OP_UNSUPPORTED`.
 
 **Downloads.**
 
-- OPEN(read) opens one streaming `GetObject` with a bounded read-ahead (default 1 MiB).
+- OPEN(read) opens one streaming `GetObject` with a bounded read-ahead
+  (`limits.sftp.read_ahead`, default 1 MiB, reserved from `max_transfer_memory`).
 - Sequential READs are served from the stream. A non-sequential READ reopens with a `Range`.
 - A READ past the end returns `SSH_FX_EOF`.
 
@@ -690,13 +732,14 @@ write (create or overwrite) of the target, and a delete of the source (D7).
 - A create-only RENAME on a `check_then_write` backend is guarded like a create-only upload
   (D8): the target is claimed in the in-flight registry for the whole copy, and re-checked
   immediately before the commit.
-- Renaming a non-empty directory is refused in v1. An empty directory (a marker) is renamed
-  as its marker.
+- Directory renames, empty or not, are not supported in v1: the source has no object at its
+  key, so RENAME answers `SSH_FX_NO_SUCH_FILE` ("directory renames are not supported").
 
 ### D10 — Directories are prefixes
 
-- **mkdir** writes a zero-byte **marker object** `key/` under `create_objects`,
-  conditionally. It is persistent across sessions, visible to S3 tools the way consoles
+- **mkdir** writes a zero-byte **marker object** `key/` under `create_objects`:
+  conditionally (`If-None-Match: *`) on a `native` backend, as a `HeadObject` then a plain
+  `PutObject` on `check_then_write`, with no in-flight claim. It is persistent across sessions, visible to S3 tools the way consoles
   already show folders, and needs no session state.
   - An existing marker ⇒ `SSH_FX_FAILURE`.
   - An *implicit* directory (objects under `key/`, no marker) gets a marker and `SSH_FX_OK`.
@@ -710,9 +753,12 @@ write (create or overwrite) of the target, and a delete of the source (D7).
   - `.` and `..` are synthesized.
   - An empty directory lists as `.` and `..` only.
   - A file `x` and a directory `x/` can coexist in an object store. Both are listed, and STAT
-    resolves to the file.
-- **Attributes** are synthesized: size and modification time from the backend, and fixed modes
-  (`0640` for files, `0750` for directories) that describe nothing about authorization.
+    resolves to the file. A listing narrowed to granted prefixes (D7) shows a single entry
+    named `x`.
+- **Attributes** are synthesized: files get size and modification time from the backend,
+  directories carry only their mode, and FSTAT on a handle reports a modification time of
+  0. Modes are fixed (`0640` for files, `0750` for directories) and describe nothing about
+  authorization.
   `longname` is rendered in `ls -l` form with owner and group `-`.
 
 ### D11 — Everything else, decided per operation
@@ -725,35 +771,41 @@ write (create or overwrite) of the target, and a delete of the source (D7).
 | `hardlink@openssh.com`, `copy-data`, `lsetstat@openssh.com`, `users-groups-by-id@openssh.com`, `expand-path@openssh.com`, `home-directory` | `SSH_FX_OP_UNSUPPORTED` | Not needed by any client in the matrix. |
 | `statvfs@openssh.com`, `fstatvfs@openssh.com` | `SSH_FX_OP_UNSUPPORTED` | No meaningful answer, and the backend's capacity is not the client's business. |
 | `fsync@openssh.com` | `SSH_FX_OP_UNSUPPORTED` | Durability is only established at CLOSE, and claiming otherwise would lie. Only `sftp -f` sends it. |
-| `limits@openssh.com` | served | It advertises s0's packet and read/write lengths and `max_write_handles`, so clients size their pipelining to the server. |
+| `limits@openssh.com` | served | It advertises the packet length (`max_sftp_packet_len`), a 255 KiB read length, a write length of `max_sftp_packet_len − 1024`, and `max_write_handles + 64` open handles (write handles plus read and directory handles), so clients size their pipelining to the server. |
 | `posix-rename@openssh.com` | served | Overwrite rename (D7). |
-| any other `SSH_FXP_EXTENDED`, any unknown packet type | `SSH_FX_OP_UNSUPPORTED`, or close for a framing error | Closed table (D2). |
+| any other `SSH_FXP_EXTENDED`, any unknown packet type | `SSH_FX_OP_UNSUPPORTED`; a framing error gets `SSH_FX_BAD_MESSAGE` (when its id is readable) and the channel closes (D4) | Closed set (D2). |
 
 The `SSH_FXP_VERSION` reply advertises exactly `limits@openssh.com` and
-`posix-rename@openssh.com`. Each row above is a black-box test case, generated from the table.
+`posix-rename@openssh.com`. Each row above is covered by a black-box test in
+`tests/sftp_e2e.rs`.
 
 ### D12 — Limits and abuse resistance
 
 All limits sit in `limits.sftp` inside the existing hot-reloadable `LimitsConfig` (loaded at
 the point of use, per `Gateway::limits`). They apply to new connections and new transfers
-without a restart. Only `frontends.sftp.listen`, `frontends.sftp.host_keys` and
-`frontends.sftp.proxy_protocol` need a restart.
+without a restart, with two exceptions fixed when the listener starts, because they live in
+russh's server config: `max_auth_attempts`, and russh's inactivity backstop
+(`idle_timeout_secs` + 60 s; the session's own idle check reads the live value). Of the
+listener settings, `frontends.sftp.listen`, `host_keys`, `proxy_protocol` and `drain_secs`
+need a restart.
 
 | Limit | Default | Scope |
 |---|---|---|
 | `max_connections` | 256 | process |
 | `max_connections_per_ip` | 16 | process, per IPv4 /32 or IPv6 /64 |
 | `max_sessions_per_subject` | 16 | process; rclone's defaults (4 transfers + 8 checkers) open about 13 connections |
-| `preauth_rate_per_ip` | 10/min, burst 20 | process, token bucket |
+| `preauth_rate_per_ip_per_min`, `preauth_burst_per_ip` | 10/min, burst 20 | process, token bucket per IP |
 | `handshake_timeout_secs` | 30 | from TCP accept to authentication success, including the PROXY header, the version exchange and KEX; an authenticated connection that has not started the `sftp` subsystem one more timeout later is disconnected (D9) |
-| `max_auth_attempts` | 6 | connection |
+| `max_auth_attempts` | 6 (1–10) | connection; fixed at listener start |
 | `max_key_probes` | 10 | connection, counted separately from attempts (D3) |
-| `auth_failure_ban` | 10 failures in 5 min ⇒ 15 min ban | process, per /32 or /64, LRU-bounded table; only credential mismatches count, and only when their connection ends unauthenticated (D3) |
+| `auth_failure_ban_threshold`, `auth_failure_window_secs`, `auth_failure_ban_secs` | 10 failures in 300 s ⇒ 900 s ban | process, per /32 or /64; only credential mismatches count, and only when their connection ends unauthenticated (D3) |
+| `ban_table_size` | 65,536 | process; LRU bound on both the ban table and the pre-auth rate table |
 | `idle_timeout_secs` | 300 | session, no SFTP request |
 | `transfer_idle_timeout_secs` | 120 | transfer |
 | `max_file_size` | 50 GiB | transfer |
 | `bandwidth_bytes_per_sec` | unlimited | per session, per direction; optional process-wide cap |
 | `part_size`, `max_inflight_parts`, `reorder_window`, `max_write_handles`, `max_transfer_memory` | D9 | transfer / session / process |
+| `read_ahead` | 1 MiB | read handle; reserved from `max_transfer_memory`, which it must not exceed |
 | `max_sftp_packet_len` | 262,144 | packet |
 
 **Bans are per replica and reconstructible, not shared.** The failure counters live in
@@ -797,8 +849,9 @@ denial of service, so a deployment that cannot preserve the source must configur
   reason names the half that denied it (`"rename source read: …"`, `"rename target write:
   …"`, `"rename source delete: …"`), following ADR-002 D4.
 - **A file transfer is one operation.** OPEN to CLOSE is one record: the decision at OPEN,
-  settled at CLOSE with the outcome (`committed`, `aborted` or `rejected`, plus the reason),
-  byte count and part count, through the `PendingAudit` pattern. Per-packet records would
+  settled at CLOSE through the `PendingAudit` pattern with a `transfer` block: `commit` is
+  `committed`, `aborted`, `rejected` or `denied` for an upload and `read` for a download
+  (`parts: 0`), with the byte count, the part count and an optional `reason`. Per-packet records would
   mean 32,768 records per GiB carrying no extra information. A mid-transfer denial settles
   the same record as `denied`, naming the byte offset.
 - A new optional `gateway.session` block, absent on S3 records:
@@ -814,10 +867,12 @@ denial of service, so a deployment that cannot preserve the source must configur
                       "ca_fingerprint": "SHA256:…" } },
   "sftp_op": "OPEN",
   "open_flags": ["WRITE", "CREAT", "TRUNC"],
-  "transfer": { "bytes": 7340032, "parts": 1, "commit": "committed" },
-  "omitted_entries": 0
+  "transfer": { "bytes": 7340032, "parts": 1, "commit": "committed" }
 }
 ```
+
+`omitted_entries` (D6) appears only on a listing's record, set when its directory handle
+closes.
 
 `session_id` is a gateway-generated UUID, not the SSH exchange hash, which is a protocol value
 rather than an identifier. `sftp_op` sits next to the verb in `input.action`.
@@ -825,13 +880,17 @@ rather than an identifier. `sftp_op` sits next to the verb in `input.action`.
 **Connection-level events** are a third record shape beside decision and gate records.
 Exactly one of `input`, `gate` or `session_event` is present, and `path` is `sftp/session`:
 
+A `session_event` carries the event kind, `protocol`, `session_id`, `client_ip`, and when
+known `login`, `auth` and `tenant`; `disconnected` adds the duration, operation count and
+bytes in each direction, and `auth_failed` adds `credential_mismatch`.
+
 | Event | Attribution | Budgeted |
 |---|---|---|
 | `preauth_rejected` (connection cap, rate limit, ban, CIDR denylist, bad PROXY header, non-strict KEX) | none | yes — the gate-denial budget |
 | `auth_failed` (unknown login, unknown key, revoked certificate, CIDR mismatch, …) | none; `login` recorded, org label **omitted** | yes |
 | `banned` | none | no — bounded by the ban rate itself |
 | `auth_succeeded` | principal and org label | no |
-| `disconnected` (client close, connection lost, idle, credential revoked, shutdown, no `sftp` subsystem, session teardown timeout, protocol error) with duration, operation count and bytes in each direction | principal and org label | no |
+| `disconnected` (client close, connection lost, idle, credential revoked, shutdown, no `sftp` subsystem, session teardown timeout, protocol error) with duration, operation count and bytes in each direction — **authenticated sessions only**; a connection that ends unauthenticated leaves no `disconnected` record | principal and org label | no |
 
 Every record still carries the required `result: Decision`. For a session event it states
 what happened rather than a PDP answer, and `obligations` is always empty:
@@ -840,7 +899,7 @@ what happened rather than a PDP answer, and `obligations` is always empty:
 |---|---|---|
 | `preauth_rejected`, `auth_failed`, `banned` | `false` | `deny (gateway): <why>` — for example `deny (gateway): key not authorized for login` |
 | `auth_succeeded` | `true` | `allow (gateway): publickey` or `allow (gateway): openssh-cert` |
-| `disconnected` | whether the session had authenticated | `disconnect: <reason>` |
+| `disconnected` | `true` (emitted only for sessions that authenticated) | `disconnect: <reason>` |
 
 The `(gateway)` prefix follows `GatewayAccess::refuse`: no policy was asked, and the reason
 must not read as a policy verdict.
@@ -872,17 +931,23 @@ Nothing is inspected in v1. The ordering between "upload complete on the SFTP si
 moving commits:
 
 1. OPEN authorized;
-2. bytes streamed: each part passes an **observer** (`on_bytes`, a no-op in v1) and is then
-   sent as `UploadPart`;
-3. CLOSE received, and the last part flushed;
+2. bytes streamed: each in-order chunk passes an **observer** (`transfer::Observer`, an
+   `Arc<dyn Fn(&[u8])>` closure, a no-op in v1 with no way yet to install another) as it
+   is appended; full parts are sent as `UploadPart` as they fill;
+3. CLOSE received;
 4. **final re-authorization** against the current bundle;
-5. **commit gate** — `CommitGate::before_commit(&TransferContext) -> CommitVerdict`, where
-   `CommitVerdict` is `Commit`, `Reject { reason }` or `Quarantine { reason }`. v1 always
-   returns `Commit`, and `Quarantine` is refused as unimplemented until a later ADR defines
-   where quarantined objects go and who may read them;
-6. conditional commit (D8);
+5. parts already in flight drained, then the **commit gate** —
+   `CommitGate::before_commit(&TransferContext) -> CommitVerdict`, where `CommitVerdict` is
+   `Commit`, `Reject { reason }` or `Quarantine { reason }`. v1 always returns `Commit`, and
+   `Quarantine` is refused as unimplemented until a later ADR defines where quarantined
+   objects go and who may read them;
+6. the `check_then_write` re-check (D8), then the last partial part sent (or, for a file
+   under `part_size`, the single `PutObject`), and the conditional commit;
 7. audit settled;
 8. `SSH_FX_OK` returned to CLOSE.
+
+The gate therefore sees every byte through the observer, but runs before the last part
+reaches the backend.
 
 A `Reject` aborts the upload and answers `SSH_FX_FAILURE` with the reason, and the record says
 `commit: "rejected"`. Inspection time adds to CLOSE latency, which a later ADR must weigh
@@ -899,7 +964,7 @@ against client timeouts.
 | T3 | Escape from the virtual root (`..`, NUL, `\`, encodings, stem prefixes) | D6 normalization, post-mapping prefix assertion, `/`-terminated homes, PDP grant scope as an independent second layer. | None known. Traversal is a named regression suite. |
 | T4 | Overwrite or destroy existing drops | `create_objects` in policy. Existence refused at OPEN. Conditional commit, or re-check plus in-flight registry (D8). Delete requires `delete_objects`. | `check_then_write` backends: a one-round-trip cross-replica race. |
 | T5 | Reading other drops through stat, readdir or rename | Stat and readdir need `list_objects`. Rename needs `read_objects` on the source. Internal HEADs return no content (D7). | A `list_objects` holder sees names, sizes and times, by design. |
-| T6 | A revoked key keeps a session | Per-operation credential re-check, a sweep on every bundle swap, transfer re-decision (D5). | Up to one poll interval. |
+| T6 | A revoked key keeps a session | Per-operation credential re-check, a re-check by every session on each bundle change, transfer re-decision (D5). | Up to one poll interval. |
 | T7 | Pre-auth flood, brute force | Per-IP rate, connection caps, handshake timeout, constant-time rejection, auth-attempt and key-probe caps, bans, bundle-distributed CIDR denylist (D12). | Bans are per replica: an `R`× budget across `R` replicas. |
 | T8 | Resource exhaustion by pipelined writes, many handles or slow clients | Up-front memory reservation, bounded reorder window, handle caps, idle timeouts, SSH flow control (D9, D12). | None beyond configured bounds. |
 | T9 | Orphaned multipart parts consuming storage | Abort on every error path (D9). | A hard kill leaves parts; a lifecycle rule is an operator obligation. |
@@ -970,7 +1035,8 @@ against client timeouts.
   - a newer binary on a v2 bundle serves S3 exactly as before and no SFTP.
 - Every captured input gains `"protocol": "s3"`. The corpus is regenerated once. No S3
   decision changes, which the parity gate proves.
-- The core refactor (D2) is a separate PR proven only by the existing suite.
+- The core refactor (D2) landed together with the SFTP front (#42); the existing suite and
+  the parity gate pass on it with only references renamed.
 - RSA partner keys are not accepted in v1.
 - WinSCP's default transfer to a temporary name followed by rename, and its timestamp
   preservation, do not work for a create-only account (see the client matrix).
@@ -986,8 +1052,9 @@ against client timeouts.
 
 ### Follow-ups
 
-- **F1** — map S3 `PutObject` / `CompleteMultipartUpload` with `If-None-Match: *` onto
-  `create_objects`, so the drop-box posture is available over S3 too.
+- **F1** — *done*: S3 `PutObject` / `CompleteMultipartUpload` with `If-None-Match: *` map
+  onto `create_objects` on `native` backends, so the drop-box posture is available over S3
+  too (D7).
 - **F2** — RSA client keys, once the signature algorithm is enforceable (E6).
 - **F3** — `excluded_prefixes`, for both fronts at once.
 - **F4** — the content-inspection stage (D14).
@@ -1049,6 +1116,10 @@ Every client is exercised in PR 8 against the real stack. The expected settings 
   - abort on disconnect (no orphaned upload left).
 
 ## Implementation slicing
+
+The slicing below was the plan. In practice the `Enforcer` extraction, `request.protocol` and
+`create_objects`, and the whole SFTP front landed together in one PR (#42); the list is kept
+as a map of the pieces.
 
 0. This ADR.
 1. `refactor(access)`: extract the `Enforcer`. No behaviour change, and the existing suite is
