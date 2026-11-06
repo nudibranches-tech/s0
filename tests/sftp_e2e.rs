@@ -2329,3 +2329,189 @@ async fn a_client_stalled_at_the_tcp_level_has_its_socket_closed() {
     pipeline.abort();
     assert!(closed, "the stalled connection's socket is released");
 }
+
+// ── ADR-009 test plan: security regressions on the key path ──────────────────
+
+/// A 3072-bit RSA key — the size floor the original requirement named — so a refusal
+/// can only be about the algorithm, never the size.
+fn rsa_3072() -> PrivateKey {
+    PrivateKey::from_openssh(include_str!("data/sftp-rsa-3072-client-key")).unwrap()
+}
+
+fn auth_failures(recs: &[AuditRecord]) -> Vec<&AuditRecord> {
+    recs.iter()
+        .filter(|x| {
+            x.session_event
+                .as_ref()
+                .is_some_and(|e| e.event == SessionEventKind::AuthFailed)
+        })
+        .collect()
+}
+
+/// D3 / E6: RSA client keys are refused, whatever signature algorithm the client
+/// proposes — `ssh-rsa` (SHA-1) included — and even when the bundle lists the key.
+///
+/// The SHA-1 attempt is negotiable as far as the transport goes: the client signature
+/// algorithm is not part of KEX, so the host-key and KEX floors do not stop a client
+/// from *offering* `ssh-rsa`. What the server does is (a) advertise no RSA algorithm
+/// at all in `server-sig-algs`, and (b) refuse the key at the probe, so no SHA-1
+/// signature is ever verified. russh 0.63.3 also routes a signed request that skips
+/// the probe through `auth_publickey_offered`, the same refusal; and the account layer
+/// refuses RSA again at authentication
+/// (`account::tests::a_listed_rsa_key_is_refused_as_a_credential_mismatch`).
+#[tokio::test]
+async fn an_rsa_client_key_is_refused_in_every_signature_algorithm_sha1_included() {
+    let h = harness("sftp-rsa", "native").await;
+    let rsa = Arc::new(rsa_3072());
+    // List the RSA key on the account, so a refusal cannot be "key not authorized".
+    let mut b = bundle(&h.drop_key, &h.ops_key);
+    b["sftp"]["accounts"]["acme-ops"]["authorized_keys"] = serde_json::json!([
+        { "key_type": "ssh-ed25519", "fingerprint": fp(&h.ops_key) },
+        { "key_type": "ssh-rsa", "fingerprint": fp(&rsa) }
+    ]);
+    h.fx.gw
+        .bundles
+        .store(s0::pdp::Bundle::new("rev-rsa-listed", b));
+
+    let algs = [
+        (None, "ssh-rsa (SHA-1)"),
+        (Some(ssh_key::HashAlg::Sha256), "rsa-sha2-256"),
+        (Some(ssh_key::HashAlg::Sha512), "rsa-sha2-512"),
+    ];
+    for (hash, name) in algs {
+        let cfg = Arc::new(russh::client::Config::default());
+        let mut session = russh::client::connect(cfg, h.addr, Client)
+            .await
+            .expect("KEX completes: the client signature algorithm is not negotiated there");
+        if hash.is_none() {
+            assert_eq!(
+                session.best_supported_rsa_hash().await.unwrap(),
+                None,
+                "server-sig-algs must advertise no RSA signature algorithm, SHA-1 included"
+            );
+        }
+        let r = session
+            .authenticate_publickey("acme-ops", PrivateKeyWithHashAlg::new(rsa.clone(), hash))
+            .await;
+        assert!(
+            !matches!(&r, Ok(a) if a.success()),
+            "an RSA key authenticated with {name}: {r:?}"
+        );
+    }
+
+    let recs = records(&h.fx, |r| auth_failures(r).len() >= algs.len()).await;
+    let failures = auth_failures(&recs);
+    assert_eq!(failures.len(), algs.len(), "one refusal per attempt");
+    for f in failures {
+        assert!(
+            f.result.reason.contains("is not accepted") && f.result.reason.contains("RSA"),
+            "{}",
+            f.result.reason
+        );
+        assert!(!f.result.allow);
+        assert!(!f.labels.contains_key("s0/organization-id"));
+        assert_eq!(
+            f.session_event.as_ref().unwrap().credential_mismatch,
+            Some(true),
+            "an RSA key is a credential mismatch, counted toward the ban"
+        );
+    }
+    // The listed ed25519 key on the same account still logs in.
+    assert!(connect(h.addr, "acme-ops", &h.ops_key).await.is_ok());
+}
+
+/// D3 / D12: probes are capped separately from attempts. Past `max_key_probes` the
+/// connection is dropped, the overflow is one `auth_failed` credential mismatch, and it
+/// counts toward the ban because the connection ends unauthenticated.
+///
+/// The ban threshold is set to exactly the number of failures the flood produces (the
+/// two signed-and-rejected keys plus the overflow), so the ban only happens if the
+/// overflow itself is counted.
+#[tokio::test]
+async fn a_key_probe_flood_is_disconnected_and_counts_toward_the_ban() {
+    let h = harness_with("sftp-probe-flood", "native", |c| {
+        sftp_limits(
+            c,
+            serde_json::json!({
+                "max_key_probes": 2,
+                "max_auth_attempts": 10,
+                "auth_failure_ban_threshold": 3
+            }),
+        );
+    })
+    .await;
+    let cfg = Arc::new(russh::client::Config::default());
+    let mut session = russh::client::connect(cfg, h.addr, Client).await.unwrap();
+    // russh's client probes each key before signing: every call is one probe.
+    for i in 0..2 {
+        let r = session
+            .authenticate_publickey(
+                "acme-ops",
+                PrivateKeyWithHashAlg::new(Arc::new(ed25519()), None),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("probe {i} is within the cap: {e}"));
+        assert!(!r.success());
+    }
+    let r = session
+        .authenticate_publickey(
+            "acme-ops",
+            PrivateKeyWithHashAlg::new(Arc::new(ed25519()), None),
+        )
+        .await;
+    assert!(
+        !matches!(&r, Ok(a) if a.success()),
+        "the probe over the cap: {r:?}"
+    );
+    // The connection is gone: not even the right key gets in on it.
+    let r = session
+        .authenticate_publickey(
+            "acme-ops",
+            PrivateKeyWithHashAlg::new(Arc::new(h.ops_key.clone()), None),
+        )
+        .await;
+    assert!(
+        !matches!(&r, Ok(a) if a.success()),
+        "the flooded connection must be closed: {r:?}"
+    );
+
+    let recs = records(&h.fx, |r| {
+        r.iter().any(|x| {
+            x.session_event
+                .as_ref()
+                .is_some_and(|e| e.event == SessionEventKind::Banned)
+        })
+    })
+    .await;
+    let failures = auth_failures(&recs);
+    let overflow: Vec<_> = failures
+        .iter()
+        .filter(|f| f.result.reason.contains("more than 2 public keys offered"))
+        .collect();
+    assert_eq!(overflow.len(), 1, "one overflow record: {failures:#?}");
+    assert_eq!(
+        overflow[0]
+            .session_event
+            .as_ref()
+            .unwrap()
+            .credential_mismatch,
+        Some(true)
+    );
+    assert_eq!(
+        failures.len(),
+        3,
+        "two rejected keys and the overflow: {failures:#?}"
+    );
+    assert!(
+        recs.iter().any(|x| x
+            .session_event
+            .as_ref()
+            .is_some_and(|e| e.event == SessionEventKind::Banned)),
+        "the overflow counted: three failures reach the threshold of three"
+    );
+    assert!(
+        connect(h.addr, "acme-ops", &h.ops_key).await.is_err(),
+        "the address is banned, even for the right key"
+    );
+}
+
