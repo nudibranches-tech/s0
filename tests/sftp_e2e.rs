@@ -483,6 +483,7 @@ struct Harness {
     addr: SocketAddr,
     drop_key: PrivateKey,
     ops_key: PrivateKey,
+    metrics: Arc<s0::sftp::SftpMetrics>,
     _stop: tokio::sync::oneshot::Sender<()>,
 }
 
@@ -545,6 +546,7 @@ async fn harness_with(tag: &str, mode: &str, edit: impl FnOnce(&mut serde_json::
     }))
     .unwrap();
     let front = SftpFront::build(fx.gw.clone(), &cfg).expect("front");
+    let metrics = front.metrics();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -557,6 +559,7 @@ async fn harness_with(tag: &str, mode: &str, edit: impl FnOnce(&mut serde_json::
         addr,
         drop_key,
         ops_key,
+        metrics,
         _stop: stop,
     }
 }
@@ -2328,4 +2331,55 @@ async fn a_client_stalled_at_the_tcp_level_has_its_socket_closed() {
     }
     pipeline.abort();
     assert!(closed, "the stalled connection's socket is released");
+}
+
+#[tokio::test]
+async fn the_process_bandwidth_cap_holds_concurrent_sessions_together() {
+    // 256 KiB/s for the whole replica, no per-session cap: two sessions downloading
+    // 512 KiB each (1 MiB together) need at least (1 MiB - the 1 s burst) / rate = 3 s,
+    // where uncapped they take milliseconds.
+    const RATE: usize = 256 * 1024;
+    const SIZE: usize = 512 * 1024;
+    let h = harness_with("sftp-process-bandwidth", "native", |c| {
+        sftp_limits(
+            c,
+            serde_json::json!({ "process_bandwidth_bytes_per_sec": RATE }),
+        )
+    })
+    .await;
+    let data: Vec<u8> = (0..SIZE).map(|i| (i % 249) as u8).collect();
+    h.put("a.bin", &data);
+    h.put("b.bin", &data);
+    let download = |path: &'static str| {
+        let (addr, key, want) = (h.addr, h.ops_key.clone(), data.clone());
+        async move {
+            let mut c = connect(addr, "acme-ops", &key).await.expect("connect");
+            let Reply::Handle(hd) = c.open(path, SSH_FXF_READ).await else {
+                panic!()
+            };
+            let mut got = Vec::new();
+            loop {
+                match c.read(&hd, got.len() as u64, 32 * 1024).await {
+                    Reply::Data(d) => got.extend_from_slice(&d),
+                    Reply::Status(1, _) => break,
+                    other => panic!("{other:?}"),
+                }
+            }
+            assert_eq!(got, want, "{path}");
+            tokio::time::Instant::now()
+        }
+    };
+    let t0 = tokio::time::Instant::now();
+    let (a, b) = tokio::join!(download("/a.bin"), download("/b.bin"));
+    let total = a.max(b) - t0;
+    let floor = Duration::from_secs_f64((2 * SIZE - RATE) as f64 / RATE as f64);
+    assert!(
+        total >= floor.mul_f64(0.9),
+        "1 MiB at 256 KiB/s with a 1 s burst took only {total:?}"
+    );
+    assert!(total < Duration::from_secs(15), "{total:?}");
+    // Neither session is starved: they share the budget and finish close together.
+    let gap = if a > b { a - b } else { b - a };
+    assert!(gap < Duration::from_millis(1500), "finish gap {gap:?}");
+    assert!(h.metrics.process_bandwidth_wait_ms.load(Ordering::Relaxed) > 0);
 }

@@ -45,8 +45,8 @@ use crate::error::{GatewayError, Result};
 use crate::gateway::Gateway;
 use account::{Authenticated, Credential, DirectoryCache};
 use limits::{
-    BanPolicy, BanTable, Cidr, ConnectionTracker, MemoryBudget, PreauthRate, SubjectGuard,
-    SubjectSessions,
+    BanPolicy, BanTable, Cidr, ConnectionTracker, MemoryBudget, PreauthRate, ProcessBandwidth,
+    SubjectGuard, SubjectSessions,
 };
 use preauth::{KillSwitch, ProxyHeader, StrictKexGuard};
 use session::{Next, SessionIdentity, SftpSession};
@@ -65,6 +65,9 @@ pub struct SftpMetrics {
     pub transfers_started: AtomicU64,
     pub transfers_committed: AtomicU64,
     pub transfers_aborted: AtomicU64,
+    /// Milliseconds replies were held by the process-wide bandwidth cap, summed over
+    /// sessions.
+    pub process_bandwidth_wait_ms: AtomicU64,
 }
 
 impl SftpMetrics {
@@ -132,6 +135,12 @@ impl SftpMetrics {
                 "Upload transfers aborted or rejected (never committed).",
                 g(&self.transfers_aborted),
             ),
+            (
+                "s0_sftp_process_bandwidth_wait_milliseconds_total",
+                "counter",
+                "Time SFTP sessions were held by limits.sftp.process_bandwidth_bytes_per_sec, summed over sessions.",
+                g(&self.process_bandwidth_wait_ms),
+            ),
         ]
     }
 }
@@ -152,6 +161,8 @@ pub struct Shared {
     pub directory: DirectoryCache,
     pub inflight: Arc<InflightKeys>,
     pub memory: MemoryBudget,
+    /// `limits.sftp.process_bandwidth_bytes_per_sec`, shared by every session.
+    pub bandwidth: ProcessBandwidth,
     pub connections: Arc<ConnectionTracker>,
     pub subjects: Arc<SubjectSessions>,
     pub bans: BanTable,
@@ -465,6 +476,7 @@ impl SftpFront {
             directory: DirectoryCache::default(),
             inflight: Arc::new(InflightKeys::default()),
             memory: MemoryBudget::new(limits.max_transfer_memory),
+            bandwidth: ProcessBandwidth::default(),
             connections: Arc::new(ConnectionTracker::default()),
             subjects: Arc::new(SubjectSessions::default()),
             bans: BanTable::default(),
@@ -990,14 +1002,21 @@ struct Sent {
     close: Option<&'static str>,
 }
 
-/// Per-session bandwidth cap, per direction (ADR-009 D12). Unlimited by default.
+/// The bandwidth caps (ADR-009 D12), applied after each reply: the per-session cap and
+/// the optional process-wide one. Both are unlimited by default; the session waits for
+/// the longer of the two holds.
 ///
-/// The budget accrues from a baseline that is moved forward whenever the session is more
-/// than [`Pacer::MAX_CREDIT`] under its rate, so an idle or slow stretch cannot bank an
-/// unbounded burst to spend later at full speed.
+/// Per session, the budget accrues from a baseline that is moved forward whenever the
+/// session is more than [`Pacer::MAX_CREDIT`] under its rate, so an idle or slow stretch
+/// cannot bank an unbounded burst to spend later at full speed. Process-wide, the bytes
+/// moved since the last reply are charged to [`Shared::bandwidth`], per direction (see
+/// [`limits::TokenBucket`] for the fairness and burst argument).
 struct Pacer {
     base: Instant,
     base_moved: u64,
+    /// `bytes_in` / `bytes_out` already charged to the process-wide buckets.
+    charged_in: u64,
+    charged_out: u64,
 }
 
 impl Pacer {
@@ -1007,20 +1026,50 @@ impl Pacer {
         Pacer {
             base: Instant::now(),
             base_moved: 0,
+            charged_in: 0,
+            charged_out: 0,
         }
     }
 
     async fn pace(&mut self, shared: &Shared, conn: &ConnState) {
-        let rate = shared.gw.limits().sftp.bandwidth_bytes_per_sec;
-        if rate == 0 {
-            return;
+        let (session_rate, process_rate) = {
+            let l = &shared.gw.limits().sftp;
+            (l.bandwidth_bytes_per_sec, l.process_bandwidth_bytes_per_sec)
+        };
+        let now = Instant::now();
+        let bytes_in = conn.counters.bytes_in.load(Ordering::Relaxed);
+        let bytes_out = conn.counters.bytes_out.load(Ordering::Relaxed);
+        let mut wait = Duration::ZERO;
+        if session_rate != 0
+            && let Some(w) = self.delay(bytes_in.max(bytes_out), session_rate, now)
+        {
+            wait = w;
         }
-        let moved = conn
-            .counters
-            .bytes_in
-            .load(Ordering::Relaxed)
-            .max(conn.counters.bytes_out.load(Ordering::Relaxed));
-        if let Some(wait) = self.delay(moved, rate, Instant::now()) {
+        // The baseline advances even while the cap is off, so switching it on never bills
+        // a session for bytes it moved before. A direction is charged only when it moved:
+        // an upload does not wait out the downloads' debt.
+        let up = bytes_in.saturating_sub(self.charged_in);
+        let down = bytes_out.saturating_sub(self.charged_out);
+        (self.charged_in, self.charged_out) = (bytes_in, bytes_out);
+        if process_rate != 0 {
+            let b = &shared.bandwidth;
+            let charge = |bucket: &limits::TokenBucket, n: u64| {
+                if n == 0 {
+                    Duration::ZERO
+                } else {
+                    bucket.charge(n, process_rate, now)
+                }
+            };
+            let held = charge(&b.upload, up).max(charge(&b.download, down));
+            if !held.is_zero() {
+                shared
+                    .metrics
+                    .process_bandwidth_wait_ms
+                    .fetch_add(held.as_millis() as u64, Ordering::Relaxed);
+            }
+            wait = wait.max(held);
+        }
+        if !wait.is_zero() {
             tokio::time::sleep(wait).await;
         }
     }
@@ -1053,6 +1102,8 @@ mod tests {
         let mut p = Pacer {
             base: t0,
             base_moved: 0,
+            charged_in: 0,
+            charged_out: 0,
         };
         // An hour of near-idle requests: a few bytes a minute, never held.
         let mut moved = 0;
@@ -1076,6 +1127,8 @@ mod tests {
         let mut p = Pacer {
             base: t0,
             base_moved: 0,
+            charged_in: 0,
+            charged_out: 0,
         };
         assert_eq!(
             p.delay(2_000, 1_000, t0 + Duration::from_secs(1)),
