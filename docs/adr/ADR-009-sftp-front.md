@@ -84,42 +84,57 @@ Apache-2.0. The BSD-3-Clause and ISC notices must ship with the image; PR 1 adds
 
 ### D1 — Process shape: same binary, same core, a front selected by config
 
-- A new top-level `frontends` list selects which data-plane fronts a process serves:
-  `["s3"]` (the default when absent, so every existing config keeps its behaviour),
-  `["sftp"]`, or `["s3", "sftp"]` (development only; logged at `warn`).
-- A new optional `sftp` section configures the listener. **No `sftp` section, no listener** —
-  exactly as with `sts_mint` and `internal`. `"sftp"` in `frontends` without the section, or
-  the section without `"sftp"` in `frontends`, is refused by `GatewayConfig::validate`.
-- An SFTP-only process (`frontends: ["sftp"]`) binds no S3 port. It still runs the bundle
-  poller, the audit worker and the admin listener.
+- A new top-level `frontends` object holds one section per data-plane front, each switched
+  by its own required `enabled` boolean (`GatewayConfig::s3_enabled`, `sftp_enabled`):
+  - `frontends.s3` — **absent ⇒ the S3 front is enabled**, so every existing config keeps
+    its behaviour. Present, it is `{ "enabled": bool, "listen"?: addr }`.
+  - `frontends.sftp` — **absent ⇒ no SFTP listener**, exactly as with `sts_mint` and
+    `internal`. Present, it carries `enabled`, `listen`, `host_keys`, `proxy_protocol` and
+    `drain_secs`. A section kept with `enabled: false` binds nothing, but its shape is
+    still validated, so flipping the switch later cannot be the moment a typo is found.
+  - Both enabled is for development only and logged at `warn`. Both disabled is refused:
+    the process would serve nothing.
+  - An `s3` or `sftp` section written at the top level instead of under `frontends` is
+    refused rather than ignored: it would load cleanly and switch nothing.
+- An SFTP-only process (`frontends.s3.enabled: false` plus an enabled `frontends.sftp`)
+  binds no S3 port. It still runs the bundle poller, the audit worker and the admin
+  listener.
 - **Config fields that only the S3 front needs become conditional.** Today `listen` and `sts`
   (including its signing key) are required, and `Gateway::build` always builds the STS
-  authority. After this change `listen` is required iff `"s3"` is in `frontends`, and `sts`
-  iff the process serves S3 or the mint or internal listeners, which mint STS sessions. An
-  SFTP pod therefore carries no STS key material. Every existing config names no
-  `frontends`, so it still means `["s3"]`, and its required fields do not change. This
-  lands with the refactor in D2, behind the existing suite. The production shape is **two
-  Deployments from one image**: a crash, a resource exhaustion or a memory-safety bug in SSH
-  parsing takes down SFTP pods and never the S3 front.
-- `sftp.listen` joins the listener-uniqueness check in `GatewayConfig::validate`.
+  authority. After this change the S3 listener — the top-level `listen` (its historical
+  place) or `frontends.s3.listen`, never both — is required iff the S3 front is enabled, and
+  refused when it is disabled, since a listener that is never bound reads exactly like one
+  that is. `sts` is required iff the process serves S3 or the mint or internal listeners,
+  which mint or verify STS sessions. An SFTP pod therefore carries no STS key material.
+  Every existing config has no `frontends`, so it still serves S3 alone, and its required
+  fields do not change. This lands with the refactor in D2, behind the existing suite. The
+  production shape is **two Deployments from one image**: a crash, a resource exhaustion or
+  a memory-safety bug in SSH parsing takes down SFTP pods and never the S3 front.
+- `frontends.sftp.listen` joins the listener-uniqueness check in `GatewayConfig::validate`.
 - **The admin listener is unchanged**: no new route. Host-key fingerprints are published as a
   metric series, `s0_sftp_host_key_info{algorithm="ssh-ed25519",fingerprint="SHA256:…"} 1`,
   and logged once at startup at `info`. Operators publish them for client pinning.
 - **Shutdown**: on SIGTERM readiness fails first (unchanged), the SFTP listener stops
-  accepting, open sessions get `sftp_drain_secs` (default 20) to finish in-flight commands;
+  accepting, open sessions get `frontends.sftp.drain_secs` (default 20) to finish in-flight commands;
   after that every open transfer is **aborted** (never committed), each session is closed with
   a `disconnected{reason: "shutdown"}` record, and only then is the audit worker drained. The
   documented `terminationGracePeriodSeconds: 60` still covers it.
 
 ```jsonc
 {
-  "frontends": ["sftp"],
-  "sftp": {
-    "listen": "0.0.0.0:2222",
-    "host_keys": ["/etc/s0/sftp/ssh_host_ed25519_key", "/etc/s0/sftp/ssh_host_ecdsa_key"],
-    "proxy_protocol": { "trusted_cidrs": ["198.51.100.0/28"] },
-    "conditional_create": { "backend-eu-1": "check_then_write" }
-  }
+  "frontends": {
+    "s3": { "enabled": false },
+    "sftp": {
+      "enabled": true,
+      "listen": "0.0.0.0:2222",
+      "host_keys": ["/etc/s0/sftp/ssh_host_ed25519_key", "/etc/s0/sftp/ssh_host_ecdsa_key"],
+      "proxy_protocol": { "trusted_cidrs": ["198.51.100.0/28"] },
+      "drain_secs": 20
+    }
+  },
+  "backends": [
+    { "id": "backend-eu-1", "conditional_create": "check_then_write" /* … */ }
+  ]
 }
 ```
 
@@ -234,7 +249,7 @@ ships with a release:
   gets an explicit `SSH_MSG_CHANNEL_FAILURE` and the channel is closed. Every global request
   (`tcpip-forward`, `streamlocal-forward@openssh.com`, …) gets `SSH_MSG_REQUEST_FAILURE`.
   Nothing relies on a russh default (E5).
-- **Host keys** come from `sftp.host_keys`, which are paths to a mounted secret. A missing,
+- **Host keys** come from `frontends.sftp.host_keys`, which are paths to a mounted secret. A missing,
   unreadable, world-readable, encrypted, RSA or duplicate key refuses startup. There is no
   silent generation: a pod that regenerates its host key on restart teaches every partner to
   accept key changes, which is the MITM this pinning exists to stop. Rotation is additive:
@@ -552,7 +567,8 @@ decision rather than an accident. An explicit SETSTAT is refused (D11).
 
 **Closing the check-then-write race.** The `HeadObject` at OPEN gives an early, byte-free
 refusal. It does not close the race. What closes it depends on the backend, declared per
-backend in `sftp.conditional_create`:
+backend in `backends[].conditional_create` (a property of the backend, shared by both
+fronts; the old `sftp.conditional_create` map is refused, not ignored):
 
 - **`native`**: the commit is conditional — `PutObject` or `CompleteMultipartUpload` with
   `If-None-Match: *` (E4). A concurrent create makes the loser's commit fail with 412; s0
@@ -720,8 +736,8 @@ The `SSH_FXP_VERSION` reply advertises exactly `limits@openssh.com` and
 
 All limits sit in `limits.sftp` inside the existing hot-reloadable `LimitsConfig` (loaded at
 the point of use, per `Gateway::limits`). They apply to new connections and new transfers
-without a restart. Only `sftp.listen`, `sftp.host_keys` and `sftp.proxy_protocol` need a
-restart.
+without a restart. Only `frontends.sftp.listen`, `frontends.sftp.host_keys` and
+`frontends.sftp.proxy_protocol` need a restart.
 
 | Limit | Default | Scope |
 |---|---|---|
@@ -1075,7 +1091,8 @@ The control plane must:
 
 Deployment assumptions:
 
-- SFTP runs as its own Deployment from the same image, with `frontends: ["sftp"]`.
+- SFTP runs as its own Deployment from the same image, with `frontends.s3.enabled: false`
+  and an enabled `frontends.sftp` section.
 - The load balancer preserves the client source address, or speaks PROXY v2 from the
   configured CIDRs.
 - Host keys are mounted secrets.
