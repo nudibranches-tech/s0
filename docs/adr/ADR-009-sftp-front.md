@@ -211,18 +211,21 @@ ships with a release:
     rejected certificate, a key type or source address the account does not accept, a
     refused method (`password`, `keyboard-interactive`), and the key-probe cap. Refusals
     that a correct credential also gets are audited as `auth_failed` but never counted:
-    the subject's session cap, a tenant that cannot be routed, a bundle the gateway
-    refuses (its gate, the fleet-wide denylist, an unresolvable membership). Counting them
-    would ban an address — and every partner behind its NAT — for logging in correctly
-    while the subject is at its cap or the bundle is bad.
-    When the refused credential did match (session cap, unroutable tenant, unresolvable
-    membership), the connection's earlier mismatches are forgiven as well: an agent that
-    signed with its other keys first is a legitimate client.
-  - A probe for an unknown login and a probe for an unauthorized key get the same answer
-    after the same delay.
-  - A probe does answer "accepted" for an authorized (login, key) pair, as in every SSH
-    server. That confirms an account to someone who already holds its public key, which is
-    accepted: possession of the private key is what authenticates.
+    a bundle the gateway refuses (its gate, the fleet-wide denylist), and a matched
+    credential refused admission (the subject is not a member of its tenant, the tenant
+    cannot be routed, the subject is at its session cap). Counting them would ban an
+    address — and every partner behind its NAT — for logging in correctly while the
+    subject is at its cap or the bundle is bad.
+    When the refused credential did match (admission), the connection's earlier
+    mismatches are forgiven as well: an agent that signed with its other keys first is a
+    legitimate client. The same holds for a subject removed from its tenant whose keys
+    are still listed: its retries are refused every time, but never banned.
+  - Probes are answered **uniformly**: any offered key of an accepted type (ed25519,
+    ECDSA) is told to proceed to the signature, and the login is decided only once the
+    signature verifies. A probe for an unknown login, an unauthorized key and an
+    authorized (login, key) pair get the same answer, so a probe confirms no account,
+    even to someone holding its public key. The cost is a signature verification per
+    offered key. An RSA key is refused at the probe, as a credential mismatch.
 - **Channels.** One `session` channel per connection, carrying one `subsystem` request whose
   name is exactly `sftp`. Every other channel type (`direct-tcpip`, `forwarded-tcpip`, `x11`,
   `direct-streamlocal@openssh.com`, `auth-agent@openssh.com`, …) is rejected with
@@ -726,7 +729,7 @@ restart.
 | `max_connections_per_ip` | 16 | process, per IPv4 /32 or IPv6 /64 |
 | `max_sessions_per_subject` | 16 | process; rclone's defaults (4 transfers + 8 checkers) open about 13 connections |
 | `preauth_rate_per_ip` | 10/min, burst 20 | process, token bucket |
-| `handshake_timeout_secs` | 30 | from TCP accept to authentication success, including the PROXY header, the version exchange and KEX |
+| `handshake_timeout_secs` | 30 | from TCP accept to authentication success, including the PROXY header, the version exchange and KEX; an authenticated connection that has not started the `sftp` subsystem one more timeout later is disconnected (D9) |
 | `max_auth_attempts` | 6 | connection |
 | `max_key_probes` | 10 | connection, counted separately from attempts (D3) |
 | `auth_failure_ban` | 10 failures in 5 min ⇒ 15 min ban | process, per /32 or /64, LRU-bounded table; only credential mismatches count, and only when their connection ends unauthenticated (D3) |
@@ -812,7 +815,7 @@ Exactly one of `input`, `gate` or `session_event` is present, and `path` is `sft
 | `auth_failed` (unknown login, unknown key, revoked certificate, CIDR mismatch, …) | none; `login` recorded, org label **omitted** | yes |
 | `banned` | none | no — bounded by the ban rate itself |
 | `auth_succeeded` | principal and org label | no |
-| `disconnected` (client close, idle, credential revoked, shutdown, no `sftp` subsystem, protocol error) with duration, operation count and bytes in each direction | principal and org label | no |
+| `disconnected` (client close, connection lost, idle, credential revoked, shutdown, no `sftp` subsystem, session teardown timeout, protocol error) with duration, operation count and bytes in each direction | principal and org label | no |
 
 Every record still carries the required `result: Decision`. For a session event it states
 what happened rather than a PDP answer, and `obligations` is always empty:
