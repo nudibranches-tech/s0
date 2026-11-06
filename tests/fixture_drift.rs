@@ -168,6 +168,36 @@ fn every_rego_input_reference_appears_in_a_captured_input() {
 }
 
 #[test]
+fn the_captured_corpus_covers_every_protocol_the_gateway_decides_for() {
+    // `input.request.protocol` is part of the contract (ADR-009): a policy may branch on
+    // it, and every check above is only as good as the protocols the corpus spans. Both
+    // fronts decide through `Enforcer::decide`, so both must be in the recording.
+    let mut by_protocol: std::collections::BTreeMap<String, BTreeSet<String>> = Default::default();
+    for (name, raw) in captured_inputs() {
+        let protocol = raw["request"]["protocol"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{name} has no request.protocol"))
+            .to_string();
+        let action = raw["action"].as_str().unwrap_or("").to_string();
+        by_protocol.entry(protocol).or_default().insert(action);
+    }
+    let protocols: Vec<&String> = by_protocol.keys().collect();
+    assert_eq!(
+        protocols,
+        ["s3", "sftp"],
+        "the captured corpus must span both fronts; regenerate it with \
+         S0_CAPTURE_REGENERATE=1 cargo test --test golden_capture"
+    );
+    for action in ["create_objects", "read_objects", "list_objects"] {
+        assert!(
+            by_protocol["sftp"].contains(action),
+            "no SFTP capture decides {action}: {:?}",
+            by_protocol["sftp"]
+        );
+    }
+}
+
+#[test]
 fn the_hand_written_corpus_matches_the_captured_wire_shape() {
     // `policy/testdata/corpus.json` is hand-authored — it encodes *expected decisions* for
     // bundles the gateway has never run against. What it may not do is invent input fields:

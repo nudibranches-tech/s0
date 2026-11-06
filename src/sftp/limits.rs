@@ -309,6 +309,87 @@ impl MemoryBudget {
     }
 }
 
+/// The optional process-wide bandwidth cap (ADR-009 D12,
+/// `limits.sftp.process_bandwidth_bytes_per_sec`): one bucket per direction, shared by
+/// every session of the replica, so uploads and downloads are each held to the rate.
+#[derive(Default)]
+pub struct ProcessBandwidth {
+    pub upload: TokenBucket,
+    pub download: TokenBucket,
+}
+
+/// A token bucket that is charged **after** the bytes moved and answers how long the
+/// caller must wait before moving more.
+///
+/// The level may go negative: a charge is never refused, it turns into debt, and the
+/// caller sleeps until its share of that debt has been repaid at `rate`. Two properties
+/// follow, and they are why this shape was chosen over a bucket sessions poll or a
+/// semaphore they queue on:
+///
+/// * **Fair without a scheduler.** Each charge is one reply's worth of bytes (at most
+///   `max_sftp_packet_len`), and a session charges only after the reply it is paying for,
+///   then sleeps before it reads its next request. So a session holds at most one small
+///   grant of debt at a time, and its wait is fixed when it charges: a later charge by
+///   another session queues *behind* it and cannot lengthen it. Charges are served in
+///   arrival order, every session gets its turn about once per round of the others'
+///   small grants, and none can be starved, however many bytes it or the others move.
+/// * **Bounded burst.** The level never exceeds one second of `rate`, so an idle stretch
+///   banks at most one second of traffic.
+///
+/// The rate is passed on every charge rather than stored, so a hot reload of the limit
+/// takes effect at the next charge: outstanding debt is in bytes and is simply repaid at
+/// the new rate, and the burst ceiling follows the new rate. `rate == 0` is unlimited.
+#[derive(Default)]
+pub struct TokenBucket {
+    state: Mutex<BucketState>,
+}
+
+#[derive(Default)]
+struct BucketState {
+    /// Bytes available; negative is debt.
+    level: f64,
+    /// When `level` was last brought up to date.
+    last: Option<Instant>,
+    /// The rate `level` was last accrued at; 0 when the cap was off.
+    rate: u64,
+}
+
+impl TokenBucket {
+    /// The most credit an idle stretch can bank.
+    pub const MAX_BURST: Duration = Duration::from_secs(1);
+
+    /// Charge `bytes` at `now` against `rate` bytes per second; returns how long the
+    /// caller must wait before moving more (zero when within budget).
+    pub fn charge(&self, bytes: u64, rate: u64, now: Instant) -> Duration {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if rate == 0 {
+            // Off: forget everything, so switching it back on starts with a full bucket.
+            *s = BucketState::default();
+            return Duration::ZERO;
+        }
+        let r = rate as f64;
+        let cap = r * Self::MAX_BURST.as_secs_f64();
+        match s.last {
+            // First use, or the cap was just switched back on: start full.
+            None => s.level = cap,
+            // Accrue at the rate in force until now (a reload is seen at a charge).
+            Some(last) => {
+                let elapsed = now.saturating_duration_since(last).as_secs_f64();
+                s.level += elapsed * s.rate as f64;
+            }
+        }
+        s.level = s.level.min(cap);
+        s.last = Some(s.last.map_or(now, |l| l.max(now)));
+        s.rate = rate;
+        s.level -= bytes as f64;
+        if s.level >= 0.0 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs_f64(-s.level / r)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,5 +484,56 @@ mod tests {
                 .await
                 .is_some()
         );
+    }
+    #[test]
+    fn the_process_bucket_holds_the_rate_and_bounds_the_burst() {
+        let b = TokenBucket::default();
+        let t0 = Instant::now();
+        // A full bucket: one second of traffic passes unheld, then debt is paced.
+        assert_eq!(b.charge(1_000, 1_000, t0), Duration::ZERO);
+        assert_eq!(b.charge(500, 1_000, t0), Duration::from_millis(500));
+        // A second charge at the same instant queues behind the first.
+        assert_eq!(b.charge(500, 1_000, t0), Duration::from_secs(1));
+        // An hour idle banks one second, not an hour.
+        let later = t0 + Duration::from_secs(3600);
+        assert_eq!(b.charge(1_000, 1_000, later), Duration::ZERO);
+        assert_eq!(b.charge(2_000, 1_000, later), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn the_process_bucket_over_time_moves_rate_bytes_per_second() {
+        // Many small charges from "several sessions", each sleeping its answer: the
+        // total after ten seconds is ten seconds of rate plus the one-second burst.
+        let b = TokenBucket::default();
+        let t0 = Instant::now();
+        let mut ready = [t0; 4];
+        let mut moved = 0u64;
+        let end = t0 + Duration::from_secs(10);
+        loop {
+            let (i, &now) = ready.iter().enumerate().min_by_key(|(_, t)| **t).unwrap();
+            if now >= end {
+                break;
+            }
+            moved += 100;
+            ready[i] = now + b.charge(100, 1_000, now);
+        }
+        // Up to one 100-byte charge per session may be in flight past the end.
+        assert!((11_000..=11_400).contains(&moved), "{moved}");
+    }
+
+    #[test]
+    fn the_process_bucket_follows_a_hot_reload() {
+        let b = TokenBucket::default();
+        let t0 = Instant::now();
+        assert_eq!(b.charge(3_000, 1_000, t0), Duration::from_secs(2));
+        // The rate doubled: the 2,000-byte debt is repaid at the new rate.
+        assert_eq!(b.charge(0, 2_000, t0), Duration::from_secs(1));
+        // Lowered: the burst ceiling follows (one second of the new rate).
+        let later = t0 + Duration::from_secs(60);
+        assert_eq!(b.charge(100, 100, later), Duration::ZERO);
+        assert_eq!(b.charge(100, 100, later), Duration::from_secs(1));
+        // Switched off, then on again: unlimited meanwhile, then a fresh full bucket.
+        assert_eq!(b.charge(1_000_000, 0, later), Duration::ZERO);
+        assert_eq!(b.charge(100, 100, later), Duration::ZERO);
     }
 }
