@@ -77,7 +77,77 @@ pub struct GatewayConfig {
     /// endpoint. Absent by default — no listener is bound, nothing is served.
     #[serde(default)]
     pub internal: Option<InternalApiConfig>,
+    /// Optional **control backend**: an S3 endpoint served by the control plane that
+    /// answers the bucket creation and configuration operations it lists (ADR-011).
+    /// Absent by default, and then those operations are refused at the gate like every other
+    /// non-enforced operation. Read
+    /// once at startup: a config reload that changes it is logged and ignored.
+    #[serde(default)]
+    pub control_backend: Option<ControlBackendConfig>,
 }
+
+/// Where the delegable operations go, and as whom. One credential is bound to one
+/// (organization, backend), which is why a gateway serving several of either refuses to
+/// load with this section ([`GatewayConfig::validate`]).
+///
+/// `deny_unknown_fields`, so a mistyped key fails to load instead of silently delegating
+/// nothing.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlBackendConfig {
+    pub endpoint_url: String,
+    #[serde(default = "default_region")]
+    pub region: String,
+    pub access_key_id: String,
+    pub secret_access_key: Secret<String>,
+    /// The operations handed to the control backend; each must be
+    /// [`crate::access::Coverage::Delegable`].
+    pub operations: Vec<String>,
+    #[serde(default = "default_control_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+    /// Bound on one delegated call, retries being off. It must exceed the control
+    /// backend's own wait and, with `create_bucket_placement_wait_secs`, stay under the
+    /// 60 s default read timeout of the AWS CLI and boto3.
+    #[serde(default = "default_control_call_timeout_secs")]
+    pub call_timeout_secs: u64,
+    /// How long `CreateBucket` waits for the new bucket to be placed, and `DeleteBucket` for
+    /// it to be unplaced, before answering.
+    #[serde(default = "default_control_placement_wait_secs")]
+    pub create_bucket_placement_wait_secs: u64,
+}
+
+/// Field-wise, secret included: a reload that only rotates the credential still differs
+/// from the running control backend.
+impl PartialEq for ControlBackendConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.endpoint_url == other.endpoint_url
+            && self.region == other.region
+            && self.access_key_id == other.access_key_id
+            && self.secret_access_key.expose() == other.secret_access_key.expose()
+            && self.operations == other.operations
+            && self.connect_timeout_secs == other.connect_timeout_secs
+            && self.call_timeout_secs == other.call_timeout_secs
+            && self.create_bucket_placement_wait_secs == other.create_bucket_placement_wait_secs
+    }
+}
+
+impl ControlBackendConfig {
+    pub fn connect_timeout(&self) -> Duration {
+        Duration::from_secs(self.connect_timeout_secs)
+    }
+
+    pub fn call_timeout(&self) -> Duration {
+        Duration::from_secs(self.call_timeout_secs)
+    }
+
+    pub fn placement_wait(&self) -> Duration {
+        Duration::from_secs(self.create_bucket_placement_wait_secs)
+    }
+}
+
+/// The client's read timeout the delegated call, and the placement wait after it, must
+/// finish inside: the AWS CLI's and boto3's default.
+const CLIENT_READ_TIMEOUT_SECS: u64 = 60;
 
 /// The authenticated internal control-plane surface (`POST /internal/v1/sts/sessions`).
 ///
@@ -628,6 +698,88 @@ impl GatewayConfig {
         }
         self.validate_internal_listener()?;
         self.validate_mint_listener()?;
+        self.validate_control_backend()?;
+        Ok(())
+    }
+
+    /// The refusals of ADR-011 D2. Every one is a load-time error, because a control
+    /// backend that is half right would answer bucket configuration as the wrong identity.
+    fn validate_control_backend(&self) -> Result<()> {
+        let Some(c) = &self.control_backend else {
+            return Ok(());
+        };
+        let refuse = |why: String| GatewayError::Config(format!("control_backend: {why}"));
+        crate::access::optable::DelegatedOps::from_names(&c.operations).map_err(refuse)?;
+        if c.connect_timeout_secs == 0 || c.call_timeout_secs == 0 {
+            return Err(refuse(
+                "connect_timeout_secs and call_timeout_secs must be > 0; zero is not 'no \
+                 timeout', it fails every delegated call"
+                    .into(),
+            ));
+        }
+        if c.create_bucket_placement_wait_secs == 0 {
+            return Err(refuse(
+                "create_bucket_placement_wait_secs must be > 0".into(),
+            ));
+        }
+        if c.call_timeout_secs
+            .checked_add(c.create_bucket_placement_wait_secs)
+            .is_none_or(|total| total >= CLIENT_READ_TIMEOUT_SECS)
+        {
+            return Err(refuse(format!(
+                "call_timeout_secs ({}) + create_bucket_placement_wait_secs ({}) must be \
+                 under {CLIENT_READ_TIMEOUT_SECS}, the default read timeout of the AWS CLI \
+                 and boto3",
+                c.call_timeout_secs, c.create_bucket_placement_wait_secs
+            )));
+        }
+        if c.access_key_id.trim().is_empty() || c.secret_access_key.expose().trim().is_empty() {
+            return Err(refuse(
+                "access_key_id and secret_access_key must not be empty".into(),
+            ));
+        }
+        if c.access_key_id.contains('/') {
+            return Err(refuse(
+                "access_key_id must not contain '/', which delimits a SigV4 credential scope"
+                    .into(),
+            ));
+        }
+        let endpoint = match reqwest::Url::parse(&c.endpoint_url) {
+            Ok(url) if matches!(url.scheme(), "http" | "https") && url.host().is_some() => url,
+            _ => {
+                return Err(refuse(
+                    "endpoint_url is not an http(s) URL with a host".into(),
+                ));
+            }
+        };
+        let same = |other: &str| {
+            reqwest::Url::parse(other).is_ok_and(|other| {
+                other.as_str().trim_end_matches('/') == endpoint.as_str().trim_end_matches('/')
+            })
+        };
+        if self.backends.iter().any(|b| same(&b.endpoint_url)) {
+            return Err(refuse(
+                "endpoint_url equals a storage backend's endpoint".into(),
+            ));
+        }
+        if self.bundle_url.as_deref().is_some_and(same) {
+            return Err(refuse("endpoint_url equals bundle_url".into()));
+        }
+        let organizations: std::collections::BTreeSet<&str> = self
+            .tenants
+            .iter()
+            .map(|t| t.organization_id.as_str())
+            .collect();
+        let backends: std::collections::BTreeSet<&str> =
+            self.tenants.iter().map(|t| t.backend_id.as_str()).collect();
+        if organizations.len() > 1 || backends.len() > 1 {
+            return Err(refuse(format!(
+                "the tenants span {} organization(s) and {} backend(s); one control \
+                 credential is bound to one (organization, backend)",
+                organizations.len(),
+                backends.len()
+            )));
+        }
         Ok(())
     }
 
@@ -987,6 +1139,15 @@ fn default_cache_capacity() -> u64 {
 }
 fn default_pdp_timeout_ms() -> u64 {
     2000
+}
+fn default_control_connect_timeout_secs() -> u64 {
+    5
+}
+fn default_control_call_timeout_secs() -> u64 {
+    35
+}
+fn default_control_placement_wait_secs() -> u64 {
+    10
 }
 fn default_region() -> String {
     "us-east-1".into()
@@ -1693,6 +1854,199 @@ mod tests {
         cfg.as_object_mut().unwrap().remove("bundle_url");
         cfg.as_object_mut().unwrap().remove("bundle_shared_secret");
         assert!(GatewayConfig::from_json(&cfg.to_string()).is_ok());
+    }
+
+    // ── control_backend (ADR-011 D2) ────────────────────────────────────────────
+
+    fn with_control(edit: impl FnOnce(&mut serde_json::Value)) -> serde_json::Value {
+        let mut cfg = example();
+        let mut section = cfg["control_backend"].clone();
+        edit(&mut section);
+        cfg["control_backend"] = section;
+        cfg
+    }
+
+    fn refusal(cfg: &serde_json::Value) -> String {
+        GatewayConfig::from_json(&cfg.to_string())
+            .expect_err("this control_backend must not load")
+            .to_string()
+    }
+
+    #[test]
+    fn the_shipped_example_loads_its_control_backend() {
+        let loaded = GatewayConfig::from_json(&example().to_string()).expect("loads");
+        let control = loaded.control_backend.expect("section present");
+        assert_eq!(control.operations.len(), 16);
+        assert_eq!(control.call_timeout_secs, 35);
+        assert_eq!(control.region, "us-east-1");
+    }
+
+    #[test]
+    fn the_control_backend_defaults_are_five_thirty_five_and_ten() {
+        let cfg = with_control(|s| {
+            for k in [
+                "connect_timeout_secs",
+                "call_timeout_secs",
+                "create_bucket_placement_wait_secs",
+                "region",
+            ] {
+                s.as_object_mut().unwrap().remove(k);
+            }
+        });
+        let c = GatewayConfig::from_json(&cfg.to_string())
+            .unwrap()
+            .control_backend
+            .unwrap();
+        assert_eq!(
+            (
+                c.connect_timeout_secs,
+                c.call_timeout_secs,
+                c.create_bucket_placement_wait_secs
+            ),
+            (5, 35, 10)
+        );
+        assert_eq!(c.region, default_region());
+    }
+
+    #[test]
+    fn a_mistyped_control_backend_key_refuses_to_load() {
+        let cfg = with_control(|s| {
+            s["operatons"] = serde_json::json!(["GetBucketCors"]);
+        });
+        assert!(refusal(&cfg).contains("operatons"), "{}", refusal(&cfg));
+    }
+
+    #[test]
+    fn a_control_backend_listing_a_non_delegable_operation_refuses_to_load() {
+        for op in [
+            "CreateSession",
+            "WriteGetObjectResponse",
+            "GetObject",
+            "PutBucketPolicy",
+            "GetBucketPolicy",
+            "NoSuchOp",
+        ] {
+            let cfg = with_control(|s| s["operations"] = serde_json::json!(["GetBucketCors", op]));
+            let err = refusal(&cfg);
+            assert!(
+                err.contains("control_backend") && err.contains(op),
+                "{op}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_or_duplicated_operation_list_refuses_to_load() {
+        let cfg = with_control(|s| s["operations"] = serde_json::json!([]));
+        assert!(refusal(&cfg).contains("empty"));
+        let cfg = with_control(|s| {
+            s["operations"] = serde_json::json!(["GetBucketCors", "GetBucketCors"]);
+        });
+        assert!(refusal(&cfg).contains("twice"));
+    }
+
+    #[test]
+    fn zero_control_timeouts_refuse_to_load() {
+        for key in [
+            "connect_timeout_secs",
+            "call_timeout_secs",
+            "create_bucket_placement_wait_secs",
+        ] {
+            let cfg = with_control(|s| s[key] = serde_json::json!(0));
+            let err = refusal(&cfg);
+            assert!(err.contains("> 0"), "{key}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_control_budget_at_or_over_the_client_read_timeout_refuses_to_load() {
+        let cfg = with_control(|s| {
+            s["call_timeout_secs"] = serde_json::json!(50);
+            s["create_bucket_placement_wait_secs"] = serde_json::json!(10);
+        });
+        assert!(refusal(&cfg).contains("read timeout"));
+        let cfg = with_control(|s| {
+            s["call_timeout_secs"] = serde_json::json!(u64::MAX);
+            s["create_bucket_placement_wait_secs"] = serde_json::json!(2);
+        });
+        assert!(refusal(&cfg).contains("read timeout"));
+        let cfg = with_control(|s| {
+            s["call_timeout_secs"] = serde_json::json!(49);
+            s["create_bucket_placement_wait_secs"] = serde_json::json!(10);
+        });
+        assert!(GatewayConfig::from_json(&cfg.to_string()).is_ok());
+    }
+
+    #[test]
+    fn a_control_backend_over_two_organizations_or_backends_refuses_to_load() {
+        let mut cfg = example();
+        let mut second = cfg["tenants"][0].clone();
+        second["tenant"] = serde_json::json!("globex");
+        second["organization_id"] = serde_json::json!("org-globex");
+        cfg["tenants"].as_array_mut().unwrap().push(second);
+        assert!(refusal(&cfg).contains("one control credential"));
+
+        let mut cfg = example();
+        let mut second = cfg["tenants"][0].clone();
+        second["tenant"] = serde_json::json!("globex");
+        second["backend_id"] = serde_json::json!("backend-s3-1");
+        cfg["tenants"].as_array_mut().unwrap().push(second);
+        assert!(refusal(&cfg).contains("one control credential"));
+
+        // The same two tenants without a control backend are the supported topology.
+        cfg.as_object_mut().unwrap().remove("control_backend");
+        assert!(GatewayConfig::from_json(&cfg.to_string()).is_ok());
+    }
+
+    #[test]
+    fn a_control_endpoint_that_is_a_storage_backend_or_the_bundle_url_refuses_to_load() {
+        let cfg = with_control(|s| {
+            s["endpoint_url"] = serde_json::json!("https://s3-backend.example.com:7480/");
+        });
+        assert!(refusal(&cfg).contains("storage backend"));
+        let cfg = with_control(|s| {
+            s["endpoint_url"] = serde_json::json!(
+                "http://controlplane.example.com/api/v1/organizations/org-acme/bundle"
+            );
+        });
+        assert!(refusal(&cfg).contains("bundle_url"));
+        for bad in ["not a url", "ftp://console.example", "http://"] {
+            let cfg = with_control(|s| s["endpoint_url"] = serde_json::json!(bad));
+            assert!(refusal(&cfg).contains("endpoint_url"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_empty_control_credential_refuses_to_load() {
+        for key in ["access_key_id", "secret_access_key"] {
+            let cfg = with_control(|s| s[key] = serde_json::json!(" "));
+            assert!(refusal(&cfg).contains("must not be empty"), "{key}");
+        }
+        let cfg = with_control(|s| s["access_key_id"] = serde_json::json!("a/b"));
+        assert!(refusal(&cfg).contains("'/'"));
+    }
+
+    #[test]
+    fn the_control_secret_never_prints() {
+        let cfg = with_control(|s| {
+            s["secret_access_key"] = serde_json::json!("super-secret-control-value");
+        });
+        let loaded = GatewayConfig::from_json(&cfg.to_string()).unwrap();
+        let shown = format!("{loaded:?}");
+        assert!(!shown.contains("super-secret-control-value"), "{shown}");
+        assert!(shown.contains("redacted"));
+    }
+
+    #[test]
+    fn a_config_without_a_control_backend_loads_as_before() {
+        let mut cfg = example();
+        cfg.as_object_mut().unwrap().remove("control_backend");
+        assert!(
+            GatewayConfig::from_json(&cfg.to_string())
+                .unwrap()
+                .control_backend
+                .is_none()
+        );
     }
 
     #[test]

@@ -25,8 +25,9 @@ use hyper_util::server::graceful::GracefulShutdown;
 use tokio::net::TcpListener;
 
 use crate::audit::{AuditMetrics, AuditSink};
-use crate::bundle_refresh::BundleHealth;
+use crate::bundle_refresh::{BundleHealth, BundleRefresher};
 use crate::cors::{CorsMetrics, Denial};
+use crate::counters::LabeledCounters;
 use crate::error::Result;
 use crate::mint::MintMetrics;
 use crate::pdp::BundleStore;
@@ -50,6 +51,11 @@ pub struct AdminState {
     /// reason as `mint`: a state built without them reports no `s0_cors_*` series rather
     /// than a flat zero.
     cors: Option<Arc<CorsMetrics>>,
+    /// The refresher whose on-demand fetches are counted, when this process runs one.
+    refresher: Option<Arc<BundleRefresher>>,
+    /// Delegated requests by operation and status class, when a control backend is
+    /// configured.
+    delegated: Option<Arc<LabeledCounters>>,
     instance: String,
     shutting_down: AtomicBool,
 }
@@ -62,6 +68,8 @@ impl AdminState {
             bundles,
             mint: None,
             cors: None,
+            refresher: None,
+            delegated: None,
             instance: crate::config::instance_id(),
             shutting_down: AtomicBool::new(false),
         }
@@ -80,6 +88,21 @@ impl AdminState {
     #[must_use]
     pub fn with_cors_metrics(mut self, metrics: Arc<CorsMetrics>) -> Self {
         self.cors = Some(metrics);
+        self
+    }
+
+    /// Publish the on-demand bundle refresh counters.
+    #[must_use]
+    pub fn with_bundle_refresher(mut self, refresher: Arc<BundleRefresher>) -> Self {
+        self.refresher = Some(refresher);
+        self
+    }
+
+    /// Publish the delegated request counters. Call it only when a control backend is
+    /// configured, for the same reason as [`Self::with_mint_metrics`].
+    #[must_use]
+    pub fn with_delegation_metrics(mut self, counters: Arc<LabeledCounters>) -> Self {
+        self.delegated = Some(counters);
         self
     }
 
@@ -408,6 +431,35 @@ fn prometheus(state: &AdminState) -> Response<Full<Bytes>> {
         );
     }
 
+    if let Some(refresher) = &state.refresher {
+        out.push_str(
+            "# HELP s0_bundle_on_demand_refresh_total Bundle fetches made outside the poll \
+             loop, by what triggered them and how they ended.\n\
+             # TYPE s0_bundle_on_demand_refresh_total counter\n",
+        );
+        for (trigger, result, n) in refresher.on_demand_total().snapshot() {
+            out.push_str(&format!(
+                "s0_bundle_on_demand_refresh_total{{trigger=\"{}\",result=\"{}\"}} {n}\n",
+                escape_label(&trigger),
+                escape_label(&result),
+            ));
+        }
+    }
+    if let Some(delegated) = &state.delegated {
+        out.push_str(
+            "# HELP s0_delegated_requests_total Requests handed to the control backend, by \
+             operation and the class of the status it answered (none: no answer).\n\
+             # TYPE s0_delegated_requests_total counter\n",
+        );
+        for (operation, class, n) in delegated.snapshot() {
+            out.push_str(&format!(
+                "s0_delegated_requests_total{{operation=\"{}\",status_class=\"{}\"}} {n}\n",
+                escape_label(&operation),
+                escape_label(&class),
+            ));
+        }
+    }
+
     out.push_str("# HELP s0_build_info Build and instance identity.\n");
     out.push_str("# TYPE s0_build_info gauge\n");
     out.push_str(&format!(
@@ -590,6 +642,95 @@ mod tests {
             "{text}"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn metrics_expose_delegated_requests_by_operation_and_status_class() {
+        let dir = tmpdir();
+        let (st, _h) = state(false, &dir);
+        let counters = Arc::new(LabeledCounters::default());
+        counters.increment("CreateBucket", "2xx");
+        counters.increment("CreateBucket", "2xx");
+        counters.increment("PutBucketCors", "none");
+        let st = st_with(st, |s| s.with_delegation_metrics(counters));
+        let body = prometheus(&st).into_body();
+        let text = String::from_utf8(
+            http_body_util::BodyExt::collect(body)
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            text.contains(
+                "\ns0_delegated_requests_total{operation=\"CreateBucket\",status_class=\"2xx\"} 2\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "\ns0_delegated_requests_total{operation=\"PutBucketCors\",status_class=\"none\"} 1\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            !text.contains("s0_bundle_on_demand_refresh_total"),
+            "{text}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn metrics_expose_on_demand_refreshes_by_trigger_and_result() {
+        let dir = tmpdir();
+        let (st, _h) = state(false, &dir);
+        let pdp: Arc<dyn crate::pdp::Pdp> = Arc::new(
+            crate::pdp::RegorusPdp::new(crate::pdp::GATEWAY_REGO, &serde_json::json!({})).unwrap(),
+        );
+        let bundles = Arc::new(BundleStore::new(Bundle::new(
+            "rev-1",
+            serde_json::json!({}),
+        )));
+        let refresher = BundleRefresher::new(
+            pdp,
+            bundles,
+            crate::bundle_refresh::BundleSource::File(dir.join("none.json")),
+            Arc::new(BundleHealth::new(false)),
+        );
+        refresher.on_demand_total().increment("miss", "reloaded");
+        refresher
+            .on_demand_total()
+            .increment("placement_wait", "timed_out");
+        let st = st_with(st, |s| s.with_bundle_refresher(refresher));
+        let body = prometheus(&st).into_body();
+        let text = String::from_utf8(
+            http_body_util::BodyExt::collect(body)
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            text.contains(
+                "\ns0_bundle_on_demand_refresh_total{trigger=\"miss\",result=\"reloaded\"} 1\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "\ns0_bundle_on_demand_refresh_total{trigger=\"placement_wait\",result=\"timed_out\"} 1\n"
+            ),
+            "{text}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn st_with(st: Arc<AdminState>, f: impl FnOnce(AdminState) -> AdminState) -> Arc<AdminState> {
+        Arc::new(f(
+            Arc::try_unwrap(st).unwrap_or_else(|_| panic!("sole owner"))
+        ))
     }
 
     /// A queued mint and a broken identity provider produce the same symptom — "clients

@@ -8,6 +8,7 @@
 //! `S3Request<Input>` and we forward that same value — there is no raw passthrough.
 
 pub mod bucketfilter;
+pub mod control;
 pub mod fanout;
 pub mod obligations;
 
@@ -28,11 +29,17 @@ use s3s::header::{X_AMZ_ID_2, X_AMZ_REQUEST_ID};
 use s3s::{S3, S3Error, S3Request, S3Response, S3Result, s3_error};
 use s3s_aws::Proxy;
 
-use crate::access::proof;
+use crate::access::{OperationName, delegation, percent_decode, proof};
 use crate::audit::{BackendOutcome, PendingAudit};
+use crate::bundle_refresh::{PlacementWait, PlacementWaitOutcome};
 use crate::config::{BackendConfig, GatewayConfig, LimitsConfig};
+use crate::cors::CorsState;
 use crate::error::{GatewayError, Result, is_backend_error, remint_backend_error};
+use crate::identity::ResolvedPrincipal;
 use crate::model::{BackendId, BackendKind};
+use crate::proxy::control::{
+    CALLER, CheckedAt, ControlBackend, DELEGATED_DEADLINE, DelegatedCaller,
+};
 use crate::proxy::obligations::{BucketSource, BucketVisibility, ResponseObligations};
 use crate::quota::QuotaReservation;
 use crate::secret::Secret;
@@ -343,11 +350,47 @@ pub struct S3GatewayState {
     /// The *live* limits handle, not a copy: a reader must get the value a config apply
     /// installed rather than the one this service was assembled with.
     limits: Arc<ArcSwap<LimitsConfig>>,
+    /// Where the delegated operations go; `None` without a `control_backend`, and then no
+    /// operation is ever admitted as delegated.
+    control: Option<Arc<ControlBackend>>,
+    /// The CORS cache a delegated CORS write drops its entry from.
+    cors: Option<Arc<CorsState>>,
+    /// Waits for a created bucket to be placed. Never the refresher itself: this layer
+    /// has no PDP handle to re-decide with.
+    placement_wait: Option<Arc<dyn PlacementWait>>,
 }
 
 impl S3GatewayState {
     pub fn new(registry: Arc<BackendRegistry>, limits: Arc<ArcSwap<LimitsConfig>>) -> Self {
-        S3GatewayState { registry, limits }
+        S3GatewayState {
+            registry,
+            limits,
+            control: None,
+            cors: None,
+            placement_wait: None,
+        }
+    }
+
+    /// The same state, dropping CORS cache entries from `cors` after a delegated write.
+    #[must_use]
+    pub fn with_cors(mut self, cors: Arc<CorsState>) -> Self {
+        self.cors = Some(cors);
+        self
+    }
+
+    /// The same state, answering a delegated `CreateBucket` once `wait` sees the bucket
+    /// placed.
+    #[must_use]
+    pub fn with_placement_wait(mut self, wait: Arc<dyn PlacementWait>) -> Self {
+        self.placement_wait = Some(wait);
+        self
+    }
+
+    /// The same state, answering its delegated operations through `control`.
+    #[must_use]
+    pub fn with_control(mut self, control: Arc<ControlBackend>) -> Self {
+        self.control = Some(control);
+        self
     }
 
     /// The hardening limits in force right now.
@@ -367,10 +410,12 @@ impl S3GatewayState {
     }
 }
 
-/// The dispatching `impl S3` in front of the per-tenant proxies. Only the ops `OP_TABLE`
-/// marks `Coverage::Enforced` have an arm here; every other op is denied at
-/// `S3Access::check`, and falls to the trait's `NotImplemented` default if it somehow does
-/// not — except [`GatewayS3::post_object`], whose trait default forwards rather than
+/// The dispatching `impl S3` in front of the per-tenant proxies and the control backend.
+/// Only the ops `OP_TABLE` marks `Coverage::Enforced` or `Coverage::Delegable` have an arm
+/// here: an enforced one forwards through [`GatewayS3::forward`] under an `AuthzProof`, a
+/// delegated one through [`GatewayS3::delegate`] under a `DelegationProof`, and neither
+/// proof opens the other's arms. Every other op is denied at `S3Access::check`, and falls
+/// to the trait's `NotImplemented` default if it somehow does not — except [`GatewayS3::post_object`], whose trait default forwards rather than
 /// refusing. `tests/gate_invariants.rs` probes both halves of that claim.
 pub struct GatewayS3 {
     state: Arc<S3GatewayState>,
@@ -474,6 +519,253 @@ impl GatewayS3 {
             }
         }
     }
+
+    /// Hand a delegated operation to the control backend and settle its audit record.
+    ///
+    /// The mirror of [`Self::forward`], with three differences. The proof demanded is the
+    /// [`DelegationProof`](crate::access::DelegationProof), checked before the control
+    /// client is touched. The caller's identity is scoped to the call as a task-local, for
+    /// the client's interceptor to sign. And the control backend's answer passes through
+    /// unchanged — code, message and status — because it authored the body, so there is
+    /// nothing to re-mint or scrub; only the request id is replaced by this request's
+    /// decision id, which joins the client's error to the delegated audit record. A
+    /// transport failure has no body to pass, so the gateway answers `503` itself.
+    async fn delegate<T, O, F, Fut>(&self, req: S3Request<T>, call: F) -> S3Result<S3Response<O>>
+    where
+        F: FnOnce(Arc<ControlBackend>, S3Request<T>) -> Fut + Send,
+        Fut: std::future::Future<Output = S3Result<S3Response<O>>> + Send,
+    {
+        self.delegate_then(req, AfterDelegation::Nothing, call)
+            .await
+    }
+
+    /// [`Self::delegate`], then what the operation needs done once the control backend
+    /// has answered: wait for the created bucket to be placed, or drop the CORS entry the
+    /// write made stale. Both run before the audit record is settled.
+    async fn delegate_then<T, O, F, Fut>(
+        &self,
+        req: S3Request<T>,
+        after: AfterDelegation,
+        call: F,
+    ) -> S3Result<S3Response<O>>
+    where
+        F: FnOnce(Arc<ControlBackend>, S3Request<T>) -> Fut + Send,
+        Fut: std::future::Future<Output = S3Result<S3Response<O>>> + Send,
+    {
+        delegation::require(&req)?;
+        let checked_at = req
+            .extensions
+            .get::<CheckedAt>()
+            .map_or_else(std::time::Instant::now, |c| c.0);
+        let operation = req
+            .extensions
+            .get::<OperationName>()
+            .map(|o| o.0.to_string())
+            .unwrap_or_default();
+        let control = self.state.control.clone().ok_or_else(|| {
+            tracing::error!("delegation refused: no control backend is configured");
+            s3_error!(InternalError, "no control backend is configured")
+        })?;
+        let (Some(principal), Some(route), Some(pending)) = (
+            req.extensions.get::<Arc<ResolvedPrincipal>>().cloned(),
+            req.extensions.get::<Arc<RouteSnapshot>>().cloned(),
+            req.extensions.get::<Arc<PendingAudit>>().cloned(),
+        ) else {
+            tracing::error!("delegation refused: `check` left no principal, route or audit record");
+            return Err(s3_error!(
+                InternalError,
+                "delegated request context missing"
+            ));
+        };
+        let request_id = pending
+            .decision_id()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let caller = Arc::new(DelegatedCaller::new(
+            crate::pdp::principal_subject_key(principal.principal_type, &principal.sub),
+            route.tenant.clone(),
+            route.organization_id.clone(),
+            route.backend_id.0.clone(),
+            request_id.clone(),
+        ));
+        pending.mark_delegation_dispatched();
+        let cors_guard = match (&after, &self.state.cors) {
+            (
+                AfterDelegation::DropCors { bucket } | AfterDelegation::AwaitRemoval { bucket },
+                Some(cors),
+            ) => DropCorsOnCancel::armed(cors.clone(), route.clone(), bucket.clone()),
+            _ => DropCorsOnCancel::disarmed(),
+        };
+        let result = CALLER
+            .scope(caller.clone(), call(control.clone(), req))
+            .await;
+        let status = caller.observed_status();
+        control.requests_total().increment(
+            &operation,
+            &status.map_or_else(|| "none".to_string(), |s| format!("{}xx", s / 100)),
+        );
+        if result.is_ok() {
+            pending.note_control_answer(status, None);
+        }
+        match &after {
+            AfterDelegation::Nothing => {}
+            AfterDelegation::DropCors { bucket } => {
+                if let Some(cors) = &self.state.cors {
+                    if !matches!(&result, Err(e) if status == Some(403)
+                        && e.code().as_str() == "AccessDenied")
+                    {
+                        cors.invalidate(&route, bucket).await;
+                    }
+                }
+                cors_guard.disarm();
+            }
+            AfterDelegation::AwaitRemoval { bucket } => {
+                if let Some(cors) = &self.state.cors {
+                    if !matches!(&result, Err(e) if status == Some(403)
+                        && e.code().as_str() == "AccessDenied")
+                    {
+                        cors.invalidate(&route, bucket).await;
+                    }
+                }
+                cors_guard.disarm();
+                if let (Ok(_), Some(wait)) = (&result, &self.state.placement_wait) {
+                    let budget = control
+                        .placement_wait()
+                        .min(DELEGATED_DEADLINE.saturating_sub(checked_at.elapsed()));
+                    let outcome = wait
+                        .wait_until_removed(&route.backend_id.0, &route.tenant, bucket, budget)
+                        .await;
+                    if outcome == PlacementWaitOutcome::TimedOut {
+                        tracing::warn!(
+                            tenant = %route.tenant, %bucket,
+                            "the deleted bucket is still in the bundle; answering anyway"
+                        );
+                    }
+                    pending.note_placement_wait(outcome);
+                }
+            }
+            AfterDelegation::AwaitPlacement { bucket } => {
+                if let (Ok(_), Some(wait)) = (&result, &self.state.placement_wait) {
+                    let budget = control
+                        .placement_wait()
+                        .min(DELEGATED_DEADLINE.saturating_sub(checked_at.elapsed()));
+                    let outcome = wait
+                        .wait_until_placed(&route.backend_id.0, &route.tenant, bucket, budget)
+                        .await;
+                    if outcome == PlacementWaitOutcome::TimedOut {
+                        tracing::warn!(
+                            tenant = %route.tenant, %bucket,
+                            "the created bucket is not in the bundle yet; answering anyway"
+                        );
+                    }
+                    pending.note_placement_wait(outcome);
+                }
+            }
+        }
+        match result {
+            Ok(mut resp) => {
+                pending.settle_delegated(status, None);
+                stamp_request_id(&mut resp.headers, &request_id);
+                Ok(resp)
+            }
+            Err(mut e) if control_authored(status, &e) => {
+                let code = e.code().as_str().to_string();
+                if refuses_gateway_credential(status, &code) {
+                    tracing::error!(
+                        code = %code,
+                        "the control backend refused the gateway's own credential"
+                    );
+                    pending.settle_delegated(status, Some(code));
+                    let mut out = s3_error!(
+                        ServiceUnavailable,
+                        "control backend refused the gateway's credential"
+                    );
+                    out.set_request_id(request_id);
+                    return Err(out);
+                }
+                pending.settle_delegated(status, Some(code));
+                e.set_request_id(request_id);
+                Err(e)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "control backend unavailable");
+                pending.settle_delegated(status, status.map(|_| e.code().as_str().to_string()));
+                let mut out = s3_error!(ServiceUnavailable, "control backend unavailable");
+                out.set_request_id(request_id);
+                out.set_source(Box::new(e));
+                Err(out)
+            }
+        }
+    }
+}
+
+/// Drops a bucket's cached CORS entry when the request ends before the control backend's
+/// answer was handled, so a write the control backend may already have applied is not
+/// served stale from this replica.
+struct DropCorsOnCancel(Option<(Arc<CorsState>, Arc<RouteSnapshot>, String)>);
+
+impl DropCorsOnCancel {
+    fn armed(cors: Arc<CorsState>, route: Arc<RouteSnapshot>, bucket: String) -> Self {
+        DropCorsOnCancel(Some((cors, route, bucket)))
+    }
+
+    fn disarmed() -> Self {
+        DropCorsOnCancel(None)
+    }
+
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for DropCorsOnCancel {
+    fn drop(&mut self) {
+        if let Some((cors, route, bucket)) = self.0.take() {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move { cors.invalidate(&route, &bucket).await });
+            }
+        }
+    }
+}
+
+/// What a delegated operation needs done after the control backend has answered.
+enum AfterDelegation {
+    Nothing,
+    /// A created bucket must be in the bundle before the client is answered, or its next
+    /// request would be refused as not on this backend.
+    AwaitPlacement {
+        bucket: String,
+    },
+    /// A deleted bucket must be out of the bundle before the client is answered, and its
+    /// cached CORS entry is dropped, whatever the answer was.
+    AwaitRemoval {
+        bucket: String,
+    },
+    /// The bucket's cached CORS configuration is stale, whatever the answer was.
+    DropCors {
+        bucket: String,
+    },
+}
+
+/// Whether `e` is an error the control backend itself authored: a non-2xx answer the SDK
+/// parsed as a service error. A body that failed after a 2xx, or an error the SDK raised
+/// on its own, is the gateway's failure to relay an answer, not the control backend's.
+fn control_authored(status: Option<u16>, e: &S3Error) -> bool {
+    matches!(status, Some(s) if !(200..300).contains(&s)) && e.status_code().is_some()
+}
+
+/// Whether the control backend's 403 is about the gateway's own credential rather than
+/// the caller's request: the caller's SigV4 was verified by the gateway, so these codes
+/// say the gateway's control credential is wrong.
+fn refuses_gateway_credential(status: Option<u16>, code: &str) -> bool {
+    status == Some(403)
+        && matches!(
+            code,
+            "InvalidAccessKeyId"
+                | "SignatureDoesNotMatch"
+                | "RequestTimeTooSkewed"
+                | "AuthorizationHeaderMalformed"
+                | "ExpiredToken"
+        )
 }
 
 /// A successful backend answer, cleared of the identifiers the backend authored about
@@ -509,6 +801,7 @@ answers_without_backend_identifiers!(
     ListBucketsOutput,
     ListMultipartUploadsOutput,
     ListObjectsOutput,
+    ListObjectVersionsOutput,
     ListObjectsV2Output,
     ListPartsOutput,
     PutObjectTaggingOutput,
@@ -767,6 +1060,33 @@ impl S3 for GatewayS3 {
         Ok(resp)
     }
 
+    /// Every version and delete marker under the decided prefix, with the identity fields
+    /// stripped.
+    ///
+    /// The forward is re-signed with the owner credential and the backend lists the whole
+    /// prefix it is given; "the backend honored the narrowing" is not observable here, so
+    /// the rows are re-filtered to the prefix the access hook decided. The obligation is
+    /// checked before the forward: its absence means no hook ran, and nothing is listed.
+    /// `Owner` names the shared tenant-owner credential on both row types and is withheld.
+    async fn list_object_versions(
+        &self,
+        req: S3Request<ListObjectVersionsInput>,
+    ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
+        let Some(scope) = ResponseObligations::of(&req).and_then(|o| o.version_scope.clone())
+        else {
+            return Err(s3_error!(
+                InternalError,
+                "version listing reached the forward path with no prefix obligation, which \
+                 means no authorization decision was applied to it"
+            ));
+        };
+        let mut resp = self
+            .forward(req, |p, r| async move { p.list_object_versions(r).await })
+            .await?;
+        restrict_versions(&mut resp.output, &scope.prefix);
+        Ok(resp)
+    }
+
     /// Enumerate buckets — the one arm that **withholds** what the backend returned.
     ///
     /// The forward is re-signed with the owner credential, so the backend answers with the
@@ -853,13 +1173,190 @@ impl S3 for GatewayS3 {
             .await
     }
 
-    // ── bucket lifecycle and sub-resources: NO ARMS, DELIBERATELY ───────────────
+    // ── delegated operations ────────────────────────────────────────────────────
     //
-    // No arm rather than an `AccessDenied` stub: a stub still proves the op is routable, and
-    // the next person to add a `forward` to it has no gate to trip over. With no arm these
-    // fall to `s3s`'s `NotImplemented` default, which holds even if `check` is wrong
-    // (`tests/gate_invariants.rs::denied_ops_have_no_dispatch_arm`). Bucket existence,
-    // policy, CORS and quota are control-plane — see `access::optable::NON_GATEWAY_VERBS`.
+    // The 16 `Coverage::Delegable` operations, answered by the control backend under a
+    // `DelegationProof` (`GatewayS3::delegate`). Everything else in the bucket family has
+    // no arm rather than an `AccessDenied` stub: a stub still proves the op is routable,
+    // and the next person to add a `forward` to it has no gate to trip over. With no arm
+    // the rest fall to `s3s`'s `NotImplemented` default, which holds even if `check` is
+    // wrong (`tests/gate_invariants.rs::denied_ops_have_no_dispatch_arm`). Bucket policy
+    // stays control-plane — see `access::optable::NON_GATEWAY_VERBS`.
+
+    async fn create_bucket(
+        &self,
+        req: S3Request<CreateBucketInput>,
+    ) -> S3Result<S3Response<CreateBucketOutput>> {
+        let bucket = req.input.bucket.clone();
+        self.delegate_then(
+            req,
+            AfterDelegation::AwaitPlacement { bucket },
+            |c, r| async move { c.proxy().create_bucket(r).await },
+        )
+        .await
+    }
+
+    async fn delete_bucket(
+        &self,
+        req: S3Request<DeleteBucketInput>,
+    ) -> S3Result<S3Response<DeleteBucketOutput>> {
+        let bucket = req.input.bucket.clone();
+        self.delegate_then(
+            req,
+            AfterDelegation::AwaitRemoval { bucket },
+            |c, r| async move { c.proxy().delete_bucket(r).await },
+        )
+        .await
+    }
+
+    async fn get_bucket_cors(
+        &self,
+        req: S3Request<GetBucketCorsInput>,
+    ) -> S3Result<S3Response<GetBucketCorsOutput>> {
+        self.delegate(
+            req,
+            |c, r| async move { c.proxy().get_bucket_cors(r).await },
+        )
+        .await
+    }
+
+    async fn put_bucket_cors(
+        &self,
+        req: S3Request<PutBucketCorsInput>,
+    ) -> S3Result<S3Response<PutBucketCorsOutput>> {
+        let bucket = req.input.bucket.clone();
+        self.delegate_then(
+            req,
+            AfterDelegation::DropCors { bucket },
+            |c, r| async move { c.proxy().put_bucket_cors(r).await },
+        )
+        .await
+    }
+
+    async fn delete_bucket_cors(
+        &self,
+        req: S3Request<DeleteBucketCorsInput>,
+    ) -> S3Result<S3Response<DeleteBucketCorsOutput>> {
+        let bucket = req.input.bucket.clone();
+        self.delegate_then(
+            req,
+            AfterDelegation::DropCors { bucket },
+            |c, r| async move { c.proxy().delete_bucket_cors(r).await },
+        )
+        .await
+    }
+
+    async fn get_bucket_lifecycle_configuration(
+        &self,
+        req: S3Request<GetBucketLifecycleConfigurationInput>,
+    ) -> S3Result<S3Response<GetBucketLifecycleConfigurationOutput>> {
+        self.delegate(req, |c, r| async move {
+            c.proxy().get_bucket_lifecycle_configuration(r).await
+        })
+        .await
+    }
+
+    async fn put_bucket_lifecycle_configuration(
+        &self,
+        req: S3Request<PutBucketLifecycleConfigurationInput>,
+    ) -> S3Result<S3Response<PutBucketLifecycleConfigurationOutput>> {
+        self.delegate(req, |c, r| async move {
+            c.proxy().put_bucket_lifecycle_configuration(r).await
+        })
+        .await
+    }
+
+    async fn delete_bucket_lifecycle(
+        &self,
+        req: S3Request<DeleteBucketLifecycleInput>,
+    ) -> S3Result<S3Response<DeleteBucketLifecycleOutput>> {
+        self.delegate(req, |c, r| async move {
+            c.proxy().delete_bucket_lifecycle(r).await
+        })
+        .await
+    }
+
+    async fn get_bucket_tagging(
+        &self,
+        req: S3Request<GetBucketTaggingInput>,
+    ) -> S3Result<S3Response<GetBucketTaggingOutput>> {
+        self.delegate(
+            req,
+            |c, r| async move { c.proxy().get_bucket_tagging(r).await },
+        )
+        .await
+    }
+
+    async fn put_bucket_tagging(
+        &self,
+        req: S3Request<PutBucketTaggingInput>,
+    ) -> S3Result<S3Response<PutBucketTaggingOutput>> {
+        self.delegate(
+            req,
+            |c, r| async move { c.proxy().put_bucket_tagging(r).await },
+        )
+        .await
+    }
+
+    async fn delete_bucket_tagging(
+        &self,
+        req: S3Request<DeleteBucketTaggingInput>,
+    ) -> S3Result<S3Response<DeleteBucketTaggingOutput>> {
+        self.delegate(req, |c, r| async move {
+            c.proxy().delete_bucket_tagging(r).await
+        })
+        .await
+    }
+
+    async fn get_bucket_versioning(
+        &self,
+        req: S3Request<GetBucketVersioningInput>,
+    ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
+        self.delegate(req, |c, r| async move {
+            c.proxy().get_bucket_versioning(r).await
+        })
+        .await
+    }
+
+    async fn put_bucket_versioning(
+        &self,
+        req: S3Request<PutBucketVersioningInput>,
+    ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
+        self.delegate(req, |c, r| async move {
+            c.proxy().put_bucket_versioning(r).await
+        })
+        .await
+    }
+
+    async fn get_bucket_encryption(
+        &self,
+        req: S3Request<GetBucketEncryptionInput>,
+    ) -> S3Result<S3Response<GetBucketEncryptionOutput>> {
+        self.delegate(req, |c, r| async move {
+            c.proxy().get_bucket_encryption(r).await
+        })
+        .await
+    }
+
+    async fn put_bucket_encryption(
+        &self,
+        req: S3Request<PutBucketEncryptionInput>,
+    ) -> S3Result<S3Response<PutBucketEncryptionOutput>> {
+        self.delegate(req, |c, r| async move {
+            c.proxy().put_bucket_encryption(r).await
+        })
+        .await
+    }
+
+    async fn delete_bucket_encryption(
+        &self,
+        req: S3Request<DeleteBucketEncryptionInput>,
+    ) -> S3Result<S3Response<DeleteBucketEncryptionOutput>> {
+        self.delegate(req, |c, r| async move {
+            c.proxy().delete_bucket_encryption(r).await
+        })
+        .await
+    }
 
     // ── object tagging and attributes ───────────────────────────────────────────
 
@@ -1061,6 +1558,43 @@ fn bucket_listing_page(
     // substituting the caller would invent a canonical user id the backend never issued.
     output.owner = None;
     Ok(S3Response::new(output))
+}
+
+/// Keep the versions, delete markers and common prefixes whose key starts with `prefix`,
+/// and withhold `Owner` from every row.
+///
+/// Keys are compared decoded when the answer is URL-encoded, since `prefix` is the raw
+/// string the request carried. A row with no key was never authorized against anything and
+/// goes.
+fn restrict_versions(output: &mut ListObjectVersionsOutput, prefix: &str) {
+    let encoded = output
+        .encoding_type
+        .as_ref()
+        .is_some_and(|e| e.as_str().eq_ignore_ascii_case("url"));
+    let under = |key: Option<&str>| {
+        key.is_some_and(|k| {
+            if encoded {
+                percent_decode(&k.replace('+', "%20")).starts_with(prefix)
+            } else {
+                k.starts_with(prefix)
+            }
+        })
+    };
+    if let Some(versions) = output.versions.as_mut() {
+        versions.retain(|v| under(v.key.as_deref()));
+        for v in versions.iter_mut() {
+            v.owner = None;
+        }
+    }
+    if let Some(markers) = output.delete_markers.as_mut() {
+        markers.retain(|m| under(m.key.as_deref()));
+        for m in markers.iter_mut() {
+            m.owner = None;
+        }
+    }
+    if let Some(common) = output.common_prefixes.as_mut() {
+        common.retain(|c| under(c.prefix.as_deref()));
+    }
 }
 
 /// Decode a client-supplied continuation token, or refuse the request.

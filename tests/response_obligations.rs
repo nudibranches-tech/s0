@@ -21,7 +21,10 @@ use s0::access::GatewayAccess;
 use s0::proxy::obligations::{BucketVisibility, ResponseObligations};
 use s0::proxy::{GatewayS3, S3GatewayState};
 use s3s::access::S3Access;
-use s3s::dto::{ListBucketsInput, ListBucketsOutput, ListMultipartUploadsInput, ListPartsInput};
+use s3s::dto::{
+    ListBucketsInput, ListBucketsOutput, ListMultipartUploadsInput, ListObjectVersionsInput,
+    ListPartsInput,
+};
 use s3s::{S3, S3Request};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -784,5 +787,250 @@ async fn list_parts_strips_the_shared_identity_and_keeps_the_parts() {
         out.parts.unwrap_or_default().len(),
         1,
         "the parts are the answer to an authorized question and must survive"
+    );
+}
+
+// ── ListObjectVersions ──────────────────────────────────────────────────────────
+
+fn versions_xml(encoding: Option<&str>, version_keys: &[&str], marker_keys: &[&str]) -> String {
+    let encoding = encoding
+        .map(|e| format!("<EncodingType>{e}</EncodingType>"))
+        .unwrap_or_default();
+    let versions: String = version_keys
+        .iter()
+        .map(|k| {
+            format!(
+                "<Version><Key>{k}</Key><VersionId>v1</VersionId><IsLatest>true</IsLatest>\
+                 <LastModified>2024-01-01T00:00:00.000Z</LastModified><ETag>\"e\"</ETag>\
+                 <Size>3</Size><StorageClass>STANDARD</StorageClass>{OWNER_XML}</Version>"
+            )
+        })
+        .collect();
+    let markers: String = marker_keys
+        .iter()
+        .map(|k| {
+            format!(
+                "<DeleteMarker><Key>{k}</Key><VersionId>m1</VersionId><IsLatest>false</IsLatest>\
+                 <LastModified>2024-01-01T00:00:00.000Z</LastModified>{OWNER_XML}</DeleteMarker>"
+            )
+        })
+        .collect();
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Name>reports</Name><Prefix>20</Prefix><MaxKeys>1000</MaxKeys>{encoding}\
+         <IsTruncated>false</IsTruncated>{versions}{markers}</ListVersionsResult>"
+    )
+}
+
+async fn list_versions(
+    fx: &common::Fixture,
+    input: ListObjectVersionsInput,
+) -> s3s::S3Result<s3s::dto::ListObjectVersionsOutput> {
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request("ListObjectVersions", input, Method::GET);
+    access.list_object_versions(&mut req).await?;
+    gateway_s3(fx)
+        .list_object_versions(req)
+        .await
+        .map(|r| r.output)
+}
+
+fn versions_input(prefix: &str) -> ListObjectVersionsInput {
+    ListObjectVersionsInput {
+        bucket: "reports".into(),
+        prefix: Some(prefix.into()),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn versions_outside_the_narrowed_prefix_are_dropped() {
+    let backend = spawn_fake(|_| {
+        versions_xml(
+            None,
+            &["2024/inside.csv", "2023/outside.csv"],
+            &["2024/gone.csv", "2023/gone.csv"],
+        )
+    })
+    .await;
+    let fx = common::fixture_with_backend("ov-prefix", common::alice_bundle(), &backend.url);
+    let out = list_versions(&fx, versions_input("20"))
+        .await
+        .expect("allowed");
+    let keys = |rows: Option<Vec<String>>| rows.unwrap_or_default();
+    assert_eq!(
+        keys(
+            out.versions
+                .map(|v| v.into_iter().filter_map(|v| v.key).collect())
+        ),
+        vec!["2024/inside.csv"]
+    );
+    assert_eq!(
+        keys(
+            out.delete_markers
+                .map(|v| v.into_iter().filter_map(|v| v.key).collect())
+        ),
+        vec!["2024/gone.csv"],
+        "a delete marker outside the prefix names a key the principal cannot see"
+    );
+}
+
+#[tokio::test]
+async fn version_and_delete_marker_owners_are_withheld() {
+    let backend = spawn_fake(|_| versions_xml(None, &["2024/a.csv"], &["2024/b.csv"])).await;
+    let fx = common::fixture_with_backend("ov-owner", common::alice_bundle(), &backend.url);
+    let out = list_versions(&fx, versions_input("2024/"))
+        .await
+        .expect("allowed");
+    let versions = out.versions.unwrap_or_default();
+    let markers = out.delete_markers.unwrap_or_default();
+    assert_eq!((versions.len(), markers.len()), (1, 1));
+    assert!(versions.iter().all(|v| v.owner.is_none()));
+    assert!(markers.iter().all(|m| m.owner.is_none()));
+}
+
+#[tokio::test]
+async fn the_version_filter_compares_decoded_keys_under_url_encoding() {
+    // Under `encoding-type=url` the backend names keys percent-encoded while the granted
+    // prefix is the raw string: a literal comparison would drop an inside key whose
+    // prefix contains an encoded character, or keep an outside one that merely encodes to
+    // the same bytes.
+    let backend = spawn_fake(|_| {
+        versions_xml(
+            Some("url"),
+            &["2024/a%20b.csv", "2023/a%20b.csv"],
+            &["2024%2Fm.csv"],
+        )
+    })
+    .await;
+    let fx = common::fixture_with_backend("ov-url", common::alice_bundle(), &backend.url);
+    let mut input = versions_input("2024/");
+    input.encoding_type = Some(s3s::dto::EncodingType::from_static(
+        s3s::dto::EncodingType::URL,
+    ));
+    let out = list_versions(&fx, input).await.expect("allowed");
+    let kept: Vec<String> = out
+        .versions
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| v.key)
+        .collect();
+    assert_eq!(kept.len(), 1, "only the 2024/ version survives: {kept:?}");
+    assert_eq!(
+        out.delete_markers.unwrap_or_default().len(),
+        1,
+        "`2024%2Fm.csv` decodes to `2024/m.csv`, which is under the prefix"
+    );
+}
+
+#[tokio::test]
+async fn the_version_filter_reads_a_plus_as_a_space_under_url_encoding() {
+    let backend = spawn_fake(|_| {
+        versions_xml(
+            Some("url"),
+            &["my+docs/a.txt", "my%2Bdocs/b.txt"],
+            &["my+docs/m.txt"],
+        )
+    })
+    .await;
+    let fx = common::fixture_with_backend("ov-plus", whole_bucket_bundle(), &backend.url);
+    let mut input = versions_input("my docs/");
+    input.encoding_type = Some(s3s::dto::EncodingType::from_static(
+        s3s::dto::EncodingType::URL,
+    ));
+    let out = list_versions(&fx, input).await.expect("allowed");
+    let kept: Vec<String> = out
+        .versions
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| v.key)
+        .collect();
+    assert_eq!(
+        kept,
+        vec!["my+docs/a.txt"],
+        "`+` is a space and `%2B` a literal plus"
+    );
+    assert_eq!(out.delete_markers.unwrap_or_default().len(), 1);
+}
+
+fn whole_bucket_bundle() -> serde_json::Value {
+    let mut bundle = common::alice_bundle();
+    bundle["tenants"]["acme"]["s3_grants"]["alice"][0]["prefixes"] = serde_json::json!([""]);
+    bundle
+}
+
+fn two_prefix_bundle() -> serde_json::Value {
+    let mut bundle = common::alice_bundle();
+    bundle["tenants"]["acme"]["s3_grants"]["alice"][0]["prefixes"] =
+        serde_json::json!(["2024/", "2025/"]);
+    bundle
+}
+
+async fn refused_version_listing(
+    tag: &str,
+    bundle: serde_json::Value,
+    prefix: Option<&str>,
+) -> (s3s::S3Error, usize) {
+    let backend = spawn_fake(|_| versions_xml(None, &["2024/a.csv"], &[])).await;
+    let fx = common::fixture_with_backend(tag, bundle, &backend.url);
+    let mut input = versions_input("");
+    input.prefix = prefix.map(Into::into);
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request("ListObjectVersions", input, Method::GET);
+    let err = access
+        .list_object_versions(&mut req)
+        .await
+        .expect_err("the listing must be refused");
+    assert!(
+        ResponseObligations::of(&req).is_none(),
+        "a refused listing installs no obligation"
+    );
+    assert!(req.extensions.get::<s0::access::AuthzProof>().is_none());
+    (err, backend.requests.load(Ordering::Relaxed))
+}
+
+#[tokio::test]
+async fn a_multi_prefix_grant_refuses_a_version_listing() {
+    let (err, sent) = refused_version_listing("ov-multi", two_prefix_bundle(), Some("20")).await;
+    assert_eq!(*err.code(), s3s::S3ErrorCode::AccessDenied);
+    assert!(
+        err.message()
+            .is_some_and(|m| m.contains("multi-prefix listing")),
+        "{err:?}"
+    );
+    assert_eq!(sent, 0);
+}
+
+#[tokio::test]
+async fn an_unbounded_version_listing_needs_a_whole_bucket_grant() {
+    for (tag, bundle) in [
+        ("ov-unbounded", common::alice_bundle()),
+        ("ov-unbounded-multi", two_prefix_bundle()),
+    ] {
+        let (err, sent) = refused_version_listing(tag, bundle, None).await;
+        assert_eq!(*err.code(), s3s::S3ErrorCode::AccessDenied);
+        assert!(
+            err.message()
+                .is_some_and(|m| m.contains("unbounded list needs a whole-bucket grant")),
+            "{err:?}"
+        );
+        assert_eq!(sent, 0);
+    }
+}
+
+#[tokio::test]
+async fn a_version_listing_without_its_obligation_fails_closed() {
+    let backend = spawn_fake(|_| versions_xml(None, &["2024/a.csv"], &[])).await;
+    let fx = common::fixture_with_backend("ov-nohook", common::alice_bundle(), &backend.url);
+    let req = fx.request("ListObjectVersions", versions_input("2024/"), Method::GET);
+    let Err(err) = gateway_s3(&fx).list_object_versions(req).await else {
+        panic!("a version listing no hook decided must not be forwarded")
+    };
+    assert_eq!(*err.code(), s3s::S3ErrorCode::InternalError);
+    assert_eq!(
+        backend.requests.load(Ordering::Relaxed),
+        0,
+        "the refusal must happen before the backend is contacted"
     );
 }

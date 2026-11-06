@@ -2,7 +2,8 @@
 //!
 //! A cross-origin `PUT` or `GET` starts with a preflight (`OPTIONS`), and the page can read
 //! the response only if it names its origin. CORS stays a property of the managed resource
-//! (`GetBucketCors` and `PutBucketCors` remain refused to clients), but s0 is the endpoint
+//! (`GetBucketCors` and `PutBucketCors` are refused to clients unless a `control_backend`
+//! answers them, ADR-011; preflights still read the storage backend), but s0 is the endpoint
 //! the browser reaches, so it honours the rule the control plane set on the backend bucket:
 //!
 //! 1. [`lookup`] reads the bucket's CORS configuration from the backend with the tenant's

@@ -5,7 +5,7 @@
 //! `Enforced` without adding it here fails the suite rather than quietly losing
 //! coverage.
 
-use s0::access::optable::enforced_ops;
+use s0::access::optable::{delegable_ops, enforced_ops};
 use s3s::dto::*;
 
 pub fn copy_source() -> CopySource {
@@ -74,6 +74,64 @@ pub fn put_object_tagging_input() -> PutObjectTaggingInput {
         request_payer: None,
         version_id: None,
     }
+}
+
+pub fn put_bucket_cors_input() -> PutBucketCorsInput {
+    PutBucketCorsInput {
+        bucket: "reports".into(),
+        cors_configuration: CORSConfiguration::default(),
+        checksum_algorithm: None,
+        content_md5: None,
+        expected_bucket_owner: None,
+    }
+}
+
+pub fn put_bucket_tagging_input() -> PutBucketTaggingInput {
+    PutBucketTaggingInput {
+        bucket: "reports".into(),
+        tagging: Tagging {
+            tag_set: vec![Tag {
+                key: Some("tier".into()),
+                value: Some("internal".into()),
+            }],
+        },
+        checksum_algorithm: None,
+        content_md5: None,
+        expected_bucket_owner: None,
+    }
+}
+
+pub fn put_bucket_versioning_input() -> PutBucketVersioningInput {
+    PutBucketVersioningInput {
+        bucket: "reports".into(),
+        versioning_configuration: VersioningConfiguration::default(),
+        checksum_algorithm: None,
+        content_md5: None,
+        expected_bucket_owner: None,
+        mfa: None,
+    }
+}
+
+pub fn put_bucket_encryption_input() -> PutBucketEncryptionInput {
+    PutBucketEncryptionInput {
+        bucket: "reports".into(),
+        server_side_encryption_configuration: ServerSideEncryptionConfiguration::default(),
+        checksum_algorithm: None,
+        content_md5: None,
+        expected_bucket_owner: None,
+    }
+}
+
+/// Fail unless the operations a probe actually walked are exactly `OP_TABLE`'s
+/// delegable set.
+pub fn assert_matches_delegable_set(mut seen: Vec<&str>) {
+    let mut expected = delegable_ops();
+    seen.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(
+        seen, expected,
+        "the probe list in each_delegable_op! and OP_TABLE's Delegable set disagree"
+    );
 }
 
 /// Fail unless the operations a probe actually walked are exactly `OP_TABLE`'s
@@ -222,6 +280,15 @@ macro_rules! each_enforced_op {
             }
         );
         $probe!(
+            list_object_versions,
+            "ListObjectVersions",
+            s3s::dto::ListObjectVersionsInput {
+                bucket: "reports".into(),
+                prefix: Some("2024/".into()),
+                ..Default::default()
+            }
+        );
+        $probe!(
             list_objects,
             "ListObjects",
             s3s::dto::ListObjectsInput {
@@ -287,6 +354,129 @@ macro_rules! each_enforced_op {
             upload_part_copy,
             "UploadPartCopy",
             $crate::common::ops::upload_part_copy_input()
+        );
+    }};
+}
+
+/// Apply `$probe!(s3s_method, "OpName", input)` to each delegable operation.
+#[macro_export]
+macro_rules! each_delegable_op {
+    ($probe:ident) => {{
+        $probe!(
+            create_bucket,
+            "CreateBucket",
+            s3s::dto::CreateBucketInput {
+                bucket: "reports".into(),
+                ..Default::default()
+            }
+        );
+        $probe!(
+            delete_bucket,
+            "DeleteBucket",
+            s3s::dto::DeleteBucketInput {
+                bucket: "reports".into(),
+                ..Default::default()
+            }
+        );
+        $probe!(
+            get_bucket_cors,
+            "GetBucketCors",
+            s3s::dto::GetBucketCorsInput {
+                bucket: "reports".into(),
+                ..Default::default()
+            }
+        );
+        $probe!(
+            put_bucket_cors,
+            "PutBucketCors",
+            $crate::common::ops::put_bucket_cors_input()
+        );
+        $probe!(
+            delete_bucket_cors,
+            "DeleteBucketCors",
+            s3s::dto::DeleteBucketCorsInput {
+                bucket: "reports".into(),
+                ..Default::default()
+            }
+        );
+        $probe!(
+            get_bucket_lifecycle_configuration,
+            "GetBucketLifecycleConfiguration",
+            s3s::dto::GetBucketLifecycleConfigurationInput {
+                bucket: "reports".into(),
+                ..Default::default()
+            }
+        );
+        $probe!(
+            put_bucket_lifecycle_configuration,
+            "PutBucketLifecycleConfiguration",
+            s3s::dto::PutBucketLifecycleConfigurationInput {
+                bucket: "reports".into(),
+                ..Default::default()
+            }
+        );
+        $probe!(
+            delete_bucket_lifecycle,
+            "DeleteBucketLifecycle",
+            s3s::dto::DeleteBucketLifecycleInput {
+                bucket: "reports".into(),
+                ..Default::default()
+            }
+        );
+        $probe!(
+            get_bucket_tagging,
+            "GetBucketTagging",
+            s3s::dto::GetBucketTaggingInput {
+                bucket: "reports".into(),
+                ..Default::default()
+            }
+        );
+        $probe!(
+            put_bucket_tagging,
+            "PutBucketTagging",
+            $crate::common::ops::put_bucket_tagging_input()
+        );
+        $probe!(
+            delete_bucket_tagging,
+            "DeleteBucketTagging",
+            s3s::dto::DeleteBucketTaggingInput {
+                bucket: "reports".into(),
+                ..Default::default()
+            }
+        );
+        $probe!(
+            get_bucket_versioning,
+            "GetBucketVersioning",
+            s3s::dto::GetBucketVersioningInput {
+                bucket: "reports".into(),
+                ..Default::default()
+            }
+        );
+        $probe!(
+            put_bucket_versioning,
+            "PutBucketVersioning",
+            $crate::common::ops::put_bucket_versioning_input()
+        );
+        $probe!(
+            get_bucket_encryption,
+            "GetBucketEncryption",
+            s3s::dto::GetBucketEncryptionInput {
+                bucket: "reports".into(),
+                ..Default::default()
+            }
+        );
+        $probe!(
+            put_bucket_encryption,
+            "PutBucketEncryption",
+            $crate::common::ops::put_bucket_encryption_input()
+        );
+        $probe!(
+            delete_bucket_encryption,
+            "DeleteBucketEncryption",
+            s3s::dto::DeleteBucketEncryptionInput {
+                bucket: "reports".into(),
+                ..Default::default()
+            }
         );
     }};
 }

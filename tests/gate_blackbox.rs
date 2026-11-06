@@ -152,6 +152,22 @@ fn post_object_request_for(key: &str) -> RawRequest {
 }
 
 fn assert_refused_by_the_gate(route: &Route, resp: &Response) {
+    if s0::access::optable::refusal_is_not_implemented(route.op) {
+        assert_eq!(
+            resp.status, 501,
+            "{} must be refused by the gate with 501, got {}: {}",
+            route.op, resp.status, resp.body
+        );
+        if route.method != "HEAD" {
+            assert!(
+                resp.body.contains("<Code>NotImplemented</Code>") && resp.body.contains(route.op),
+                "{}: {}",
+                route.op,
+                resp.body
+            );
+        }
+        return;
+    }
     assert_eq!(
         resp.status, 403,
         "{} must be refused by the gate with 403, got {}: {}",
@@ -227,10 +243,11 @@ async fn every_denied_op_403s_over_real_http() {
     );
     assert_eq!(
         checked.len(),
-        76,
-        "99 operations minus the 23 enforced. The six control-plane ops (CreateBucket, \
-         DeleteBucket and the bucket policy/CORS pairs) are among them, and this is the \
-         test that proves the refusal reaches the WIRE, not just the table"
+        75,
+        "99 operations minus the 24 enforced. The two never-delegable control-plane ops \
+         (the bucket policy pair) and the 16 delegable ones, which this \
+         fixture leaves unconfigured, are among them, and this is the test that proves the \
+         refusal reaches the WIRE, not just the table"
     );
     drop(fx);
 }

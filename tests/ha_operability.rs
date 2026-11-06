@@ -25,7 +25,7 @@ use s0::audit::{
 use s0::auth::sts::StsAuthority;
 use s0::auth::{Identity, StaticCredentialStore};
 use s0::authz::{Backend, Decision, OpaInput, Principal, PrincipalAttributes, RequestMeta};
-use s0::bundle_refresh::{self, BundleHealth, BundleSource};
+use s0::bundle_refresh::{self, BundleHealth, BundleRefresher, BundleSource};
 use s0::config::GatewayConfig;
 use s0::gateway::Gateway;
 use s0::mint::{self, Mint, OidcVerifier, VerifiedIdentity};
@@ -91,6 +91,8 @@ async fn test_gateway(dir: &std::path::Path) -> Arc<Gateway> {
         cors: Arc::new(s0::cors::CorsState::new()),
         quota: Arc::new(s0::quota::QuotaLedger::new()),
         capture: None,
+        control: None,
+        refresher: None,
     })
 }
 
@@ -128,6 +130,8 @@ fn record(id: &str) -> AuditRecord {
             backend_kind: "ceph".into(),
             outcome: Outcome::Allowed,
             denied_keys: vec![],
+            versions: vec![],
+            denied_versions: vec![],
             backend: BackendOutcome::NotAttempted,
             backend_status: None,
             object_name: None,
@@ -288,11 +292,13 @@ async fn readiness_waits_for_a_real_poll_then_metrics_report_the_state() {
     let pdp: Arc<dyn Pdp> =
         Arc::new(RegorusPdp::new(GATEWAY_REGO, &bundle_json()).expect("regorus"));
     bundle_refresh::spawn(
-        pdp,
-        bundles.clone(),
-        BundleSource::File(bundle_file),
+        BundleRefresher::new(
+            pdp,
+            bundles.clone(),
+            BundleSource::File(bundle_file),
+            health.clone(),
+        ),
         Duration::from_millis(20),
-        health.clone(),
     );
 
     let mut ready = false;

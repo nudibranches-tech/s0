@@ -181,13 +181,19 @@ fn get(bucket: &str, key: &str) -> GetObjectInput {
     }
 }
 
-/// Assert `result` is the gateway's `AccessDenied` carrying `reason`, verbatim.
+/// Assert `result` is the gateway's refusal carrying `reason`, verbatim: `NoSuchBucket`
+/// for a bucket no tenant holds, `AccessDenied` for everything else.
 fn assert_refused<T: std::fmt::Debug>(label: &str, result: Result<T, s3s::S3Error>, reason: &str) {
     let err = match result {
         Ok(v) => panic!("{label}: must be refused, got {v:?}"),
         Err(e) => e,
     };
-    assert_eq!(*err.code(), S3ErrorCode::AccessDenied, "{label}: {err}");
+    let code = if reason == BUCKET_NOT_ON_THIS_BACKEND {
+        S3ErrorCode::NoSuchBucket
+    } else {
+        S3ErrorCode::AccessDenied
+    };
+    assert_eq!(*err.code(), code, "{label}: {err}");
     assert_eq!(err.message(), Some(reason), "{label}");
 }
 
@@ -318,7 +324,7 @@ async fn at_v3_tenants_sharing_an_upstream_identity_are_kept_apart_by_the_placem
 // ── v3: the owning-tenant gate ──────────────────────────────────────────────────
 
 #[tokio::test]
-async fn a_bucket_of_another_tenant_is_refused_before_any_policy_is_asked() {
+async fn a_bucket_of_another_tenant_is_still_access_denied() {
     let fx = common::fixture("v3-cross-tenant", v3());
     let access = GatewayAccess::new(fx.gw.clone());
     let mut req = fx.request_as("wild", "GetObject", get("ledger", "k"), Method::GET);
@@ -430,7 +436,7 @@ async fn a_v2_record_carries_no_object_name() {
 }
 
 #[tokio::test]
-async fn a_bucket_no_tenant_has_on_this_backend_is_refused() {
+async fn a_bucket_no_tenant_holds_is_no_such_bucket() {
     let fx = common::fixture("v3-not-here", v3());
     let access = GatewayAccess::new(fx.gw.clone());
     let mut req = fx.request_as(
@@ -459,6 +465,74 @@ async fn a_bucket_no_tenant_has_on_this_backend_is_refused() {
     for rec in decision_records(&records) {
         assert_eq!(rec.result.reason, BUCKET_NOT_ON_THIS_BACKEND);
     }
+}
+
+#[tokio::test]
+async fn a_copy_source_on_no_tenant_is_no_such_bucket() {
+    let fx = common::fixture("v3-copy-not-here", v3());
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut copy = common::ops::copy_object_input();
+    copy.copy_source = CopySource::Bucket {
+        bucket: "elsewhere".into(),
+        key: "src.csv".into(),
+        version_id: None,
+    };
+    let mut req = fx.request_as("wild", "CopyObject", copy, Method::PUT);
+    assert_refused(
+        "CopyObject out of a bucket no tenant holds",
+        access.copy_object(&mut req).await,
+        BUCKET_NOT_ON_THIS_BACKEND,
+    );
+    assert_eq!(fx.pdp_calls(), 0);
+}
+
+#[tokio::test]
+async fn a_listing_of_a_bucket_no_tenant_holds_is_no_such_bucket() {
+    let fx = common::fixture("v3-list-not-here", v3());
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request_as(
+        "wild",
+        "ListObjectsV2",
+        ListObjectsV2Input {
+            bucket: "elsewhere".into(),
+            ..Default::default()
+        },
+        Method::GET,
+    );
+    assert_refused(
+        "ListObjectsV2",
+        access.list_objects_v2(&mut req).await,
+        BUCKET_NOT_ON_THIS_BACKEND,
+    );
+    let mut req = fx.request_as(
+        "wild",
+        "ListObjects",
+        ListObjectsInput {
+            bucket: "elsewhere".into(),
+            ..Default::default()
+        },
+        Method::GET,
+    );
+    assert_refused(
+        "ListObjects",
+        access.list_objects(&mut req).await,
+        BUCKET_NOT_ON_THIS_BACKEND,
+    );
+    let mut req = fx.request_as(
+        "wild",
+        "ListMultipartUploads",
+        ListMultipartUploadsInput {
+            bucket: "elsewhere".into(),
+            ..Default::default()
+        },
+        Method::GET,
+    );
+    assert_refused(
+        "ListMultipartUploads",
+        access.list_multipart_uploads(&mut req).await,
+        BUCKET_NOT_ON_THIS_BACKEND,
+    );
+    assert_eq!(fx.pdp_calls(), 0);
 }
 
 /// The positive control: the owner's own bucket reaches the PDP, and the policy still

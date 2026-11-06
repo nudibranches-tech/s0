@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 
 use s0::access::optable::{
     Coverage, DangerTier, GATEWAY_VERBS, GateDenial, NON_GATEWAY_VERBS, OP_TABLE, action_for,
-    enforced_ops, gate_op, spec,
+    delegable_ops, enforced_ops, gate_op, spec,
 };
 use s0::model::Action;
 
@@ -24,13 +24,13 @@ const S3S_OPS: &str = include_str!("data/s3s-0.14.1-ops.txt");
 /// s0's own manifest, so a s3s bump cannot silently leave the reference list behind.
 const CARGO_TOML: &str = include_str!("../Cargo.toml");
 
-/// The reviewed enforced scope: 23 operations.
+/// The reviewed enforced scope: 24 operations.
 ///
 /// Checked in so the target is a diff against a written-down set rather than a number
 /// someone remembers, and so that flipping an op to `Enforced` that is NOT in this list
 /// is a visible, deliberate act. The ops deliberately kept out are named in
-/// `RE_DENIED_2026_08_08` rather than silently absent.
-const TARGET_ENFORCED: [&str; 23] = [
+/// `NEVER_DELEGABLE` or `DELEGABLE_ADR_0056` rather than silently absent.
+const TARGET_ENFORCED: [&str; 24] = [
     // the object data plane
     "AbortMultipartUpload",
     "CompleteMultipartUpload",
@@ -41,6 +41,7 @@ const TARGET_ENFORCED: [&str; 23] = [
     "GetObject",
     "HeadObject",
     "ListMultipartUploads",
+    "ListObjectVersions",
     "ListObjects",
     "ListObjectsV2",
     "ListParts",
@@ -59,22 +60,13 @@ const TARGET_ENFORCED: [&str; 23] = [
     "PutObjectTagging",
 ];
 
-/// The six control-plane operations that are `Denied` **permanently** rather than
-/// pending work, each with its reason.
+/// The control-plane operations that no configuration delegates, each with its reason.
 ///
-/// The other half of `TARGET_ENFORCED`: that array says what may be enforced, this one
-/// says what may not. Without it, adding `CreateBucket` to `TARGET_ENFORCED` would read
-/// as restoring something dropped by accident.
-const RE_DENIED_2026_08_08: [(&str, &str); 6] = [
-    (
-        "CreateBucket",
-        "a bucket made through S3 has no HFBucket CR: unmanaged, unquota'd, invisible to \
-         the console, and absent from the bucket_attributes the denylist is keyed on",
-    ),
-    (
-        "DeleteBucket",
-        "destroys a bucket the console still believes it manages",
-    ),
+/// The other half of `DELEGABLE_ADR_0056`: that array says what a control backend may
+/// answer, this one says what stays refused whatever the configuration. Without it,
+/// adding a bucket policy operation to the delegable set would read as restoring something
+/// dropped by accident.
+const NEVER_DELEGABLE: [(&str, &str); 2] = [
     (
         "GetBucketPolicy",
         "the document names the tenant-owner ARN and describes a second, backend-side \
@@ -85,15 +77,27 @@ const RE_DENIED_2026_08_08: [(&str, &str); 6] = [
         "a bucket policy IS a second PDP this gateway does not evaluate, so an Allow \
          written here widens access to a principal no projected grant named",
     ),
-    (
-        "GetBucketCors",
-        "CORS is bucket posture, and posture is control-plane",
-    ),
-    (
-        "PutBucketCors",
-        "rule contents were never inspected, so a write-config grant permitted \
-         AllowedOrigin `*`",
-    ),
+];
+
+/// The 16 operations ADR-0056 hands to a control backend: refused unless
+/// `control_backend.operations` lists them, answered by the control backend when it does.
+const DELEGABLE_ADR_0056: [&str; 16] = [
+    "CreateBucket",
+    "DeleteBucket",
+    "DeleteBucketCors",
+    "DeleteBucketEncryption",
+    "DeleteBucketLifecycle",
+    "DeleteBucketTagging",
+    "GetBucketCors",
+    "GetBucketEncryption",
+    "GetBucketLifecycleConfiguration",
+    "GetBucketTagging",
+    "GetBucketVersioning",
+    "PutBucketCors",
+    "PutBucketEncryption",
+    "PutBucketLifecycleConfiguration",
+    "PutBucketTagging",
+    "PutBucketVersioning",
 ];
 
 fn s3s_op_names() -> Vec<&'static str> {
@@ -150,41 +154,59 @@ fn op_table_covers_every_s3s_operation_and_nothing_else() {
 }
 
 #[test]
-fn exactly_23_enforced_76_denied() {
-    // The gateway is data-plane only. The other 76 ops are refused at the gate, before
+fn exactly_24_enforced_75_denied() {
+    // The gateway is data-plane only. The other 75 ops are refused at the gate, before
     // deserialization.
     let enforced = enforced_ops();
     let denied = OP_TABLE.len() - enforced.len();
     assert_eq!(
         enforced.len(),
-        23,
+        24,
         "enforced set changed to {enforced:?} — a Denied → Enforced flip needs two \
          reviewers, its hook, its dispatch arm, and this number updated"
     );
-    assert_eq!(denied, 76);
+    assert_eq!(denied, 75);
 }
 
 #[test]
-fn the_re_denied_ops_are_not_quietly_re_enforced() {
+fn the_non_delegable_ops_are_not_quietly_enforced_or_delegated() {
     // The count above is the weak form of this claim: an edit could re-enforce
-    // `PutBucketPolicy` and deny something else to keep 23/76 true. Naming the six also
+    // `PutBucketPolicy` and deny something else to keep 24/75 true. Naming them also
     // asserts they are refused by the TABLE rather than by a hook that returns an error.
     let target: BTreeSet<&str> = TARGET_ENFORCED.into_iter().collect();
-    for (op, why) in RE_DENIED_2026_08_08 {
+    for (op, why) in NEVER_DELEGABLE {
         assert!(
             spec(op).is_some(),
-            "RE_DENIED_2026_08_08 names {op}, which is not an s3s operation"
+            "NEVER_DELEGABLE names {op}, which is not an s3s operation"
         );
         assert_eq!(
             spec(op).unwrap().coverage,
             Coverage::Denied,
-            "{op} is Enforced again. It was removed from the gateway's scope on \
-             2026-08-08 and the reason has not expired: {why}"
+            "{op} is Enforced or Delegable again. The reason it was kept out has not \
+             expired: {why}"
         );
         assert_eq!(gate_op(op), Err(GateDenial::NotEnforced), "{op}");
         assert!(
             !target.contains(op),
-            "{op} is back in TARGET_ENFORCED; the two lists now contradict each other"
+            "{op} is in TARGET_ENFORCED; the two lists now contradict each other"
+        );
+    }
+}
+
+#[test]
+fn the_delegable_ops_are_exactly_the_adr_0056_sixteen() {
+    let mut named: Vec<&str> = DELEGABLE_ADR_0056.to_vec();
+    named.sort_unstable();
+    let mut delegable = delegable_ops();
+    delegable.sort_unstable();
+    assert_eq!(delegable, named);
+    let target: BTreeSet<&str> = TARGET_ENFORCED.into_iter().collect();
+    for op in DELEGABLE_ADR_0056 {
+        assert_ne!(spec(op).unwrap().coverage, Coverage::Enforced, "{op}");
+        assert!(!target.contains(op), "{op} is delegable, not enforced");
+        assert!(
+            !NEVER_DELEGABLE.iter().any(|(n, _)| *n == op),
+            "{op} is listed as both delegable and never delegable"
         );
     }
 }
@@ -194,11 +216,11 @@ fn every_enforced_op_is_in_the_target_scope() {
     // The target set is the review boundary: an op may only become Enforced if it was
     // already argued for. Adding one to TARGET_ENFORCED is the argument.
     let target: BTreeSet<&str> = TARGET_ENFORCED.into_iter().collect();
-    assert_eq!(target.len(), 23, "TARGET_ENFORCED has duplicates");
+    assert_eq!(target.len(), 24, "TARGET_ENFORCED has duplicates");
     for op in enforced_ops() {
         assert!(
             target.contains(op),
-            "{op} is Enforced but is not in the reviewed 23-op target scope"
+            "{op} is Enforced but is not in the reviewed 24-op target scope"
         );
     }
     for op in TARGET_ENFORCED {
@@ -223,6 +245,15 @@ fn every_non_enforced_op_is_denied_at_the_gate() {
                     s.tier,
                     DangerTier::NeverImplement,
                     "{} is both enforced and structurally unauthorizable",
+                    s.name
+                );
+            }
+            Coverage::Delegable => {
+                // Refused exactly like a denied op until a control backend lists it.
+                assert_eq!(
+                    gate_op(s.name),
+                    Err(GateDenial::NotEnforced),
+                    "{} is delegable and must be refused with no delegation configured",
                     s.name
                 );
             }
@@ -253,6 +284,23 @@ fn the_two_structural_denials_are_never_implement() {
 }
 
 #[test]
+fn only_the_delete_ops_carry_a_versioned_path_and_it_names_the_versioned_verb() {
+    let with_path: Vec<&str> = OP_TABLE
+        .iter()
+        .filter(|s| s.versioned.is_some())
+        .map(|s| s.name)
+        .collect();
+    assert_eq!(with_path, vec!["DeleteObject", "DeleteObjects"]);
+    for s in OP_TABLE {
+        let Some(v) = s.versioned else { continue };
+        assert_eq!(s.coverage, Coverage::Enforced, "{}", s.name);
+        assert_eq!(v.verb, "delete_object_versions", "{}", s.name);
+        assert!(GATEWAY_VERBS.contains(&v.verb), "{}", s.name);
+        assert_eq!(v.tier, DangerTier::PostureAltering, "{}", s.name);
+    }
+}
+
+#[test]
 fn op_table_verbs_are_grantable_or_explicitly_control_plane() {
     // Every row's verb is one of exactly two things: a verb a grant can carry, or a
     // label saying the authority belongs to the control plane. There is no third
@@ -268,7 +316,7 @@ fn op_table_verbs_are_grantable_or_explicitly_control_plane() {
             ),
             Some(v) => assert!(
                 GATEWAY_VERBS.contains(&v) || NON_GATEWAY_VERBS.contains(&v),
-                "{} maps to {v}, which is neither one of the six projected grant verbs \
+                "{} maps to {v}, which is neither one of the seven projected grant verbs \
                  nor a recorded control-plane label",
                 s.name
             ),
@@ -288,7 +336,7 @@ fn op_table_verbs_are_grantable_or_explicitly_control_plane() {
 }
 
 #[test]
-fn the_gateway_vocabulary_is_the_six_projected_verbs() {
+fn the_gateway_vocabulary_is_the_seven_projected_verbs() {
     // The vocabulary a control plane projects grants into. Changing it is a cross-repo
     // contract change, not a local edit.
     let mut verbs = GATEWAY_VERBS.to_vec();
@@ -296,6 +344,7 @@ fn the_gateway_vocabulary_is_the_six_projected_verbs() {
     assert_eq!(
         verbs,
         [
+            "delete_object_versions",
             "delete_objects",
             "list_objects",
             "read",
@@ -368,9 +417,9 @@ fn the_write_set_matches_the_shipped_rego() {
     );
     assert_eq!(
         from_rust.len(),
-        3,
-        "the write set is 3 verbs: create_bucket, delete_bucket and \
-         write_bucket_config left the vocabulary, and write_object_acl with them"
+        4,
+        "the write set is 4 verbs: write_objects, delete_objects, delete_object_versions \
+         and write_object_tags"
     );
 }
 

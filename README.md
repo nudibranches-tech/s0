@@ -19,33 +19,85 @@ Operations it does not own are denied, not passed through.
 
 ## Supported operations
 
-s0 knows all **99** operations in the `s3s` 0.14.1 surface. **23** are enforced and
-forwarded; the other **76** are refused with `403 AccessDenied`. There is no third
-category — an operation with no entry in the table cannot reach a backend.
+s0 knows all **99** operations in the `s3s` 0.14.1 surface. **24** are enforced and
+forwarded; the other **75** are refused with `403 AccessDenied`, unless a control backend
+is configured: **16** of those can be delegated to it and answered there instead (below).
+An operation with no entry in the table cannot reach a backend, and one that is delegated
+never reaches the storage backend either.
 
 The table is [`src/access/optable.rs`](src/access/optable.rs) and it is the only source
 of truth. `tests/gate_blackbox.rs` drives every refused operation as a signed HTTP
 request through the real gate, and `tests/readme_optable.rs` fails if the counts below
 drift from the table.
 
-### Enforced (23)
+### Enforced (24)
 
-Each is authorized against one of six grant verbs. A grant is per-subject, per-bucket,
+Each is authorized against one of seven grant verbs. A grant is per-subject, per-bucket,
 per-verb, with object-prefix scopes.
 
 | Grant verb | Operations |
 |---|---|
 | `read` | `HeadBucket`, `GetBucketLocation`, `ListBuckets` |
 | `read_objects` | `GetObject`, `HeadObject`, `GetObjectAttributes`, `GetObjectTagging`, `ListParts` |
-| `list_objects` | `ListObjects`, `ListObjectsV2`, `ListMultipartUploads` |
+| `list_objects` | `ListObjects`, `ListObjectsV2`, `ListObjectVersions`, `ListMultipartUploads` |
 | `write_objects` | `PutObject`, `PostObject`, `CopyObject`, `CreateMultipartUpload`, `UploadPart`, `UploadPartCopy`, `CompleteMultipartUpload`, `AbortMultipartUpload` |
-| `delete_objects` | `DeleteObject`, `DeleteObjects` |
+| `delete_objects` | `DeleteObject`, `DeleteObjects` (entries with no `versionId`) |
+| `delete_object_versions` | `DeleteObject` with a `versionId`, and each `DeleteObjects` entry carrying one |
 | `write_object_tags` | `PutObjectTagging`, `DeleteObjectTagging` |
 
 That covers ordinary object storage: get/put/head/delete, multipart upload, server-side
 copy, listing, and object tagging.
 
-### Not supported (76)
+### Delegated (16)
+
+Bucket creation, deletion and bucket configuration cannot be answered by the storage backend alone:
+on a platform that owns its buckets through a control plane, a bucket is a declared
+resource. When `control_backend` is configured, s0 hands the operations it lists to that
+S3 endpoint and returns its answer; without it they are refused like any other.
+
+| Group | Operations |
+|---|---|
+| Creation and deletion | `CreateBucket`, `DeleteBucket` |
+| CORS | `GetBucketCors`, `PutBucketCors`, `DeleteBucketCors` |
+| Lifecycle | `GetBucketLifecycleConfiguration`, `PutBucketLifecycleConfiguration`, `DeleteBucketLifecycle` |
+| Tags | `GetBucketTagging`, `PutBucketTagging`, `DeleteBucketTagging` |
+| Versioning | `GetBucketVersioning`, `PutBucketVersioning` |
+| Default encryption | `GetBucketEncryption`, `PutBucketEncryption`, `DeleteBucketEncryption` |
+
+Whatever s0 forwards to the storage backend, s0 authorizes; **whatever it delegates, the
+control backend authorizes.** For these operations s0 authenticates the caller, resolves the
+tenant's route, and never asks the policy engine. It checks no placement, quota,
+`freeze_writes` or rider either: the control backend sees the whole request and owns those
+answers. It re-issues the parsed request signed with a dedicated control credential, adds the
+caller's identity in `x-s0-caller-subject`, `x-s0-caller-tenant`, `x-s0-caller-organization`,
+`x-s0-backend-id` and `x-s0-request-id` **before** signing so all of them are in
+`SignedHeaders`, does not retry (a delegated write is not known to be idempotent), and passes
+the control backend's S3 error through unchanged except for the request id, which becomes the
+delegated audit record's id. A control backend that cannot be reached answers `503
+ServiceUnavailable`. `GetBucketPolicy` and `PutBucketPolicy` are never delegated. Reads of bucket configuration that s0 neither enforces nor delegates
+(`GetBucketPolicy`, `GetBucketAcl`, `GetBucketWebsite`, `GetBucketLogging`, ...) answer `501
+NotImplemented`, not `AccessDenied`: no grant would open them, and infrastructure tools such as
+the Terraform AWS provider treat `NotImplemented` as "not served" and carry on.
+
+**Read your writes.** The bucket a delegated `CreateBucket` made reaches s0 through the
+bundle, and the bundle is polled. So after a `2xx` from the control backend s0 fetches the
+bundle itself, with a short backoff, until the bucket is placed under the caller's tenant
+(at most `create_bucket_placement_wait_secs`, and never past 55 s from the request's
+arrival), and only then passes the `200` on. If the wait runs out s0 answers `200` anyway,
+because refusing would make the client retry into `BucketAlreadyOwnedByYou`; the delegated
+audit record says `placement_wait: timed_out`. A replica that did not serve the create
+catches up the same way: an authenticated request refused as "not on this backend" makes it
+fetch the bundle once (fetches start at most once a second per replica, concurrent misses share one) and decide
+again on a bundle fetched after the request arrived; without a `control_backend` nothing is
+fetched on a miss. After a delegated `DeleteBucket` s0 does the same until the bucket is no longer placed
+(`placement_wait: removed`). A delegated `PutBucketCors`, `DeleteBucketCors` or `DeleteBucket` drops
+this replica's cached CORS entry for the bucket; other replicas follow within about a
+minute. The fetches are counted in `s0_bundle_on_demand_refresh_total{trigger,result}`
+(`trigger` is `miss` or `placement_wait`) and
+the delegated requests in `s0_delegated_requests_total{operation,status_class}`. See [ADR-011](docs/adr/ADR-011-delegated-operations.md) and `control_backend` in
+[`docs/gateway.example.json`](docs/gateway.example.json).
+
+### Not supported (75)
 
 **Bucket lifecycle and configuration — 63 operations.** Every `*BucketAcl`, `*BucketPolicy`,
 `*BucketCors`, `*BucketEncryption`, `*BucketVersioning`, `*BucketLifecycle`,
@@ -60,9 +112,10 @@ with nothing upstream knowing. Those five verbs (`create_bucket`, `delete_bucket
 `read_bucket_config`, `write_bucket_config`, `write_object_acl`) are held in
 `NON_GATEWAY_VERBS` as a classification only — three tests hold that set disjoint from the
 grantable vocabulary, so flipping one of these operations to enforced does not quietly
-compile.
+compile. The 16 operations of the section above are the exception, and only when a
+control backend answers them; without one they are in this list too.
 
-**Object-level operations outside the model — 11 operations.**
+**Object-level operations outside the model — 10 operations.**
 
 | Operation(s) | Why |
 |---|---|
@@ -71,7 +124,6 @@ compile.
 | `RestoreObject` | Glacier-class restore; no verb, no backend parity. |
 | `SelectObjectContent` | Server-side SQL over object contents — the response is a projection s0 cannot authorize at object granularity. |
 | `GetObjectTorrent` | Legacy. |
-| `ListObjectVersions` | Versioned listing is not modelled; the prefix-scoping rules below apply to the unversioned listing only. |
 | `ListDirectoryBuckets` | S3 Express One Zone directory buckets are out of scope. |
 
 **Structurally unauthorizable — 2 operations.** These are refused *ahead of* the coverage
@@ -84,8 +136,14 @@ table, so no pushed policy can enable them:
 
 ### Other known limits
 
-- **Versioning**: `version_id` rides into the OPA input on the operations that accept it,
-  but there is no version-aware grant shape and no versioned listing.
+- **Versioning**: `ListObjectVersions` is decided under `list_objects` for a single prefix
+  (a multi-prefix grant is refused, not fanned out), its response is re-filtered to the
+  decided prefix and owners are withheld. A delete naming a version is decided under
+  `delete_object_versions`, per entry in a batch; `delete_objects` does not confer it and
+  the reverse holds too. A grant of `["*"]` confers both. `GetObject`, `HeadObject`,
+  `GetObjectAttributes`, `GetObjectTagging` and copy sources naming a `versionId` read an
+  old version under the current key's `read_objects` grant, and tag writes naming one stay
+  `write_object_tags`.
 - **SSE-C / KMS**: encryption headers pass through to the backend; s0 does not authorize
   on them.
 - **Presigned URLs** are supported (the STS session token is resolved from the query
@@ -150,8 +208,9 @@ Three independent layers, and they only work together:
 
 | Layer | What it stops |
 |---|---|
-| `check`, pre-deserialization | Denies anonymous requests and any operation the table does not mark `Enforced`. Emits a **gate** audit record naming the stage, operation and access-key id. |
+| `check`, pre-deserialization | Denies anonymous requests and any operation the table does not mark `Enforced`, or `Delegable` and listed in `control_backend.operations`. Emits a **gate** audit record naming the stage, operation and access-key id. |
 | `AuthzProof` ([`src/access/proof.rs`](src/access/proof.rs)) | The enforce path mints a proof; the forward path requires one bound to the same operation. A typed hook that forgets to authorize cannot reach a backend — it fails with an internal error. |
+| `DelegationProof` ([`src/access/delegation.rs`](src/access/delegation.rs)) | `check` mints a proof for a request it admitted as delegated; the delegated hook and dispatch arm both require one bound to the same operation. Neither proof opens the other's arm, so a delegated operation never reaches the policy engine or the storage backend, and an enforced one never reaches the control backend. |
 | PDP error handling | Any PDP error, missing key, or unparseable decision denies. |
 
 The table proves a hook *exists*; the proof proves it *ran*.
@@ -285,12 +344,13 @@ key, so replacing it invalidates live sessions. Rotate it in a window.
 A browser that uploads to or downloads from a presigned URL pointing at s0 sends a preflight
 (`OPTIONS`) first, and can read the answer only if it names the page's origin. s0 serves both
 from **the CORS configuration the control plane already set on the backend bucket**. There is
-no gateway-level CORS setting, and `GetBucketCors` / `PutBucketCors` stay refused to clients:
-CORS remains a property of the managed resource, and s0 only reads it back.
+no gateway-level CORS setting. `GetBucketCors` / `PutBucketCors` stay refused to clients
+unless a control backend is configured to answer them (see Delegated, above): CORS remains
+a property of the managed resource, and s0 only reads it back.
 
 | | |
 |---|---|
-| **Source** | `GetBucketCors` against the backend, signed with the tenant's own backend credential, cached per `(backend, tenant, bucket)` for about 60 s. "No CORS configuration" is cached too; a failed read is remembered for a few seconds only. A rule written on the backend reaches browsers within about a minute. |
+| **Source** | `GetBucketCors` against the backend, signed with the tenant's own backend credential, cached per `(backend, tenant, bucket)` for about 60 s. "No CORS configuration" is cached too; a failed read is remembered for a few seconds only. A rule written on the backend reaches browsers within about a minute; a rule written through a delegated `PutBucketCors` or `DeleteBucketCors` reaches them at once on the replica that served the write. |
 | **Evaluation** | As S3 does it: `*` wildcards in `AllowedOrigin` and `AllowedHeader`, `AllowedMethod`, `ExposeHeader`, `MaxAgeSeconds`; the first rule that matches wins, and a preflight rule must allow the origin, the method **and every** requested header. |
 | **Preflight** | Answered before s3s sees it, since `OPTIONS` is never an S3 operation. `200` with `Access-Control-Allow-Origin` (`*` for a `*` rule, otherwise the request origin), `-Allow-Methods`, `-Allow-Headers`, `-Expose-Headers`, `-Max-Age` and `Vary`; every refusal is the same `403`, whether the cause is the rule, the credential, the tenant or the bucket. |
 | **Real requests** | Any other request that carries `Origin` gets the matching `Access-Control-Allow-Origin`, `-Expose-Headers` and `Vary` after s3s has answered, success or S3 error. A request with no `Origin` is untouched. |
@@ -405,7 +465,7 @@ S0_CAPTURE_REGENERATE=1 cargo test --test golden_capture   # re-record the captu
 | the policy is tested against the *emitted* input, never a hand-written one | every fixture in [`tests/data/captured_inputs/`](tests/data/captured_inputs) is recorded at `GatewayAccess::decide`, the single funnel every PDP question passes through |
 | a renamed or dropped input field fails the build | `OpaInput` carries `deny_unknown_fields`; every capture must round-trip, and adding a field is a compile error until `OPA_INPUT_FIELDS` is updated ([`tests/fixture_drift.rs`](tests/fixture_drift.rs)) |
 | a policy cannot read a field the gateway never sends | every `input.<path>` in the shipped rego must resolve in a captured input — the exact failure that once left 35 rego tests green over a deny-all production |
-| every refused operation is refused over real HTTP | all 76 are driven as signed requests through the real `check`, table-driven off s3s's own route table ([`tests/gate_blackbox.rs`](tests/gate_blackbox.rs)) |
+| every refused operation is refused over real HTTP | all 75 are driven as signed requests through the real `check`, table-driven off s3s's own route table ([`tests/gate_blackbox.rs`](tests/gate_blackbox.rs)) |
 | the embedded engine cannot be licensed by an absent oracle | the parity gate **fails** rather than skips when `opa` is missing, and the oracle version is pinned to production's in CI, docker-compose and the test itself ([`tests/parity.rs`](tests/parity.rs)) |
 | cursors and cache keys survive a rebuild | `content_revision` / `scope_hash` are SHA-256, pinned by [`tests/golden_hash.rs`](tests/golden_hash.rs) — `DefaultHasher` is not stable across toolchains |
 | a configured secret cannot be printed | every plaintext credential is a `Secret<String>` whose `Debug` renders `Secret(<redacted>)`, with no `Display` and no `Serialize` ([`src/secret.rs`](src/secret.rs)) |
@@ -468,7 +528,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md). Security reports: [`SECURITY.md`](SECU
 ## License
 
 Business Source License 1.1 (`BUSL-1.1`), converting to Apache-2.0 on the change
-date (`2030-10-26`, four years after this release). See [`LICENSE`](LICENSE);
+date (`2030-11-04`, four years after this release). See [`LICENSE`](LICENSE);
 the future Apache text is in [`LICENSE-APACHE-2.0.txt`](LICENSE-APACHE-2.0.txt).
 
 Until that date, in short:

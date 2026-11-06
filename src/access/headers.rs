@@ -56,8 +56,10 @@ pub struct AclFields<'a> {
     pub full_control: Option<&'a str>,
     pub read: Option<&'a str>,
     /// Only bucket ACLs have a WRITE grant, and every op that could carry one is
-    /// `Coverage::Denied`, so this is `None` at every construction site today. Kept so
-    /// that an op which can carry `x-amz-grant-write` is screened the day it is enforced.
+    /// `Coverage::Denied` or `Coverage::Delegable`, so this is `None` at every construction
+    /// site today: a delegated `CreateBucket`'s grants are screened by the control backend
+    /// (ADR-011 D3). Kept so that an op which can carry `x-amz-grant-write` is screened the
+    /// day it is enforced.
     pub write: Option<&'a str>,
     pub read_acp: Option<&'a str>,
     pub write_acp: Option<&'a str>,

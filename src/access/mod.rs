@@ -2,7 +2,8 @@
 //! request — including the riders (canned ACL, `x-amz-grant-*`, inline `x-amz-tagging`,
 //! governance bypass) a path-only check would miss. `check` is the deny-by-default
 //! backstop: it refuses anonymous callers and every op [`optable`] does not mark
-//! [`Coverage::Enforced`], because the default hooks fail OPEN. Every refusal is audited;
+//! [`Coverage::Enforced`], or [`Coverage::Delegable`] and listed by `control_backend`
+//! (ADR-011), because the default hooks fail OPEN. Every refusal is audited;
 //! an allowed record is held for the forward leg ([`crate::audit::PendingAudit`]), a
 //! denied one emitted at once. Riders no grant may authorize are refused in code, never
 //! silently stripped ([`headers`], ADR-008); an inline tag set is decomposed onto
@@ -13,6 +14,7 @@
 //! the policy allowed is then charged to the byte quotas that bundle states, if any
 //! ([`crate::quota`]).
 
+pub mod delegation;
 pub mod headers;
 pub mod optable;
 pub mod proof;
@@ -30,7 +32,8 @@ use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Result, s3_error};
 use crate::access::headers::RequestRiders;
 use crate::access::tagging::ReservedTagKeys;
 use crate::audit::{
-    AuditRecord, BackendOutcome, GateContext, GateStage, GatewayMeta, Outcome, PendingAudit,
+    AuditRecord, BackendOutcome, DelegationContext, GateContext, GateStage, GatewayMeta, Outcome,
+    PendingAudit, VersionedKey,
 };
 use crate::auth::SECURITY_TOKEN_HEADER;
 use crate::authz::{Backend, CopySource as AuthzCopySource, Decision, OpaInput, RequestMeta};
@@ -40,10 +43,12 @@ use crate::identity::ResolvedPrincipal;
 use crate::model::Action;
 use crate::pdp::{BucketPlacement, PlacementRefusal};
 use crate::proxy::RouteSnapshot;
+use crate::proxy::control::CheckedAt;
 use crate::proxy::obligations::{BucketSource, BucketVisibility, ResponseObligations};
 use crate::quota::{Admission, QuotaRefusal, WriteTarget};
 
-pub use optable::{Coverage, DangerTier, GateDenial, OP_TABLE, OpSpec, ResourceShape};
+pub use delegation::DelegationProof;
+pub use optable::{Coverage, DangerTier, Gate, GateDenial, OP_TABLE, OpSpec, ResourceShape};
 pub use proof::AuthzProof;
 
 /// The ACL fields of an object-shaped s3s input, as [`headers::AclFields`].
@@ -253,6 +258,7 @@ impl GatewayAccess {
         decision: &Decision,
         outcome: Outcome,
         denied_keys: Vec<String>,
+        versions: VersionedAudit,
     ) -> AuditRecord {
         // The live revision rather than the request's pinned one: this names, it never
         // decides, and a bucket keeps its object name for as long as it exists.
@@ -263,6 +269,8 @@ impl GatewayAccess {
             backend_kind: input.backend.kind.as_str().to_string(),
             outcome,
             denied_keys,
+            versions: versions.requested,
+            denied_versions: versions.refused,
             backend: BackendOutcome::NotAttempted,
             backend_status: None,
             object_name: object_name(&input.bucket),
@@ -289,7 +297,17 @@ impl GatewayAccess {
         decision: &Decision,
         denied_keys: Vec<String>,
     ) -> String {
-        let record = self.record(input, decision, Outcome::Denied, denied_keys);
+        self.audit_denied_versions(input, decision, denied_keys, VersionedAudit::default())
+    }
+
+    fn audit_denied_versions(
+        &self,
+        input: OpaInput,
+        decision: &Decision,
+        denied_keys: Vec<String>,
+        versions: VersionedAudit,
+    ) -> String {
+        let record = self.record(input, decision, Outcome::Denied, denied_keys, versions);
         let decision_id = record.decision_id.clone();
         self.gw.audit.emit(record);
         decision_id
@@ -308,7 +326,18 @@ impl GatewayAccess {
         decision: &Decision,
         denied_keys: Vec<String>,
     ) {
-        let record = self.record(input, decision, Outcome::Allowed, denied_keys);
+        self.audit_pending_versions(cx, input, decision, denied_keys, VersionedAudit::default());
+    }
+
+    fn audit_pending_versions(
+        &self,
+        cx: &mut ReqCtx<'_>,
+        input: OpaInput,
+        decision: &Decision,
+        denied_keys: Vec<String>,
+        versions: VersionedAudit,
+    ) {
+        let record = self.record(input, decision, Outcome::Allowed, denied_keys, versions);
         cx.extensions
             .insert(Arc::new(PendingAudit::new(self.gw.audit.clone(), record)));
     }
@@ -343,12 +372,54 @@ impl GatewayAccess {
         ));
     }
 
+    /// The record of a request handed to the control backend, held until the dispatcher
+    /// knows what the control backend answered. Names the live bundle's own name for the
+    /// bucket when it has one, like every other record.
+    fn delegated_record(
+        &self,
+        op: &str,
+        bucket: String,
+        principal: &ResolvedPrincipal,
+        route: &RouteSnapshot,
+    ) -> AuditRecord {
+        let object_name = self
+            .gw
+            .bundles
+            .current()
+            .placement()
+            .object_name(&bucket)
+            .map(str::to_string);
+        AuditRecord::delegated(
+            new_decision_id(),
+            now_rfc3339(),
+            DelegationContext {
+                operation: op.to_string(),
+                bucket,
+                tenant: route.tenant.clone(),
+                subject: crate::pdp::principal_subject_key(
+                    principal.principal_type,
+                    &principal.sub,
+                ),
+                control_status: None,
+                control_error: None,
+                placement_wait: None,
+            },
+            principal.sub.clone(),
+            &route.organization_id,
+            route.backend_id.0.clone(),
+            route.backend_kind.as_str().to_string(),
+            object_name,
+            self.gw.audit.labels(),
+        )
+    }
+
     /// Ask the PDP about one prepared input, then act on the answer: hold the record and
     /// mint the proof on allow, emit the record and refuse on deny. Every single-decision
     /// hook funnels through here, so "audited exactly once, and a proof exists only on the
     /// allow side" is one branch to read rather than one per op.
     async fn enforce(&self, cx: &mut ReqCtx<'_>, input: OpaInput) -> S3Result<()> {
-        self.enforce_charged(cx, input, Charge::Nothing).await
+        self.enforce_charged(cx, input, Charge::Nothing, VersionedAudit::default())
+            .await
     }
 
     /// [`Self::enforce`] for a write that adds bytes: once the policy allowed it, it is
@@ -358,6 +429,7 @@ impl GatewayAccess {
         cx: &mut ReqCtx<'_>,
         input: OpaInput,
         charge: Charge,
+        versions: VersionedAudit,
     ) -> S3Result<()> {
         // Screened here as well as in `decide`, so the client gets the placement's client
         // message rather than the decision's reason, which is the audit's.
@@ -373,7 +445,7 @@ impl GatewayAccess {
             && let Some(reason) = unimplemented_obligations(&decision)
         {
             let decision = Decision::deny(reason.clone());
-            self.audit_denied(input, &decision, vec![]);
+            self.audit_denied_versions(input, &decision, vec![], versions);
             return Err(s3_error!(AccessDenied, "{reason}"));
         }
         let (allow, reason) = (decision.allow, decision.reason.clone());
@@ -381,11 +453,11 @@ impl GatewayAccess {
             if let Err(denial) = self.hold_quota(cx, &input, &charge).await {
                 return Err(self.deny_quota(input, denial));
             }
-            self.audit_pending(cx, input, &decision, vec![]);
+            self.audit_pending_versions(cx, input, &decision, vec![], versions);
             cx.prove();
             Ok(())
         } else {
-            self.audit_denied(input, &decision, vec![]);
+            self.audit_denied_versions(input, &decision, vec![], versions);
             Err(s3_error!(AccessDenied, "{reason}"))
         }
     }
@@ -510,11 +582,12 @@ impl GatewayAccess {
         s3_error!(AccessDenied, "{reason}")
     }
 
-    /// Record a placement refusal with its full reason, and answer 403 with the client's
-    /// version of it ([`PlacementRefusal::client_message`]).
+    /// Record a placement refusal with its full reason, and answer with the client's
+    /// version of it ([`PlacementRefusal::client_message`]), under the code
+    /// [`PlacementRefusal::s3_code`].
     fn deny_placement(&self, input: OpaInput, refusal: &PlacementRefusal) -> S3Error {
         self.audit_denied(input, &Decision::deny(refusal.reason()), vec![]);
-        s3_error!(AccessDenied, "{}", refusal.client_message())
+        S3Error::with_message(refusal.s3_code(), refusal.client_message())
     }
 
     /// The reserved-key list currently published by the control plane.
@@ -597,7 +670,7 @@ impl GatewayAccess {
         bucket: String,
         object: String,
         riders: Result<RequestRiders, String>,
-        charge: Charge,
+        (charge, versions): (Charge, VersionedAudit),
     ) -> S3Result<()> {
         // The riders are parsed from `&req.input` *before* the `ReqCtx` takes its mutable
         // borrow, so a malformed one arrives here as an `Err` rather than as an early
@@ -622,7 +695,7 @@ impl GatewayAccess {
         if let Some(why) = self.authorize_riders(cx, &input, &riders).await {
             return Err(self.deny(input, why));
         }
-        self.enforce_charged(cx, input, charge).await
+        self.enforce_charged(cx, input, charge, versions).await
     }
 
     /// The single-object path (get/head/put/delete-one/post-form/tagging). One
@@ -649,7 +722,8 @@ impl GatewayAccess {
     ) -> S3Result<()> {
         let mut input = cx.base_input(action, bucket);
         input.object = Some(object);
-        self.enforce_charged(cx, input, charge).await
+        self.enforce_charged(cx, input, charge, VersionedAudit::default())
+            .await
     }
 
     /// The keyless bucket path (head/location). No object and no prefix, so grant
@@ -817,16 +891,21 @@ impl GatewayAccess {
         // Ahead of `decide`, for the client message; see `enforce_charged`.
         if let Some(refusal) = cx.placement_refusal(&input) {
             self.audit_denied(input, &Decision::deny(refusal.reason()), vec![]);
-            return ListVerdict::Deny(refusal.client_message());
+            return match refusal.s3_code() {
+                s3s::S3ErrorCode::NoSuchBucket => {
+                    ListVerdict::NoSuchBucket(refusal.client_message())
+                }
+                _ => ListVerdict::Deny(refusal.client_message()),
+            };
         }
         let decision = self.decide(cx, &input).await;
         let verdict = classify_list(&decision, self.gw.limits().max_list_fanout, fanout);
         match &verdict {
-            ListVerdict::Deny(reason) => {
+            ListVerdict::Deny(reason) | ListVerdict::NoSuchBucket(reason) => {
                 let d = Decision::deny(reason.clone());
                 self.audit_denied(input, &d, vec![]);
             }
-            _ => {
+            ListVerdict::AllowAsIs | ListVerdict::Narrow(_) | ListVerdict::FanOut(_) => {
                 self.audit_pending(cx, input, &decision, vec![]);
                 cx.prove();
             }
@@ -864,20 +943,27 @@ impl S3Access for GatewayAccess {
         };
         // Deny-by-default backstop: an op the table does not mark `Enforced` fails
         // OPEN at its typed hook (s3s defaults every one of them to `Ok(())`), so it
-        // MUST be rejected here. `gate_op` also refuses the two structurally
-        // unauthorizable ops ahead of, and independently of, their coverage.
-        if let Err(denial) = optable::gate_op(&op) {
-            tracing::warn!(%op, %access_key, reason = denial.as_str(), "gate deny: operation refused");
-            self.audit_gate_denial(
-                &op,
-                GateStage::OperationNotEnforced,
-                Some(&access_key),
-                None,
-                None,
-                denial.as_str().to_string(),
-            );
-            return Err(s3_error!(AccessDenied, "{}: {op}", denial.as_str()));
-        }
+        // MUST be rejected here. `gate` also refuses the two structurally unauthorizable
+        // ops ahead of, and independently of, their coverage, and a `Delegable` op only
+        // passes when `control_backend.operations` lists it.
+        let gate = match optable::gate(&op, self.gw.delegated_ops()) {
+            Ok(gate) => gate,
+            Err(denial) => {
+                tracing::warn!(%op, %access_key, reason = denial.as_str(), "gate deny: operation refused");
+                self.audit_gate_denial(
+                    &op,
+                    GateStage::OperationNotEnforced,
+                    Some(&access_key),
+                    None,
+                    None,
+                    denial.as_str().to_string(),
+                );
+                if optable::refusal_is_not_implemented(&op) {
+                    return Err(s3_error!(NotImplemented, "{}: {op}", denial.as_str()));
+                }
+                return Err(s3_error!(AccessDenied, "{}: {op}", denial.as_str()));
+            }
+        };
         // The STS session token rides in the header for signed requests and in the
         // query string for presigned URLs — presigned links flow through the
         // same OPA gate, so accept both.
@@ -922,9 +1008,46 @@ impl S3Access for GatewayAccess {
                 principal.tenant
             ));
         };
+        if matches!(gate, Gate::Delegated(_)) {
+            // No policy question, placement, quota, freeze or rider check: the control
+            // backend sees the whole request and owns those answers (ADR-011 D3).
+            let bucket = cx
+                .s3_path()
+                .get_bucket_name()
+                .unwrap_or_default()
+                .to_string();
+            let (principal, route) = (Arc::new(principal), Arc::new(route));
+            let record = self.delegated_record(&op, bucket, &principal, &route);
+            let ext = cx.extensions_mut();
+            ext.insert(principal);
+            ext.insert(route);
+            ext.insert(OperationName(Arc::from(op.as_str())));
+            ext.insert(Arc::new(PendingAudit::new(self.gw.audit.clone(), record)));
+            ext.insert(DelegationProof::mint(Arc::from(op.as_str())));
+            ext.insert(CheckedAt(std::time::Instant::now()));
+            return Ok(());
+        }
+
         // The placement is pinned here for the same reason: a bundle swap mid-request must
         // not let one sub-decision see a bucket where another did not.
-        let placement = self.gw.bundles.current().placement().clone();
+        let mut placement = self.gw.bundles.current().placement().clone();
+        // A bucket this replica's bundle does not place may have been created since the
+        // last poll: fetch once, rate-limited, and decide with what that brings.
+        if let (Gate::Enforced(_), Some(refresher), Some(_)) =
+            (&gate, &self.gw.refresher, &self.gw.control)
+        {
+            let bucket = cx.s3_path().get_bucket_name().map(str::to_string);
+            let missing = bucket.is_some_and(|bucket| {
+                matches!(
+                    placement.refusal(&route.backend_id.0, &principal.tenant, &bucket),
+                    Some(PlacementRefusal::NotOnBackend)
+                )
+            });
+            if missing {
+                refresher.refresh_on_miss().await;
+                placement = self.gw.bundles.current().placement().clone();
+            }
+        }
         let ext = cx.extensions_mut();
         ext.insert(Arc::new(principal));
         ext.insert(Arc::new(route));
@@ -969,8 +1092,15 @@ impl S3Access for GatewayAccess {
             max_tags,
         );
         let mut cx = ReqCtx::new(req)?;
-        self.enforce_object_write(&mut cx, Action::WriteObjects, bucket, key, riders, charge)
-            .await
+        self.enforce_object_write(
+            &mut cx,
+            Action::WriteObjects,
+            bucket,
+            key,
+            riders,
+            (charge, VersionedAudit::default()),
+        )
+        .await
     }
 
     /// Browser form upload: the key is in the parsed multipart body, not in the path, so
@@ -997,8 +1127,15 @@ impl S3Access for GatewayAccess {
         // length unset only for an empty one.
         let charge = Charge::Body(Some(req.input.content_length.unwrap_or(0)));
         let mut cx = ReqCtx::new(req)?;
-        self.enforce_object_write(&mut cx, Action::WriteObjects, bucket, key, riders, charge)
-            .await
+        self.enforce_object_write(
+            &mut cx,
+            Action::WriteObjects,
+            bucket,
+            key,
+            riders,
+            (charge, VersionedAudit::default()),
+        )
+        .await
     }
 
     /// Delete one object — refusing outright to defeat its retention.
@@ -1012,14 +1149,27 @@ impl S3Access for GatewayAccess {
             bypass_governance: req.input.bypass_governance_retention.unwrap_or(false),
             ..RequestRiders::default()
         });
+        let action = delete_action(req.input.version_id.as_deref());
+        let versions = VersionedAudit {
+            requested: req
+                .input
+                .version_id
+                .iter()
+                .map(|v| VersionedKey {
+                    key: key.clone(),
+                    version_id: v.clone(),
+                })
+                .collect(),
+            refused: vec![],
+        };
         let mut cx = ReqCtx::new(req)?;
         self.enforce_object_write(
             &mut cx,
-            Action::DeleteObjects,
+            action,
             bucket,
             key,
             riders,
-            Charge::Nothing,
+            (Charge::Nothing, versions),
         )
         .await
     }
@@ -1033,17 +1183,33 @@ impl S3Access for GatewayAccess {
         let bucket = req.input.bucket.clone();
         let bypass_governance = req.input.bypass_governance_retention.unwrap_or(false);
         let key_count = req.input.delete.objects.len();
-        let all_keys: Vec<String> = req
+        let entries: Vec<(String, Option<String>)> = req
             .input
             .delete
             .objects
             .iter()
-            .map(|o| o.key.clone())
+            .map(|o| (o.key.clone(), o.version_id.clone()))
+            .collect();
+        // The batch is recorded under the stronger verb when any entry names a version.
+        let batch_action = if entries.iter().any(|(_, v)| v.is_some()) {
+            Action::DeleteObjectVersions
+        } else {
+            Action::DeleteObjects
+        };
+        let all_keys: Vec<String> = entries.iter().map(|(k, _)| k.clone()).collect();
+        let versions: Vec<VersionedKey> = entries
+            .iter()
+            .filter_map(|(k, v)| {
+                v.as_ref().map(|v| VersionedKey {
+                    key: k.clone(),
+                    version_id: v.clone(),
+                })
+            })
             .collect();
         let mut cx = ReqCtx::new(req)?;
         // Once for the batch, not per key: every key would be refused for the same
         // reason, and the record would then say only "all delete keys denied".
-        let placement_input = cx.base_input(Action::DeleteObjects, bucket.clone());
+        let placement_input = cx.base_input(batch_action, bucket.clone());
         if let Some(refusal) = cx.placement_refusal(&placement_input) {
             return Err(self.deny_placement(placement_input, &refusal));
         }
@@ -1052,7 +1218,7 @@ impl S3Access for GatewayAccess {
         // NOT recorded here: the request is over the bound precisely because it carries
         // too many, and an audit record is not the place to copy an unbounded list.
         if key_count > max_delete_keys {
-            let input = cx.base_input(Action::DeleteObjects, bucket);
+            let input = cx.base_input(batch_action, bucket);
             return Err(self.refuse(
                 input,
                 format!(
@@ -1064,7 +1230,7 @@ impl S3Access for GatewayAccess {
         // is decided, and refuses the whole request. A partially-honored WORM bypass is
         // not a thing this gateway should be able to produce.
         if bypass_governance {
-            let mut input = cx.base_input(Action::DeleteObjects, bucket);
+            let mut input = cx.base_input(batch_action, bucket);
             input.bypass_governance = true;
             let why = self
                 .screen_riders(&RequestRiders {
@@ -1075,37 +1241,48 @@ impl S3Access for GatewayAccess {
             return Err(self.refuse(input, why));
         }
 
-        let mut allowed: Vec<String> = Vec::new();
+        // Decided per entry, under the entry's own verb, and kept by position: one key may
+        // appear twice, once with a version and once without, under different verbs.
+        let mut keep: Vec<bool> = Vec::with_capacity(entries.len());
         let mut denied: Vec<String> = Vec::new();
-        for key in &all_keys {
-            let mut input = cx.base_input(Action::DeleteObjects, bucket.clone());
+        let mut refused: Vec<VersionedKey> = Vec::new();
+        for (key, version) in &entries {
+            let mut input = cx.base_input(delete_action(version.as_deref()), bucket.clone());
             input.object = Some(key.clone());
-            if self.decide(&cx, &input).await.allow {
-                allowed.push(key.clone());
-            } else {
+            let allow = self.decide(&cx, &input).await.allow;
+            keep.push(allow);
+            if !allow {
                 denied.push(key.clone());
+                if let Some(version_id) = version {
+                    refused.push(VersionedKey {
+                        key: key.clone(),
+                        version_id: version_id.clone(),
+                    });
+                }
             }
         }
+        let allowed = keep.iter().filter(|k| **k).count();
 
-        let mut record_input = cx.base_input(Action::DeleteObjects, bucket);
+        let versions = VersionedAudit {
+            requested: versions,
+            refused,
+        };
+        let mut record_input = cx.base_input(batch_action, bucket);
         record_input.delete_keys = Some(all_keys);
-        if allowed.is_empty() {
+        if allowed == 0 {
             let decision = Decision::deny("all delete keys denied");
-            self.audit_denied(record_input, &decision, denied);
+            self.audit_denied_versions(record_input, &decision, denied, versions);
             return Err(s3_error!(AccessDenied, "all delete keys denied by policy"));
         }
-        let decision = Decision::allow(format!(
-            "{} allowed, {} denied",
-            allowed.len(),
-            denied.len()
-        ));
-        self.audit_pending(&mut cx, record_input, &decision, denied);
+        let decision = Decision::allow(format!("{allowed} allowed, {} denied", denied.len()));
+        self.audit_pending_versions(&mut cx, record_input, &decision, denied, versions);
         cx.prove();
-        // Per-key filtering: forward only authorized keys.
+        // Per-entry filtering: forward only authorized entries.
+        let mut positions = keep.into_iter();
         req.input
             .delete
             .objects
-            .retain(|o| allowed.contains(&o.key));
+            .retain(|_| positions.next().unwrap_or(false));
         Ok(())
     }
 
@@ -1174,6 +1351,7 @@ impl S3Access for GatewayAccess {
         };
         match verdict {
             ListVerdict::Deny(reason) => Err(s3_error!(AccessDenied, "{reason}")),
+            ListVerdict::NoSuchBucket(reason) => Err(s3_error!(NoSuchBucket, "{reason}")),
             ListVerdict::AllowAsIs => Ok(()),
             ListVerdict::Narrow(np) => {
                 req.input.prefix = Some(np);
@@ -1205,6 +1383,34 @@ impl S3Access for GatewayAccess {
         list_verdict_single(verdict, &mut req.input.prefix)
     }
 
+    /// Version listing is a single-prefix `list_objects` decision: a multi-prefix grant is
+    /// refused rather than fanned out, because the version markers do not merge across
+    /// prefixes. The response is re-filtered to the decided prefix by the dispatcher, which
+    /// is why the obligation is installed here even when the grant is the whole bucket.
+    async fn list_object_versions(
+        &self,
+        req: &mut S3Request<ListObjectVersionsInput>,
+    ) -> S3Result<()> {
+        // Same s3s comma-list defect as `get_object_attributes`; see `split_comma_list`.
+        if let Some(opt) = req.input.optional_object_attributes.as_mut() {
+            split_comma_list(opt);
+        }
+        let (bucket, prefix) = (req.input.bucket.clone(), req.input.prefix.clone());
+        let verdict = {
+            let mut cx = ReqCtx::new(req)?;
+            self.enforce_list(
+                &mut cx,
+                bucket,
+                prefix,
+                Fanout::Unsupported(NO_FANOUT_ON_THIS_OP),
+            )
+            .await
+        };
+        list_verdict_single(verdict, &mut req.input.prefix)?;
+        ResponseObligations::version_listing(req.input.prefix.clone()).install(&mut req.extensions);
+        Ok(())
+    }
+
     // ── Multipart upload lifecycle (write on the key), plus its copy + list ops ──
 
     /// Begin a multipart upload. The ACL and tag set are fixed **here**, at creation, not
@@ -1231,7 +1437,7 @@ impl S3Access for GatewayAccess {
             bucket,
             key,
             riders,
-            Charge::Nothing,
+            (Charge::Nothing, VersionedAudit::default()),
         )
         .await
     }
@@ -1354,18 +1560,109 @@ impl S3Access for GatewayAccess {
         Ok(())
     }
 
-    // ── bucket existence (client compatibility) ─────────────────────────────────
+    // ── delegated operations ────────────────────────────────────────────────────
     //
-    // Deliberately absent: `create_bucket`, `delete_bucket`, `{get,put}_bucket_policy`
-    // and `{get,put}_bucket_cors`. The gateway is data-plane only, and these are REMOVED
-    // rather than stubbed — a stub returning `Ok(())` is the s3s fail-OPEN default wearing
-    // a comment. With no hook and no dispatch arm, `OP_TABLE` marks each
-    // `Coverage::Denied`, `check` refuses before deserialization, and even a bug in
-    // `check` lands on s3s's `NotImplemented`;
+    // The 16 `Coverage::Delegable` operations. Each hook only demands the
+    // `DelegationProof` that `check` mints for a request it admitted as delegated, because
+    // the s3s default would answer `Ok(())` and a hook that did nothing would read as an
+    // authorization. They never reach the policy engine: the control backend authorizes
+    // (ADR-011). `{get,put}_bucket_policy` stay absent, so the table
+    // keeps them `Coverage::Denied`, `check` refuses them before deserialization, and even
+    // a bug in `check` lands on s3s's `NotImplemented`;
     // `tests/gate_invariants.rs::denied_ops_have_no_dispatch_arm` holds that.
-    //
-    // Bucket existence, policy, CORS and quota are properties of the managed resource and
-    // are changed through the control plane. See `optable::NON_GATEWAY_VERBS`.
+
+    async fn create_bucket(&self, req: &mut S3Request<CreateBucketInput>) -> S3Result<()> {
+        delegation::require(req)
+    }
+
+    async fn delete_bucket(&self, req: &mut S3Request<DeleteBucketInput>) -> S3Result<()> {
+        delegation::require(req)
+    }
+
+    async fn get_bucket_cors(&self, req: &mut S3Request<GetBucketCorsInput>) -> S3Result<()> {
+        delegation::require(req)
+    }
+
+    async fn put_bucket_cors(&self, req: &mut S3Request<PutBucketCorsInput>) -> S3Result<()> {
+        delegation::require(req)
+    }
+
+    async fn delete_bucket_cors(&self, req: &mut S3Request<DeleteBucketCorsInput>) -> S3Result<()> {
+        delegation::require(req)
+    }
+
+    async fn get_bucket_lifecycle_configuration(
+        &self,
+        req: &mut S3Request<GetBucketLifecycleConfigurationInput>,
+    ) -> S3Result<()> {
+        delegation::require(req)
+    }
+
+    async fn put_bucket_lifecycle_configuration(
+        &self,
+        req: &mut S3Request<PutBucketLifecycleConfigurationInput>,
+    ) -> S3Result<()> {
+        delegation::require(req)
+    }
+
+    async fn delete_bucket_lifecycle(
+        &self,
+        req: &mut S3Request<DeleteBucketLifecycleInput>,
+    ) -> S3Result<()> {
+        delegation::require(req)
+    }
+
+    async fn get_bucket_tagging(&self, req: &mut S3Request<GetBucketTaggingInput>) -> S3Result<()> {
+        delegation::require(req)
+    }
+
+    async fn put_bucket_tagging(&self, req: &mut S3Request<PutBucketTaggingInput>) -> S3Result<()> {
+        delegation::require(req)
+    }
+
+    async fn delete_bucket_tagging(
+        &self,
+        req: &mut S3Request<DeleteBucketTaggingInput>,
+    ) -> S3Result<()> {
+        delegation::require(req)
+    }
+
+    async fn get_bucket_versioning(
+        &self,
+        req: &mut S3Request<GetBucketVersioningInput>,
+    ) -> S3Result<()> {
+        delegation::require(req)
+    }
+
+    async fn put_bucket_versioning(
+        &self,
+        req: &mut S3Request<PutBucketVersioningInput>,
+    ) -> S3Result<()> {
+        delegation::require(req)
+    }
+
+    async fn get_bucket_encryption(
+        &self,
+        req: &mut S3Request<GetBucketEncryptionInput>,
+    ) -> S3Result<()> {
+        delegation::require(req)
+    }
+
+    async fn put_bucket_encryption(
+        &self,
+        req: &mut S3Request<PutBucketEncryptionInput>,
+    ) -> S3Result<()> {
+        delegation::require(req)
+    }
+
+    async fn delete_bucket_encryption(
+        &self,
+        req: &mut S3Request<DeleteBucketEncryptionInput>,
+    ) -> S3Result<()> {
+        delegation::require(req)
+    }
+
+    // ── bucket existence (client compatibility) ─────────────────────────────────
 
     async fn head_bucket(&self, req: &mut S3Request<HeadBucketInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
@@ -1531,6 +1828,8 @@ header_list_item!(OptionalObjectAttributes);
 /// What to do with a list request after the PDP decision.
 enum ListVerdict {
     Deny(String),
+    /// The bucket is on no tenant of this backend.
+    NoSuchBucket(String),
     /// Allowed as requested (whole-bucket or already-in-scope prefix).
     AllowAsIs,
     /// Rewrite the request prefix to this single granted prefix.
@@ -1784,10 +2083,29 @@ fn unimplemented_obligations(decision: &Decision) -> Option<String> {
     ))
 }
 
+/// The verb a delete is decided under: naming a version, `"null"` included, is a versioned
+/// delete.
+/// The versioned entries of a delete, for the decision record: what the request named and
+/// what policy refused of it.
+#[derive(Default)]
+struct VersionedAudit {
+    requested: Vec<VersionedKey>,
+    refused: Vec<VersionedKey>,
+}
+
+fn delete_action(version_id: Option<&str>) -> Action {
+    if version_id.is_some() {
+        Action::DeleteObjectVersions
+    } else {
+        Action::DeleteObjects
+    }
+}
+
 /// Apply a list verdict for ops without fan-out dispatch (v1 list, multipart list).
 fn list_verdict_single(verdict: ListVerdict, prefix: &mut Option<String>) -> S3Result<()> {
     match verdict {
         ListVerdict::Deny(reason) => Err(s3_error!(AccessDenied, "{reason}")),
+        ListVerdict::NoSuchBucket(reason) => Err(s3_error!(NoSuchBucket, "{reason}")),
         ListVerdict::AllowAsIs => Ok(()),
         ListVerdict::Narrow(np) => {
             *prefix = Some(np);
@@ -1939,6 +2257,7 @@ mod tests {
             "CopyObject",
             "DeleteObjects",
             "ListObjectsV2",
+            "ListObjectVersions",
             "CreateMultipartUpload",
             "UploadPartCopy",
             "CompleteMultipartUpload",
@@ -1953,18 +2272,23 @@ mod tests {
         assert!(optable::gate_op("ListBuckets").is_ok());
         // Ops with no hook must be refused — they would fail-open at their default
         // typed hook, so check() must reject them.
-        for op in [
-            "PutBucketAcl",
-            "PutObjectAcl",
-            "ListObjectVersions",
-            "RestoreObject",
-        ] {
+        for op in ["PutBucketAcl", "PutObjectAcl", "RestoreObject"] {
             assert_eq!(
                 optable::gate_op(op),
                 Err(GateDenial::NotEnforced),
                 "{op} must be denied by default"
             );
         }
+    }
+
+    #[test]
+    fn a_null_version_id_is_a_versioned_delete() {
+        assert_eq!(delete_action(Some("null")), Action::DeleteObjectVersions);
+        assert_eq!(
+            delete_action(Some("3HL4kqtJ")),
+            Action::DeleteObjectVersions
+        );
+        assert_eq!(delete_action(None), Action::DeleteObjects);
     }
 
     #[test]
@@ -2045,7 +2369,7 @@ mod tests {
                         ListVerdict::FanOut(_) => "FanOut",
                         ListVerdict::AllowAsIs => "AllowAsIs",
                         ListVerdict::Narrow(_) => "Narrow",
-                        ListVerdict::Deny(_) => unreachable!(),
+                        ListVerdict::Deny(_) | ListVerdict::NoSuchBucket(_) => unreachable!(),
                     }
                 ),
             }

@@ -273,9 +273,9 @@ impl PlacementRefusal {
     /// What the client is told. A bundle-wide refusal is one fixed sentence: its detail can
     /// name another tenant (an unreadable `bucket_attributes`), both backend ids, or the
     /// fact that the tenant shares its upstream identity, and stays on the audit record.
-    /// The per-bucket refusals are the audit reason verbatim: telling "another tenant" from
-    /// "not here" discloses that the name is taken on this backend, which a bucket creation
-    /// refused as "name already used" discloses anyway.
+    /// The per-bucket refusals are the audit reason verbatim, under the code
+    /// [`Self::s3_code`]: a bucket no tenant holds is told apart from another tenant's
+    /// (ADR-011 D8).
     #[must_use]
     pub fn client_message(&self) -> String {
         match self {
@@ -285,6 +285,18 @@ impl PlacementRefusal {
             PlacementRefusal::AnotherTenant
             | PlacementRefusal::Contested
             | PlacementRefusal::NotOnBackend => self.reason(),
+        }
+    }
+}
+
+impl PlacementRefusal {
+    /// The S3 error code the client is answered with: `NoSuchBucket` for a name no tenant
+    /// holds on this backend, `AccessDenied` for every other refusal.
+    #[must_use]
+    pub fn s3_code(&self) -> s3s::S3ErrorCode {
+        match self {
+            PlacementRefusal::NotOnBackend => s3s::S3ErrorCode::NoSuchBucket,
+            _ => s3s::S3ErrorCode::AccessDenied,
         }
     }
 }

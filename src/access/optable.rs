@@ -6,12 +6,17 @@
 //! deny-by-default backstop in `check` stands between that and the backend. The table
 //! records whether a hook and a dispatch arm really exist; `tests/op_coverage.rs` and
 //! `tests/gate_invariants.rs` hold it to the source. Flipping an entry to
-//! [`Coverage::Enforced`] must land with its hook and arm or the tests fail — but no test
-//! can check that a [`DangerTier`] is right, so treat such a diff as a security review.
+//! [`Coverage::Enforced`] must land with its hook and arm, and a flip to
+//! [`Coverage::Delegable`] with its delegated hook and arm, or the tests fail
+//! (`tests/gate_invariants.rs` and `tests/op_coverage.rs` hold both to the source) — but no
+//! test can check that a [`DangerTier`] is right, so treat such a diff as a security review.
+
+use std::collections::BTreeSet;
 
 use crate::model::Action;
 
-/// Whether the gateway authorizes an operation, or refuses it at the gate.
+/// Whether the gateway authorizes an operation, hands it to a control backend, or refuses
+/// it at the gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Coverage {
     /// A typed `S3Access` hook authorizes the *parsed* request and a `GatewayS3` arm
@@ -20,6 +25,13 @@ pub enum Coverage {
     /// `check` refuses it before deserialization. There is no dispatch arm, so even a
     /// bug in `check` leaves the s3s `NotImplemented` default in the way.
     Denied,
+    /// Refused like [`Coverage::Denied`] unless `control_backend.operations` lists it, in
+    /// which case a control backend answers it and the policy engine is never asked
+    /// ([`gate`], ADR-011). A property of the table, which cannot know the configuration:
+    /// the runtime verdict is [`Gate::Delegated`]. It has a typed hook and a dispatch arm
+    /// that both demand a [`crate::access::DelegationProof`], so an unlisted row is
+    /// refused at the gate and a bug in `check` cannot reach the control backend either.
+    Delegable,
 }
 
 /// What the operation's input actually names — i.e. what there is to authorize.
@@ -67,7 +79,7 @@ pub enum DangerTier {
     NeverImplement,
 }
 
-/// The grant vocabulary the gateway can actually decide against: the six verbs a control
+/// The grant vocabulary the gateway can actually decide against: the seven verbs a control
 /// plane's grant projection emits.
 ///
 /// Held as strings rather than [`Action`] because the table classifies *denied* ops too;
@@ -78,6 +90,7 @@ pub const GATEWAY_VERBS: &[&str] = &[
     "list_objects",
     "write_objects",
     "delete_objects",
+    "delete_object_versions",
     "write_object_tags",
     "read",
 ];
@@ -91,6 +104,9 @@ pub const GATEWAY_VERBS: &[&str] = &[
 /// this set is disjoint from [`GATEWAY_VERBS`], no `Enforced` entry may name one, and
 /// [`action_for`] returns `None` for each — so flipping such an op to `Enforced` fails the
 /// suite rather than quietly compiling.
+///
+/// Only `Denied` and `Delegable` rows carry them: a delegable row's authority is the
+/// control backend's, never a grant's.
 pub const NON_GATEWAY_VERBS: &[&str] = &[
     "create_bucket",
     "delete_bucket",
@@ -119,6 +135,24 @@ pub struct OpSpec {
     /// What an enforced op's hook does **not** inspect: the parts of the request that ride
     /// along unauthorized once bucket+key have been allowed. Empty for denied ops.
     pub blind_spots: &'static [&'static str],
+    /// The verb and tier a request of this op takes when it names an object version, or
+    /// `None` when the op has no versioned path.
+    pub versioned: Option<VersionedPath>,
+}
+
+/// The decision an op takes instead of its own when the request names an object version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VersionedPath {
+    pub verb: &'static str,
+    pub tier: DangerTier,
+}
+
+impl OpSpec {
+    /// Names the decision a request of this op takes when it carries an object version.
+    const fn with_versioned(mut self, verb: &'static str, tier: DangerTier) -> OpSpec {
+        self.versioned = Some(VersionedPath { verb, tier });
+        self
+    }
 }
 
 /// An operation with a typed hook and a dispatch arm.
@@ -136,6 +170,7 @@ const fn enforced(
         shape,
         tier,
         blind_spots,
+        versioned: None,
     }
 }
 
@@ -154,6 +189,27 @@ const fn denied(
         shape,
         tier,
         blind_spots: &[],
+        versioned: None,
+    }
+}
+
+/// An operation a control backend can answer, refused by `check` unless the configuration
+/// lists it. Classified like [`denied`]: the verb and shape are labels, since no grant
+/// carries them.
+const fn delegable(
+    name: &'static str,
+    verb: &'static str,
+    shape: ResourceShape,
+    tier: DangerTier,
+) -> OpSpec {
+    OpSpec {
+        name,
+        coverage: Coverage::Delegable,
+        verb: Some(verb),
+        shape,
+        tier,
+        blind_spots: &[],
+        versioned: None,
     }
 }
 
@@ -173,6 +229,7 @@ const fn unauthorizable(name: &'static str, shape: ResourceShape) -> OpSpec {
         shape,
         tier: DangerTier::NeverImplement,
         blind_spots: &[],
+        versioned: None,
     }
 }
 
@@ -217,9 +274,10 @@ pub const OP_TABLE: &[OpSpec] = &[
     ),
     // A bucket created through the gateway is unmanaged and absent from
     // `bucket_attributes`, so the per-bucket denylist the policy reads has nothing to key
-    // on. Bucket existence is control-plane. Compatibility cost: rclone issues CreateBucket
-    // before every upload and aborts on a refusal, so it needs `--s3-no-check-bucket`.
-    denied(
+    // on. Bucket existence is control-plane, so it is delegated to a control backend when
+    // one is configured (ADR-011). Without one, rclone, which issues CreateBucket before
+    // every upload and aborts on a refusal, needs `--s3-no-check-bucket`.
+    delegable(
         "CreateBucket",
         "create_bucket",
         ResourceShape::Bucket,
@@ -242,9 +300,9 @@ pub const OP_TABLE: &[OpSpec] = &[
         ],
     ),
     unauthorizable("CreateSession", ResourceShape::Bucket),
-    // The more dangerous half of the pair: it destroys a bucket the control plane still
-    // believes it manages.
-    denied(
+    // Delegated with `CreateBucket`: the control backend authorizes it and the backend's
+    // own `DeleteBucket` is the emptiness check (ADR-011).
+    delegable(
         "DeleteBucket",
         "delete_bucket",
         ResourceShape::Bucket,
@@ -256,13 +314,13 @@ pub const OP_TABLE: &[OpSpec] = &[
         ResourceShape::BucketSubresource,
         DangerTier::PostureAltering,
     ),
-    denied(
+    delegable(
         "DeleteBucketCors",
         "write_bucket_config",
         ResourceShape::Bucket,
         DangerTier::PostureAltering,
     ),
-    denied(
+    delegable(
         "DeleteBucketEncryption",
         "write_bucket_config",
         ResourceShape::Bucket,
@@ -280,7 +338,7 @@ pub const OP_TABLE: &[OpSpec] = &[
         ResourceShape::BucketSubresource,
         DangerTier::PostureAltering,
     ),
-    denied(
+    delegable(
         "DeleteBucketLifecycle",
         "write_bucket_config",
         ResourceShape::Bucket,
@@ -316,7 +374,7 @@ pub const OP_TABLE: &[OpSpec] = &[
         ResourceShape::Bucket,
         DangerTier::PostureAltering,
     ),
-    denied(
+    delegable(
         "DeleteBucketTagging",
         "write_bucket_config",
         ResourceShape::Bucket,
@@ -333,8 +391,9 @@ pub const OP_TABLE: &[OpSpec] = &[
         "delete_objects",
         ResourceShape::Object,
         DangerTier::Mutating,
-        &["version_id (a versioned delete is not distinguished from a delete marker)"],
-    ),
+        &[],
+    )
+    .with_versioned("delete_object_versions", DangerTier::PostureAltering),
     enforced(
         "DeleteObjectTagging",
         "write_object_tags",
@@ -351,8 +410,9 @@ pub const OP_TABLE: &[OpSpec] = &[
         "delete_objects",
         ResourceShape::ObjectBatch,
         DangerTier::Mutating,
-        &["per-key version_id"],
-    ),
+        &[],
+    )
+    .with_versioned("delete_object_versions", DangerTier::PostureAltering),
     denied(
         "DeletePublicAccessBlock",
         "write_bucket_config",
@@ -377,13 +437,13 @@ pub const OP_TABLE: &[OpSpec] = &[
         ResourceShape::BucketSubresource,
         DangerTier::Routine,
     ),
-    denied(
+    delegable(
         "GetBucketCors",
         "read_bucket_config",
         ResourceShape::Bucket,
         DangerTier::Routine,
     ),
-    denied(
+    delegable(
         "GetBucketEncryption",
         "read_bucket_config",
         ResourceShape::Bucket,
@@ -401,7 +461,7 @@ pub const OP_TABLE: &[OpSpec] = &[
         ResourceShape::BucketSubresource,
         DangerTier::Routine,
     ),
-    denied(
+    delegable(
         "GetBucketLifecycleConfiguration",
         "read_bucket_config",
         ResourceShape::Bucket,
@@ -471,13 +531,13 @@ pub const OP_TABLE: &[OpSpec] = &[
         ResourceShape::Bucket,
         DangerTier::Routine,
     ),
-    denied(
+    delegable(
         "GetBucketTagging",
         "read_bucket_config",
         ResourceShape::Bucket,
         DangerTier::Routine,
     ),
-    denied(
+    delegable(
         "GetBucketVersioning",
         "read_bucket_config",
         ResourceShape::Bucket,
@@ -639,11 +699,17 @@ pub const OP_TABLE: &[OpSpec] = &[
              owner/initiator (the shared tenant-owner identity) are stripped",
         ],
     ),
-    denied(
+    enforced(
         "ListObjectVersions",
         "list_objects",
         ResourceShape::Listing,
         DangerTier::Routine,
+        &[
+            "a multi-prefix grant is refused, not fanned out or merged",
+            "the response is re-filtered to the decided prefix and owners are withheld; \
+             version ids, sizes, ETags and delete markers ride through as the backend \
+             reported them",
+        ],
     ),
     enforced(
         "ListObjects",
@@ -710,13 +776,13 @@ pub const OP_TABLE: &[OpSpec] = &[
     // CORS decides which browser origins may reach a bucket's data — posture, not data —
     // and the gateway never inspected the rules it forwarded, so a write-config grant
     // permitted `AllowedOrigin: *`. Bucket configuration is control-plane.
-    denied(
+    delegable(
         "PutBucketCors",
         "write_bucket_config",
         ResourceShape::Bucket,
         DangerTier::PostureAltering,
     ),
-    denied(
+    delegable(
         "PutBucketEncryption",
         "write_bucket_config",
         ResourceShape::Bucket,
@@ -734,7 +800,7 @@ pub const OP_TABLE: &[OpSpec] = &[
         ResourceShape::BucketSubresource,
         DangerTier::PostureAltering,
     ),
-    denied(
+    delegable(
         "PutBucketLifecycleConfiguration",
         "write_bucket_config",
         ResourceShape::Bucket,
@@ -785,13 +851,13 @@ pub const OP_TABLE: &[OpSpec] = &[
         ResourceShape::Bucket,
         DangerTier::Mutating,
     ),
-    denied(
+    delegable(
         "PutBucketTagging",
         "write_bucket_config",
         ResourceShape::Bucket,
         DangerTier::Mutating,
     ),
-    denied(
+    delegable(
         "PutBucketVersioning",
         "write_bucket_config",
         ResourceShape::Bucket,
@@ -930,8 +996,24 @@ pub fn spec(op: &str) -> Option<&'static OpSpec> {
         .map(|i| &OP_TABLE[i])
 }
 
-/// The op half of the deny-by-default backstop, and the *only* place the allowlist is
-/// derived.
+/// Whether the gate answers a refusal of `op` with `NotImplemented` rather than
+/// `AccessDenied`: a read of bucket configuration that s0 neither enforces nor delegates
+/// (ACL, policy, website, logging, ...). No right the caller could be granted would open
+/// it, so `AccessDenied` would send them to ask for one; S3 clients and infrastructure
+/// tools read these as "this endpoint does not serve it" only from `NotImplemented`.
+/// A `Delegable` row an unconfigured gateway refuses keeps `AccessDenied`.
+#[must_use]
+pub fn refusal_is_not_implemented(op: &str) -> bool {
+    spec(op).is_some_and(|s| {
+        s.coverage == Coverage::Denied
+            && s.tier != DangerTier::NeverImplement
+            && s.verb == Some("read_bucket_config")
+    })
+}
+
+/// The op half of the deny-by-default backstop with no delegation configured, and the
+/// *only* place the enforced allowlist is derived. [`gate`] is the same decision with a
+/// control backend's operations taken into account.
 ///
 /// Factored out of `S3Access::check` so the full 99-op matrix is testable:
 /// `S3AccessContext` cannot be constructed outside s3s, so a table-driven test cannot go
@@ -951,12 +1033,94 @@ pub fn gate_op(op: &str) -> Result<&'static OpSpec, GateDenial> {
     Ok(spec)
 }
 
+/// The operations `control_backend.operations` lists, validated against the table.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DelegatedOps(BTreeSet<&'static str>);
+
+impl DelegatedOps {
+    /// Delegates nothing: a gateway with no `control_backend`.
+    #[must_use]
+    pub const fn none() -> Self {
+        DelegatedOps(BTreeSet::new())
+    }
+
+    /// Refuses an empty list, an unknown name, a duplicate, and any row that is not
+    /// [`Coverage::Delegable`] (which includes every [`DangerTier::NeverImplement`] row).
+    pub fn from_names(names: &[String]) -> Result<Self, String> {
+        if names.is_empty() {
+            return Err("operations is empty".into());
+        }
+        let mut set = BTreeSet::new();
+        for name in names {
+            let Some(spec) = spec(name) else {
+                return Err(format!("{name} is not an S3 operation s0 knows"));
+            };
+            if matches!(spec.tier, DangerTier::NeverImplement) {
+                return Err(format!("{name} cannot be authorized by the gateway"));
+            }
+            if spec.coverage != Coverage::Delegable {
+                return Err(format!("{name} cannot be delegated"));
+            }
+            if !set.insert(spec.name) {
+                return Err(format!("{name} is listed twice"));
+            }
+        }
+        Ok(DelegatedOps(set))
+    }
+
+    #[must_use]
+    pub fn contains(&self, op: &str) -> bool {
+        self.0.contains(op)
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// What the gate decided for an operation that is not refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gate {
+    /// The policy engine authorizes it and the storage backend serves it.
+    Enforced(&'static OpSpec),
+    /// The control backend answers it; the policy engine is never asked.
+    Delegated(&'static OpSpec),
+}
+
+/// [`gate_op`] with the configured delegation: the tier is checked first, then coverage.
+/// A [`Coverage::Delegable`] row the configuration does not list is refused with the same
+/// [`GateDenial::NotEnforced`] as without any delegation.
+pub fn gate(op: &str, delegated: &DelegatedOps) -> Result<Gate, GateDenial> {
+    let Some(spec) = spec(op) else {
+        return Err(GateDenial::Unknown);
+    };
+    if matches!(spec.tier, DangerTier::NeverImplement) {
+        return Err(GateDenial::Unauthorizable);
+    }
+    match spec.coverage {
+        Coverage::Enforced => Ok(Gate::Enforced(spec)),
+        Coverage::Delegable if delegated.contains(spec.name) => Ok(Gate::Delegated(spec)),
+        Coverage::Delegable | Coverage::Denied => Err(GateDenial::NotEnforced),
+    }
+}
+
 /// The generated allowlist: every operation with a hook and a dispatch arm.
 #[must_use]
 pub fn enforced_ops() -> Vec<&'static str> {
     OP_TABLE
         .iter()
         .filter(|s| s.coverage == Coverage::Enforced)
+        .map(|s| s.name)
+        .collect()
+}
+
+/// Every operation that can be delegated, whatever the configuration says.
+#[must_use]
+pub fn delegable_ops() -> Vec<&'static str> {
+    OP_TABLE
+        .iter()
+        .filter(|s| s.coverage == Coverage::Delegable)
         .map(|s| s.name)
         .collect()
 }
@@ -1008,11 +1172,7 @@ mod tests {
         typed.sort_unstable();
         gateway.sort_unstable();
         assert_eq!(typed, gateway);
-        assert_eq!(
-            gateway.len(),
-            6,
-            "the projected vocabulary is six verbs (settled 2026-08-08)"
-        );
+        assert_eq!(gateway.len(), 7, "the projected vocabulary is seven verbs");
     }
 
     #[test]
@@ -1040,6 +1200,101 @@ mod tests {
         }
     }
 
+    const ADR_0056_OPS: [&str; 16] = [
+        "CreateBucket",
+        "DeleteBucket",
+        "GetBucketCors",
+        "PutBucketCors",
+        "DeleteBucketCors",
+        "GetBucketLifecycleConfiguration",
+        "PutBucketLifecycleConfiguration",
+        "DeleteBucketLifecycle",
+        "GetBucketTagging",
+        "PutBucketTagging",
+        "DeleteBucketTagging",
+        "GetBucketVersioning",
+        "PutBucketVersioning",
+        "GetBucketEncryption",
+        "PutBucketEncryption",
+        "DeleteBucketEncryption",
+    ];
+
+    fn names(ops: &[&str]) -> Vec<String> {
+        ops.iter().map(|o| (*o).to_string()).collect()
+    }
+
+    #[test]
+    fn the_delegable_set_is_sixteen() {
+        let mut expected = ADR_0056_OPS.to_vec();
+        let mut actual = delegable_ops();
+        expected.sort_unstable();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn no_never_implement_operation_is_delegable() {
+        for s in OP_TABLE {
+            if matches!(s.tier, DangerTier::NeverImplement) {
+                assert_ne!(s.coverage, Coverage::Delegable, "{}", s.name);
+            }
+        }
+    }
+
+    #[test]
+    fn a_delegable_operation_is_refused_unless_configured() {
+        for op in ADR_0056_OPS {
+            assert_eq!(
+                gate(op, &DelegatedOps::none()),
+                Err(GateDenial::NotEnforced),
+                "{op}"
+            );
+            assert_eq!(gate_op(op), Err(GateDenial::NotEnforced), "{op}");
+        }
+        let only_cors = DelegatedOps::from_names(&names(&["GetBucketCors"])).unwrap();
+        assert!(matches!(
+            gate("GetBucketCors", &only_cors),
+            Ok(Gate::Delegated(s)) if s.name == "GetBucketCors"
+        ));
+        assert_eq!(
+            gate("PutBucketCors", &only_cors),
+            Err(GateDenial::NotEnforced)
+        );
+        // Delegation never changes an enforced row.
+        assert!(matches!(
+            gate("GetObject", &only_cors),
+            Ok(Gate::Enforced(s)) if s.name == "GetObject"
+        ));
+    }
+
+    #[test]
+    fn a_listed_never_implement_operation_is_still_unauthorizable() {
+        assert!(DelegatedOps::from_names(&names(&["CreateSession"])).is_err());
+        assert!(DelegatedOps::from_names(&names(&["WriteGetObjectResponse"])).is_err());
+        assert_eq!(
+            gate("CreateSession", &DelegatedOps::none()),
+            Err(GateDenial::Unauthorizable)
+        );
+    }
+
+    #[test]
+    fn delegated_operations_refuse_what_is_not_delegable() {
+        for bad in [
+            "GetObject",
+            "PutBucketPolicy",
+            "GetBucketPolicy",
+            "NoSuchOp",
+        ] {
+            assert!(
+                DelegatedOps::from_names(&names(&[bad])).is_err(),
+                "{bad} must not be listable"
+            );
+        }
+        assert!(DelegatedOps::from_names(&[]).is_err());
+        assert!(DelegatedOps::from_names(&names(&["GetBucketCors", "GetBucketCors"])).is_err());
+        assert!(DelegatedOps::from_names(&names(&ADR_0056_OPS)).is_ok());
+    }
+
     #[test]
     fn no_control_plane_operation_is_enforced() {
         // Stated where a reviewer editing this table will trip over it: the gateway is
@@ -1049,9 +1304,9 @@ mod tests {
             if let Some(v) = s.verb
                 && NON_GATEWAY_VERBS.contains(&v)
             {
-                assert_eq!(
+                assert_ne!(
                     s.coverage,
-                    Coverage::Denied,
+                    Coverage::Enforced,
                     "{} is Enforced under the control-plane label {v}; the gateway does \
                      not broker that authority and there is no grant that carries it",
                     s.name
@@ -1066,12 +1321,21 @@ mod tests {
     }
 
     #[test]
-    fn the_six_ops_re_denied_on_2026_08_08_are_refused_at_the_gate() {
+    fn delete_bucket_is_delegable_and_refused_when_unconfigured() {
+        assert_eq!(spec("DeleteBucket").unwrap().coverage, Coverage::Delegable);
+        assert_eq!(
+            gate("DeleteBucket", &DelegatedOps::none()),
+            Err(GateDenial::NotEnforced)
+        );
+        assert!(DelegatedOps::from_names(&names(&["DeleteBucket"])).is_ok());
+    }
+
+    #[test]
+    fn the_control_plane_ops_are_refused_at_the_gate_without_a_control_backend() {
         // Named one by one rather than counted: a future edit could flip one back on and
         // rebalance the total by denying something else, and a count would still pass.
         for op in [
             "CreateBucket",
-            "DeleteBucket",
             "GetBucketPolicy",
             "PutBucketPolicy",
             "GetBucketCors",
@@ -1086,6 +1350,36 @@ mod tests {
                 spec(op).unwrap().blind_spots.is_empty(),
                 "{op} is denied but still claims blind spots"
             );
+        }
+    }
+
+    #[test]
+    fn only_refused_reads_of_bucket_configuration_answer_not_implemented() {
+        for op in [
+            "GetBucketPolicy",
+            "GetBucketPolicyStatus",
+            "GetBucketAcl",
+            "GetBucketWebsite",
+            "GetBucketLogging",
+            "GetBucketAccelerateConfiguration",
+            "GetBucketRequestPayment",
+            "GetBucketReplication",
+            "GetObjectLockConfiguration",
+        ] {
+            assert!(refusal_is_not_implemented(op), "{op}");
+        }
+        for op in [
+            "PutBucketPolicy",
+            "DeleteBucketPolicy",
+            "PutBucketAcl",
+            "DeleteBucket",
+            "GetObjectAcl",
+            "GetBucketCors",
+            "CreateBucket",
+            "GetObject",
+            "NoSuchOp",
+        ] {
+            assert!(!refusal_is_not_implemented(op), "{op}");
         }
     }
 

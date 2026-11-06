@@ -2,19 +2,23 @@
 //! **trusted label** so a downstream extractor can attribute fail-closed. Exactly one
 //! record is emitted per S3 request.
 //!
-//! Two shapes share the type, and exactly one half is present:
+//! Three shapes share the type, and exactly one half is present:
 //!
 //! - a **decision** record (`input`) — the gate admitted the request, a policy question
 //!   was formed and answered;
 //! - a **gate** record (`gate`) — the request was refused *before* any policy question
 //!   existed. There is no `action`, no `bucket` and often no principal at that point,
-//!   and inventing them would put claims in a regulated record that was never made.
+//!   and inventing them would put claims in a regulated record that was never made;
+//! - a **delegated** record (`delegated`) — a control backend answered the request and no
+//!   policy question was asked, so there is neither an `input` nor an `action` to claim
+//!   (ADR-011, amending ADR-002). A consumer dispatches on `path` first.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
 use crate::authz::{Decision, OpaInput};
+use crate::bundle_refresh::PlacementWaitOutcome;
 
 /// The label key carrying org attribution when the operator configures none.
 ///
@@ -31,6 +35,16 @@ pub const DECISION_PATH: &str = "s3/authz/decision";
 /// evaluated, so claiming the decision entrypoint ran would be false.
 pub const GATE_PATH: &str = "s3/authz/gate";
 
+const CONTROL_UNREACHABLE: &str = "control backend unreachable";
+
+const NOT_DELEGATED: &str = "request ended before the control backend was called";
+
+const NO_CONTROL_ANSWER: &str = "request ended before the control backend answered";
+
+/// The `path` of a delegated record. Not [`DECISION_PATH`]: the control backend, not the
+/// policy engine, answered.
+pub const DELEGATED_PATH: &str = "s3/authz/delegated";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditRecord {
     pub decision_id: String,
@@ -45,7 +59,12 @@ pub struct AuditRecord {
     /// the little it knew when it did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<GateContext>,
-    /// The verdict. For a gate record this is the gate's own deny, not a PDP answer.
+    /// Present exactly when the request was delegated to a control backend, in which case
+    /// `input` and `gate` are both absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegated: Option<DelegationContext>,
+    /// The verdict. For a gate record this is the gate's own deny, not a PDP answer. For a
+    /// delegated record `allow` is the control backend's authorization answer.
     pub result: Decision,
     /// Principal subject — the end-user identity, never a service identity. Empty on a
     /// gate record that was refused before the identity was resolved.
@@ -71,6 +90,14 @@ pub struct GatewayMeta {
     /// (per-key filtering). Empty for non-multi-delete ops.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub denied_keys: Vec<String>,
+    /// The `(key, version)` pairs of a versioned delete the request carried. Audit only:
+    /// never an input to a decision.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub versions: Vec<VersionedKey>,
+    /// The subset of `versions` a multi-delete's policy refused and the PEP stripped from
+    /// the forwarded batch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denied_versions: Vec<VersionedKey>,
     /// What the gateway knows about the backend leg. Filled in post-forward
     /// ([`crate::audit::PendingAudit`]), which is why the record is emitted when the
     /// request finishes rather than when the decision is made.
@@ -90,6 +117,13 @@ pub struct GatewayMeta {
     /// The same, for a copy's source bucket.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copy_source_object_name: Option<String>,
+}
+
+/// One object version a request asked to delete.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionedKey {
+    pub key: String,
+    pub version_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,6 +195,30 @@ pub struct GateContext {
     pub suppressed_since_last: u64,
 }
 
+/// What a delegated request knew: the operation, whom it was for, and what the control
+/// backend answered. Everything here was observed, never inferred.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationContext {
+    /// The s3s operation name.
+    pub operation: String,
+    /// The bucket named by the request path; empty when the path names none.
+    pub bucket: String,
+    pub tenant: String,
+    /// The caller's subject key (`user:<sub>` or `sa:<client id>`), as sent in
+    /// `x-s0-caller-subject`.
+    pub subject: String,
+    /// The HTTP status the control backend answered; absent when none was received.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_status: Option<u16>,
+    /// The error code the control backend answered; absent on success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_error: Option<String>,
+    /// How the placement wait (CreateBucket) or the removal wait (DeleteBucket) ended;
+    /// absent for an operation that waits for nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_wait: Option<PlacementWaitOutcome>,
+}
+
 fn is_zero(n: &u64) -> bool {
     *n == 0
 }
@@ -217,6 +275,7 @@ impl AuditRecord {
             gateway,
             input: Some(input),
             gate: None,
+            delegated: None,
             result,
         }
     }
@@ -241,6 +300,7 @@ impl AuditRecord {
             path: GATE_PATH.to_string(),
             input: None,
             gate: Some(gate),
+            delegated: None,
             result: Decision::deny(reason),
             requested_by,
             timestamp,
@@ -252,12 +312,113 @@ impl AuditRecord {
                 backend_kind: String::new(),
                 outcome: Outcome::Denied,
                 denied_keys: vec![],
+                versions: vec![],
+                denied_versions: vec![],
                 backend: BackendOutcome::NotAttempted,
                 backend_status: None,
                 object_name: None,
                 copy_source_object_name: None,
             },
         }
+    }
+
+    /// Build the record of a request delegated to a control backend, in the state of one
+    /// that ended before the control backend was called: `allow` is `false` because no
+    /// answer was observed. [`Self::settle_delegated`] says what happened once a call was
+    /// made.
+    /// The organization label comes from the route, like every other shape.
+    #[allow(clippy::too_many_arguments)]
+    pub fn delegated(
+        decision_id: String,
+        timestamp: String,
+        delegated: DelegationContext,
+        requested_by: String,
+        organization_id: &str,
+        backend_id: String,
+        backend_kind: String,
+        object_name: Option<String>,
+        labels: &LabelPolicy,
+    ) -> Self {
+        AuditRecord {
+            decision_id,
+            path: DELEGATED_PATH.to_string(),
+            input: None,
+            gate: None,
+            delegated: Some(delegated),
+            result: Decision::deny(NOT_DELEGATED),
+            requested_by,
+            timestamp,
+            labels: labels.labels(Some(organization_id)),
+            gateway: GatewayMeta {
+                backend_id,
+                backend_kind,
+                outcome: Outcome::Error,
+                denied_keys: vec![],
+                versions: vec![],
+                denied_versions: vec![],
+                backend: BackendOutcome::NotAttempted,
+                backend_status: None,
+                object_name,
+                copy_source_object_name: None,
+            },
+        }
+    }
+
+    /// Note how the placement wait (CreateBucket) or removal wait (DeleteBucket) ended.
+    pub fn note_placement_wait(&mut self, outcome: PlacementWaitOutcome) {
+        if let Some(delegated) = self.delegated.as_mut() {
+            delegated.placement_wait = Some(outcome);
+        }
+    }
+
+    /// The control backend call is about to start. A record still unsettled when the
+    /// request ends from here on says the call's answer was never observed, not that the
+    /// call was never made. `allow` stays `false` and `control_status` absent.
+    pub fn mark_delegation_dispatched(&mut self) {
+        if self.delegated.is_some() {
+            self.result = Decision::deny(NO_CONTROL_ANSWER);
+        }
+    }
+
+    /// Record what the control backend answered. Called once, when the request finishes,
+    /// by [`crate::audit::PendingAudit`]. `gateway.backend` stays `not_attempted`: the
+    /// storage backend was never contacted.
+    ///
+    /// `allow` is the control backend's authorization answer, not an s0 verdict: `false`
+    /// only for `403 AccessDenied`. Any other answered status leaves it `true` and names
+    /// the control backend and its error code in the reason.
+    pub fn settle_delegated(&mut self, status: Option<u16>, error_code: Option<String>) {
+        let Some(delegated) = self.delegated.as_mut() else {
+            return;
+        };
+        delegated.control_status = status;
+        delegated.control_error = error_code.clone();
+        let (outcome, result) = match (status, error_code.as_deref()) {
+            (None, _) => (Outcome::Error, Decision::allow(CONTROL_UNREACHABLE)),
+            (Some(s), Some(code)) if (200..300).contains(&s) => (
+                Outcome::Error,
+                Decision::allow(format!(
+                    "control backend answered {s}, then the answer failed: {code}"
+                )),
+            ),
+            (Some(s), None) if (200..300).contains(&s) => (
+                Outcome::Allowed,
+                Decision::allow("delegated to the control backend"),
+            ),
+            (Some(403), Some("AccessDenied")) => (
+                Outcome::Denied,
+                Decision::deny("control backend denied the request: AccessDenied"),
+            ),
+            (Some(_), code) => (
+                Outcome::Error,
+                Decision::allow(format!(
+                    "control backend answered {}",
+                    code.unwrap_or("an error")
+                )),
+            ),
+        };
+        self.gateway.outcome = outcome;
+        self.result = result;
     }
 
     /// Record what the forward leg did. Called once, post-forward, by
@@ -313,6 +474,8 @@ mod tests {
             backend_kind: "ceph".into(),
             outcome,
             denied_keys,
+            versions: vec![],
+            denied_versions: vec![],
             backend: BackendOutcome::NotAttempted,
             backend_status: None,
             object_name: None,
@@ -484,5 +647,92 @@ mod tests {
             json["gateway"].get("backend_status").is_none(),
             "a 200 nobody observed must not be synthesized: {json}"
         );
+    }
+
+    fn delegated_record() -> AuditRecord {
+        AuditRecord::delegated(
+            "dec-7".into(),
+            "2026-11-02T00:00:00Z".into(),
+            DelegationContext {
+                operation: "PutBucketCors".into(),
+                bucket: "reports".into(),
+                tenant: "acme".into(),
+                subject: "user:alice".into(),
+                control_status: None,
+                control_error: None,
+                placement_wait: None,
+            },
+            "alice".into(),
+            "org-acme",
+            "backend-1".into(),
+            "ceph".into(),
+            None,
+            &labels(),
+        )
+    }
+
+    #[test]
+    fn a_delegated_record_asks_no_policy_question() {
+        let rec = delegated_record();
+        assert_eq!(rec.path, DELEGATED_PATH);
+        assert_ne!(rec.path, DECISION_PATH);
+        assert!(rec.input.is_none() && rec.gate.is_none());
+        let json = serde_json::to_value(&rec).unwrap();
+        assert!(json.get("input").is_none() && json.get("gate").is_none());
+        assert_eq!(json["delegated"]["operation"], "PutBucketCors");
+        assert_eq!(json["labels"][DEFAULT_ORG_LABEL_KEY], "org-acme");
+        assert_eq!(rec.gateway.backend, BackendOutcome::NotAttempted);
+    }
+
+    #[test]
+    fn an_unsettled_delegated_record_says_the_control_backend_was_not_called() {
+        let rec = delegated_record();
+        assert_eq!(rec.gateway.outcome, Outcome::Error);
+        assert!(!rec.result.allow);
+        assert_eq!(
+            rec.result.reason,
+            "request ended before the control backend was called"
+        );
+    }
+
+    #[test]
+    fn settling_a_delegated_record_maps_the_control_answer_to_the_outcome() {
+        let settle = |status: Option<u16>, code: Option<&str>| {
+            let mut rec = delegated_record();
+            rec.settle_delegated(status, code.map(str::to_string));
+            rec
+        };
+        let ok = settle(Some(200), None);
+        assert_eq!(ok.gateway.outcome, Outcome::Allowed);
+        assert!(ok.result.allow);
+        assert_eq!(ok.delegated.as_ref().unwrap().control_status, Some(200));
+
+        let denied = settle(Some(403), Some("AccessDenied"));
+        assert_eq!(denied.gateway.outcome, Outcome::Denied);
+        assert!(!denied.result.allow);
+
+        let other_403 = settle(Some(403), Some("SignatureDoesNotMatch"));
+        assert_eq!(other_403.gateway.outcome, Outcome::Error);
+        assert!(other_403.result.allow);
+
+        let conflict = settle(Some(409), Some("OperationAborted"));
+        assert_eq!(conflict.gateway.outcome, Outcome::Error);
+        assert!(conflict.result.allow);
+        assert!(conflict.result.reason.contains("OperationAborted"));
+        let d = conflict.delegated.as_ref().unwrap();
+        assert_eq!(
+            (d.control_status, d.control_error.as_deref()),
+            (Some(409), Some("OperationAborted"))
+        );
+
+        let broken_body = settle(Some(200), Some("InternalError"));
+        assert_eq!(broken_body.gateway.outcome, Outcome::Error);
+        assert!(broken_body.result.reason.contains("InternalError"));
+
+        let down = settle(None, None);
+        assert_eq!(down.gateway.outcome, Outcome::Error);
+        assert_eq!(down.result.reason, "control backend unreachable");
+        assert!(down.delegated.as_ref().unwrap().control_status.is_none());
+        assert_eq!(down.gateway.backend, BackendOutcome::NotAttempted);
     }
 }

@@ -739,6 +739,8 @@ mod tests {
                 backend_kind: "ceph".into(),
                 outcome: Outcome::Allowed,
                 denied_keys: vec![],
+                versions: vec![],
+                denied_versions: vec![],
                 backend: BackendOutcome::NotAttempted,
                 backend_status: None,
                 object_name: None,

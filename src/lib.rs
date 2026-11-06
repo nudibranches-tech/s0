@@ -34,6 +34,7 @@ pub mod authz;
 pub mod bundle_refresh;
 pub mod config;
 pub mod cors;
+pub mod counters;
 pub mod error;
 pub mod gateway;
 pub mod identity;

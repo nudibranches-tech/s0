@@ -1,6 +1,6 @@
 # ADR-002: Decision-log record shape
 
-- **Status**: Accepted — implemented (src/audit/record.rs); amended by ADR-009: optional `gateway.object_name` / `gateway.copy_source_object_name` from bundle v3
+- **Status**: Accepted — implemented (src/audit/record.rs); amended by ADR-009: optional `gateway.object_name` / `gateway.copy_source_object_name` from bundle v3; amended by ADR-011: a third, delegated record shape (`path` `s3/authz/delegated`); amended by ADR-012: optional `gateway.versions` / `gateway.denied_versions`, and a batch carrying a versioned entry is recorded under `delete_object_versions`
 - **Date**: 2026-07-15
 - **Owners**: gateway team (this repo)
 - **Related**: `src/audit/record.rs`, `src/audit/sink.rs`, `src/authz/input.rs`, `src/authz/decision.rs`, `policy/gateway/authz.rego`; ADR-001, ADR-003
