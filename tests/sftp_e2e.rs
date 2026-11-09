@@ -1282,6 +1282,17 @@ async fn every_unsupported_request_gets_its_documented_answer() {
     // An unknown packet type: OP_UNSUPPORTED, and the session survives.
     let r = c.call(77, |_| {}).await.unwrap();
     assert_eq!(code(&r), OP_UNSUPPORTED);
+    // One too short to carry an id: still OP_UNSUPPORTED, answered with id 0.
+    let mut b = BytesMut::new();
+    b.put_u8(77);
+    assert!(c.send_raw(b).await);
+    let (t, body) = c
+        .recv_raw()
+        .await
+        .expect("a reply to an id-less unknown packet");
+    assert_eq!(t, SSH_FXP_STATUS);
+    assert_eq!(&body[..4], &0u32.to_be_bytes(), "reply id");
+    assert_eq!(&body[4..8], &OP_UNSUPPORTED.to_be_bytes(), "status code");
     assert!(matches!(
         c.path_op(SSH_FXP_STAT, "/").await.unwrap(),
         Reply::Attrs(_)

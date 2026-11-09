@@ -720,8 +720,12 @@ keeps 64 × 32 KiB in flight).
   obligation for every bucket that is an SFTP home. s0 cannot set it, because bucket
   configuration is control-plane territory.
 
-**Resume and append** are refused in v1 (D8). An OPEN with `APPEND`, or a first WRITE at a
-non-zero offset, is `SSH_FX_OP_UNSUPPORTED`.
+**Resume and append** are refused in v1 (D8). An OPEN with `APPEND`, or one that would modify
+an existing file in place (the D8 table), is `SSH_FX_OP_UNSUPPORTED`. A first WRITE
+at a non-zero offset gets no special treatment: it is an out-of-order WRITE under the
+reorder-window rules above — held if it ends within `reorder_window` (the CLOSE then fails
+with `SSH_FX_FAILURE`, "close with a gap in the written data", if the gap never fills),
+refused with `SSH_FX_OP_UNSUPPORTED` beyond it.
 
 **Downloads.**
 
