@@ -1,6 +1,6 @@
 # ADR-009: SFTP front — a second protocol on the gateway core
 
-- **Status**: Proposed
+- **Status**: Accepted — implemented (src/sftp/)
 - **Date**: 2026-09-29
 - **Extends**: ADR-002 (a new record shape and an optional `gateway.session` block, D13) and
   ADR-006 (a new verb and `grant_schema_version: 3`, D5, D7). Both stay in force; this ADR
