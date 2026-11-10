@@ -31,14 +31,15 @@ use crate::access::headers::RequestRiders;
 use crate::access::tagging::ReservedTagKeys;
 use crate::audit::{
     AuditRecord, BackendOutcome, GateContext, GateStage, GatewayMeta, Outcome, PendingAudit,
+    SummaryScope,
 };
 use crate::auth::SECURITY_TOKEN_HEADER;
 use crate::authz::{Backend, CopySource as AuthzCopySource, Decision, OpaInput, RequestMeta};
 use crate::error::{is_backend_error, remint_backend_error};
 use crate::gateway::Gateway;
 use crate::identity::ResolvedPrincipal;
-use crate::model::Action;
-use crate::pdp::{BucketPlacement, PlacementRefusal};
+use crate::model::{Action, PrincipalType};
+use crate::pdp::{BucketPlacement, PlacementRefusal, principal_subject_key};
 use crate::proxy::RouteSnapshot;
 use crate::proxy::obligations::{BucketSource, BucketVisibility, ResponseObligations};
 use crate::quota::{Admission, QuotaRefusal, WriteTarget};
@@ -87,6 +88,8 @@ struct ReqCtx<'a> {
     /// the name is available.
     operation: Arc<str>,
     meta: RequestMeta,
+    /// The access-key id the request was signed with; it names the session for an STS one.
+    access_key: Option<&'a str>,
     /// The live extensions of the request being enforced — where the authz proof, the
     /// response obligations and the pending-audit handle are stashed.
     extensions: &'a mut Extensions,
@@ -123,6 +126,7 @@ impl<'a> ReqCtx<'a> {
             placement,
             operation,
             meta,
+            access_key: req.credentials.as_ref().map(|c| c.access_key.as_str()),
             extensions: &mut req.extensions,
         })
     }
@@ -270,6 +274,7 @@ impl GatewayAccess {
                 .copy_source
                 .as_ref()
                 .and_then(|source| object_name(&source.bucket)),
+            summary: None,
         };
         AuditRecord::new(
             new_decision_id(),
@@ -279,6 +284,34 @@ impl GatewayAccess {
             meta,
             self.gw.audit.labels(),
         )
+    }
+
+    /// Whether this allowed request is one the bundle summarises (ADR-011): a read or a
+    /// list, by a service account listed in `org_settings.audit_summary_subjects`.
+    /// Every other request returns at the first, cheapest check.
+    fn summary_scope(&self, cx: &ReqCtx<'_>, input: &OpaInput) -> Option<SummaryScope> {
+        if !matches!(
+            input.action,
+            Action::ReadObjects | Action::ListObjects | Action::Read
+        ) || input.principal.kind != PrincipalType::ServiceAccount
+        {
+            return None;
+        }
+        let bundle = self.gw.bundles.current();
+        let subjects = bundle.audit_summary_subjects();
+        if subjects.is_empty()
+            || !subjects.contains(&principal_subject_key(
+                input.principal.kind,
+                &input.principal.sub,
+            ))
+        {
+            return None;
+        }
+        Some(SummaryScope {
+            operation: cx.operation.to_string(),
+            access_key_id: cx.access_key.map(str::to_owned),
+            presigned: is_presigned(&input.request),
+        })
     }
 
     /// Emit now: the request is refused here and there is no forward leg to wait for.
@@ -308,7 +341,9 @@ impl GatewayAccess {
         decision: &Decision,
         denied_keys: Vec<String>,
     ) {
-        let record = self.record(input, decision, Outcome::Allowed, denied_keys);
+        let summary_scope = self.summary_scope(cx, &input);
+        let mut record = self.record(input, decision, Outcome::Allowed, denied_keys);
+        record.summary_scope = summary_scope;
         cx.extensions
             .insert(Arc::new(PendingAudit::new(self.gw.audit.clone(), record)));
     }
@@ -1912,6 +1947,18 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
+/// Signed by a presigned URL: SigV4 puts the signature in the query rather than in the
+/// `Authorization` header.
+fn is_presigned(meta: &RequestMeta) -> bool {
+    meta.params.as_deref().is_some_and(|query| {
+        query.split('&').any(|pair| {
+            pair.split('=')
+                .next()
+                .is_some_and(|name| name.eq_ignore_ascii_case("x-amz-signature"))
+        })
+    })
+}
+
 fn new_decision_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
@@ -2191,6 +2238,23 @@ mod tests {
         ] {
             assert_eq!(copy_range_len(other), None, "{other:?}");
         }
+    }
+
+    #[test]
+    fn a_presigned_request_is_told_from_a_header_signed_one() {
+        let meta = |params: Option<&str>| RequestMeta {
+            method: "GET".into(),
+            params: params.map(str::to_string),
+            headers_subset: Default::default(),
+        };
+        assert!(is_presigned(&meta(Some(
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=REDACTED"
+        ))));
+        assert!(is_presigned(&meta(Some("x-amz-signature=REDACTED"))));
+        assert!(!is_presigned(&meta(Some(
+            "list-type=2&prefix=x-amz-signature"
+        ))));
+        assert!(!is_presigned(&meta(None)));
     }
 
     #[test]

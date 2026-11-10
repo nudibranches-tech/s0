@@ -379,6 +379,32 @@ an unauthenticated caller controls the rate of, so they are budgeted — without
 scanner could evict the decision records of real access. A sustained non-zero value means
 someone is scanning.
 
+### Summarised platform identities
+
+A platform job that reads whole buckets, a backup copier for instance, would otherwise
+fill the trail with one record per object and can outrun the queue, which then drops the
+records of everyone else. The control plane may list such service accounts, by
+`sa:<client id>`, in `org_settings.audit_summary_subjects`; any other key is ignored, so a
+person's trail is never summarised. A listed account's allowed reads and lists that the
+backend served are folded into one record per operation, HTTP method, access key,
+presigned or not, bucket and window (`audit.summary_window_secs`, 60 by default). A window
+also closes when it stands for `audit.summary_max_requests` requests (10 000 by default).
+
+A summary record has its own `path`, `s3/authz/summary`, so a consumer that predates it
+cannot take it for a single request. It keeps the decision-log envelope, with the first
+request's input minus its object, prefix, query and headers, a result without
+obligations, and a `gateway.summary` block:
+`{ "operation", "requests", "first_at", "last_at", "access_key_id", "presigned" }`.
+
+A denial, a failed forward and every other verb keep their own record. A list that is
+absent or is not an array of strings summarises nobody. Summaries never take a queue
+slot: the worker ships closed windows on its flush tick, and every open one on shutdown,
+after which a late request keeps its own record. `s0_audit_summarized_total` counts the
+requests folded into summaries, and `s0_audit_summaries_emitted_total` the summary
+records. A lost summary counts as one record in `s0_audit_dropped_total`. A consumer must
+understand summaries before its control plane lists any account. See
+[ADR-011](docs/adr/ADR-011-summarised-platform-identities.md).
+
 ---
 
 ## Build and test

@@ -80,6 +80,8 @@ impl Gateway {
                 cfg.audit.organization_label_key.clone(),
                 cfg.audit.extra_labels.clone(),
             ),
+            summary_window: std::time::Duration::from_secs(cfg.audit.summary_window_secs),
+            summary_max_requests: cfg.audit.summary_max_requests,
             ..AuditConfig::default()
         });
 

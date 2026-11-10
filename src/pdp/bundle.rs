@@ -14,7 +14,7 @@
 //! byte quotas the document states for those buckets, their tenants and the backend
 //! ([`crate::quota`]).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -137,16 +137,26 @@ pub struct Bundle {
     /// The projected policy data (`tenants`, `org_settings`, …).
     pub data: serde_json::Value,
     placement: Arc<BucketPlacement>,
+    audit_summary_subjects: Arc<BTreeSet<String>>,
 }
 
 impl Bundle {
     pub fn new(revision: impl Into<String>, data: serde_json::Value) -> Self {
         let placement = Arc::new(BucketPlacement::from_data(&data));
+        let audit_summary_subjects = Arc::new(audit_summary_subjects(&data));
         Bundle {
             revision: revision.into(),
             data,
             placement,
+            audit_summary_subjects,
         }
+    }
+
+    /// The subjects whose allowed reads and lists are audited as summaries (ADR-011),
+    /// keyed by [`principal_subject_key`].
+    #[must_use]
+    pub fn audit_summary_subjects(&self) -> &BTreeSet<String> {
+        &self.audit_summary_subjects
     }
 
     /// The placement this revision publishes. An `Arc` so a request can hold the one it
@@ -610,6 +620,51 @@ pub fn content_revision(raw: &str) -> String {
     let mut h = Sha256::new();
     h.update(raw.as_bytes());
     hex::encode(h.finalize())
+}
+
+/// Where the control plane lists the subjects audited as summaries (ADR-011).
+pub const AUDIT_SUMMARY_SUBJECTS_PATH: &[&str] = &["org_settings", "audit_summary_subjects"];
+
+/// The listed service-account keys (`sa:<client id>`). Absent, or anything but an array
+/// of strings, summarises nobody: a list that cannot be read must never make the trail
+/// coarser. Any other key is ignored, so a person's trail is never summarised (ADR-002).
+fn audit_summary_subjects(data: &serde_json::Value) -> BTreeSet<String> {
+    let mut cursor = data;
+    for segment in AUDIT_SUMMARY_SUBJECTS_PATH {
+        match cursor.get(segment) {
+            Some(next) => cursor = next,
+            None => return BTreeSet::new(),
+        }
+    }
+    let listed: Option<BTreeSet<String>> = cursor.as_array().and_then(|items| {
+        items
+            .iter()
+            .map(|item| item.as_str().map(str::to_string))
+            .collect()
+    });
+    let Some(listed) = listed else {
+        tracing::warn!(
+            "bundle carries org_settings.audit_summary_subjects but it is not an array of \
+             strings; every request keeps its own audit record"
+        );
+        return BTreeSet::new();
+    };
+    let (accounts, others): (BTreeSet<String>, BTreeSet<String>) = listed
+        .into_iter()
+        .partition(|key| is_service_account_key(key));
+    if !others.is_empty() {
+        tracing::warn!(
+            ignored = ?others,
+            "org_settings.audit_summary_subjects names keys that are not service accounts; \
+             they keep a record per request"
+        );
+    }
+    accounts
+}
+
+fn is_service_account_key(key: &str) -> bool {
+    key.strip_prefix("sa:")
+        .is_some_and(|client_id| !client_id.is_empty())
 }
 
 /// The subject key the control plane's projection writes for a service account:
@@ -1584,5 +1639,39 @@ mod tests {
                 .reason()
                 .starts_with("deny (gateway):")
         );
+    }
+
+    #[test]
+    fn the_listed_subjects_are_read_once_per_revision() {
+        let bundle = Bundle::new(
+            "r1",
+            serde_json::json!({ "org_settings": {
+                "audit_summary_subjects": ["sa:hf-replication-manager-acme", "user:bob"]
+            } }),
+        );
+        let listed: Vec<&str> = bundle
+            .audit_summary_subjects()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            listed,
+            ["sa:hf-replication-manager-acme"],
+            "a person's key is never summarised"
+        );
+    }
+
+    #[test]
+    fn an_absent_or_unreadable_list_summarises_nobody() {
+        for data in [
+            serde_json::json!({}),
+            serde_json::json!({ "org_settings": {} }),
+            serde_json::json!({ "org_settings": { "audit_summary_subjects": "sa:x" } }),
+            serde_json::json!({ "org_settings": { "audit_summary_subjects": ["sa:x", 7] } }),
+            serde_json::json!({ "org_settings": { "audit_summary_subjects": ["user:bob", "sa:", "bob"] } }),
+        ] {
+            let bundle = Bundle::new("r1", data.clone());
+            assert!(bundle.audit_summary_subjects().is_empty(), "{data}");
+        }
     }
 }

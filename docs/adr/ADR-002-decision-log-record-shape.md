@@ -1,6 +1,6 @@
 # ADR-002: Decision-log record shape
 
-- **Status**: Accepted — implemented (src/audit/record.rs); amended by ADR-009: optional `gateway.object_name` / `gateway.copy_source_object_name` from bundle v3
+- **Status**: Accepted — implemented (src/audit/record.rs); amended by ADR-009: optional `gateway.object_name` / `gateway.copy_source_object_name` from bundle v3; amended by ADR-011: allowed reads and lists of control-plane-named service accounts are recorded as summaries (`path: s3/authz/summary`, `gateway.summary`)
 - **Date**: 2026-07-15
 - **Owners**: gateway team (this repo)
 - **Related**: `src/audit/record.rs`, `src/audit/sink.rs`, `src/authz/input.rs`, `src/authz/decision.rs`, `policy/gateway/authz.rego`; ADR-001, ADR-003
