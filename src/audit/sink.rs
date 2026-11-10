@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 
 use super::backend::{AuditBackend, ControlPlaneBackend, StdoutNdjsonBackend};
 use super::record::AuditRecord;
+use super::summary::{Folded, Summaries};
 
 /// Cap on the on-disk spill file: replay reads it whole, so this bounds replay memory
 /// during a long sink outage.
@@ -69,6 +70,11 @@ pub struct AuditMetrics {
     /// dropped: this is a policy, not a failure, and the alternative is letting a
     /// scanner evict real decision records. Alert on it separately.
     pub gate_suppressed: AtomicU64,
+    /// Requests recorded through a summary rather than their own record (ADR-011).
+    /// **Not** dropped: each is counted in the summary that stands for it.
+    pub summarized: AtomicU64,
+    /// Summary records handed on for shipping.
+    pub summaries_emitted: AtomicU64,
 }
 
 impl AuditMetrics {
@@ -162,6 +168,10 @@ pub struct AuditConfig {
     pub instance: String,
     /// How records are labelled for the consumer that ingests them.
     pub labels: crate::audit::LabelPolicy,
+    /// How long a summary stays open before it is shipped (ADR-011).
+    pub summary_window: Duration,
+    /// A summary is shipped at once when it stands for this many requests.
+    pub summary_max_requests: u64,
 }
 
 impl Default for AuditConfig {
@@ -176,6 +186,8 @@ impl Default for AuditConfig {
             spill_path: PathBuf::from("/var/lib/s0/audit-spill.ndjson"),
             instance: crate::config::instance_id(),
             labels: crate::audit::LabelPolicy::default(),
+            summary_window: Duration::from_secs(60),
+            summary_max_requests: 10_000,
         }
     }
 }
@@ -187,6 +199,7 @@ pub struct AuditSink {
     metrics: Arc<AuditMetrics>,
     gate: Arc<GateBudget>,
     labels: crate::audit::LabelPolicy,
+    summaries: Arc<Summaries>,
 }
 
 impl AuditSink {
@@ -217,9 +230,24 @@ impl AuditSink {
         self.emit(record);
     }
 
-    /// Non-blocking. On overflow the record is dropped with a loud alert — the
+    /// Non-blocking. A request the bundle summarises is folded into its open summary
+    /// instead of queued; on overflow a record is dropped with a loud alert — the
     /// request is never held up for the audit queue.
     pub fn emit(&self, record: AuditRecord) {
+        let record = match self.summaries.fold(record) {
+            Folded::Kept => {
+                self.metrics.summarized.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            Folded::Full(summary) => {
+                self.metrics.summarized.fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .summaries_emitted
+                    .fetch_add(1, Ordering::Relaxed);
+                summary
+            }
+            Folded::Own(record) => record,
+        };
         if let Err(err) = self.tx.try_send(record) {
             let n = self.metrics.queue_dropped.fetch_add(1, Ordering::Relaxed) + 1;
             match err {
@@ -296,6 +324,7 @@ pub fn spawn_with_backend(
     backend: Arc<dyn AuditBackend>,
 ) -> (AuditSink, AuditHandle) {
     let labels = cfg.labels.clone();
+    let summaries = Arc::new(Summaries::new(cfg.summary_window, cfg.summary_max_requests));
     let (tx, rx) = mpsc::channel(cfg.queue_capacity);
     let metrics = Arc::new(AuditMetrics::default());
     let shutdown = Arc::new(tokio::sync::Notify::new());
@@ -313,6 +342,7 @@ pub fn spawn_with_backend(
             backend,
             shutdown: shutdown.clone(),
             metrics: metrics.clone(),
+            summaries: summaries.clone(),
         }
         .run(),
     );
@@ -322,6 +352,7 @@ pub fn spawn_with_backend(
             metrics,
             gate: Arc::new(GateBudget::new()),
             labels,
+            summaries,
         },
         AuditHandle { join, shutdown },
     )
@@ -427,6 +458,7 @@ struct Worker {
     backend: Arc<dyn AuditBackend>,
     shutdown: Arc<tokio::sync::Notify>,
     metrics: Arc<AuditMetrics>,
+    summaries: Arc<Summaries>,
 }
 
 impl Worker {
@@ -444,12 +476,14 @@ impl Worker {
                         }
                     }
                     None => {
+                        self.close_summaries(&mut buf, None);
                         self.flush(&mut buf).await;
                         self.finish().await;
                         break;
                     }
                 },
                 _ = ticker.tick() => {
+                    self.close_summaries(&mut buf, Some(Instant::now()));
                     self.flush(&mut buf).await;
                     self.replay_spill().await;
                 }
@@ -462,12 +496,24 @@ impl Worker {
                             self.flush(&mut buf).await;
                         }
                     }
+                    self.close_summaries(&mut buf, None);
                     self.flush(&mut buf).await;
                     self.finish().await;
                     break;
                 }
             }
         }
+    }
+
+    /// Move the summaries whose window closed by `now` (every one, on exit) into the
+    /// batch. They never pass through the queue, so a full queue cannot drop them.
+    fn close_summaries(&self, buf: &mut Vec<AuditRecord>, now: Option<Instant>) {
+        let closed = match now {
+            Some(now) => self.summaries.take_due(now),
+            None => self.summaries.take_all(),
+        };
+        AuditMetrics::add(&self.metrics.summaries_emitted, closed.len());
+        buf.extend(closed);
     }
 
     /// The last thing the worker does, on either exit path: one final replay attempt,
@@ -743,6 +789,7 @@ mod tests {
                 backend_status: None,
                 object_name: None,
                 copy_source_object_name: None,
+                summary: None,
             },
             &crate::audit::LabelPolicy::default(),
         )
@@ -925,5 +972,64 @@ mod tests {
         );
         assert_eq!(sink.dropped_total(), 2, "and surface in the exported total");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<AuditRecord>>);
+
+    #[async_trait::async_trait]
+    impl AuditBackend for Recorder {
+        fn name(&self) -> &'static str {
+            "recorder"
+        }
+        async fn ship(&self, batch: &[AuditRecord]) -> Result<(), String> {
+            self.0.lock().unwrap().extend_from_slice(batch);
+            Ok(())
+        }
+    }
+
+    fn a_summarised_read(id: &str) -> AuditRecord {
+        let mut record = a_record(id);
+        record.settle(crate::audit::BackendOutcome::SucceededStatusUnknown, None);
+        record.summarise = true;
+        record
+    }
+
+    #[tokio::test]
+    async fn summarised_reads_take_no_queue_slot_and_ship_as_one_record_on_drain() {
+        let dir = tmpdir("summaries");
+        let backend = Arc::new(Recorder::default());
+        let (sink, handle) = spawn_with_backend(
+            AuditConfig {
+                spill_path: dir.join("audit-spill.ndjson"),
+                instance: "pod-a".into(),
+                queue_capacity: 1,
+                summary_window: Duration::from_secs(3600),
+                ..AuditConfig::default()
+            },
+            backend.clone(),
+        );
+        for i in 0..50 {
+            sink.emit(a_summarised_read(&format!("read-{i}")));
+        }
+        let mut denied = a_record("denied");
+        denied.summarise = true;
+        denied.gateway.outcome = crate::audit::Outcome::Denied;
+        sink.emit(denied);
+        handle.drain(Duration::from_secs(2)).await;
+
+        let shipped = backend.0.lock().unwrap().clone();
+        let ids: Vec<&str> = shipped.iter().map(|r| r.decision_id.as_str()).collect();
+        assert_eq!(ids, ["denied", "read-0"], "the denial keeps its own record");
+        let summary = shipped[1].gateway.summary.as_ref().expect("a summary");
+        assert_eq!(summary.requests, 50);
+        let m = sink.metrics();
+        assert_eq!(
+            sink.dropped_total(),
+            0,
+            "a one-slot queue never saw the reads"
+        );
+        assert_eq!(m.summarized.load(Ordering::Relaxed), 50);
+        assert_eq!(m.summaries_emitted.load(Ordering::Relaxed), 1);
     }
 }

@@ -334,6 +334,20 @@ pub struct AuditFileConfig {
     /// somebody else's domain as a constant.
     #[serde(default)]
     pub extra_labels: BTreeMap<String, String>,
+    /// How long a summary of a listed subject's reads stays open (ADR-011).
+    #[serde(default = "default_summary_window_secs")]
+    pub summary_window_secs: u64,
+    /// A summary is shipped at once when it stands for this many requests.
+    #[serde(default = "default_summary_max_requests")]
+    pub summary_max_requests: u64,
+}
+
+fn default_summary_window_secs() -> u64 {
+    60
+}
+
+fn default_summary_max_requests() -> u64 {
+    10_000
 }
 
 fn default_org_label_key() -> String {
@@ -348,6 +362,8 @@ impl Default for AuditFileConfig {
             backend: crate::audit::AuditBackendKind::default(),
             organization_label_key: default_org_label_key(),
             extra_labels: BTreeMap::new(),
+            summary_window_secs: default_summary_window_secs(),
+            summary_max_requests: default_summary_max_requests(),
         }
     }
 }
@@ -600,6 +616,11 @@ impl GatewayConfig {
             return Err(GatewayError::Config(
                 "bundle_timeout_secs must be > 0; an unbounded bundle fetch stalls revocation"
                     .into(),
+            ));
+        }
+        if self.audit.summary_window_secs == 0 || self.audit.summary_max_requests == 0 {
+            return Err(GatewayError::Config(
+                "audit.summary_window_secs and audit.summary_max_requests must be > 0".into(),
             ));
         }
         if self.limits.backend_connect_timeout_secs == 0 {
@@ -1130,6 +1151,24 @@ mod tests {
 
     fn example() -> serde_json::Value {
         serde_json::from_str(include_str!("../docs/gateway.example.json")).unwrap()
+    }
+
+    #[test]
+    fn summaries_default_to_a_minute_and_refuse_a_zero_bound() {
+        let loaded = GatewayConfig::from_json(&example().to_string()).unwrap();
+        assert_eq!(
+            (
+                loaded.audit.summary_window_secs,
+                loaded.audit.summary_max_requests
+            ),
+            (60, 10_000)
+        );
+        for field in ["summary_window_secs", "summary_max_requests"] {
+            let mut cfg = example();
+            cfg["audit"][field] = serde_json::json!(0);
+            let err = GatewayConfig::from_json(&cfg.to_string()).unwrap_err();
+            assert!(err.to_string().contains(field), "{err}");
+        }
     }
 
     #[test]

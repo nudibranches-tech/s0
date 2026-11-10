@@ -299,6 +299,9 @@ fn fixture_from_config(
             // rather than on the flush ticker: `await_audit_records` then converges in
             // milliseconds instead of racing a 2 s timer.
             batch_max: 1,
+            // Ships a summary on the worker's next tick (ADR-011); only a bundle that
+            // lists a subject in `org_settings.audit_summary_subjects` opens one.
+            summary_window: std::time::Duration::from_millis(100),
             ..AuditConfig::default()
         },
         audit_log.clone(),

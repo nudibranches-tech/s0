@@ -38,7 +38,7 @@ use crate::error::{is_backend_error, remint_backend_error};
 use crate::gateway::Gateway;
 use crate::identity::ResolvedPrincipal;
 use crate::model::Action;
-use crate::pdp::{BucketPlacement, PlacementRefusal};
+use crate::pdp::{BucketPlacement, PlacementRefusal, principal_subject_key};
 use crate::proxy::RouteSnapshot;
 use crate::proxy::obligations::{BucketSource, BucketVisibility, ResponseObligations};
 use crate::quota::{Admission, QuotaRefusal, WriteTarget};
@@ -270,15 +270,30 @@ impl GatewayAccess {
                 .copy_source
                 .as_ref()
                 .and_then(|source| object_name(&source.bucket)),
+            summary: None,
         };
-        AuditRecord::new(
+        // Allowed reads and lists only; the sink also requires the forward to succeed.
+        let summarise = outcome == Outcome::Allowed
+            && matches!(
+                input.action,
+                Action::ReadObjects | Action::ListObjects | Action::Read
+            )
+            && bundle
+                .audit_summary_subjects()
+                .contains(&principal_subject_key(
+                    input.principal.kind,
+                    &input.principal.sub,
+                ));
+        let mut record = AuditRecord::new(
             new_decision_id(),
             now_rfc3339(),
             input,
             decision.clone(),
             meta,
             self.gw.audit.labels(),
-        )
+        );
+        record.summarise = summarise;
+        record
     }
 
     /// Emit now: the request is refused here and there is no forward leg to wait for.

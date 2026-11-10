@@ -56,6 +56,10 @@ pub struct AuditRecord {
     pub labels: BTreeMap<String, String>,
     /// S3-specific fields the decision-log extractor consumes beyond the OPA envelope.
     pub gateway: GatewayMeta,
+    /// The bundle lists the principal for summaries (ADR-011). Never on the wire: the
+    /// sink reads it, and a record that reaches the wire either is a summary or is not.
+    #[serde(skip)]
+    pub(crate) summarise: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +94,19 @@ pub struct GatewayMeta {
     /// The same, for a copy's source bucket.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copy_source_object_name: Option<String>,
+    /// Present on a summary record only: the requests it stands for (ADR-011).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<AccessSummary>,
+}
+
+/// Allowed requests of one verb, by one subject, on one bucket, folded into one record.
+/// The record's `input` is the first request's, without its object, prefix or query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccessSummary {
+    pub requests: u64,
+    /// RFC3339 UTC, the decision times of the first and the last request folded in.
+    pub first_at: String,
+    pub last_at: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,6 +235,7 @@ impl AuditRecord {
             input: Some(input),
             gate: None,
             result,
+            summarise: false,
         }
     }
 
@@ -256,8 +274,28 @@ impl AuditRecord {
                 backend_status: None,
                 object_name: None,
                 copy_source_object_name: None,
+                summary: None,
             },
+            summarise: false,
         }
+    }
+
+    /// The first record of a summary: what it says about one request alone is dropped,
+    /// so it cannot be read as naming the one object or listing it covers.
+    pub(crate) fn into_summary(mut self) -> Self {
+        if let Some(input) = self.input.as_mut() {
+            input.object = None;
+            input.prefix = None;
+            input.request.params = None;
+            input.request.headers_subset.clear();
+        }
+        self.gateway.denied_keys.clear();
+        self.gateway.summary = Some(AccessSummary {
+            requests: 1,
+            first_at: self.timestamp.clone(),
+            last_at: self.timestamp.clone(),
+        });
+        self
     }
 
     /// Record what the forward leg did. Called once, post-forward, by
@@ -317,6 +355,7 @@ mod tests {
             backend_status: None,
             object_name: None,
             copy_source_object_name: None,
+            summary: None,
         }
     }
 

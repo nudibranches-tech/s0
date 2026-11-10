@@ -255,6 +255,22 @@ fn prometheus(state: &AdminState) -> Response<Full<Bytes>> {
     );
     metric(
         &mut out,
+        "s0_audit_summarized_total",
+        "counter",
+        "Allowed reads and lists of a subject the bundle lists in \
+         org_settings.audit_summary_subjects, recorded through a summary rather than \
+         their own record. NOT dropped: each is counted in the summary that stands for it.",
+        m.summarized.load(Ordering::Relaxed),
+    );
+    metric(
+        &mut out,
+        "s0_audit_summaries_emitted_total",
+        "counter",
+        "Summary records handed on for shipping, one per subject, verb, bucket and window.",
+        m.summaries_emitted.load(Ordering::Relaxed),
+    );
+    metric(
+        &mut out,
         "s0_audit_spill_replayed_total",
         "counter",
         "Audit records recovered from the spill file and shipped.",

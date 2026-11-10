@@ -379,6 +379,26 @@ an unauthenticated caller controls the rate of, so they are budgeted — without
 scanner could evict the decision records of real access. A sustained non-zero value means
 someone is scanning.
 
+### Summarised platform identities
+
+A platform job that reads whole buckets, a backup copier for instance, would otherwise
+fill the trail with one record per object and can outrun the queue, which then drops the
+records of everyone else. The control plane may list such identities by subject key
+(`sa:<client id>`, `user:<sub>`) in `org_settings.audit_summary_subjects`. Their allowed
+reads and lists that the backend served are folded into one record per subject, verb,
+bucket and window (`audit.summary_window_secs`, 60 by default). A summary is also shipped
+when it stands for `audit.summary_max_requests` requests (10 000 by default). The record
+keeps the decision-log envelope, with the first request's input minus its object,
+prefix and query, and a `gateway.summary` block:
+`{ "requests", "first_at", "last_at" }`.
+
+A denial, a failed forward and every other verb keep their own record. A list that is
+absent or is not an array of strings summarises nobody. Summaries never take a queue
+slot: the worker ships them when their window closes, and drains the open ones on
+shutdown. `s0_audit_summarized_total` counts the requests folded into summaries, and
+`s0_audit_summaries_emitted_total` the summary records. See
+[ADR-011](docs/adr/ADR-011-summarised-platform-identities.md).
+
 ---
 
 ## Build and test

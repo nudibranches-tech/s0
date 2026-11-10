@@ -13,12 +13,13 @@ mod backend;
 mod pending;
 mod record;
 mod sink;
+mod summary;
 
 pub use backend::{AuditBackend, ControlPlaneBackend, EVENT_KIND, StdoutNdjsonBackend};
 pub use pending::PendingAudit;
 pub use record::{
-    AuditRecord, BackendOutcome, DECISION_PATH, DEFAULT_ORG_LABEL_KEY, GATE_PATH, GateContext,
-    GateStage, GatewayMeta, LabelPolicy, Outcome,
+    AccessSummary, AuditRecord, BackendOutcome, DECISION_PATH, DEFAULT_ORG_LABEL_KEY, GATE_PATH,
+    GateContext, GateStage, GatewayMeta, LabelPolicy, Outcome,
 };
 pub use sink::{
     AuditBackendKind, AuditConfig, AuditHandle, AuditMetrics, AuditSink, spawn, spawn_with_backend,
