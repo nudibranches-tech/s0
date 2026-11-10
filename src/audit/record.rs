@@ -31,6 +31,10 @@ pub const DECISION_PATH: &str = "s3/authz/decision";
 /// evaluated, so claiming the decision entrypoint ran would be false.
 pub const GATE_PATH: &str = "s3/authz/gate";
 
+/// The `path` of a summary record (ADR-011). Its own path, like a gate record's, so a
+/// consumer that predates summaries cannot count one as a single request unawares.
+pub const SUMMARY_PATH: &str = "s3/authz/summary";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditRecord {
     pub decision_id: String,
@@ -56,10 +60,21 @@ pub struct AuditRecord {
     pub labels: BTreeMap<String, String>,
     /// S3-specific fields the decision-log extractor consumes beyond the OPA envelope.
     pub gateway: GatewayMeta,
-    /// The bundle lists the principal for summaries (ADR-011). Never on the wire: the
-    /// sink reads it, and a record that reaches the wire either is a summary or is not.
+    /// Set only when the bundle lists the principal for summaries (ADR-011). Never on
+    /// the wire: the sink reads it, and a shipped record either is a summary or is not.
     #[serde(skip)]
-    pub(crate) summarise: bool,
+    pub(crate) summary_scope: Option<SummaryScope>,
+}
+
+/// What, beyond who, where and which verb, keeps two requests in different summaries.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct SummaryScope {
+    /// The s3s operation (`GetObject`, `HeadObject`…).
+    pub operation: String,
+    /// The access-key id the request was signed with: one per session.
+    pub access_key_id: Option<String>,
+    /// Signed by a presigned URL rather than by the client holding the session.
+    pub presigned: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,14 +114,19 @@ pub struct GatewayMeta {
     pub summary: Option<AccessSummary>,
 }
 
-/// Allowed requests of one verb, by one subject, on one bucket, folded into one record.
-/// The record's `input` is the first request's, without its object, prefix or query.
+/// Allowed requests of one operation, by one session of one subject, on one bucket,
+/// folded into one record. The record's `input` is the first request's, without its
+/// object, prefix, query or headers, and its `result` carries no obligations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccessSummary {
+    pub operation: String,
     pub requests: u64,
-    /// RFC3339 UTC, the decision times of the first and the last request folded in.
+    /// RFC3339 UTC: the earliest and the latest decision time among them.
     pub first_at: String,
     pub last_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_key_id: Option<String>,
+    pub presigned: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,7 +255,7 @@ impl AuditRecord {
             input: Some(input),
             gate: None,
             result,
-            summarise: false,
+            summary_scope: None,
         }
     }
 
@@ -276,24 +296,29 @@ impl AuditRecord {
                 copy_source_object_name: None,
                 summary: None,
             },
-            summarise: false,
+            summary_scope: None,
         }
     }
 
     /// The first record of a summary: what it says about one request alone is dropped,
     /// so it cannot be read as naming the one object or listing it covers.
-    pub(crate) fn into_summary(mut self) -> Self {
+    pub(crate) fn into_summary(mut self, scope: SummaryScope) -> Self {
         if let Some(input) = self.input.as_mut() {
             input.object = None;
             input.prefix = None;
             input.request.params = None;
             input.request.headers_subset.clear();
         }
+        self.path = SUMMARY_PATH.to_string();
+        self.result.obligations = Default::default();
         self.gateway.denied_keys.clear();
         self.gateway.summary = Some(AccessSummary {
+            operation: scope.operation,
             requests: 1,
             first_at: self.timestamp.clone(),
             last_at: self.timestamp.clone(),
+            access_key_id: scope.access_key_id,
+            presigned: scope.presigned,
         });
         self
     }
@@ -392,6 +417,59 @@ mod tests {
         let back: AuditRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(back.requested_by, "alice");
         assert!(back.input.is_some() && back.gate.is_none());
+    }
+
+    /// ADR-011 must not change a record nobody summarises: same path, same keys, nothing
+    /// of the summary on the wire, and a scope set in memory never serialised.
+    #[test]
+    fn a_record_nobody_summarises_is_unchanged_on_the_wire() {
+        let mut rec = AuditRecord::new(
+            "dec-1".into(),
+            "2026-07-15T00:00:00Z".into(),
+            sample_input(),
+            Decision::allow("grant matched"),
+            meta(Outcome::Allowed, vec![]),
+            &labels(),
+        );
+        rec.summary_scope = Some(SummaryScope {
+            operation: "GetObject".into(),
+            access_key_id: Some("AKIA-EXAMPLE".into()),
+            presigned: false,
+        });
+        let json = serde_json::to_value(&rec).unwrap();
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "decision_id",
+                "gateway",
+                "input",
+                "labels",
+                "path",
+                "requested_by",
+                "result",
+                "timestamp"
+            ]
+        );
+        assert_eq!(json["path"], DECISION_PATH);
+        let mut gateway: Vec<&str> = json["gateway"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        gateway.sort_unstable();
+        assert_eq!(
+            gateway,
+            ["backend", "backend_id", "backend_kind", "outcome"]
+        );
+        assert!(!json.to_string().contains("AKIA-EXAMPLE"));
     }
 
     #[test]

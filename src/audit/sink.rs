@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 
 use super::backend::{AuditBackend, ControlPlaneBackend, StdoutNdjsonBackend};
 use super::record::AuditRecord;
-use super::summary::{Folded, Summaries};
+use super::summary::Summaries;
 
 /// Cap on the on-disk spill file: replay reads it whole, so this bounds replay memory
 /// during a long sink outage.
@@ -234,19 +234,9 @@ impl AuditSink {
     /// instead of queued; on overflow a record is dropped with a loud alert — the
     /// request is never held up for the audit queue.
     pub fn emit(&self, record: AuditRecord) {
-        let record = match self.summaries.fold(record) {
-            Folded::Kept => {
-                self.metrics.summarized.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-            Folded::Full(summary) => {
-                self.metrics.summarized.fetch_add(1, Ordering::Relaxed);
-                self.metrics
-                    .summaries_emitted
-                    .fetch_add(1, Ordering::Relaxed);
-                summary
-            }
-            Folded::Own(record) => record,
+        let Some(record) = self.summaries.fold(record) else {
+            self.metrics.summarized.fetch_add(1, Ordering::Relaxed);
+            return;
         };
         if let Err(err) = self.tx.try_send(record) {
             let n = self.metrics.queue_dropped.fetch_add(1, Ordering::Relaxed) + 1;
@@ -476,27 +466,29 @@ impl Worker {
                         }
                     }
                     None => {
-                        self.close_summaries(&mut buf, None);
+                        self.close_summaries(&mut buf);
                         self.flush(&mut buf).await;
                         self.finish().await;
                         break;
                     }
                 },
                 _ = ticker.tick() => {
-                    self.close_summaries(&mut buf, Some(Instant::now()));
+                    self.ship_due_summaries(&mut buf);
                     self.flush(&mut buf).await;
                     self.replay_spill().await;
                 }
                 _ = self.shutdown.notified() => {
                     // Shutdown: drain everything currently queued, ship it, and exit.
                     // serve() has already drained the data path, so nothing races in.
+                    // Summaries first: what is emitted from here on keeps its own record
+                    // and goes through the queue this loop drains.
+                    self.close_summaries(&mut buf);
                     while let Ok(rec) = self.rx.try_recv() {
                         buf.push(rec);
                         if buf.len() >= self.cfg.batch_max {
                             self.flush(&mut buf).await;
                         }
                     }
-                    self.close_summaries(&mut buf, None);
                     self.flush(&mut buf).await;
                     self.finish().await;
                     break;
@@ -505,15 +497,19 @@ impl Worker {
         }
     }
 
-    /// Move the summaries whose window closed by `now` (every one, on exit) into the
-    /// batch. They never pass through the queue, so a full queue cannot drop them.
-    fn close_summaries(&self, buf: &mut Vec<AuditRecord>, now: Option<Instant>) {
-        let closed = match now {
-            Some(now) => self.summaries.take_due(now),
-            None => self.summaries.take_all(),
-        };
-        AuditMetrics::add(&self.metrics.summaries_emitted, closed.len());
-        buf.extend(closed);
+    /// Move the summaries that are due into the batch. They never pass through the
+    /// queue, so a full queue cannot drop them.
+    fn ship_due_summaries(&self, buf: &mut Vec<AuditRecord>) {
+        let due = self.summaries.take_due(Instant::now());
+        AuditMetrics::add(&self.metrics.summaries_emitted, due.len());
+        buf.extend(due);
+    }
+
+    /// Every summary still held, on the way out; nothing is folded afterwards.
+    fn close_summaries(&self, buf: &mut Vec<AuditRecord>) {
+        let all = self.summaries.close();
+        AuditMetrics::add(&self.metrics.summaries_emitted, all.len());
+        buf.extend(all);
     }
 
     /// The last thing the worker does, on either exit path: one final replay attempt,
@@ -991,37 +987,52 @@ mod tests {
     fn a_summarised_read(id: &str) -> AuditRecord {
         let mut record = a_record(id);
         record.settle(crate::audit::BackendOutcome::SucceededStatusUnknown, None);
-        record.summarise = true;
+        record.summary_scope = Some(crate::audit::SummaryScope {
+            operation: "GetObject".into(),
+            access_key_id: Some("HFST0.session".into()),
+            presigned: false,
+        });
         record
+    }
+
+    fn summaries_sink(
+        tag: &str,
+        max_requests: u64,
+        backend: Arc<Recorder>,
+    ) -> (AuditSink, AuditHandle) {
+        spawn_with_backend(
+            AuditConfig {
+                spill_path: tmpdir(tag).join("audit-spill.ndjson"),
+                instance: "pod-a".into(),
+                queue_capacity: 1,
+                summary_window: Duration::from_secs(3600),
+                summary_max_requests: max_requests,
+                ..AuditConfig::default()
+            },
+            backend,
+        )
     }
 
     #[tokio::test]
     async fn summarised_reads_take_no_queue_slot_and_ship_as_one_record_on_drain() {
-        let dir = tmpdir("summaries");
         let backend = Arc::new(Recorder::default());
-        let (sink, handle) = spawn_with_backend(
-            AuditConfig {
-                spill_path: dir.join("audit-spill.ndjson"),
-                instance: "pod-a".into(),
-                queue_capacity: 1,
-                summary_window: Duration::from_secs(3600),
-                ..AuditConfig::default()
-            },
-            backend.clone(),
-        );
+        let (sink, handle) = summaries_sink("summaries", 10_000, backend.clone());
         for i in 0..50 {
             sink.emit(a_summarised_read(&format!("read-{i}")));
         }
-        let mut denied = a_record("denied");
-        denied.summarise = true;
+        let mut denied = a_summarised_read("denied");
         denied.gateway.outcome = crate::audit::Outcome::Denied;
         sink.emit(denied);
         handle.drain(Duration::from_secs(2)).await;
 
         let shipped = backend.0.lock().unwrap().clone();
-        let ids: Vec<&str> = shipped.iter().map(|r| r.decision_id.as_str()).collect();
+        let mut ids: Vec<&str> = shipped.iter().map(|r| r.decision_id.as_str()).collect();
+        ids.sort_unstable();
         assert_eq!(ids, ["denied", "read-0"], "the denial keeps its own record");
-        let summary = shipped[1].gateway.summary.as_ref().expect("a summary");
+        let summary = shipped
+            .iter()
+            .find_map(|r| r.gateway.summary.as_ref())
+            .expect("a summary");
         assert_eq!(summary.requests, 50);
         let m = sink.metrics();
         assert_eq!(
@@ -1031,5 +1042,50 @@ mod tests {
         );
         assert_eq!(m.summarized.load(Ordering::Relaxed), 50);
         assert_eq!(m.summaries_emitted.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn full_windows_wait_for_the_worker_rather_than_the_queue() {
+        let backend = Arc::new(Recorder::default());
+        let (sink, handle) = summaries_sink("summaries-cap", 10, backend.clone());
+        for i in 0..25 {
+            sink.emit(a_summarised_read(&format!("read-{i}")));
+        }
+        handle.drain(Duration::from_secs(2)).await;
+
+        let mut sizes: Vec<u64> = backend
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r.gateway.summary.as_ref().map(|s| s.requests))
+            .collect();
+        sizes.sort_unstable();
+        assert_eq!(
+            sizes,
+            [5, 10, 10],
+            "every request is in exactly one summary"
+        );
+        assert_eq!(
+            sink.dropped_total(),
+            0,
+            "two full windows never touched the one-slot queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_summarised_read_after_the_worker_left_is_counted_lost() {
+        let backend = Arc::new(Recorder::default());
+        let (sink, handle) = summaries_sink("summaries-late", 10_000, backend.clone());
+        handle.drain(Duration::from_secs(2)).await;
+
+        sink.emit(a_summarised_read("late"));
+
+        assert_eq!(
+            sink.dropped_total(),
+            1,
+            "folding into a summary no worker will ship would hide the loss"
+        );
+        assert_eq!(sink.metrics().summarized.load(Ordering::Relaxed), 0);
     }
 }

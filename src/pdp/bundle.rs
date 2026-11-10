@@ -625,8 +625,9 @@ pub fn content_revision(raw: &str) -> String {
 /// Where the control plane lists the subjects audited as summaries (ADR-011).
 pub const AUDIT_SUMMARY_SUBJECTS_PATH: &[&str] = &["org_settings", "audit_summary_subjects"];
 
-/// The listed subject keys. Absent, or anything but an array of strings, summarises
-/// nobody: a list that cannot be read must never make the trail coarser.
+/// The listed service-account keys (`sa:<client id>`). Absent, or anything but an array
+/// of strings, summarises nobody: a list that cannot be read must never make the trail
+/// coarser. Any other key is ignored, so a person's trail is never summarised (ADR-002).
 fn audit_summary_subjects(data: &serde_json::Value) -> BTreeSet<String> {
     let mut cursor = data;
     for segment in AUDIT_SUMMARY_SUBJECTS_PATH {
@@ -641,13 +642,29 @@ fn audit_summary_subjects(data: &serde_json::Value) -> BTreeSet<String> {
             .map(|item| item.as_str().map(str::to_string))
             .collect()
     });
-    listed.unwrap_or_else(|| {
+    let Some(listed) = listed else {
         tracing::warn!(
             "bundle carries org_settings.audit_summary_subjects but it is not an array of \
              strings; every request keeps its own audit record"
         );
-        BTreeSet::new()
-    })
+        return BTreeSet::new();
+    };
+    let (accounts, others): (BTreeSet<String>, BTreeSet<String>) = listed
+        .into_iter()
+        .partition(|key| is_service_account_key(key));
+    if !others.is_empty() {
+        tracing::warn!(
+            ignored = ?others,
+            "org_settings.audit_summary_subjects names keys that are not service accounts; \
+             they keep a record per request"
+        );
+    }
+    accounts
+}
+
+fn is_service_account_key(key: &str) -> bool {
+    key.strip_prefix("sa:")
+        .is_some_and(|client_id| !client_id.is_empty())
 }
 
 /// The subject key the control plane's projection writes for a service account:
@@ -1637,7 +1654,11 @@ mod tests {
             .iter()
             .map(String::as_str)
             .collect();
-        assert_eq!(listed, ["sa:hf-replication-manager-acme", "user:bob"]);
+        assert_eq!(
+            listed,
+            ["sa:hf-replication-manager-acme"],
+            "a person's key is never summarised"
+        );
     }
 
     #[test]
@@ -1647,6 +1668,7 @@ mod tests {
             serde_json::json!({ "org_settings": {} }),
             serde_json::json!({ "org_settings": { "audit_summary_subjects": "sa:x" } }),
             serde_json::json!({ "org_settings": { "audit_summary_subjects": ["sa:x", 7] } }),
+            serde_json::json!({ "org_settings": { "audit_summary_subjects": ["user:bob", "sa:", "bob"] } }),
         ] {
             let bundle = Bundle::new("r1", data.clone());
             assert!(bundle.audit_summary_subjects().is_empty(), "{data}");

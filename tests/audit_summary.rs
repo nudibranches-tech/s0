@@ -1,6 +1,7 @@
-//! ADR-011 through the real `S3Access` hooks: the allowed reads of a subject the bundle
-//! lists in `org_settings.audit_summary_subjects` are recorded as one summary; its
-//! denials, and every request of anyone else, keep a record each.
+//! ADR-011 through the real `S3Access` hooks: the allowed reads of a service account the
+//! bundle lists in `org_settings.audit_summary_subjects` are recorded as one summary; its
+//! denials, a person listed by mistake, and every request of anyone else keep a record
+//! each.
 
 mod common;
 
@@ -8,19 +9,31 @@ use std::sync::Arc;
 
 use http::Method;
 use s0::access::GatewayAccess;
-use s0::audit::{AuditRecord, BackendOutcome, PendingAudit};
+use s0::audit::{AuditRecord, BackendOutcome, PendingAudit, SUMMARY_PATH};
+use s0::identity::ResolvedPrincipal;
+use s0::model::PrincipalType;
 use s3s::access::S3Access;
 use s3s::dto::GetObjectInput;
 
 fn bundle() -> serde_json::Value {
     let mut b = common::alice_bundle();
-    b["org_settings"]["audit_summary_subjects"] = serde_json::json!(["user:replicator"]);
+    b["org_settings"]["audit_summary_subjects"] =
+        serde_json::json!(["sa:replicator", "user:alice"]);
     b["tenants"]["acme"]["user_attributes"]["replicator"] =
         serde_json::json!({ "groups": [], "attributes": [] });
     b["tenants"]["acme"]["s3_grants"]["replicator"] = serde_json::json!([
         { "bucket": "reports", "actions": ["read_objects", "list_objects"], "prefixes": [] }
     ]);
     b
+}
+
+/// `replicator` is a service account, as a platform job is; `alice` a person.
+fn principal(sub: &str) -> ResolvedPrincipal {
+    let mut principal = common::principal(sub);
+    if sub == "replicator" {
+        principal.principal_type = PrincipalType::ServiceAccount;
+    }
+    principal
 }
 
 /// A `GetObject` the backend then answered, settled the way the forward path does.
@@ -31,8 +44,10 @@ async fn read(
     bucket: &str,
     key: &str,
 ) -> bool {
-    let mut req = fx.request_as(
-        sub,
+    let mut req = common::seeded_request(
+        &fx.cfg,
+        &fx.gw.bundles,
+        principal(sub),
         "GetObject",
         GetObjectInput {
             bucket: bucket.into(),
@@ -40,6 +55,7 @@ async fn read(
             ..Default::default()
         },
         Method::GET,
+        "/",
     );
     let allowed = access.get_object(&mut req).await.is_ok();
     if let Some(pending) = req.extensions.get::<Arc<PendingAudit>>() {
@@ -78,8 +94,12 @@ async fn a_listed_subjects_reads_are_one_summary_and_its_denial_its_own_record()
     assert_eq!(records.len(), 2, "one summary and one denial: {records:#?}");
     let summary = summaries(&records);
     assert_eq!(summary.len(), 1);
+    assert_eq!(summary[0].path, SUMMARY_PATH);
     let folded = summary[0].gateway.summary.as_ref().expect("summary");
-    assert_eq!(folded.requests, 5);
+    assert_eq!(
+        (folded.requests, folded.operation.as_str()),
+        (5, "GetObject")
+    );
     let input = summary[0].input.as_ref().expect("input");
     assert_eq!(
         (input.bucket.as_str(), input.object.as_deref()),
@@ -97,12 +117,38 @@ async fn a_listed_subjects_reads_are_one_summary_and_its_denial_its_own_record()
     );
 }
 
+/// `user:alice` is listed too, but a person's trail is never summarised (ADR-002).
 #[tokio::test]
-async fn an_unlisted_subject_keeps_a_record_per_read() {
+async fn a_person_listed_by_mistake_keeps_a_record_per_read() {
     let fx = common::fixture("audit-summary-unlisted", bundle());
     let access = GatewayAccess::new(fx.gw.clone());
     for n in 0..3 {
         assert!(read(&access, &fx, "alice", "reports", &format!("2024/{n}.csv")).await);
+    }
+
+    let records = fx.await_audit_records(3).await;
+
+    assert_eq!(records.len(), 3);
+    assert!(summaries(&records).is_empty());
+}
+
+#[tokio::test]
+async fn an_unlisted_service_account_keeps_a_record_per_read() {
+    let mut unlisted = bundle();
+    unlisted["org_settings"]["audit_summary_subjects"] = serde_json::json!(["sa:someone-else"]);
+    let fx = common::fixture("audit-summary-unlisted-sa", unlisted);
+    let access = GatewayAccess::new(fx.gw.clone());
+    for n in 0..3 {
+        assert!(
+            read(
+                &access,
+                &fx,
+                "replicator",
+                "reports",
+                &format!("2024/{n}.csv")
+            )
+            .await
+        );
     }
 
     let records = fx.await_audit_records(3).await;
