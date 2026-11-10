@@ -75,6 +75,18 @@ jobs:
         with:
           command: check licenses
 
+  # Reported, never gating: a red job means "a new advisory to triage", not "this change
+  # broke something". Accepted advisories are listed, with a reason, in deny.toml.
+  advisories:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: EmbarkStudios/cargo-deny-action@v2.1.1
+        with:
+          command: check advisories
+
   # ADR-009 T2: the SFTP codec and the PROXY v2 parser are fuzzed in CI. libFuzzer needs
   # nightly; the fuzz crate is its own workspace (fuzz/Cargo.toml), so the stable jobs
   # above never build it. Each target runs for a bounded time from an empty corpus; a

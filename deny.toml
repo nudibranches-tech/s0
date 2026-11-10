@@ -1,7 +1,7 @@
 # cargo-deny configuration (ADR-009: "PR 1 adds a `cargo deny` licence check").
 #
-# CI gates on `cargo deny check licenses` only (ci.yml, job `licenses`). The other sections
-# are configured so `cargo deny check` is useful locally, but are not a merge gate yet.
+# CI gates on `cargo deny check licenses` only (ci.yml, job `licenses`). Advisories run in CI
+# too (job `advisories`) but never gate. The other sections are for local `cargo deny check`.
 
 [graph]
 all-features = true
@@ -39,7 +39,13 @@ exceptions = [
 ]
 
 [advisories]
-ignore = []
+# Accepted only when no compatible fix exists and the affected path is unreachable.
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "rsa: private-key operations only, and s0 performs none. RSA host and client keys are refused (ADR-009 D3, E8), JWTs are verified with public keys, STS tokens are HMAC. russh pins rsa =0.10.0-rc.18 up to 0.65.1." },
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5: secret-dependent paths only. jsonwebtoken's p256/p384 verify public inputs; aws-sigv4 signs with them only for SigV4a (multi-region access points), and s3s rejects ARN bucket names. No 0.5.x fix." },
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils: unmaintained, no known vulnerability. Pulled by aws-smithy-http." },
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml: unmaintained, no known vulnerability. Pulled by serde_yaml under regorus 0.10; regorus 0.12 moves to yaml_serde." },
+]
 
 [bans]
 multiple-versions = "allow"
