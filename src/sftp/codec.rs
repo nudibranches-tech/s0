@@ -417,6 +417,11 @@ impl Reader {
     }
 }
 
+/// A client-to-server v3 request type that `parse` decodes field by field (`INIT` aside).
+fn is_request_kind(kind: u8) -> bool {
+    matches!(kind, SSH_FXP_OPEN..=SSH_FXP_SYMLINK | SSH_FXP_EXTENDED)
+}
+
 /// Parse one packet body (the bytes after the 4-byte length: type, then fields).
 ///
 /// The caller has already bounded the body by `max_sftp_packet_len`.
@@ -436,6 +441,10 @@ pub fn parse(body: Bytes) -> Result<Request, CodecError> {
     }
     let id = match r.u32() {
         Ok(id) => id,
+        // ADR-009 D2: a type outside the request set is answered OP_UNSUPPORTED even when
+        // it is too short to carry an id (the reply then uses id 0). A known type without
+        // an id is malformed, and that ends the session.
+        Err(_) if !is_request_kind(kind) => return Ok(Request::Unknown { kind, id: None }),
         Err(reason) => return Err(CodecError { id: None, reason }),
     };
     let fail = |reason| CodecError {
@@ -793,6 +802,25 @@ mod tests {
     }
 
     #[test]
+    fn an_unknown_packet_type_too_short_for_an_id_is_still_unknown() {
+        for tail in [&[][..], &[0, 0, 1][..]] {
+            let body = pkt(42, |b| b.extend_from_slice(tail));
+            assert_eq!(
+                parse(body).unwrap(),
+                Request::Unknown { kind: 42, id: None }
+            );
+        }
+    }
+
+    #[test]
+    fn a_known_packet_type_without_an_id_is_malformed() {
+        for kind in [SSH_FXP_OPEN, SSH_FXP_SYMLINK, SSH_FXP_EXTENDED] {
+            let err = parse(pkt(kind, |_| {})).unwrap_err();
+            assert_eq!(err.id, None, "type {kind}");
+        }
+    }
+
+    #[test]
     fn write_data_is_a_zero_copy_slice() {
         let body = pkt(SSH_FXP_WRITE, |b| {
             b.put_u32(1);
@@ -838,7 +866,8 @@ mod tests {
 
     #[test]
     fn arbitrary_bytes_never_panic() {
-        // A tiny deterministic fuzz pass; the cargo-fuzz target runs the same function.
+        // A tiny deterministic fuzz pass; the cargo-fuzz target `sftp_codec`
+        // (fuzz/fuzz_targets/sftp_codec.rs) runs the same function, unbiased, in CI.
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;
         for _ in 0..20_000 {
             seed ^= seed << 13;

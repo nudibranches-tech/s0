@@ -204,6 +204,9 @@ pub struct SftpLimits {
     pub max_file_size: u64,
     /// Per session, per direction. 0 ⇒ unlimited.
     pub bandwidth_bytes_per_sec: u64,
+    /// Process-wide (all sessions of the replica together), per direction: uploads and
+    /// downloads are each held to it, on top of the per-session cap. 0 ⇒ unlimited.
+    pub process_bandwidth_bytes_per_sec: u64,
     /// 5–64 MiB.
     pub part_size: usize,
     /// 1–4.
@@ -239,6 +242,7 @@ impl Default for SftpLimits {
             transfer_idle_timeout_secs: 120,
             max_file_size: 50 * 1024 * 1024 * 1024,
             bandwidth_bytes_per_sec: 0,
+            process_bandwidth_bytes_per_sec: 0,
             part_size: 8 * 1024 * 1024,
             max_inflight_parts: 2,
             reorder_window: 2 * 1024 * 1024,
@@ -328,6 +332,16 @@ impl SftpLimits {
         }
         if self.read_ahead == 0 {
             return Err("limits.sftp.read_ahead must be > 0".into());
+        }
+        if self.process_bandwidth_bytes_per_sec != 0
+            && self.process_bandwidth_bytes_per_sec < self.max_sftp_packet_len as u64
+        {
+            return Err(format!(
+                "limits.sftp.process_bandwidth_bytes_per_sec {} is below max_sftp_packet_len \
+                 {}; one packet would exceed a second of the whole replica's budget (0 is \
+                 unlimited)",
+                self.process_bandwidth_bytes_per_sec, self.max_sftp_packet_len
+            ));
         }
         if self.read_ahead > self.max_transfer_memory {
             return Err(format!(
@@ -1648,11 +1662,18 @@ mod tests {
             ("reorder_window", serde_json::json!(64 * 1024 * 1024)),
             ("max_file_size", serde_json::json!(1u64 << 50)),
             ("max_connections", serde_json::json!(0)),
+            ("process_bandwidth_bytes_per_sec", serde_json::json!(1024)),
         ] {
             let l: SftpLimits =
                 serde_json::from_value(serde_json::json!({ field: value })).unwrap();
             assert!(l.validate().is_err(), "{field}={value}");
         }
+        assert_eq!(l.process_bandwidth_bytes_per_sec, 0, "unlimited by default");
+        let l: SftpLimits = serde_json::from_value(
+            serde_json::json!({ "process_bandwidth_bytes_per_sec": 1 << 20 }),
+        )
+        .unwrap();
+        assert!(l.validate().is_ok());
     }
 
     #[test]

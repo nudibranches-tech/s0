@@ -483,6 +483,7 @@ struct Harness {
     addr: SocketAddr,
     drop_key: PrivateKey,
     ops_key: PrivateKey,
+    metrics: Arc<s0::sftp::SftpMetrics>,
     _stop: tokio::sync::oneshot::Sender<()>,
 }
 
@@ -545,6 +546,7 @@ async fn harness_with(tag: &str, mode: &str, edit: impl FnOnce(&mut serde_json::
     }))
     .unwrap();
     let front = SftpFront::build(fx.gw.clone(), &cfg).expect("front");
+    let metrics = front.metrics();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -557,6 +559,7 @@ async fn harness_with(tag: &str, mode: &str, edit: impl FnOnce(&mut serde_json::
         addr,
         drop_key,
         ops_key,
+        metrics,
         _stop: stop,
     }
 }
@@ -1279,6 +1282,17 @@ async fn every_unsupported_request_gets_its_documented_answer() {
     // An unknown packet type: OP_UNSUPPORTED, and the session survives.
     let r = c.call(77, |_| {}).await.unwrap();
     assert_eq!(code(&r), OP_UNSUPPORTED);
+    // One too short to carry an id: still OP_UNSUPPORTED, answered with id 0.
+    let mut b = BytesMut::new();
+    b.put_u8(77);
+    assert!(c.send_raw(b).await);
+    let (t, body) = c
+        .recv_raw()
+        .await
+        .expect("a reply to an id-less unknown packet");
+    assert_eq!(t, SSH_FXP_STATUS);
+    assert_eq!(&body[..4], &0u32.to_be_bytes(), "reply id");
+    assert_eq!(&body[4..8], &OP_UNSUPPORTED.to_be_bytes(), "status code");
     assert!(matches!(
         c.path_op(SSH_FXP_STAT, "/").await.unwrap(),
         Reply::Attrs(_)
@@ -2328,4 +2342,592 @@ async fn a_client_stalled_at_the_tcp_level_has_its_socket_closed() {
     }
     pipeline.abort();
     assert!(closed, "the stalled connection's socket is released");
+}
+
+#[tokio::test]
+async fn the_process_bandwidth_cap_holds_concurrent_sessions_together() {
+    // 256 KiB/s for the whole replica, no per-session cap: two sessions downloading
+    // 512 KiB each (1 MiB together) need at least (1 MiB - the 1 s burst) / rate = 3 s,
+    // where uncapped they take milliseconds.
+    const RATE: usize = 256 * 1024;
+    const SIZE: usize = 512 * 1024;
+    let h = harness_with("sftp-process-bandwidth", "native", |c| {
+        sftp_limits(
+            c,
+            serde_json::json!({ "process_bandwidth_bytes_per_sec": RATE }),
+        )
+    })
+    .await;
+    let data: Vec<u8> = (0..SIZE).map(|i| (i % 249) as u8).collect();
+    h.put("a.bin", &data);
+    h.put("b.bin", &data);
+    let download = |path: &'static str| {
+        let (addr, key, want) = (h.addr, h.ops_key.clone(), data.clone());
+        async move {
+            let mut c = connect(addr, "acme-ops", &key).await.expect("connect");
+            let Reply::Handle(hd) = c.open(path, SSH_FXF_READ).await else {
+                panic!()
+            };
+            let mut got = Vec::new();
+            loop {
+                match c.read(&hd, got.len() as u64, 32 * 1024).await {
+                    Reply::Data(d) => got.extend_from_slice(&d),
+                    Reply::Status(1, _) => break,
+                    other => panic!("{other:?}"),
+                }
+            }
+            assert_eq!(got, want, "{path}");
+            tokio::time::Instant::now()
+        }
+    };
+    let t0 = tokio::time::Instant::now();
+    let (a, b) = tokio::join!(download("/a.bin"), download("/b.bin"));
+    let total = a.max(b) - t0;
+    let floor = Duration::from_secs_f64((2 * SIZE - RATE) as f64 / RATE as f64);
+    assert!(
+        total >= floor.mul_f64(0.9),
+        "1 MiB at 256 KiB/s with a 1 s burst took only {total:?}"
+    );
+    assert!(total < Duration::from_secs(15), "{total:?}");
+    // Neither session is starved: they share the budget and finish close together.
+    let gap = if a > b { a - b } else { b - a };
+    assert!(gap < Duration::from_millis(1500), "finish gap {gap:?}");
+    assert!(h.metrics.process_bandwidth_wait_ms.load(Ordering::Relaxed) > 0);
+}
+
+// ── ADR-009 test plan: security regressions on the key path ──────────────────
+
+/// A 3072-bit RSA key — the size floor the original requirement named — so a refusal
+/// can only be about the algorithm, never the size.
+fn rsa_3072() -> PrivateKey {
+    PrivateKey::from_openssh(include_str!("data/sftp-rsa-3072-client-key")).unwrap()
+}
+
+fn auth_failures(recs: &[AuditRecord]) -> Vec<&AuditRecord> {
+    recs.iter()
+        .filter(|x| {
+            x.session_event
+                .as_ref()
+                .is_some_and(|e| e.event == SessionEventKind::AuthFailed)
+        })
+        .collect()
+}
+
+/// D3 / E6: RSA client keys are refused, whatever signature algorithm the client
+/// proposes — `ssh-rsa` (SHA-1) included — and even when the bundle lists the key.
+///
+/// The SHA-1 attempt is negotiable as far as the transport goes: the client signature
+/// algorithm is not part of KEX, so the host-key and KEX floors do not stop a client
+/// from *offering* `ssh-rsa`. What the server does is (a) advertise no RSA algorithm
+/// at all in `server-sig-algs`, and (b) refuse the key at the probe, so no SHA-1
+/// signature is ever verified. russh 0.63.3 also routes a signed request that skips
+/// the probe through `auth_publickey_offered`, the same refusal; and the account layer
+/// refuses RSA again at authentication
+/// (`account::tests::a_listed_rsa_key_is_refused_as_a_credential_mismatch`).
+#[tokio::test]
+async fn an_rsa_client_key_is_refused_in_every_signature_algorithm_sha1_included() {
+    let h = harness("sftp-rsa", "native").await;
+    let rsa = Arc::new(rsa_3072());
+    // List the RSA key on the account, so a refusal cannot be "key not authorized".
+    let mut b = bundle(&h.drop_key, &h.ops_key);
+    b["sftp"]["accounts"]["acme-ops"]["authorized_keys"] = serde_json::json!([
+        { "key_type": "ssh-ed25519", "fingerprint": fp(&h.ops_key) },
+        { "key_type": "ssh-rsa", "fingerprint": fp(&rsa) }
+    ]);
+    h.fx.gw
+        .bundles
+        .store(s0::pdp::Bundle::new("rev-rsa-listed", b));
+
+    let algs = [
+        (None, "ssh-rsa (SHA-1)"),
+        (Some(ssh_key::HashAlg::Sha256), "rsa-sha2-256"),
+        (Some(ssh_key::HashAlg::Sha512), "rsa-sha2-512"),
+    ];
+    for (hash, name) in algs {
+        let cfg = Arc::new(russh::client::Config::default());
+        let mut session = russh::client::connect(cfg, h.addr, Client)
+            .await
+            .expect("KEX completes: the client signature algorithm is not negotiated there");
+        if hash.is_none() {
+            assert_eq!(
+                session.best_supported_rsa_hash().await.unwrap(),
+                None,
+                "server-sig-algs must advertise no RSA signature algorithm, SHA-1 included"
+            );
+        }
+        let r = session
+            .authenticate_publickey("acme-ops", PrivateKeyWithHashAlg::new(rsa.clone(), hash))
+            .await;
+        assert!(
+            !matches!(&r, Ok(a) if a.success()),
+            "an RSA key authenticated with {name}: {r:?}"
+        );
+    }
+
+    let recs = records(&h.fx, |r| auth_failures(r).len() >= algs.len()).await;
+    let failures = auth_failures(&recs);
+    assert_eq!(failures.len(), algs.len(), "one refusal per attempt");
+    for f in failures {
+        assert!(
+            f.result.reason.contains("is not accepted") && f.result.reason.contains("RSA"),
+            "{}",
+            f.result.reason
+        );
+        assert!(!f.result.allow);
+        assert!(!f.labels.contains_key("s0/organization-id"));
+        assert_eq!(
+            f.session_event.as_ref().unwrap().credential_mismatch,
+            Some(true),
+            "an RSA key is a credential mismatch, counted toward the ban"
+        );
+    }
+    // The listed ed25519 key on the same account still logs in.
+    assert!(connect(h.addr, "acme-ops", &h.ops_key).await.is_ok());
+}
+
+/// D3 / D12: probes are capped separately from attempts. Past `max_key_probes` the
+/// connection is dropped, the overflow is one `auth_failed` credential mismatch, and it
+/// counts toward the ban because the connection ends unauthenticated.
+///
+/// The ban threshold is set to exactly the number of failures the flood produces (the
+/// two signed-and-rejected keys plus the overflow), so the ban only happens if the
+/// overflow itself is counted.
+#[tokio::test]
+async fn a_key_probe_flood_is_disconnected_and_counts_toward_the_ban() {
+    let h = harness_with("sftp-probe-flood", "native", |c| {
+        sftp_limits(
+            c,
+            serde_json::json!({
+                "max_key_probes": 2,
+                "max_auth_attempts": 10,
+                "auth_failure_ban_threshold": 3
+            }),
+        );
+    })
+    .await;
+    let cfg = Arc::new(russh::client::Config::default());
+    let mut session = russh::client::connect(cfg, h.addr, Client).await.unwrap();
+    // russh's client probes each key before signing: every call is one probe.
+    for i in 0..2 {
+        let r = session
+            .authenticate_publickey(
+                "acme-ops",
+                PrivateKeyWithHashAlg::new(Arc::new(ed25519()), None),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("probe {i} is within the cap: {e}"));
+        assert!(!r.success());
+    }
+    let r = session
+        .authenticate_publickey(
+            "acme-ops",
+            PrivateKeyWithHashAlg::new(Arc::new(ed25519()), None),
+        )
+        .await;
+    assert!(
+        !matches!(&r, Ok(a) if a.success()),
+        "the probe over the cap: {r:?}"
+    );
+    // The connection is gone: not even the right key gets in on it.
+    let r = session
+        .authenticate_publickey(
+            "acme-ops",
+            PrivateKeyWithHashAlg::new(Arc::new(h.ops_key.clone()), None),
+        )
+        .await;
+    assert!(
+        !matches!(&r, Ok(a) if a.success()),
+        "the flooded connection must be closed: {r:?}"
+    );
+
+    let recs = records(&h.fx, |r| {
+        r.iter().any(|x| {
+            x.session_event
+                .as_ref()
+                .is_some_and(|e| e.event == SessionEventKind::Banned)
+        })
+    })
+    .await;
+    let failures = auth_failures(&recs);
+    let overflow: Vec<_> = failures
+        .iter()
+        .filter(|f| f.result.reason.contains("more than 2 public keys offered"))
+        .collect();
+    assert_eq!(overflow.len(), 1, "one overflow record: {failures:#?}");
+    assert_eq!(
+        overflow[0]
+            .session_event
+            .as_ref()
+            .unwrap()
+            .credential_mismatch,
+        Some(true)
+    );
+    assert_eq!(
+        failures.len(),
+        3,
+        "two rejected keys and the overflow: {failures:#?}"
+    );
+    assert!(
+        recs.iter().any(|x| x
+            .session_event
+            .as_ref()
+            .is_some_and(|e| e.event == SessionEventKind::Banned)),
+        "the overflow counted: three failures reach the threshold of three"
+    );
+    assert!(
+        connect(h.addr, "acme-ops", &h.ops_key).await.is_err(),
+        "the address is banned, even for the right key"
+    );
+}
+
+// ── ADR-009 D2: a login and an operation in both key spaces ──────────────────
+
+/// The fixture bundle's tenant data re-keyed the way a control plane projects it:
+/// `sa:<client id>` / `user:<sub>`.
+fn prefixed(mut b: serde_json::Value) -> serde_json::Value {
+    let rekey = |k: &str| match k {
+        "partner-drop" => "sa:partner-drop".to_string(),
+        "ops" => "user:ops".to_string(),
+        other => panic!("unexpected subject {other}"),
+    };
+    for field in ["user_attributes", "s3_grants"] {
+        let old = b["tenants"]["acme"][field].as_object().unwrap().clone();
+        b["tenants"]["acme"][field] = old.into_iter().map(|(k, v)| (rekey(&k), v)).collect();
+    }
+    b
+}
+
+/// A pushed module: the compiled-in policy, keyed on the prefixed subject key the way a
+/// control plane's module derives it (`sprintf` over `principal.type`).
+fn prefixed_module() -> String {
+    let m = s0::pdp::GATEWAY_REGO
+        .replace(
+            "user_attributes[input.principal.sub]",
+            "user_attributes[subject_key]",
+        )
+        .replace("s3_grants[input.principal.sub]", "s3_grants[subject_key]");
+    assert_eq!(
+        m.matches("[subject_key]").count(),
+        3,
+        "the compiled-in policy's subject lookups moved; update this rewrite"
+    );
+    format!(
+        "{m}\n\
+         subject_key := sprintf(\"sa:%s\", [input.principal.sub]) if {{\n\
+         \tinput.principal.type == \"service_account\"\n\
+         }} else := sprintf(\"user:%s\", [input.principal.sub]) if {{\n\
+         \tinput.principal.type == \"user\"\n\
+         }}\n"
+    )
+}
+
+/// ADR-009 D2: the login check reads the key space the PDP reads — prefixed under a
+/// pushed module, raw `sub` under the compiled-in default — so a login **and** an
+/// allowed operation succeed under both. The crossed combinations are refused, which is
+/// what makes the two passes discriminating.
+#[tokio::test]
+async fn a_login_and_an_operation_succeed_in_both_key_spaces() {
+    for module in [false, true] {
+        let h = harness(&format!("sftp-keyspace-{module}"), "native").await;
+        let raw = bundle(&h.drop_key, &h.ops_key);
+        if module {
+            // Crossed: the module's key space over raw-keyed data. No login.
+            h.fx.gw.bundles.store(
+                s0::pdp::Bundle::new("rev-crossed-module", raw.clone()).with_policy_module(true),
+            );
+            assert!(
+                connect(h.addr, "acme-ops", &h.ops_key).await.is_err(),
+                "prefixed lookup over raw-keyed data must not log in"
+            );
+            let b = prefixed(raw);
+            h.fx.gw
+                .pdp
+                .reload(Some(&prefixed_module()), &b)
+                .await
+                .expect("the pushed module loads");
+            h.fx.gw
+                .bundles
+                .store(s0::pdp::Bundle::new("rev-module", b).with_policy_module(true));
+        } else {
+            // Crossed: the compiled-in default's key space over prefixed data. No login.
+            h.fx.gw.bundles.store(s0::pdp::Bundle::new(
+                "rev-crossed-raw",
+                prefixed(raw.clone()),
+            ));
+            assert!(
+                connect(h.addr, "acme-ops", &h.ops_key).await.is_err(),
+                "raw lookup over prefixed data must not log in"
+            );
+            h.fx.gw.bundles.store(s0::pdp::Bundle::new("rev-raw", raw));
+        }
+
+        let mut drop = connect(h.addr, "acme-partner-drop", &h.drop_key)
+            .await
+            .unwrap_or_else(|e| panic!("module={module}: drop-box login: {e}"));
+        let r = drop.upload("/k.csv", b"drop").await;
+        assert_eq!(code(&r), OK, "module={module}: drop-box create: {r:?}");
+        assert_eq!(
+            h.mem.get("inbound", "partner-x/k.csv").as_deref(),
+            Some(&b"drop"[..])
+        );
+
+        let mut ops = connect(h.addr, "acme-ops", &h.ops_key)
+            .await
+            .unwrap_or_else(|e| panic!("module={module}: ops login: {e}"));
+        let r = ops.upload("/in/k.csv", b"ops").await;
+        assert_eq!(code(&r), OK, "module={module}: ops upload: {r:?}");
+        assert!(
+            matches!(ops.path_op(SSH_FXP_STAT, "/in/k.csv").await.unwrap(), Reply::Attrs(m) if m & 0o100000 != 0),
+            "module={module}: stat"
+        );
+        assert_eq!(
+            ops.listdir("/in").await.unwrap(),
+            [".", "..", "k.csv"],
+            "module={module}: listing"
+        );
+
+        // Each allow came from the PDP, on the subject as the module reads it.
+        let recs = records(&h.fx, |r| {
+            r.iter()
+                .filter(|x| x.path == "s3/authz/decision" && x.result.allow)
+                .count()
+                >= 4
+        })
+        .await;
+        let subs: std::collections::BTreeSet<_> = recs
+            .iter()
+            .filter(|x| x.path == "s3/authz/decision" && x.result.allow)
+            .map(|x| x.input.as_ref().unwrap().principal.sub.clone())
+            .collect();
+        assert_eq!(
+            subs.into_iter().collect::<Vec<_>>(),
+            ["ops", "partner-drop"],
+            "module={module}: the PDP always sees the raw sub; only the lookup key differs"
+        );
+    }
+}
+
+// ── ADR-009 D11: the rows `every_unsupported_request_gets_its_documented_answer`
+//    does not reach ─────────────────────────────────────────────────────────────
+
+fn attrs(b: &mut BytesMut, which: &str) {
+    match which {
+        "size" => {
+            b.put_u32(SSH_FILEXFER_ATTR_SIZE);
+            b.put_u64(0);
+        }
+        "uidgid" => {
+            b.put_u32(SSH_FILEXFER_ATTR_UIDGID);
+            b.put_u32(1000);
+            b.put_u32(1000);
+        }
+        "mode" => {
+            b.put_u32(SSH_FILEXFER_ATTR_PERMISSIONS);
+            b.put_u32(0o600);
+        }
+        "times" => {
+            b.put_u32(SSH_FILEXFER_ATTR_ACMODTIME);
+            b.put_u32(1);
+            b.put_u32(2);
+        }
+        "none" => b.put_u32(0),
+        other => panic!("{other}"),
+    }
+}
+
+fn posix_rename(b: &mut BytesMut, from: &str, to: &str) {
+    s(b, b"posix-rename@openssh.com");
+    s(b, from.as_bytes());
+    s(b, to.as_bytes());
+}
+
+#[tokio::test]
+async fn the_remaining_d11_rows_get_their_documented_answers() {
+    let h = harness("sftp-d11-rest", "native").await;
+    let mut c = connect(h.addr, "acme-ops", &h.ops_key)
+        .await
+        .expect("connect");
+
+    // Extended requests the table answers OP_UNSUPPORTED, each with the payload a real
+    // client sends.
+    let Reply::Handle(dir) = c.path_op(SSH_FXP_OPENDIR, "/").await.unwrap() else {
+        panic!("opendir")
+    };
+    type Payload<'a> = Box<dyn FnOnce(&mut BytesMut) + 'a>;
+    let cases: Vec<(&str, Payload)> = vec![
+        (
+            "lsetstat@openssh.com",
+            Box::new(|b| {
+                s(b, b"/a");
+                attrs(b, "mode");
+            }),
+        ),
+        (
+            "users-groups-by-id@openssh.com",
+            Box::new(|b| {
+                s(b, &1000u32.to_be_bytes());
+                s(b, &1000u32.to_be_bytes());
+            }),
+        ),
+        ("expand-path@openssh.com", Box::new(|b| s(b, b"~/a"))),
+        ("home-directory", Box::new(|b| s(b, b"acme-ops"))),
+        ("fstatvfs@openssh.com", Box::new(|b| s(b, &dir))),
+    ];
+    for (ext, payload) in cases {
+        let r = c
+            .call(SSH_FXP_EXTENDED, |b| {
+                s(b, ext.as_bytes());
+                payload(b);
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(&r, Reply::Status(OP_UNSUPPORTED, m) if m == "unsupported extension"),
+            "{ext}: {r:?}"
+        );
+    }
+    assert_eq!(code(&c.close(&dir).await), OK);
+
+    // SETSTAT: a size change is how `truncate` arrives, and it is refused like any other.
+    let r = c
+        .call(SSH_FXP_SETSTAT, |b| {
+            s(b, b"/a");
+            attrs(b, "size");
+        })
+        .await
+        .unwrap();
+    assert_eq!(code(&r), OP_UNSUPPORTED, "truncate through SETSTAT");
+
+    // FSETSTAT on an open upload: every attribute refused, the empty set answered OK,
+    // and the transfer is unaffected by any of it.
+    let Reply::Handle(fh) = c
+        .open(
+            "/fsetstat.csv",
+            SSH_FXF_WRITE | SSH_FXF_CREAT | SSH_FXF_TRUNC,
+        )
+        .await
+    else {
+        panic!("open")
+    };
+    assert_eq!(code(&c.write(&fh, 0, b"payload").await), OK);
+    for which in ["size", "uidgid", "mode", "times"] {
+        let r = c
+            .call(SSH_FXP_FSETSTAT, |b| {
+                s(b, &fh);
+                attrs(b, which);
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(&r, Reply::Status(OP_UNSUPPORTED, m) if m.contains("cannot honour")),
+            "FSETSTAT {which}: {r:?}"
+        );
+    }
+    let r = c
+        .call(SSH_FXP_FSETSTAT, |b| {
+            s(b, &fh);
+            attrs(b, "none");
+        })
+        .await
+        .unwrap();
+    assert_eq!(code(&r), OK, "an empty FSETSTAT asks for nothing");
+    // Not in the D11 table: FSETSTAT on a handle the session does not hold is a FAILURE
+    // ("invalid handle"), checked before the attributes, like every handle operation.
+    for which in ["mode", "none"] {
+        let r = c
+            .call(SSH_FXP_FSETSTAT, |b| {
+                s(b, b"no-such-handle");
+                attrs(b, which);
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(&r, Reply::Status(FAILURE, m) if m == "invalid handle"),
+            "FSETSTAT {which} on an unknown handle: {r:?}"
+        );
+    }
+    assert_eq!(code(&c.close(&fh).await), OK);
+    assert_eq!(
+        h.mem.get("inbound", "fsetstat.csv").as_deref(),
+        Some(&b"payload"[..]),
+        "a refused FSETSTAT changes nothing in the upload"
+    );
+
+    // posix-rename@openssh.com is served: an overwrite rename (D7).
+    assert_eq!(code(&c.upload("/p/a.csv", b"alpha").await), OK);
+    assert_eq!(code(&c.upload("/p/b.csv", b"beta").await), OK);
+    let r = c
+        .call(SSH_FXP_EXTENDED, |b| {
+            posix_rename(b, "/p/a.csv", "/p/b.csv")
+        })
+        .await
+        .unwrap();
+    assert_eq!(code(&r), OK, "posix-rename overwrites: {r:?}");
+    assert!(h.mem.get("inbound", "p/a.csv").is_none());
+    assert_eq!(
+        h.mem.get("inbound", "p/b.csv").as_deref(),
+        Some(&b"alpha"[..])
+    );
+    let r = c
+        .call(SSH_FXP_EXTENDED, |b| {
+            posix_rename(b, "/p/b.csv", "/p/c.csv")
+        })
+        .await
+        .unwrap();
+    assert_eq!(code(&r), OK, "posix-rename to a free name: {r:?}");
+    assert_eq!(
+        h.mem.get("inbound", "p/c.csv").as_deref(),
+        Some(&b"alpha"[..])
+    );
+    let r = c
+        .call(SSH_FXP_EXTENDED, |b| {
+            posix_rename(b, "/p/nope.csv", "/p/d.csv")
+        })
+        .await
+        .unwrap();
+    assert_eq!(code(&r), NO_SUCH_FILE, "{r:?}");
+    // It decides `write_objects` on the target, with the source as `copy_source`.
+    let recs = records(&h.fx, |r| {
+        r.iter().any(|x| {
+            x.input.as_ref().is_some_and(|i| {
+                i.request.method == "posix-rename@openssh.com"
+                    && i.object.as_deref() == Some("p/b.csv")
+            })
+        })
+    })
+    .await;
+    let rec = recs
+        .iter()
+        .find(|x| {
+            x.input.as_ref().is_some_and(|i| {
+                i.request.method == "posix-rename@openssh.com"
+                    && i.object.as_deref() == Some("p/b.csv")
+            })
+        })
+        .expect("the overwrite rename is on the record");
+    let input = rec.input.as_ref().unwrap();
+    assert_eq!(input.action.as_str(), "write_objects");
+    assert_eq!(
+        input.copy_source.as_ref().map(|c| c.key.as_str()),
+        Some("p/a.csv")
+    );
+
+    // An overwrite needs write_objects: a create-only drop box is refused.
+    let mut d = connect(h.addr, "acme-partner-drop", &h.drop_key)
+        .await
+        .expect("connect");
+    assert_eq!(code(&d.upload("/x.csv", b"x").await), OK);
+    let r = d
+        .call(SSH_FXP_EXTENDED, |b| posix_rename(b, "/x.csv", "/y.csv"))
+        .await
+        .unwrap();
+    assert_eq!(code(&r), PERMISSION_DENIED, "{r:?}");
+    assert!(h.mem.get("inbound", "partner-x/x.csv").is_some());
+    assert!(h.mem.get("inbound", "partner-x/y.csv").is_none());
+
+    // The session survived every refusal.
+    assert!(matches!(
+        c.path_op(SSH_FXP_STAT, "/").await.unwrap(),
+        Reply::Attrs(_)
+    ));
 }

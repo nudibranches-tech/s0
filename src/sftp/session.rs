@@ -474,7 +474,8 @@ impl SftpSession {
                 ],
             });
         }
-        if req.id().is_none() {
+        // An unknown type too short for an id is still answered, with id 0 (D2).
+        if req.id().is_none() && !matches!(req, Request::Unknown { .. }) {
             return Next::Close("request without id");
         }
         if !self.initialized {
