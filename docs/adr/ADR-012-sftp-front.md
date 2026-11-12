@@ -1080,9 +1080,17 @@ against client timeouts.
 - **F3** — `excluded_prefixes`, for both fronts at once.
 - **F4** — the content-inspection stage (D14).
 - **F5** — resume and append, once there is a design that does not need in-place writes.
-- **F6** — byte quotas (ADR-010) over SFTP. Uploads stream without a declared length, so a
-  write cannot be charged up front the way an S3 `PutObject` or `UploadPart` is; today an
-  SFTP upload is not counted against any quota.
+- **F6** — *done*: byte quotas (ADR-010) over SFTP. An upload declares no length, but
+  every piece it sends has one, so each is charged right before it goes out: a part as it
+  fills, the last part and a small file's `PutObject` at CLOSE, and the commit at zero — the
+  S3 front's `UploadPart`, `PutObject` and `CompleteMultipartUpload`. The bundle in force
+  at each charge is read, so a quota reached mid-upload stops it at its next piece. A part's
+  bytes stay in flight until the upload ends: counted as stored on commit, given back when
+  the abort succeeds, kept when it fails (the parts remain until the lifecycle rule). A
+  refusal aborts the transfer, is recorded as a denial with the figures, and tells the
+  client the S3 front's fixed sentence. A rename is not charged: it moves bytes the quota
+  already counts, and a server-side copy whose delete then fails is corrected by the next
+  collection, as overwrites are.
 
 ---
 

@@ -3156,3 +3156,149 @@ async fn tenants_sharing_an_upstream_identity_need_a_placing_bundle_over_sftp() 
     .await;
     assert_eq!(code(&c.upload("/x.csv", b"x").await), OK);
 }
+
+// ── byte quotas (ADR-010) ───────────────────────────────────────────────────────
+
+/// [`placed`] (acme owns `inbound`) with a quota of `limit` bytes on `inbound`, of which
+/// none was used at the last collection.
+fn with_bucket_quota(h: &Harness, limit: u64) -> serde_json::Value {
+    let mut b = placed(&h.drop_key, &h.ops_key, "bay-1", "acme");
+    b["tenants"]["acme"]["bucket_attributes"]["inbound"]["quota"] = serde_json::json!({
+        "limit_bytes": limit, "used_bytes": 0, "collected_at": "2026-01-01T00:00:00Z"
+    });
+    b
+}
+
+/// What this replica counts against `inbound` — the ledger the S3 front reads too.
+fn counted_on_inbound(h: &Harness) -> u64 {
+    h.fx.gw
+        .quota
+        .counted(&s0::quota::QuotaScope::Bucket("inbound".into()))
+        .unwrap_or(0)
+}
+
+const MIB: usize = 1024 * 1024;
+
+#[tokio::test]
+async fn a_small_upload_is_charged_and_one_past_the_quota_is_refused_at_close() {
+    let h = harness("sftp-quota-small", "native").await;
+    install(&h, "rev-quota", with_bucket_quota(&h, 100)).await;
+    let mut c = connect(h.addr, "acme-ops", &h.ops_key)
+        .await
+        .expect("connect");
+
+    assert_eq!(code(&c.upload("/a.csv", &[b'a'; 60]).await), OK);
+    assert_eq!(counted_on_inbound(&h), 60, "the stored upload is counted");
+
+    let r = c.upload("/b.csv", &[b'b'; 60]).await;
+    assert_eq!(code(&r), FAILURE, "{r:?}");
+    assert_eq!(
+        status_text(&r),
+        "The storage quota for this bucket has been exceeded."
+    );
+    assert_eq!(h.mem.get("inbound", "b.csv"), None, "nothing committed");
+    assert_eq!(
+        counted_on_inbound(&h),
+        60,
+        "the refused upload is not counted"
+    );
+
+    // One denial record, carrying the figures the client was not told.
+    let recs = records(&h.fx, |r| {
+        !placement_denials(r, "storage quota exceeded").is_empty()
+    })
+    .await;
+    let denials = placement_denials(&recs, "storage quota exceeded");
+    assert_eq!(denials.len(), 1, "{denials:#?}");
+    let reason = &denials[0].result.reason;
+    assert!(
+        reason.contains("adds 60 bytes") && reason.contains("limit of 100 bytes"),
+        "{reason}"
+    );
+    let transfer = denials[0]
+        .gateway
+        .session
+        .as_ref()
+        .unwrap()
+        .transfer
+        .as_ref();
+    assert_eq!(transfer.map(|t| t.commit.as_str()), Some("denied"));
+
+    // Under the limit, a write still fits.
+    assert_eq!(code(&c.upload("/c.csv", &[b'c'; 40]).await), OK);
+    assert_eq!(counted_on_inbound(&h), 100);
+}
+
+#[tokio::test]
+async fn a_multipart_upload_is_charged_part_by_part_and_given_back_when_refused() {
+    let h = harness("sftp-quota-multipart", "native").await;
+    install(&h, "rev-quota", with_bucket_quota(&h, 40 * MIB as u64)).await;
+    let mut c = connect(h.addr, "acme-ops", &h.ops_key)
+        .await
+        .expect("connect");
+
+    // 20 MiB: two 8 MiB parts as they fill, the last 4 MiB at CLOSE.
+    let first: Vec<u8> = (0..20 * MIB).map(|i| (i % 251) as u8).collect();
+    assert_eq!(code(&c.upload("/first.bin", &first).await), OK);
+    assert_eq!(
+        h.mem.get("inbound", "first.bin").map(|b| b.len()),
+        Some(20 * MIB)
+    );
+    assert_eq!(counted_on_inbound(&h), 20 * MIB as u64);
+
+    // 24 MiB: the first two parts fit (36 MiB counted), the third would make 44 MiB.
+    // It is refused at the WRITE that fills it, before it is sent.
+    let second = vec![7u8; 24 * MIB];
+    let r = c.upload("/second.bin", &second).await;
+    assert_eq!(code(&r), FAILURE, "{r:?}");
+    assert_eq!(
+        status_text(&r),
+        "The storage quota for this bucket has been exceeded."
+    );
+    assert_eq!(
+        h.mem.get("inbound", "second.bin"),
+        None,
+        "nothing committed"
+    );
+    assert!(
+        h.mem.uploads.lock().unwrap().is_empty(),
+        "the multipart upload was aborted"
+    );
+    assert_eq!(
+        counted_on_inbound(&h),
+        20 * MIB as u64,
+        "the aborted upload's parts were given back"
+    );
+
+    let recs = records(&h.fx, |r| {
+        !placement_denials(r, "storage quota exceeded").is_empty()
+    })
+    .await;
+    assert_eq!(placement_denials(&recs, "storage quota exceeded").len(), 1);
+}
+
+#[tokio::test]
+async fn an_unreadable_quota_refuses_sftp_uploads_and_no_quota_charges_nothing() {
+    let h = harness("sftp-quota-unreadable", "native").await;
+    let mut b = with_bucket_quota(&h, 100);
+    b["tenants"]["acme"]["bucket_attributes"]["inbound"]["quota"] =
+        serde_json::json!({ "limit_bytes": "lots" });
+    install(&h, "rev-unreadable", b).await;
+    let mut c = connect(h.addr, "acme-ops", &h.ops_key)
+        .await
+        .expect("connect");
+    let r = c.upload("/x.csv", b"x").await;
+    assert_eq!(code(&r), FAILURE, "{r:?}");
+    assert_eq!(status_text(&r), s0::quota::QUOTA_UNREADABLE);
+    assert_eq!(h.mem.get("inbound", "x.csv"), None);
+
+    // A placing bundle with no quota anywhere: uploads are not counted at all.
+    install(
+        &h,
+        "rev-free",
+        placed(&h.drop_key, &h.ops_key, "bay-1", "acme"),
+    )
+    .await;
+    assert_eq!(code(&c.upload("/x.csv", b"x").await), OK);
+    assert_eq!(counted_on_inbound(&h), 0);
+}

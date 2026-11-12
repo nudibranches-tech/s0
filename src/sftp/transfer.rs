@@ -6,6 +6,14 @@
 //! object becomes visible only when the commit succeeds — an S3 reader sees the whole
 //! object or nothing — and every error path aborts the multipart upload.
 //!
+//! **Quotas** (ADR-010): an upload declares no size, but every piece it sends has one, so
+//! each is charged to the bundle's byte quotas right before it goes out — a part as it
+//! fills, the last part and a small file's `PutObject` at CLOSE, and the commit at zero, as
+//! the S3 front charges `UploadPart`, `PutObject` and `CompleteMultipartUpload`. A part's
+//! bytes stay in flight until the upload ends: counted as stored when it commits, given
+//! back when its abort succeeds (an aborted multipart upload stores nothing), and kept when
+//! the abort fails, since the parts then remain until the lifecycle rule removes them.
+//!
 //! **Downloads** stream one `GetObject`; a non-sequential READ reopens it with a `Range`.
 
 use std::collections::{BTreeMap, HashSet};
@@ -21,6 +29,8 @@ use tokio::task::JoinSet;
 use super::backend::{BackendError, ByteStream, SftpBackend};
 use crate::access::SftpProof;
 use crate::config::ConditionalCreate;
+use crate::pdp::BundleStore;
+use crate::quota::{Admission, QuotaLedger, QuotaRefusal, QuotaReservation, WriteTarget};
 
 /// One part upload's result: its number and ETag.
 type PartResult = Result<(i32, ETag), BackendError>;
@@ -55,6 +65,75 @@ pub enum WriteError {
     Unsupported(&'static str),
     /// `SSH_FX_FAILURE`.
     Failure(String),
+    /// Refused by a byte quota (ADR-010): the transfer ends as a denial. `reason` is the
+    /// audit's, with the figures; `client` is the fixed sentence the client is told.
+    Quota {
+        reason: String,
+        client: &'static str,
+    },
+}
+
+impl WriteError {
+    fn quota(refusal: &QuotaRefusal) -> Self {
+        WriteError::Quota {
+            reason: refusal.reason(),
+            client: refusal.client_message(),
+        }
+    }
+}
+
+/// What an upload is charged against (ADR-010): this replica's ledger, and the quotas of
+/// the bundle in force at each charge — like the authorization, re-read as the transfer
+/// goes, so a quota lowered or a level filled mid-upload stops it at its next piece.
+#[derive(Clone)]
+pub struct UploadQuota {
+    pub ledger: Arc<QuotaLedger>,
+    pub bundles: Arc<BundleStore>,
+    pub backend_id: String,
+    pub tenant: String,
+}
+
+impl UploadQuota {
+    /// Charge `bytes` written to `bucket`: `Ok(None)` when no quota applies to it.
+    fn charge(
+        &self,
+        bucket: &str,
+        bytes: u64,
+    ) -> Result<Option<Arc<QuotaReservation>>, QuotaRefusal> {
+        let bundle = self.bundles.current();
+        let Some(quotas) = bundle.placement().quotas() else {
+            return Ok(None);
+        };
+        let target = WriteTarget {
+            backend: &self.backend_id,
+            tenant: &self.tenant,
+            bucket,
+        };
+        match self.ledger.admit(quotas, &target, Some(bytes)) {
+            Admission::Unlimited => Ok(None),
+            Admission::Reserved(reservation) => {
+                // Charged right before the backend call it pays for.
+                reservation.mark_dispatched();
+                Ok(Some(reservation))
+            }
+            Admission::Refused(refusal) => Err(refusal),
+        }
+    }
+}
+
+/// Settle a single-call write's reservation with the backend's answer, as the S3 forward
+/// path does: kept on success, given back on a refusal (a 4xx) or a call never made, and
+/// on an unknown outcome kept, since the write may have landed.
+fn settle_call(reservation: Option<Arc<QuotaReservation>>, result: &Result<(), BackendError>) {
+    let Some(reservation) = reservation else {
+        return;
+    };
+    match result {
+        Ok(()) => reservation.commit(),
+        Err(BackendError::Unlicensed(_)) => reservation.release(),
+        Err(e) if e.status().is_some_and(|s| (400..500).contains(&s)) => reservation.release(),
+        Err(_) => reservation.settle_unknown(),
+    }
 }
 
 /// The extension point reserved for content inspection (ADR-012 D14).
@@ -170,6 +249,9 @@ pub struct Upload {
     failed: Option<String>,
     pub last_write: Instant,
     observer: Observer,
+    quota: UploadQuota,
+    /// The parts' reservations, in flight until the upload commits or aborts.
+    charged: Vec<Arc<QuotaReservation>>,
     // Held for the transfer's lifetime: released on drop.
     _memory: OwnedSemaphorePermit,
     _inflight_key: Option<InflightGuard>,
@@ -188,6 +270,7 @@ impl Upload {
         limits: UploadLimits,
         memory: OwnedSemaphorePermit,
         inflight_key: Option<InflightGuard>,
+        quota: UploadQuota,
     ) -> Self {
         Upload {
             backend,
@@ -208,6 +291,8 @@ impl Upload {
             last_write: Instant::now(),
             // The D14 observer: each byte passes it before it is sent. A no-op in v1.
             observer: Arc::new(|_| {}),
+            quota,
+            charged: Vec::new(),
             _memory: memory,
             _inflight_key: inflight_key,
             finished: false,
@@ -318,6 +403,10 @@ impl Upload {
         if number > 10_000 {
             return Err(self.fail("file too large".into()));
         }
+        match self.quota.charge(&self.bucket, part.len() as u64) {
+            Ok(reservation) => self.charged.extend(reservation),
+            Err(refusal) => return Err(self.refuse_quota(&refusal)),
+        }
         let (backend, proof) = (self.backend.clone(), self.proof.clone());
         let (bucket, key) = (self.bucket.clone(), self.key.clone());
         let id = self.upload_id.clone().unwrap_or_default();
@@ -356,6 +445,19 @@ impl Upload {
         WriteError::Failure(why)
     }
 
+    /// Refuse a piece over quota and poison the transfer: it cannot complete without it.
+    fn refuse_quota(&mut self, refusal: &QuotaRefusal) -> WriteError {
+        self.failed = Some(refusal.client_message().to_string());
+        WriteError::quota(refusal)
+    }
+
+    /// The parts' bytes were stored as an object: count them as completed.
+    fn commit_charged(&mut self) {
+        for reservation in self.charged.drain(..) {
+            reservation.commit();
+        }
+    }
+
     /// Abort: `AbortMultipartUpload` if one was started, and no `PutObject`. Idempotent.
     pub async fn abort(&mut self) {
         if self.finished {
@@ -364,14 +466,29 @@ impl Upload {
         self.finished = true;
         self.inflight.abort_all();
         while self.inflight.join_next().await.is_some() {}
-        if let Some(id) = self.upload_id.take()
-            && let Err(e) = self
+        let aborted = match self.upload_id.take() {
+            None => true,
+            Some(id) => match self
                 .backend
                 .abort_multipart(&self.proof, &self.bucket, &self.key, &id)
                 .await
-        {
-            // The lifecycle rule (an operator obligation, D9) is the backstop.
-            tracing::warn!(bucket = %self.bucket, key = %self.key, error = %e, "AbortMultipartUpload failed; orphaned parts remain until the bucket lifecycle rule removes them");
+            {
+                Ok(()) => true,
+                Err(e) => {
+                    // The lifecycle rule (an operator obligation, D9) is the backstop.
+                    tracing::warn!(bucket = %self.bucket, key = %self.key, error = %e, "AbortMultipartUpload failed; orphaned parts remain until the bucket lifecycle rule removes them");
+                    false
+                }
+            },
+        };
+        // An aborted upload stores nothing; one whose abort failed keeps its parts until
+        // the lifecycle rule, so they stay counted until a collection sees them gone.
+        for reservation in self.charged.drain(..) {
+            if aborted {
+                reservation.release();
+            } else {
+                reservation.settle_unknown();
+            }
         }
     }
 
@@ -441,14 +558,31 @@ impl Upload {
         let result = match self.upload_id.clone() {
             None => {
                 let data = std::mem::take(&mut self.buf).freeze();
-                self.backend
+                let reservation = match self.quota.charge(&self.bucket, data.len() as u64) {
+                    Ok(reservation) => reservation,
+                    Err(refusal) => {
+                        self.abort().await;
+                        return Err((Commit::Denied, WriteError::quota(&refusal)));
+                    }
+                };
+                let result = self
+                    .backend
                     .put(&self.proof, &self.bucket, &self.key, data, conditional)
-                    .await
+                    .await;
+                settle_call(reservation, &result);
+                result
             }
             Some(id) => {
                 if !self.buf.is_empty() {
                     let last = std::mem::take(&mut self.buf).freeze();
                     let number = (self.parts.len() + 1) as i32;
+                    match self.quota.charge(&self.bucket, last.len() as u64) {
+                        Ok(reservation) => self.charged.extend(reservation),
+                        Err(refusal) => {
+                            self.abort().await;
+                            return Err((Commit::Denied, WriteError::quota(&refusal)));
+                        }
+                    }
                     match self
                         .backend
                         .upload_part(&self.proof, &self.bucket, &self.key, &id, number, last)
@@ -463,6 +597,13 @@ impl Upload {
                             ));
                         }
                     }
+                }
+                // Completing adds no bytes (the parts were charged as they went), but it
+                // is still a write: charged at zero, refused only once a level is already
+                // over its limit — what the S3 front does for CompleteMultipartUpload.
+                if let Err(refusal) = self.quota.charge(&self.bucket, 0) {
+                    self.abort().await;
+                    return Err((Commit::Denied, WriteError::quota(&refusal)));
                 }
                 self.parts.sort_by_key(|(n, _)| *n);
                 self.backend
@@ -481,6 +622,7 @@ impl Upload {
             Ok(()) => {
                 self.finished = true;
                 self.upload_id = None;
+                self.commit_charged();
                 Ok(())
             }
             Err(BackendError::PreconditionFailed) => {

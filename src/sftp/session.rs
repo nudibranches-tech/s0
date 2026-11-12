@@ -24,7 +24,7 @@ use super::codec::{
     SSH_FXF_READ, SSH_FXF_TRUNC, SSH_FXF_WRITE, StatusCode,
 };
 use super::paths::{Mapped, PathError, realpath};
-use super::transfer::{Commit, Download, Upload, UploadLimits, WriteError};
+use super::transfer::{Commit, Download, Upload, UploadLimits, UploadQuota, WriteError};
 use super::{SessionCounters, Shared};
 use crate::access::{Enforcer, PlacementGate, SftpBackendOp as Op, SftpLicense, SftpProof};
 use crate::audit::{BackendOutcome, Outcome, PendingAudit, SessionBlock, TransferBlock};
@@ -1285,6 +1285,12 @@ impl SftpSession {
             },
             memory,
             inflight,
+            UploadQuota {
+                ledger: self.shared.gw.quota.clone(),
+                bundles: self.shared.gw.bundles.clone(),
+                backend_id: route.backend_id.0.clone(),
+                tenant: route.tenant.clone(),
+            },
         );
         self.shared
             .metrics
@@ -1413,6 +1419,18 @@ impl SftpSession {
                     .fetch_add(1, Ordering::Relaxed);
                 status(id, StatusCode::Failure, why)
             }
+            Err(WriteError::Quota { reason, client }) => {
+                // A gateway refusal, recorded as the denial it is, with the figures the
+                // client is not told (ADR-010).
+                h.up.abort().await;
+                Self::settle_transfer(&h, Commit::Denied, Some(reason));
+                self.counters.denied.fetch_add(1, Ordering::Relaxed);
+                self.shared
+                    .metrics
+                    .transfers_aborted
+                    .fetch_add(1, Ordering::Relaxed);
+                status(id, StatusCode::Failure, client)
+            }
         }
     }
 
@@ -1499,16 +1517,21 @@ impl SftpSession {
                         status(id, StatusCode::Ok, "")
                     }
                     Err((commit, e)) => {
-                        let why = match e {
-                            WriteError::Failure(w) => w,
-                            WriteError::Unsupported(w) => w.to_string(),
+                        // The record keeps the full reason; the client gets its own.
+                        let (why, told) = match e {
+                            WriteError::Failure(w) => (w.clone(), w),
+                            WriteError::Unsupported(w) => (w.to_string(), w.to_string()),
+                            WriteError::Quota { reason, client } => {
+                                self.counters.denied.fetch_add(1, Ordering::Relaxed);
+                                (reason, client.to_string())
+                            }
                         };
-                        Self::settle_transfer(&w, commit, Some(why.clone()));
+                        Self::settle_transfer(&w, commit, Some(why));
                         self.shared
                             .metrics
                             .transfers_aborted
                             .fetch_add(1, Ordering::Relaxed);
-                        status(id, StatusCode::Failure, why)
+                        status(id, StatusCode::Failure, told)
                     }
                 }
             }
