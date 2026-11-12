@@ -1,0 +1,41 @@
+# cargo-fuzz targets (ADR-012 T2). Needs a nightly toolchain and cargo-fuzz:
+#
+#     cargo +nightly fuzz run sftp_codec -- -max_total_time=60
+#     cargo +nightly fuzz run proxy_v2_header -- -max_total_time=60
+#
+# Its own workspace (the `[workspace]` table below), so the root crate's
+# `cargo build/test --all-targets` never sees it and never needs nightly or libFuzzer.
+# CI runs every target for a bounded time (`.github/workflows/ci.yml`, job `fuzz`).
+[package]
+name = "s0-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "BUSL-1.1"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+bytes = "1.12.1"
+libfuzzer-sys = "0.4"
+
+[dependencies.s0]
+path = ".."
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "sftp_codec"
+path = "fuzz_targets/sftp_codec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proxy_v2_header"
+path = "fuzz_targets/proxy_v2_header.rs"
+test = false
+doc = false
+bench = false

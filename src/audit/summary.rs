@@ -214,6 +214,7 @@ mod tests {
                 acl_grants: vec![],
                 bypass_governance: false,
                 request: RequestMeta {
+                    protocol: crate::authz::Protocol::S3,
                     method: "GET".into(),
                     params: Some("partNumber=1".into()),
                     headers_subset: [("range".to_string(), "bytes=0-9".to_string())].into(),
@@ -227,6 +228,7 @@ mod tests {
                 denied_keys: vec![],
                 backend: BackendOutcome::SucceededStatusUnknown,
                 backend_status: None,
+                session: None,
                 object_name: None,
                 copy_source_object_name: None,
                 summary: None,

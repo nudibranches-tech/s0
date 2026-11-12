@@ -45,3 +45,9 @@ tower = { version = "0.5.3", features = ["util"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 uuid = { version = "1.23.5", features = ["v4", "serde"] }
+# Pinned exactly, as `s3s` is: the SFTP front's safety argument (ADR-012 D3, E5) is a claim
+# about which `server::Handler` methods exist and what their defaults do — several answer a
+# channel request with `Ok(())` without replying. Guarded by
+# `sftp_transport::every_handler_method_of_the_pinned_russh_is_overridden`.
+russh = "=0.63.3"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }

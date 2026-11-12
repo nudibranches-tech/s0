@@ -46,6 +46,22 @@ impl PendingAudit {
         self.sink.emit(record);
     }
 
+    /// Settle with a last edit to the record — the SFTP front fills in `gateway.session`
+    /// with the transfer outcome (ADR-012 D13). Idempotent like [`Self::settle`].
+    pub fn settle_with(
+        &self,
+        backend: BackendOutcome,
+        backend_status: Option<u16>,
+        edit: impl FnOnce(&mut AuditRecord),
+    ) {
+        let Some(mut record) = self.take() else {
+            return;
+        };
+        record.settle(backend, backend_status);
+        edit(&mut record);
+        self.sink.emit(record);
+    }
+
     /// The id of the record this request is audited under, while it is still held. The
     /// forward path hands it to the client as the request id, so a reported error leads
     /// straight to its decision record.
@@ -139,6 +155,7 @@ mod tests {
                 denied_keys: vec![],
                 backend: BackendOutcome::NotAttempted,
                 backend_status: None,
+                session: None,
                 object_name: None,
                 copy_source_object_name: None,
                 summary: None,

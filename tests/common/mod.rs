@@ -140,7 +140,7 @@ pub fn config_json_for_backend(
 
 /// Counts every `decide` the enforce path issues, from **outside** the decision cache.
 ///
-/// Makes "`GatewayAccess::decide` is the only PDP call site" checkable: a hook calling
+/// Makes "`Enforcer::decide` is the only PDP call site" checkable: a hook calling
 /// `gw.pdp.decide` directly bumps this counter without producing a capture, and
 /// `tests/golden_capture.rs` compares the two.
 struct CountingPdp {
@@ -221,8 +221,22 @@ pub fn fixture(tag: &str, bundle: serde_json::Value) -> Fixture {
 /// [`fixture`] pointed at a backend that answers — for the tests that must observe what
 /// the gateway does to a *response*.
 pub fn fixture_with_backend(tag: &str, bundle: serde_json::Value, endpoint: &str) -> Fixture {
+    fixture_with_config(tag, bundle, endpoint, |_| {})
+}
+
+/// [`fixture_with_backend`], with the gateway config edited before it is loaded — e.g. to
+/// declare the backend `conditional_create: native`.
+pub fn fixture_with_config(
+    tag: &str,
+    bundle: serde_json::Value,
+    endpoint: &str,
+    edit: impl FnOnce(&mut serde_json::Value),
+) -> Fixture {
     let dir = scratch(tag);
-    fixture_from_config(tag, dir.clone(), bundle, &config_json(&dir, endpoint))
+    let mut raw: serde_json::Value =
+        serde_json::from_str(&config_json(&dir, endpoint)).expect("config json");
+    edit(&mut raw);
+    fixture_from_config(tag, dir, bundle, &raw.to_string())
 }
 
 /// [`fixture_with_backend`] with a second tenant, `globex` of the same organization,

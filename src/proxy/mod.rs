@@ -61,6 +61,10 @@ pub struct RouteSnapshot {
     /// The gateway's AUTHORITATIVE tenant→org binding — never the credential's
     /// self-declared org, so audit attribution is not drift-able.
     pub organization_id: String,
+    /// Whether this backend honours `If-None-Match: *` (an operator assertion, ADR-012
+    /// D8). Decides whether a create-only write can be forwarded at all over S3, and how
+    /// the SFTP front closes the create race.
+    pub conditional_create: crate::config::ConditionalCreate,
     /// Another tenant of this config is re-signed with the same upstream credential on the
     /// same backend, so the backend would serve either tenant's buckets to the other. Only
     /// a placing bundle keeps them apart, and without one this tenant is refused
@@ -152,6 +156,7 @@ impl BackendRegistry {
             backend_id: BackendId(route.backend.id.clone()),
             backend_kind: route.backend.kind,
             organization_id: route.organization_id.clone(),
+            conditional_create: route.backend.conditional_create,
             shares_upstream_identity: route.shares_upstream_identity,
         })
     }
@@ -1132,9 +1137,14 @@ mod tests {
             backend_id,
             backend_kind,
             organization_id,
+            conditional_create,
             // A flag derived from the credentials, never one of them.
             shares_upstream_identity,
         } = registry().route_snapshot("acme").expect("acme is routable");
+        assert_eq!(
+            conditional_create,
+            crate::config::ConditionalCreate::CheckThenWrite
+        );
         assert_eq!(tenant, "acme");
         assert_eq!(backend_id, BackendId("bay-1".into()));
         assert_eq!(backend_kind, BackendKind::Ceph);

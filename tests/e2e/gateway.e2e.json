@@ -1,12 +1,15 @@
 {
-  "_note": "e2e gateway config. One tenant (acme) fronts a MinIO backend as a remote_s3 bay; the owner_* keys are the MinIO root creds the gateway re-signs with (never the caller's). Two long-lived virtual credentials stand in for platform-issued identities. Embedded regorus PDP; the policy bundle is pushed via bundle_path and re-read every 2s so the live-revocation scenario works. State (bundle + audit spill) lives under /tmp/s0-e2e, seeded by run.sh.",
+  "_note": "e2e gateway config. One tenant (acme) fronts a MinIO backend as a remote_s3 bay; the owner_* keys are the MinIO root creds the gateway re-signs with (never the caller's). Two long-lived virtual credentials stand in for platform-issued identities. Embedded regorus PDP; the policy bundle is pushed via bundle_path and re-read every 2s so the live-revocation scenario works. State (bundle + audit spill) lives under /tmp/s0-e2e, seeded by run.sh. The SFTP front listens on 127.0.0.1:2222 with a host key run.sh generates; its accounts come from the bundle's data.sftp, which run.sh fills in with freshly generated client key fingerprints. A second tenant (beta) fronts the same MinIO through a second backend declared conditional_create: native, which the SFTP create-only race scenario needs; run.sh probes that MinIO honours If-None-Match: * before relying on it.",
   "listen": "0.0.0.0:8014",
   "sts": {
     "master_key_hex": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
     "signing_key_hex": "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100",
     "session_ttl_secs": 3600
   },
-  "pdp": { "mode": "embedded", "cache_capacity": 10000 },
+  "pdp": {
+    "mode": "embedded",
+    "cache_capacity": 10000
+  },
   "audit": {
     "sink_url": "http://127.0.0.1:9099/api/v1/decision-logs",
     "spill_path": "/tmp/s0-e2e/audit-spill.ndjson"
@@ -18,6 +21,14 @@
       "endpoint_url": "http://127.0.0.1:9000",
       "region": "us-east-1",
       "force_path_style": true
+    },
+    {
+      "id": "minio-native",
+      "kind": "remote_s3",
+      "endpoint_url": "http://127.0.0.1:9000",
+      "region": "us-east-1",
+      "force_path_style": true,
+      "conditional_create": "native"
     }
   ],
   "tenants": [
@@ -25,6 +36,13 @@
       "tenant": "acme",
       "organization_id": "org-acme",
       "backend_id": "minio",
+      "owner_access_key": "minioadmin",
+      "owner_secret_key": "minioadmin"
+    },
+    {
+      "tenant": "beta",
+      "organization_id": "org-beta",
+      "backend_id": "minio-native",
       "owner_access_key": "minioadmin",
       "owner_secret_key": "minioadmin"
     }
@@ -48,5 +66,29 @@
     }
   ],
   "bundle_path": "/tmp/s0-e2e/bundle.json",
-  "bundle_poll_secs": 2
+  "bundle_poll_secs": 2,
+  "frontends": {
+    "sftp": {
+      "enabled": true,
+      "listen": "127.0.0.1:2222",
+      "host_keys": [
+        "/tmp/s0-e2e/ssh_host_ed25519_key"
+      ],
+      "drain_secs": 2
+    }
+  },
+  "limits": {
+    "_note": "The S3 values are the defaults. SFTP: a short handshake timeout so the silent-client scenario is quick, and a pre-auth burst high enough for the suite's ~40 connections from one address.",
+    "xml_max_body_size": 20971520,
+    "presigned_url_max_skew_time_secs": 900,
+    "max_delete_keys": 1000,
+    "max_list_fanout": 16,
+    "max_connections": 1024,
+    "header_read_timeout_secs": 15,
+    "sftp": {
+      "handshake_timeout_secs": 5,
+      "preauth_burst_per_ip": 100,
+      "preauth_rate_per_ip_per_min": 600
+    }
+  }
 }

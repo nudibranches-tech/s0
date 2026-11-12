@@ -155,10 +155,35 @@ pub struct CopySource {
     pub key: String,
 }
 
+/// Which data-plane front asked the question (ADR-012 D7).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Protocol {
+    #[default]
+    S3,
+    Sftp,
+}
+
+impl Protocol {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Protocol::S3 => "s3",
+            Protocol::Sftp => "sftp",
+        }
+    }
+}
+
 /// Non-authoritative request context surfaced to policy for ABAC / logging.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequestMeta {
+    /// The front the request arrived on. **Always serialized** — the ADR-008 argument: a
+    /// rego reference to an absent field is a silent deny-all. In the decision-cache key
+    /// by construction ([`OpaInput::resource_key`]).
+    #[serde(default)]
+    pub protocol: Protocol,
+    /// The HTTP method for S3; the SFTP request name (`OPEN`, `RENAME`, …) for SFTP.
+    /// Non-authoritative context in both cases.
     pub method: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<String>,
@@ -355,6 +380,10 @@ mod tests {
         let mut m = sample();
         m.request.params = Some("list-type=2".into());
         assert_ne!(base, m.resource_key().unwrap(), "request");
+
+        let mut m = sample();
+        m.request.protocol = Protocol::Sftp;
+        assert_ne!(base, m.resource_key().unwrap(), "request.protocol");
 
         // The two shapes of the ONE existence verb. `HeadBucket` names a bucket and
         // `ListBuckets` does not, and they are the same `Action`, so the bucket field is

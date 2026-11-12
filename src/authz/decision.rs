@@ -23,7 +23,7 @@ pub struct Decision {
 /// from the control-plane bundle, so a bundle can emit an obligation this binary does not
 /// implement, and dropping it silently would turn a *restriction* into an unrestricted
 /// forward. Refusing to deserialize becomes a denial at
-/// [`crate::access::GatewayAccess::decide`] instead — which is a rollout ordering
+/// [`crate::access::Enforcer::decide`] instead — which is a rollout ordering
 /// constraint: a new binary must reach every replica before a policy using its new field
 /// is pushed, never the other way round.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

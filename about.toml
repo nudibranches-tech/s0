@@ -1,0 +1,42 @@
+# cargo-about configuration: generates THIRD_PARTY_NOTICES (the licence texts and
+# copyright notices of every crate compiled into the s0 binary) for the image and the
+# release archives. ADR-012: the BSD-3-Clause and ISC notices must ship with the image.
+#
+#     cargo fetch --locked
+#     cargo about generate --frozen --fail -o THIRD_PARTY_NOTICES about.hbs
+#
+# Reproducible: the only inputs are Cargo.lock and the crate sources cargo fetched for it.
+# `--frozen` keeps the generator offline (no clearlydefined.io or upstream-repository
+# lookups whose answers change over time), so the same lockfile yields the same file. The
+# accepted list mirrors `[licenses] allow` in deny.toml.
+
+accepted = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+# Only what the shipped binary links on the platforms we ship (the Dockerfile and
+# release.yml targets), not windows-* or wasm-* crates that are never compiled in.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-gnu",
+]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+ignore-transitive-dependencies = false
+
+# s0 itself (its own LICENSE, BUSL-1.1, is in the image and archives too).
+[s0]
+accepted = ["BUSL-1.1"]

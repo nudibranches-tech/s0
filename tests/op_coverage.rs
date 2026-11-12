@@ -268,7 +268,7 @@ fn op_table_verbs_are_grantable_or_explicitly_control_plane() {
             ),
             Some(v) => assert!(
                 GATEWAY_VERBS.contains(&v) || NON_GATEWAY_VERBS.contains(&v),
-                "{} maps to {v}, which is neither one of the six projected grant verbs \
+                "{} maps to {v}, which is neither one of the seven projected grant verbs \
                  nor a recorded control-plane label",
                 s.name
             ),
@@ -288,7 +288,7 @@ fn op_table_verbs_are_grantable_or_explicitly_control_plane() {
 }
 
 #[test]
-fn the_gateway_vocabulary_is_the_six_projected_verbs() {
+fn the_gateway_vocabulary_is_the_seven_projected_verbs() {
     // The vocabulary a control plane projects grants into. Changing it is a cross-repo
     // contract change, not a local edit.
     let mut verbs = GATEWAY_VERBS.to_vec();
@@ -296,6 +296,7 @@ fn the_gateway_vocabulary_is_the_six_projected_verbs() {
     assert_eq!(
         verbs,
         [
+            "create_objects",
             "delete_objects",
             "list_objects",
             "read",
@@ -368,9 +369,10 @@ fn the_write_set_matches_the_shipped_rego() {
     );
     assert_eq!(
         from_rust.len(),
-        3,
-        "the write set is 3 verbs: create_bucket, delete_bucket and \
-         write_bucket_config left the vocabulary, and write_object_acl with them"
+        4,
+        "the write set is 4 verbs: create_bucket, delete_bucket and \
+         write_bucket_config left the vocabulary, and write_object_acl with them; \
+         create_objects joined it (ADR-012 D7) so freeze_writes covers SFTP drops"
     );
 }
 

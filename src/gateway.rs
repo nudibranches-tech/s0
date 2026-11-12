@@ -178,16 +178,33 @@ fn build_identity(
 }
 
 fn build_sts(cfg: &GatewayConfig) -> Result<StsAuthority> {
+    let Some(sts) = cfg.sts() else {
+        // An SFTP-only process (ADR-012 D1): no listener here mints or verifies an STS
+        // session, so no STS key material is configured. `Identity` still needs an
+        // authority to hold, so it gets one keyed with fresh process-local randomness that
+        // nothing can mint against and nothing ever sees — every `HFST*` key it could be
+        // asked about resolves to nothing it issued.
+        let master = ephemeral_key();
+        let signing = ephemeral_key();
+        tracing::info!(
+            "no sts section: STS is off in this process (no S3, mint or internal listener)"
+        );
+        return StsAuthority::with_key_ring(
+            std::collections::BTreeMap::from([("ephemeral".to_string(), master)]),
+            "ephemeral",
+            signing,
+        );
+    };
     // The ring's shape (exactly one of the two forms, `current_kid` present and
     // resolvable) is settled by `GatewayConfig::validate`; what is left here is hex.
-    let (ring, current_kid) = cfg.sts.key_ring();
+    let (ring, current_kid) = sts.key_ring();
     let mut master_keys = std::collections::BTreeMap::new();
     for (kid, hex_key) in &ring {
         let key = hex::decode(hex_key.expose())
             .map_err(|e| GatewayError::Config(format!("sts master key {kid}: {e}")))?;
         master_keys.insert(kid.clone(), key);
     }
-    let signing = hex::decode(cfg.sts.signing_key_hex.expose())
+    let signing = hex::decode(sts.signing_key_hex.expose())
         .map_err(|e| GatewayError::Config(format!("sts signing_key_hex: {e}")))?;
     let authority = StsAuthority::with_key_ring(master_keys, &current_kid, signing)?;
     tracing::info!(
@@ -198,12 +215,24 @@ fn build_sts(cfg: &GatewayConfig) -> Result<StsAuthority> {
     Ok(authority)
 }
 
+/// 32 bytes of process-local randomness for an authority nothing may use.
+fn ephemeral_key() -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for _ in 0..4 {
+        h.update(uuid::Uuid::new_v4().as_bytes());
+    }
+    h.finalize().to_vec()
+}
+
 fn build_pdp(cfg: &GatewayConfig) -> Result<(Arc<BundleStore>, Arc<dyn Pdp>)> {
     let raw = std::fs::read_to_string(&cfg.bundle_path)
         .map_err(|e| GatewayError::Bundle(format!("read {:?}: {e}", cfg.bundle_path)))?;
     let parsed = parse_bundle(&raw).map_err(GatewayError::Bundle)?;
     let revision = content_revision(&raw);
-    let bundles = Arc::new(BundleStore::new(Bundle::new(revision, parsed.data.clone())));
+    let bundles = Arc::new(BundleStore::new(
+        Bundle::new(revision, parsed.data.clone()).with_policy_module(parsed.policy.is_some()),
+    ));
 
     let pdp: Arc<dyn Pdp> = match &cfg.pdp {
         PdpConfig::Embedded { cache_capacity } => {

@@ -1,6 +1,17 @@
 {
   "listen": "0.0.0.0:8014",
   "admin_listen": "0.0.0.0:8016",
+  "_frontends_note": "Each data-plane front is switched on in its own section under `frontends` (ADR-012 D1). An absent `frontends.s3` means the S3 front is on; its listener is the top-level `listen` (or `frontends.s3.listen`, not both). `frontends.sftp` binds nothing unless `enabled` is true; production runs SFTP as its own Deployment from the same image with `frontends.s3.enabled: false` (then `listen` and `sts` are omitted).",
+  "frontends": {
+    "s3": { "enabled": true },
+    "sftp": {
+      "enabled": false,
+      "listen": "0.0.0.0:2222",
+      "host_keys": ["/etc/s0/sftp/ssh_host_ed25519_key"],
+      "proxy_protocol": { "trusted_cidrs": ["198.51.100.0/28"] },
+      "drain_secs": 20
+    }
+  },
   "sts": {
     "master_keys": {
       "k0": "REPLACE_ME_openssl_rand_hex_32_0000000000000000000000000000"
@@ -46,7 +57,9 @@
       "kind": "ceph",
       "endpoint_url": "https://s3-backend.example.com:7480",
       "region": "us-east-1",
-      "force_path_style": true
+      "force_path_style": true,
+      "_conditional_create_note": "Whether this backend honours If-None-Match: * on PutObject and CompleteMultipartUpload. `native` is an operator ASSERTION (run the conformance probe first): it lets create-only writes (create_objects) through on both fronts. `check_then_write` (the default) refuses create-only writes over S3 and narrows the race with a re-check over SFTP.",
+      "conditional_create": "check_then_write"
     },
     {
       "id": "backend-s3-1",

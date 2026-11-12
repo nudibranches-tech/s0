@@ -136,6 +136,11 @@ pub struct Bundle {
     pub revision: String,
     /// The projected policy data (`tenants`, `org_settings`, …).
     pub data: serde_json::Value,
+    /// Whether the bundle carried its own policy module. Decides which **key space** the
+    /// module in force reads subjects by — the prefixed `sa:`/`user:` key for a pushed
+    /// module, the raw `sub` for the compiled-in default — which a PEP-side membership
+    /// check must follow (ADR-012 D5, [`subject_lookup_key`]).
+    pub policy_module: bool,
     placement: Arc<BucketPlacement>,
     audit_summary_subjects: Arc<BTreeSet<String>>,
 }
@@ -147,6 +152,7 @@ impl Bundle {
         Bundle {
             revision: revision.into(),
             data,
+            policy_module: false,
             placement,
             audit_summary_subjects,
         }
@@ -164,6 +170,13 @@ impl Bundle {
     #[must_use]
     pub fn placement(&self) -> &Arc<BucketPlacement> {
         &self.placement
+    }
+
+    /// Record that this bundle carried a policy module.
+    #[must_use]
+    pub fn with_policy_module(mut self, present: bool) -> Self {
+        self.policy_module = present;
+        self
     }
 }
 
@@ -608,6 +621,35 @@ impl PlacementIndex {
     }
 }
 
+/// The key the module in force reads `user_attributes` and `s3_grants` by, for a subject
+/// whose identity-contract key is `subject_key` (`sa:<client id>` / `user:<oidc sub>`).
+///
+/// A control-plane module reads the prefixed key; the compiled-in default reads the raw
+/// `input.principal.sub`. A login check reading one space while the PDP reads the other
+/// would refuse every account or deny every operation, so the PEP follows the module
+/// (ADR-012 D5). `None` when `subject_key` has no recognized prefix.
+pub fn subject_lookup_key(policy_module: bool, subject_key: &str) -> Option<String> {
+    let (_, sub) = split_subject_key(subject_key)?;
+    Some(if policy_module {
+        subject_key.to_string()
+    } else {
+        sub.to_string()
+    })
+}
+
+/// The inverse of [`principal_subject_key`]: `sa:x` ⇒ (service account, `x`),
+/// `user:x` ⇒ (user, `x`). Any other prefix, or an empty remainder, is `None`.
+pub fn split_subject_key(subject_key: &str) -> Option<(crate::model::PrincipalType, &str)> {
+    let (kind, sub) = match subject_key.strip_prefix("sa:") {
+        Some(sub) => (crate::model::PrincipalType::ServiceAccount, sub),
+        None => (
+            crate::model::PrincipalType::User,
+            subject_key.strip_prefix("user:")?,
+        ),
+    };
+    (!sub.is_empty()).then_some((kind, sub))
+}
+
 /// Stable revision derived from raw bundle content: a content change is a new
 /// revision, which is exactly the cache-invalidation signal.
 ///
@@ -758,6 +800,10 @@ pub fn bundle_knows_service_account(
 /// cache. Swapping is lock-free; readers never block a decision.
 pub struct BundleStore {
     current: ArcSwap<Bundle>,
+    /// The installed revision, published **after** the swap. Long-lived sessions (the
+    /// SFTP front) subscribe to re-validate credentials on every change (ADR-012 D5); the
+    /// S3 front ignores it.
+    installed: tokio::sync::watch::Sender<String>,
 }
 
 /// The STS door's bundle-driven audience acceptance, answered from **this** store — the
@@ -784,9 +830,16 @@ impl crate::auth::KeyEpochFloor for BundleStore {
 
 impl BundleStore {
     pub fn new(initial: Bundle) -> Self {
+        let (installed, _) = tokio::sync::watch::channel(initial.revision.clone());
         BundleStore {
             current: ArcSwap::from_pointee(initial),
+            installed,
         }
+    }
+
+    /// Watch the installed revision. Fires after every [`Self::store`].
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<String> {
+        self.installed.subscribe()
     }
 
     pub fn current(&self) -> arc_swap::Guard<std::sync::Arc<Bundle>> {
@@ -800,7 +853,10 @@ impl BundleStore {
     /// Install a newly-fetched bundle. Old cached decisions become unreachable
     /// because their cache keys embed the prior revision.
     pub fn store(&self, bundle: Bundle) {
+        let revision = bundle.revision.clone();
         self.current.store(std::sync::Arc::new(bundle));
+        // After the swap, so a subscriber woken by this sees the new bundle.
+        self.installed.send_replace(revision);
     }
 }
 

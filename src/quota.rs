@@ -275,6 +275,17 @@ impl QuotaRefusal {
         }
     }
 
+    /// The fixed sentence a client is told, on any front: it names the level, never the
+    /// tenant, the backend or the figures, which stay on the audit record.
+    #[must_use]
+    pub fn client_message(&self) -> &'static str {
+        match self {
+            QuotaRefusal::Exceeded { scope, .. } => scope.client_message(),
+            QuotaRefusal::Unreadable { .. } => QUOTA_UNREADABLE,
+            QuotaRefusal::UnknownSize { .. } => QUOTA_NEEDS_A_SIZE,
+        }
+    }
+
     /// What the client is answered: `QuotaExceeded` (403) over a limit, `AccessDenied` for
     /// a quota the bundle cannot state, `MissingContentLength` (411) for a write of
     /// unstated size. Fixed messages: the audit reason names the tenant or backend the

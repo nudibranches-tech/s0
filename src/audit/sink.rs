@@ -230,6 +230,30 @@ impl AuditSink {
         self.emit(record);
     }
 
+    /// Emit an SFTP connection-level record. Unauthenticated events (`preauth_rejected`,
+    /// `auth_failed`) share the gate-denial budget, so a pre-authentication flood cannot
+    /// evict decision records; suppression is counted, as for gate records.
+    pub fn emit_session_event(&self, mut record: AuditRecord) {
+        let budgeted = record
+            .session_event
+            .as_ref()
+            .is_some_and(|e| e.event.is_budgeted());
+        if budgeted {
+            let Some(suppressed) = self.gate.take() else {
+                let n = self.metrics.gate_suppressed.fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::warn!(
+                    gate_suppressed = n,
+                    "gate-denial audit budget exhausted; this sftp session event is counted, not recorded"
+                );
+                return;
+            };
+            if let Some(e) = record.session_event.as_mut() {
+                e.suppressed_since_last = suppressed;
+            }
+        }
+        self.emit(record);
+    }
+
     /// Non-blocking. A request the bundle summarises is folded into its open summary
     /// instead of queued; on overflow a record is dropped with a loud alert — the
     /// request is never held up for the audit queue.
@@ -783,6 +807,7 @@ mod tests {
                 denied_keys: vec![],
                 backend: BackendOutcome::NotAttempted,
                 backend_status: None,
+                session: None,
                 object_name: None,
                 copy_source_object_name: None,
                 summary: None,

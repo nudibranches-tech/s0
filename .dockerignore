@@ -15,6 +15,9 @@ bundle.json
 /audit-spill.ndjson
 .scratch_*
 
+# The cargo-fuzz crate: its own workspace, never part of the image.
+/fuzz
+
 # Docs and images that don't affect the build.
 Dockerfile
 .dockerignore

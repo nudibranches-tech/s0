@@ -16,7 +16,7 @@ pub use bundle::{
     OBJECT_NAME_FIELD, PLACEMENT_SCHEMA_VERSION, ParsedBundle, PlacementIndex, PlacementRefusal,
     UNPLACED_SHARED_IDENTITY, bundle_key_epoch_floor, bundle_knows_service_account,
     content_revision, decision_rule_path, parse_bundle, principal_subject_key,
-    service_account_subject_key,
+    service_account_subject_key, split_subject_key, subject_lookup_key,
 };
 pub use cache::CachingPdp;
 pub use embedded::RegorusPdp;
