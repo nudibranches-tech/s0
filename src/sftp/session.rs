@@ -26,7 +26,7 @@ use super::codec::{
 use super::paths::{Mapped, PathError, realpath};
 use super::transfer::{Commit, Download, Upload, UploadLimits, WriteError};
 use super::{SessionCounters, Shared};
-use crate::access::{Enforcer, SftpBackendOp as Op, SftpLicense, SftpProof};
+use crate::access::{Enforcer, PlacementGate, SftpBackendOp as Op, SftpLicense, SftpProof};
 use crate::audit::{BackendOutcome, Outcome, PendingAudit, SessionBlock, TransferBlock};
 use crate::authz::{
     Backend, CopySource, Decision, OpaInput, Principal, PrincipalAttributes, Protocol, RequestMeta,
@@ -377,6 +377,13 @@ impl SftpSession {
     ///
     /// `labels` name each question for the denial reason ("rename source read: …"); a
     /// single labelled question gets its label too.
+    ///
+    /// Every input is screened by the bucket placement first (ADR-009), against one bundle
+    /// revision and one route for the whole request, exactly as the S3 front pins them in
+    /// `check`. The home is fixed by the bundle, so this is the gateway's own check on the
+    /// control plane: a home on another tenant's bucket, a bundle projected for another
+    /// backend, or tenants sharing an upstream identity under a bundle that places nothing
+    /// are refused whatever the policy says.
     async fn authorize(
         &mut self,
         op: &str,
@@ -385,9 +392,38 @@ impl SftpSession {
         flags: Vec<String>,
         id: u32,
     ) -> Result<Vec<Decided>, Next> {
+        let Some(route) = self.route() else {
+            return Err(status(
+                id,
+                StatusCode::PermissionDenied,
+                "tenant not routable",
+            ));
+        };
+        let placement = self.shared.gw.bundles.current().placement().clone();
+        let gate = PlacementGate {
+            placement: &placement,
+            route: &route,
+        };
+        // Ahead of any decision, so the client gets the placement's client message and the
+        // record its full reason — the same split as the S3 front's `deny_placement`.
+        if let Some((n, refusal)) = inputs
+            .iter()
+            .enumerate()
+            .find_map(|(n, input)| gate.refusal(input).map(|r| (n, r)))
+        {
+            let primary = if labels.len() > 1 { 0 } else { n };
+            let denial = Decision::deny(refusal.reason());
+            self.emit_denied(inputs[primary].clone(), &denial, self.block(op, flags));
+            self.counters.denied.fetch_add(1, Ordering::Relaxed);
+            return Err(status(
+                id,
+                StatusCode::PermissionDenied,
+                refusal.client_message(),
+            ));
+        }
         let mut out = Vec::with_capacity(inputs.len());
         for (n, input) in inputs.into_iter().enumerate() {
-            let mut decision = self.enforcer().decide(op, &input).await;
+            let mut decision = self.enforcer().decide(op, gate, &input).await;
             if decision.allow
                 && let Some(reason) = Enforcer::unimplemented_obligations(&decision)
             {

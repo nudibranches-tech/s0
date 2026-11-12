@@ -43,7 +43,7 @@ use crate::proxy::RouteSnapshot;
 use crate::proxy::obligations::{BucketSource, BucketVisibility, ResponseObligations};
 use crate::quota::{Admission, QuotaRefusal, WriteTarget};
 
-pub use enforcer::Enforcer;
+pub use enforcer::{Enforcer, PlacementGate};
 pub use optable::{Coverage, DangerTier, GateDenial, OP_TABLE, OpSpec, ResourceShape};
 pub use proof::{AuthzProof, SftpBackendOp, SftpLicense, SftpProof};
 
@@ -134,20 +134,15 @@ impl<'a> ReqCtx<'a> {
     /// Why the bundle's placement refuses `input` — its bucket, and a copy's source
     /// bucket — before any policy is asked, or `None` when it does not.
     fn placement_refusal(&self, input: &OpaInput) -> Option<PlacementRefusal> {
-        if let Some(refusal) = self
-            .placement
-            .shared_identity_refusal(self.route.shares_upstream_identity)
-        {
-            return Some(refusal);
+        self.gate().refusal(input)
+    }
+
+    /// The placement gate every decision of this request is screened by.
+    fn gate(&self) -> PlacementGate<'_> {
+        PlacementGate {
+            placement: &self.placement,
+            route: &self.route,
         }
-        let backend = self.route.backend_id.0.as_str();
-        self.placement
-            .refusal(backend, &input.tenant, &input.bucket)
-            .or_else(|| {
-                let source = input.copy_source.as_ref()?;
-                self.placement
-                    .refusal(backend, &input.tenant, &source.bucket)
-            })
     }
 
     /// Where a write decided against `input` lands, for the quota check.
@@ -236,18 +231,11 @@ impl GatewayAccess {
     }
 
     /// The S3 front's view of [`Enforcer::decide`], the single PDP funnel shared with
-    /// every other protocol front.
-    ///
-    /// It is also where the bundle's bucket placement is enforced, ahead of the PDP: a
-    /// bucket placed under another tenant, or on no tenant of this backend, is refused here
-    /// whatever any policy would say, so no question about it reaches an engine. Being
-    /// the funnel is what makes that total; the hooks that summarize several decisions in
-    /// one record also screen up front, so the record carries this reason.
+    /// every other protocol front, screened by the placement this request was admitted
+    /// under. The hooks that summarize several decisions in one record also screen up
+    /// front, so the record carries the placement's reason.
     async fn decide(&self, cx: &ReqCtx<'_>, input: &OpaInput) -> Decision {
-        if let Some(refusal) = cx.placement_refusal(input) {
-            return Decision::deny(refusal.reason());
-        }
-        self.enforcer.decide(&cx.operation, input).await
+        self.enforcer.decide(&cx.operation, cx.gate(), input).await
     }
 
     /// Whether this allowed request is one the bundle summarises (ADR-011): a read or a

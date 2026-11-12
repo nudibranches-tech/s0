@@ -156,8 +156,16 @@ exists to avoid.
    `GatewayAccess` — the `decide` funnel (the single PDP call site with the golden-capture
    tap), the `must_understand` check, audit-record assembly, `PendingAudit`, and proof
    minting — moves into an `Enforcer` (`src/access/enforcer.rs`). Its
-   `decide(operation, &OpaInput)` is the single PDP call site; principal and route travel
-   inside the `OpaInput`. It mints proofs only from allow decisions (`prove_s3`,
+   `decide(operation, PlacementGate, &OpaInput)` is the single PDP call site; principal and
+   route travel inside the `OpaInput`. The `PlacementGate` carries the bucket placement of
+   the bundle revision the request is decided under and its route, and `decide` refuses
+   what the placement refuses (ADR-009) before the PDP is asked, for both fronts. The S3
+   front pins the placement in `check`; the SFTP front takes one revision and one route
+   per request in `Session::authorize`, and screens every input there first so the client
+   gets the placement's client message. The home is fixed by the bundle, so over SFTP this
+   is the gateway's own check on the control plane: a home on another tenant's bucket, a
+   bundle projected for another backend, or tenants sharing an upstream identity under a
+   bundle that places nothing are refused whatever the policy says. It mints proofs only from allow decisions (`prove_s3`,
    `prove_sftp`), refusing any decision that carries an obligation the gateway does not
    implement. `GatewayAccess` is its first caller. The extraction landed together with the
    SFTP front (#42); the existing suite passes with only references renamed, and
@@ -1072,6 +1080,9 @@ against client timeouts.
 - **F3** — `excluded_prefixes`, for both fronts at once.
 - **F4** — the content-inspection stage (D14).
 - **F5** — resume and append, once there is a design that does not need in-place writes.
+- **F6** — byte quotas (ADR-010) over SFTP. Uploads stream without a declared length, so a
+  write cannot be charged up front the way an S3 `PutObject` or `UploadPart` is; today an
+  SFTP upload is not counted against any quota.
 
 ---
 

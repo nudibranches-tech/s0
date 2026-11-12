@@ -2931,3 +2931,228 @@ async fn the_remaining_d11_rows_get_their_documented_answers() {
         Reply::Attrs(_)
     ));
 }
+
+// ── bucket placement (ADR-009) ──────────────────────────────────────────────────
+
+/// [`bundle`] at `grant_schema_version` 3, projected for backend `backend_id`, with the
+/// home bucket `inbound` placed under `owner`. `globex` is a second tenant of the org.
+fn placed(
+    drop_key: &PrivateKey,
+    ops_key: &PrivateKey,
+    backend_id: &str,
+    owner: &str,
+) -> serde_json::Value {
+    let mut b = bundle(drop_key, ops_key);
+    b["grant_schema_version"] = serde_json::json!(3);
+    b["backend"] = serde_json::json!({ "id": backend_id, "kind": "ceph" });
+    b["tenants"]["globex"] = serde_json::json!({
+        "user_attributes": {}, "bucket_attributes": {}, "s3_grants": {}, "group_grants": {}
+    });
+    let inbound = b["tenants"]["acme"]["bucket_attributes"]
+        .as_object_mut()
+        .unwrap()
+        .remove("inbound")
+        .unwrap();
+    b["tenants"][owner]["bucket_attributes"]["inbound"] = inbound;
+    b
+}
+
+/// Put `b` in force, as the bundle refresh would.
+async fn install(h: &Harness, rev: &str, b: serde_json::Value) {
+    h.fx.gw.pdp.reload(None, &b).await.unwrap();
+    h.fx.gw.bundles.store(s0::pdp::Bundle::new(rev, b));
+}
+
+fn backend_calls(h: &Harness) -> usize {
+    h.mem.calls.lock().unwrap().len()
+}
+
+/// The SFTP decision records refused with `reason`.
+fn placement_denials<'a>(recs: &'a [AuditRecord], reason: &str) -> Vec<&'a AuditRecord> {
+    recs.iter()
+        .filter(|r| {
+            r.gateway.session.is_some()
+                && r.gateway.outcome == Outcome::Denied
+                && r.result.reason.contains(reason)
+        })
+        .collect()
+}
+
+fn status_text(r: &Reply) -> &str {
+    match r {
+        Reply::Status(_, msg) => msg,
+        other => panic!("expected a status, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_home_placed_under_another_tenant_is_refused_whatever_the_policy_says() {
+    let h = harness("sftp-placement-tenant", "native").await;
+    // Positive control: the home placed under the account's own tenant is served.
+    install(
+        &h,
+        "rev-acme",
+        placed(&h.drop_key, &h.ops_key, "bay-1", "acme"),
+    )
+    .await;
+    let mut c = connect(h.addr, "acme-ops", &h.ops_key)
+        .await
+        .expect("connect");
+    assert_eq!(code(&c.upload("/mine.csv", b"ok").await), OK);
+    assert_eq!(
+        h.mem.get("inbound", "mine.csv").as_deref(),
+        Some(&b"ok"[..])
+    );
+
+    // The control plane now places `inbound` under globex. acme-ops still holds a `*`
+    // grant on it, and the session stays open: every request is refused by the placement.
+    install(
+        &h,
+        "rev-globex",
+        placed(&h.drop_key, &h.ops_key, "bay-1", "globex"),
+    )
+    .await;
+    let before = backend_calls(&h);
+    let r = c.upload("/theirs.csv", b"no").await;
+    assert_eq!(code(&r), PERMISSION_DENIED, "{r:?}");
+    assert_eq!(status_text(&r), s0::pdp::BUCKET_OF_ANOTHER_TENANT);
+    let r = c.listdir("/").await.expect_err("listing refused");
+    assert_eq!(code(&r), PERMISSION_DENIED, "{r:?}");
+    let r = c.path_op(SSH_FXP_STAT, "/mine.csv").await.unwrap();
+    assert_eq!(code(&r), PERMISSION_DENIED, "{r:?}");
+    let r = c.open("/mine.csv", SSH_FXF_READ).await;
+    assert_eq!(code(&r), PERMISSION_DENIED, "{r:?}");
+    assert_eq!(
+        code(&c.rename("/mine.csv", "/moved.csv").await),
+        PERMISSION_DENIED
+    );
+    assert_eq!(backend_calls(&h), before, "nothing reached the backend");
+    assert_eq!(h.mem.get("inbound", "theirs.csv"), None);
+
+    let recs = records(&h.fx, |r| {
+        placement_denials(r, s0::pdp::BUCKET_OF_ANOTHER_TENANT).len() >= 5
+    })
+    .await;
+    let denials = placement_denials(&recs, s0::pdp::BUCKET_OF_ANOTHER_TENANT);
+    assert_eq!(
+        denials.len(),
+        5,
+        "one record per refused request: {denials:#?}"
+    );
+    assert!(
+        denials
+            .iter()
+            .all(|r| r.input.as_ref().is_some_and(|i| i.bucket == "inbound"))
+    );
+}
+
+#[tokio::test]
+async fn an_upload_in_flight_when_the_placement_is_withdrawn_commits_nothing() {
+    // globex is re-signed with acme's credential, so only a placing bundle keeps the two
+    // apart. The policy cannot see credentials: when the placement goes away mid-upload
+    // (a rollback to a v2 bundle), only the gateway can refuse what follows.
+    let h = harness_with("sftp-placement-inflight", "native", share_acmes_identity).await;
+    install(
+        &h,
+        "rev-placed",
+        placed(&h.drop_key, &h.ops_key, "bay-1", "acme"),
+    )
+    .await;
+    let mut c = connect(h.addr, "acme-ops", &h.ops_key)
+        .await
+        .expect("connect");
+    let handle = match c
+        .open("/late.csv", SSH_FXF_WRITE | SSH_FXF_CREAT | SSH_FXF_TRUNC)
+        .await
+    {
+        Reply::Handle(h) => h,
+        other => panic!("open: {other:?}"),
+    };
+    install(&h, "rev-v2", bundle(&h.drop_key, &h.ops_key)).await;
+    let w = c.write(&handle, 0, b"data").await;
+    assert_eq!(code(&w), PERMISSION_DENIED, "{w:?}");
+    assert_eq!(status_text(&w), s0::pdp::BUNDLE_UNUSABLE);
+    assert_eq!(h.mem.get("inbound", "late.csv"), None, "nothing committed");
+}
+
+/// Gateway config edit: a second tenant, `globex`, re-signed with acme's own credential.
+fn share_acmes_identity(c: &mut serde_json::Value) {
+    let acme = c["tenants"][0].clone();
+    let mut globex = acme.clone();
+    globex["tenant"] = serde_json::json!("globex");
+    c["tenants"] = serde_json::json!([acme, globex]);
+}
+
+#[tokio::test]
+async fn a_bucket_on_no_tenant_of_this_backend_is_refused() {
+    let h = harness("sftp-placement-nowhere", "native").await;
+    let mut b = placed(&h.drop_key, &h.ops_key, "bay-1", "acme");
+    b["tenants"]["acme"]["bucket_attributes"] = serde_json::json!({});
+    install(&h, "rev-nowhere", b).await;
+    let mut c = connect(h.addr, "acme-ops", &h.ops_key)
+        .await
+        .expect("connect");
+    let r = c.upload("/x.csv", b"x").await;
+    assert_eq!(code(&r), PERMISSION_DENIED, "{r:?}");
+    assert_eq!(status_text(&r), s0::pdp::BUCKET_NOT_ON_THIS_BACKEND);
+    assert_eq!(backend_calls(&h), 0);
+}
+
+#[tokio::test]
+async fn a_bundle_projected_for_another_backend_refuses_every_sftp_request() {
+    let h = harness("sftp-placement-backend", "native").await;
+    install(
+        &h,
+        "rev-other",
+        placed(&h.drop_key, &h.ops_key, "bay-2", "acme"),
+    )
+    .await;
+    let mut c = connect(h.addr, "acme-ops", &h.ops_key)
+        .await
+        .expect("connect");
+    let r = c.upload("/x.csv", b"x").await;
+    assert_eq!(code(&r), PERMISSION_DENIED, "{r:?}");
+    // The client is told the fixed sentence; the backend ids stay on the record.
+    assert_eq!(status_text(&r), s0::pdp::BUNDLE_UNUSABLE);
+    assert!(c.listdir("/").await.is_err());
+    assert_eq!(backend_calls(&h), 0);
+    let recs = records(&h.fx, |r| !placement_denials(r, "\"bay-2\"").is_empty()).await;
+    let denial = placement_denials(&recs, "\"bay-2\"");
+    assert!(
+        denial
+            .first()
+            .is_some_and(|r| r.result.reason.contains("\"bay-1\"")),
+        "{denial:#?}"
+    );
+}
+
+#[tokio::test]
+async fn tenants_sharing_an_upstream_identity_need_a_placing_bundle_over_sftp() {
+    // globex is re-signed with acme's own credential: the backend cannot tell them apart.
+    let h = harness_with("sftp-placement-shared", "native", share_acmes_identity).await;
+    // The harness's own bundle places nothing (no grant_schema_version).
+    let mut c = connect(h.addr, "acme-ops", &h.ops_key)
+        .await
+        .expect("connect");
+    let r = c.upload("/x.csv", b"x").await;
+    assert_eq!(code(&r), PERMISSION_DENIED, "{r:?}");
+    assert_eq!(status_text(&r), s0::pdp::BUNDLE_UNUSABLE);
+    assert_eq!(backend_calls(&h), 0);
+    let recs = records(&h.fx, |r| {
+        !placement_denials(r, s0::pdp::UNPLACED_SHARED_IDENTITY).is_empty()
+    })
+    .await;
+    assert_eq!(
+        placement_denials(&recs, s0::pdp::UNPLACED_SHARED_IDENTITY).len(),
+        1
+    );
+
+    // A placing bundle keeps them apart, and the owning tenant's home is served again.
+    install(
+        &h,
+        "rev-placed",
+        placed(&h.drop_key, &h.ops_key, "bay-1", "acme"),
+    )
+    .await;
+    assert_eq!(code(&c.upload("/x.csv", b"x").await), OK);
+}

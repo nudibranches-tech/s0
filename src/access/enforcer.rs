@@ -15,8 +15,46 @@ use crate::audit::{
 };
 use crate::authz::{Decision, OpaInput};
 use crate::gateway::Gateway;
+use crate::pdp::{BucketPlacement, PlacementRefusal};
+use crate::proxy::RouteSnapshot;
 
 use super::proof::{AuthzProof, SftpLicense, SftpProof};
+
+/// What a decision is screened against before the PDP sees it (ADR-009): the bucket
+/// placement of the bundle revision the request is decided under, and the route it is
+/// forwarded on.
+///
+/// [`Enforcer::decide`] takes one, so no front can ask a policy question without the
+/// placement having had its say. A front that answers the client before deciding (for
+/// the placement's client message rather than the audit reason) asks [`Self::refusal`]
+/// itself; the gate inside `decide` is what makes the screening total.
+#[derive(Clone, Copy)]
+pub struct PlacementGate<'a> {
+    pub placement: &'a BucketPlacement,
+    pub route: &'a RouteSnapshot,
+}
+
+impl PlacementGate<'_> {
+    /// Why the placement refuses `input` — its bucket, and a copy's source bucket —
+    /// whatever the policy would say, or `None` to ask the PDP.
+    #[must_use]
+    pub fn refusal(&self, input: &OpaInput) -> Option<PlacementRefusal> {
+        if let Some(refusal) = self
+            .placement
+            .shared_identity_refusal(self.route.shares_upstream_identity)
+        {
+            return Some(refusal);
+        }
+        let backend = self.route.backend_id.0.as_str();
+        self.placement
+            .refusal(backend, &input.tenant, &input.bucket)
+            .or_else(|| {
+                let source = input.copy_source.as_ref()?;
+                self.placement
+                    .refusal(backend, &input.tenant, &source.bucket)
+            })
+    }
+}
 
 /// The decision funnel shared by every protocol front.
 #[derive(Clone)]
@@ -41,7 +79,19 @@ impl Enforcer {
     /// instrumenting a hook. A second call site would silently make the corpus incomplete;
     /// `tests/golden_capture.rs::decide_is_the_only_pdp_call_site_and_every_capture_round_trips`
     /// is the guard.
-    pub async fn decide(&self, operation: &str, input: &OpaInput) -> Decision {
+    ///
+    /// It is also where the bundle's bucket placement is enforced, for every front: a
+    /// bucket placed under another tenant, or on no tenant of this backend, is refused
+    /// here whatever any policy would say, so no question about it reaches an engine.
+    pub async fn decide(
+        &self,
+        operation: &str,
+        gate: PlacementGate<'_>,
+        input: &OpaInput,
+    ) -> Decision {
+        if let Some(refusal) = gate.refusal(input) {
+            return Decision::deny(refusal.reason());
+        }
         if let Some(capture) = &self.gw.capture {
             capture.record(operation, input);
         }
