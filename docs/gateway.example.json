@@ -50,6 +50,7 @@
     "backend_connect_timeout_secs": 5,
     "backend_read_timeout_secs": 0
   },
+  "_backends_note": "`kind` is `ceph` or `s3` (D8's \"`s3` with a profile\"; `remote_s3` still deserializes as `s3` — the 0.3.x wire spelling, kept as an alias). `profile` is an optional vendor hint (only `generic` — s0 supports Ceph and generic S3) on an `s3` backend: s0 records it and the request path never branches on it — addressing style is `force_path_style` and the SigV4 re-signing scope is `region`, both set explicitly regardless of profile. Any other value is refused at load (`unknown profile '<value>'`).",
   "backends": [
     {
       "id": "backend-eu-1",
@@ -59,6 +60,14 @@
       "force_path_style": true,
       "_conditional_create_note": "Whether this backend honours If-None-Match: * on PutObject and CompleteMultipartUpload. `native` is an operator ASSERTION (run the conformance probe first): it lets create-only writes (create_objects) through on both fronts. `check_then_write` (the default) refuses create-only writes over S3 and narrows the race with a re-check over SFTP.",
       "conditional_create": "check_then_write"
+    },
+    {
+      "id": "backend-s3-1",
+      "kind": "s3",
+      "profile": "generic",
+      "endpoint_url": "https://s3.example.com",
+      "region": "eu-west-3",
+      "force_path_style": true
     }
   ],
   "tenants": [

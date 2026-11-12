@@ -323,6 +323,50 @@ pub fn strip_aws_chunked(encoding: &mut Option<String>) {
     *encoding = (!kept.is_empty()).then(|| kept.join(","));
 }
 
+/// The number of object bytes a write's body declares — what a byte quota charges it.
+///
+/// A body the client framed as `aws-chunked` declares its payload in
+/// `x-amz-decoded-content-length`: its `Content-Length`, when it sends one, is the
+/// *encoded* length, and the SDKs with default flexible checksums (boto3 ≥ 1.36, aws-cli ≥
+/// 2.23, Java v2 ≥ 2.30) send none at all, framing the body with `Transfer-Encoding:
+/// chunked` instead. Any other body declares its size in `Content-Length`, passed here as
+/// s3s parsed it.
+///
+/// `None` when the body states no size, including an `aws-chunked` body whose decoded
+/// length is missing, repeated or not a non-negative integer: a size this cannot read is
+/// never guessed, so a quota refuses the write instead.
+#[must_use]
+pub fn declared_body_length(headers: &http::HeaderMap, content_length: Option<i64>) -> Option<i64> {
+    if !is_aws_chunked(headers) {
+        return content_length;
+    }
+    let mut values = headers.get_all("x-amz-decoded-content-length").iter();
+    let (Some(value), None) = (values.next(), values.next()) else {
+        return None;
+    };
+    let digits = value.to_str().ok()?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<i64>().ok()
+}
+
+/// Whether the client framed the body as `aws-chunked`: it says so in `Content-Encoding`,
+/// or signs a `STREAMING-…` payload, which s3s decodes as `aws-chunked` either way.
+fn is_aws_chunked(headers: &http::HeaderMap) -> bool {
+    let encoded = headers
+        .get_all(http::header::CONTENT_ENCODING)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|c| c.trim().eq_ignore_ascii_case("aws-chunked"));
+    let streaming = headers
+        .get("x-amz-content-sha256")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("STREAMING-"));
+    encoded || streaming
+}
+
 fn hex_val(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
@@ -592,5 +636,94 @@ mod tests {
         assert_eq!(strip(Some("gzip")), Some("gzip".into()));
         assert_eq!(strip(Some("")), None);
         assert_eq!(strip(None), None);
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> http::HeaderMap {
+        let mut h = http::HeaderMap::new();
+        for (k, v) in pairs {
+            h.append(
+                http::HeaderName::from_bytes(k.as_bytes()).expect("header name"),
+                http::HeaderValue::from_str(v).expect("header value"),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn an_aws_chunked_body_is_sized_by_its_decoded_length_not_its_encoded_one() {
+        // boto3 ≥ 1.36: aws-chunked, CRC32 trailer, Transfer-Encoding: chunked, no length.
+        let boto3 = headers(&[
+            ("content-encoding", "aws-chunked"),
+            ("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER"),
+            ("x-amz-decoded-content-length", "1048576"),
+            ("x-amz-trailer", "x-amz-checksum-crc32"),
+        ]);
+        assert_eq!(declared_body_length(&boto3, None), Some(1_048_576));
+        // A Content-Length next to it is the encoded length, never the object's.
+        assert_eq!(
+            declared_body_length(&boto3, Some(1_048_700)),
+            Some(1_048_576)
+        );
+        // A real coding beside aws-chunked, in any case.
+        let gzip = headers(&[
+            ("content-encoding", "gzip, AWS-Chunked"),
+            ("x-amz-decoded-content-length", "5"),
+        ]);
+        assert_eq!(declared_body_length(&gzip, Some(90)), Some(5));
+        // A signed streaming payload is aws-chunked even without the Content-Encoding.
+        let signed = headers(&[
+            ("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"),
+            ("x-amz-decoded-content-length", "0"),
+        ]);
+        assert_eq!(declared_body_length(&signed, Some(86)), Some(0));
+    }
+
+    #[test]
+    fn a_plain_body_is_sized_by_its_content_length() {
+        let plain = headers(&[("x-amz-content-sha256", "UNSIGNED-PAYLOAD")]);
+        assert_eq!(declared_body_length(&plain, Some(42)), Some(42));
+        // A decoded length on a body that is not aws-chunked describes nothing.
+        let stray = headers(&[("x-amz-decoded-content-length", "1")]);
+        assert_eq!(declared_body_length(&stray, Some(42)), Some(42));
+        assert_eq!(
+            declared_body_length(&headers(&[("content-encoding", "gzip")]), Some(7)),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn a_body_that_states_no_size_has_none() {
+        assert_eq!(declared_body_length(&headers(&[]), None), None);
+        // aws-chunked without its decoded length: the Content-Length is not a fallback.
+        let chunked = headers(&[("content-encoding", "aws-chunked")]);
+        assert_eq!(declared_body_length(&chunked, None), None);
+        assert_eq!(declared_body_length(&chunked, Some(100)), None);
+    }
+
+    #[test]
+    fn a_malformed_decoded_length_states_no_size() {
+        for bad in [
+            "",
+            "-5",
+            "+5",
+            "5 ",
+            "0x10",
+            "1e3",
+            "abc",
+            "99999999999999999999",
+        ] {
+            let h = headers(&[
+                ("content-encoding", "aws-chunked"),
+                ("x-amz-decoded-content-length", bad),
+            ]);
+            assert_eq!(declared_body_length(&h, Some(10)), None, "{bad:?}");
+        }
+        // Two values: which one the body matches is not this function's guess to make.
+        let twice = headers(&[
+            ("content-encoding", "aws-chunked"),
+            ("x-amz-decoded-content-length", "5"),
+            ("x-amz-decoded-content-length", "6"),
+        ]);
+        assert_eq!(declared_body_length(&twice, Some(10)), None);
     }
 }

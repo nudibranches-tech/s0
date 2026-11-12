@@ -81,6 +81,10 @@ impl Enforcer {
         outcome: Outcome,
         denied_keys: Vec<String>,
     ) -> AuditRecord {
+        // The live revision rather than the request's pinned one: this names, it never
+        // decides, and a bucket keeps its object name for as long as it exists.
+        let bundle = self.gw.bundles.current();
+        let object_name = |bucket: &str| bundle.placement().object_name(bucket).map(str::to_string);
         let meta = GatewayMeta {
             backend_id: input.backend.id.clone(),
             backend_kind: input.backend.kind.as_str().to_string(),
@@ -89,6 +93,12 @@ impl Enforcer {
             backend: BackendOutcome::NotAttempted,
             backend_status: None,
             session: None,
+            object_name: object_name(&input.bucket),
+            copy_source_object_name: input
+                .copy_source
+                .as_ref()
+                .and_then(|source| object_name(&source.bucket)),
+            summary: None,
         };
         AuditRecord::new(
             new_decision_id(),
@@ -101,10 +111,17 @@ impl Enforcer {
     }
 
     /// Emit a denial now: the request is refused and there is no forward leg to wait for.
-    pub fn audit_denied(&self, input: OpaInput, decision: &Decision, denied_keys: Vec<String>) {
-        self.gw
-            .audit
-            .emit(self.record(input, decision, Outcome::Denied, denied_keys));
+    /// Returns the record's decision id.
+    pub fn audit_denied(
+        &self,
+        input: OpaInput,
+        decision: &Decision,
+        denied_keys: Vec<String>,
+    ) -> String {
+        let record = self.record(input, decision, Outcome::Denied, denied_keys);
+        let decision_id = record.decision_id.clone();
+        self.gw.audit.emit(record);
+        decision_id
     }
 
     /// Emit a fully-formed record (one the caller enriched, e.g. with an SFTP session

@@ -1,0 +1,177 @@
+{
+  "data": {
+    "grant_schema_version": 3,
+    "backend": {
+      "id": "archive",
+      "kind": "s3"
+    },
+    "org_settings": {
+      "freeze_writes": false,
+      "reserved_tag_keys": [
+        "hyperfluid/*"
+      ],
+      "organization_id": "00000000-0000-0000-0000-000000000000",
+      "bundle_revision": "v3-9d1c5be0a4f37e6b2c80d15f94a7e3c2b6d08f1a5e4c937b20d6a8f13e5c7b94"
+    },
+    "tenants": {
+      "acme-prod": {
+        "user_attributes": {
+          "sa:pipeline": {
+            "groups": [],
+            "attributes": {
+              "client_id": [
+                "pipeline"
+              ]
+            }
+          },
+          "user:sub-a": {
+            "groups": [
+              "owner"
+            ],
+            "attributes": {
+              "email": [
+                "a@acme.test"
+              ],
+              "email_domain": [
+                "acme.test"
+              ],
+              "region": [
+                "eu",
+                "fr"
+              ],
+              "role": [
+                "owner"
+              ]
+            }
+          }
+        },
+        "bucket_attributes": {
+          "acme-000000-warehouse": {
+            "denylist": {
+              "raw-oidc-sub": true
+            },
+            "freeze_writes": false,
+            "sensitivity": "high",
+            "object_name": "acme-000000-warehouse.archive",
+            "created_at": "2026-09-30T08:15:00Z",
+            "quota": {
+              "limit_bytes": 107374182400,
+              "used_bytes": 21474836480,
+              "collected_at": "2026-10-01T12:00:00Z"
+            }
+          }
+        },
+        "s3_grants": {
+          "sa:pipeline": [
+            {
+              "bucket": "acme-000000-warehouse",
+              "actions": [
+                "read_objects"
+              ],
+              "prefixes": [
+                "team-a/"
+              ],
+              "conditions": []
+            }
+          ],
+          "user:sub-a": [
+            {
+              "bucket": "*",
+              "actions": [
+                "read"
+              ],
+              "prefixes": [],
+              "conditions": []
+            }
+          ]
+        },
+        "s3_deny": {
+          "sa:pipeline": [
+            {
+              "bucket": "acme-000000-warehouse",
+              "actions": [
+                "read_objects"
+              ],
+              "prefixes": [
+                "team-a/secret/"
+              ],
+              "conditions": []
+            }
+          ]
+        },
+        "group_grants": {},
+        "s3_key_epoch": 1,
+        "quota": {
+          "limit_bytes": 214748364800,
+          "used_bytes": 21474836480,
+          "collected_at": "2026-10-01T12:00:00Z"
+        }
+      },
+      "acme-staging": {
+        "user_attributes": {
+          "sa:pipeline": {
+            "groups": [],
+            "attributes": {
+              "client_id": [
+                "pipeline"
+              ]
+            }
+          },
+          "user:sub-a": {
+            "groups": [
+              "owner"
+            ],
+            "attributes": {
+              "email": [
+                "a@acme.test"
+              ],
+              "email_domain": [
+                "acme.test"
+              ],
+              "region": [
+                "eu",
+                "fr"
+              ],
+              "role": [
+                "owner"
+              ]
+            }
+          }
+        },
+        "bucket_attributes": {
+          "acme-000000-scratch": {
+            "denylist": {},
+            "freeze_writes": false,
+            "object_name": "acme-000000-scratch.archive",
+            "created_at": "2026-09-30T09:40:12.250Z",
+            "quota": {
+              "limit_bytes": 10737418240,
+              "used_bytes": 0,
+              "collected_at": "2026-10-01T12:00:00Z"
+            }
+          }
+        },
+        "s3_grants": {
+          "user:sub-a": [
+            {
+              "bucket": "*",
+              "actions": [
+                "read"
+              ],
+              "prefixes": [],
+              "conditions": []
+            }
+          ]
+        },
+        "s3_deny": {},
+        "group_grants": {},
+        "s3_key_epoch": 1
+      }
+    },
+    "backend_quota": {
+      "limit_bytes": 1099511627776,
+      "used_bytes": 21474836480,
+      "collected_at": "2026-10-01T12:00:00Z"
+    }
+  }
+}

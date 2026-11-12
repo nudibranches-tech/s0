@@ -91,7 +91,9 @@ table, so no pushed policy can enable them:
   on them.
 - **Presigned URLs** are supported (the STS session token is resolved from the query
   string), and the presigned credential is redacted from the audit record.
-- **Anonymous access** is never allowed. There is no public-bucket concept.
+- **Anonymous access** is never allowed. There is no public-bucket concept. The one request
+  answered without a verified signature is a CORS preflight, which grants nothing; see
+  [Browsers and CORS](#browsers-and-cors).
 
 ---
 
@@ -117,6 +119,31 @@ table, so no pushed policy can enable them:
 - **Live policy and live revocation**: OPA holds the policy; a revoked grant denies on the
   next request. No policy is ever baked into a credential.
 - **`freeze_writes`** org kill-switch, per-bucket denylist, and the grant superset.
+- **Bucket placement on a shared upstream identity**: from `grant_schema_version` 3 the
+  bundle names the backend it was projected for and, per bucket, the one tenant that owns
+  it. A request naming a bucket owned by another tenant, or one no tenant lists, or a
+  bundle projected for a different backend, is refused by the gateway itself — before the
+  policy is even asked — with `ListBuckets` answered straight from the bundle instead of
+  forwarded, since the shared upstream identity generally cannot list at all. This is what
+  makes a backend where every tenant of an organization shares one upstream key scoped
+  only by bucket grant safe to front. Tenants that share an
+  upstream key are refused outright while the bundle in force places nothing (a v2 or seed
+  bundle), since the backend alone would not keep them apart
+  ([ADR-009](docs/adr/ADR-009-bundle-v3-bucket-placement.md)).
+- **Byte quotas where the backend has none**: a v3 bundle may state a quota on a bucket,
+  a tenant or the backend, and a write that would pass one is refused `QuotaExceeded`
+  (403) before it is forwarded, counting what was written since the last collection rather
+  than waiting for the next. Counted per replica
+  ([ADR-010](docs/adr/ADR-010-byte-quotas-counted-per-replica.md)).
+- **No backend text in an answer**: an error the backend returns is re-minted with its
+  code and HTTP status and a message of the gateway's own, so the ARN, account id or Ceph
+  tenant an upstream error names never reaches the client. A successful answer loses the
+  backend identifiers it carries: the SSE-KMS key id (an ARN with the account id, on AWS)
+  and encryption context, and `CompleteMultipartUpload`'s `Location`, which is the
+  object's URL on the backend's own host. The request id is the gateway's on every
+  forwarded answer (the decision id of the request's audit record), and the backend's host
+  id is dropped. Other fields of a successful answer (object metadata, ETags, listing
+  entries) are the backend's.
 
 ### Fail-closed by construction
 
@@ -290,15 +317,43 @@ key, so replacing it invalidates live sessions. Rotate it in a window.
 
 ---
 
+## Browsers and CORS
+
+A browser that uploads to or downloads from a presigned URL pointing at s0 sends a preflight
+(`OPTIONS`) first, and can read the answer only if it names the page's origin. s0 serves both
+from **the CORS configuration the control plane already set on the backend bucket**. There is
+no gateway-level CORS setting, and `GetBucketCors` / `PutBucketCors` stay refused to clients:
+CORS remains a property of the managed resource, and s0 only reads it back.
+
+| | |
+|---|---|
+| **Source** | `GetBucketCors` against the backend, signed with the tenant's own backend credential, cached per `(backend, tenant, bucket)` for about 60 s. "No CORS configuration" is cached too; a failed read is remembered for a few seconds only. A rule written on the backend reaches browsers within about a minute. |
+| **Evaluation** | As S3 does it: `*` wildcards in `AllowedOrigin` and `AllowedHeader`, `AllowedMethod`, `ExposeHeader`, `MaxAgeSeconds`; the first rule that matches wins, and a preflight rule must allow the origin, the method **and every** requested header. |
+| **Preflight** | Answered before s3s sees it, since `OPTIONS` is never an S3 operation. `200` with `Access-Control-Allow-Origin` (`*` for a `*` rule, otherwise the request origin), `-Allow-Methods`, `-Allow-Headers`, `-Expose-Headers`, `-Max-Age` and `Vary`; every refusal is the same `403`, whether the cause is the rule, the credential, the tenant or the bucket. |
+| **Real requests** | Any other request that carries `Origin` gets the matching `Access-Control-Allow-Origin`, `-Expose-Headers` and `Vary` after s3s has answered, success or S3 error. A request with no `Origin` is untouched. |
+| **Which tenant** | A preflight carries no credential of its own but goes to the same URL as the request, and a presigned URL names its access key (`X-Amz-Credential`) and, for an STS session, its token (`X-Amz-Security-Token`) in the query. s0 resolves them with the identity resolution the data plane uses, which gives the tenant and so the backend. The signature is not verified: an `OPTIONS` has nothing to verify it against, and a preflight grants nothing. |
+| **Not covered** | Browser form uploads (`PostObject`), whose credential is in the multipart body; SigV2; and requests an SDK in the page signs in headers, because a browser never puts `Authorization` on the preflight, so there is no credential to resolve a tenant from. None of them gets CORS headers. |
+
+A preflight never reaches the policy engine and is not an access decision, so it is counted
+rather than audited: `s0_cors_preflight_total{result,reason}`, plus
+`s0_cors_backend_lookups_total` and `s0_cors_backend_lookup_failures_total`. The
+gate-denial audit budget stays reserved for requests that reach the gate. A sustained rise in
+`s0_cors_backend_lookup_failures_total` usually means the tenant's backend credential may not
+read bucket CORS. The implementation is [`src/cors`](src/cors).
+
+---
+
 ## Module map
 
 | Module | Role |
 |---|---|
 | [`authz`](src/authz) | the OPA input contract and the decision type — the core seam |
-| [`pdp`](src/pdp) | `Pdp` trait; embedded regorus + sidecar OPA; revision-keyed decision cache |
+| [`pdp`](src/pdp) | `Pdp` trait; embedded regorus + sidecar OPA; revision-keyed decision cache; v3 bundle bucket placement (`BucketPlacement`) |
 | [`auth`](src/auth) | identity authority, own STS, long-lived derived keys |
 | [`access`](src/access) | the OPA gate: deny-by-default `check` + typed per-op hooks |
+| [`cors`](src/cors) | preflights and response headers for browsers, from the bucket's own CORS rule |
 | [`proxy`](src/proxy) | per-`(backend, tenant)` client pool and dispatch |
+| [`quota`](src/quota.rs) | byte quotas a v3 bundle states, counted per replica between collections |
 | [`audit`](src/audit) | one reasoned decision record per request; async, non-blocking, disk-spill |
 | [`gateway`](src/gateway.rs) / [`server`](src/server.rs) | assembly and hardened hyper serving |
 | [`admin`](src/admin.rs) / [`shutdown`](src/shutdown.rs) | `/healthz` `/readyz` `/metrics`; one signal, ordered drain |
@@ -319,7 +374,7 @@ See [`docs/gateway.example.json`](docs/gateway.example.json) and
 
 ### More than one replica
 
-s0 is a Deployment, not a singleton. Three consequences a single-replica deployment never
+s0 is a Deployment, not a singleton. Four consequences a single-replica deployment never
 exercises:
 
 - **The audit spill is per-pod.** It is read-whole / POST / delete-whole, correct only for
@@ -336,6 +391,11 @@ exercises:
   → internal API and mint drain → audit worker drains (≤10s) → admin listener stops last.
   Kubernetes' 30s default truncates the audit drain and loses records; set
   `terminationGracePeriodSeconds: 60`.
+- **Quota counts are per pod.** A replica counts only the writes it accepted since the last
+  collection, so N replicas can together overshoot a bundle-stated quota by what the other
+  N − 1 accepted in one collection interval
+  ([ADR-010](docs/adr/ADR-010-byte-quotas-counted-per-replica.md)). Collect as often as that
+  overshoot requires; a backend's own per-bucket limit, where it has one, stays the backstop.
 
 ```yaml
 livenessProbe:  { httpGet: { path: /healthz, port: 8016 } }   # never depends on the control plane
@@ -356,6 +416,32 @@ The spill is node-local and dies with the pod, so those are lost, not pending.
 an unauthenticated caller controls the rate of, so they are budgeted — without a bound a
 scanner could evict the decision records of real access. A sustained non-zero value means
 someone is scanning.
+
+### Summarised platform identities
+
+A platform job that reads whole buckets, a backup copier for instance, would otherwise
+fill the trail with one record per object and can outrun the queue, which then drops the
+records of everyone else. The control plane may list such service accounts, by
+`sa:<client id>`, in `org_settings.audit_summary_subjects`; any other key is ignored, so a
+person's trail is never summarised. A listed account's allowed reads and lists that the
+backend served are folded into one record per operation, HTTP method, access key,
+presigned or not, bucket and window (`audit.summary_window_secs`, 60 by default). A window
+also closes when it stands for `audit.summary_max_requests` requests (10 000 by default).
+
+A summary record has its own `path`, `s3/authz/summary`, so a consumer that predates it
+cannot take it for a single request. It keeps the decision-log envelope, with the first
+request's input minus its object, prefix, query and headers, a result without
+obligations, and a `gateway.summary` block:
+`{ "operation", "requests", "first_at", "last_at", "access_key_id", "presigned" }`.
+
+A denial, a failed forward and every other verb keep their own record. A list that is
+absent or is not an array of strings summarises nobody. Summaries never take a queue
+slot: the worker ships closed windows on its flush tick, and every open one on shutdown,
+after which a late request keeps its own record. `s0_audit_summarized_total` counts the
+requests folded into summaries, and `s0_audit_summaries_emitted_total` the summary
+records. A lost summary counts as one record in `s0_audit_dropped_total`. A consumer must
+understand summaries before its control plane lists any account. See
+[ADR-011](docs/adr/ADR-011-summarised-platform-identities.md).
 
 ---
 
@@ -451,7 +537,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md). Security reports: [`SECURITY.md`](SECU
 ## License
 
 Business Source License 1.1 (`BUSL-1.1`), converting to Apache-2.0 on the change
-date (`2030-09-28`, four years after this release). See [`LICENSE`](LICENSE);
+date (`2030-10-26`, four years after this release). See [`LICENSE`](LICENSE);
 the future Apache text is in [`LICENSE-APACHE-2.0.txt`](LICENSE-APACHE-2.0.txt).
 
 Until that date, in short:

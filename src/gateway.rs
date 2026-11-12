@@ -12,12 +12,14 @@ use crate::auth::sts::StsAuthority;
 use crate::auth::{DerivedKeys, Identity, StaticCredentialStore};
 use crate::authz::CaptureSink;
 use crate::config::{GatewayConfig, LimitsConfig, PdpConfig};
+use crate::cors::CorsState;
 use crate::error::{GatewayError, Result};
 use crate::pdp::{
     Bundle, BundleStore, CachingPdp, GATEWAY_REGO, Pdp, RegorusPdp, SidecarPdp, content_revision,
     parse_bundle,
 };
 use crate::proxy::BackendRegistry;
+use crate::quota::QuotaLedger;
 
 /// Shared, cheaply-cloneable state. `Arc<Gateway>` is held by the auth, access, and
 /// proxy layers.
@@ -37,6 +39,11 @@ pub struct Gateway {
     pub limits: Arc<ArcSwap<LimitsConfig>>,
     /// Kept so a bundle-refresh loop can swap revisions (cache stays coherent).
     pub bundles: Arc<BundleStore>,
+    /// The CORS layer's cache of bucket configurations, and its counters.
+    pub cors: Arc<CorsState>,
+    /// What this replica has written against the bundle's byte quotas since their last
+    /// collection. Outlives every revision: a new one resets what its collection covers.
+    pub quota: Arc<QuotaLedger>,
     /// Golden-capture tap. `None` in every deployed binary: [`Gateway::build`] is the only
     /// production construction path and hard-codes `None`, with no setter and no config
     /// knob, so only a test that builds a `Gateway` literally can enable it.
@@ -73,6 +80,8 @@ impl Gateway {
                 cfg.audit.organization_label_key.clone(),
                 cfg.audit.extra_labels.clone(),
             ),
+            summary_window: std::time::Duration::from_secs(cfg.audit.summary_window_secs),
+            summary_max_requests: cfg.audit.summary_max_requests,
             ..AuditConfig::default()
         });
 
@@ -84,6 +93,8 @@ impl Gateway {
             credentials,
             limits: Arc::new(ArcSwap::from_pointee(cfg.limits.clone())),
             bundles,
+            cors: Arc::new(CorsState::new()),
+            quota: Arc::new(QuotaLedger::new()),
             // Never enabled from config: a capture sink retains principal identifiers
             // and object keys in memory, and nothing an operator can set should be able
             // to turn that on.
@@ -329,6 +340,8 @@ mod tests {
             credentials,
             limits: Arc::new(ArcSwap::from_pointee(cfg.limits.clone())),
             bundles,
+            cors: Arc::new(CorsState::new()),
+            quota: Arc::new(QuotaLedger::new()),
             capture: None,
         };
         (gw, handle)

@@ -1738,3 +1738,374 @@ async fn a_comma_separated_list_header_survives_the_forward_intact() {
         2
     );
 }
+
+// ── a backend's error text never reaches the client ─────────────────────────────
+
+/// Markers a backend can put in an answer: an AWS-style ARN and account id, a Ceph tenant
+/// id, and the backend's own request and host ids. None of them may cross the gateway.
+const UPSTREAM_ACCOUNT: &str = "123456789012";
+const UPSTREAM_TENANT: &str = "tenant-owner-acme";
+const UPSTREAM_REQUEST_ID: &str = "tx00000UPSTREAMREQ4242-zone-a";
+const UPSTREAM_HOST_ID: &str = "upstreamhostid-zone-a-zonegroup-b";
+/// The backend's own host, which a `CompleteMultipartUpload` `Location` names.
+const UPSTREAM_ENDPOINT: &str = "s3-internal.storage.svc";
+
+fn leak_markers() -> [&'static str; 7] {
+    [
+        "arn:",
+        UPSTREAM_ACCOUNT,
+        UPSTREAM_TENANT,
+        UPSTREAM_REQUEST_ID,
+        UPSTREAM_HOST_ID,
+        "Resource",
+        UPSTREAM_ENDPOINT,
+    ]
+}
+
+/// What the mock backend answers for a key, AWS-style: `(status, code)`, or `None` for a
+/// plain 200 carrying the backend's ids in its headers.
+fn upstream_answer(key: &str) -> Option<(u16, &'static str)> {
+    match key {
+        "2024/denied" => Some((403, "AccessDenied")),
+        "2024/missing" => Some((404, "NoSuchKey")),
+        "2024/precondition" => Some((412, "PreconditionFailed")),
+        // Ceph's own code, unknown to s3s: crosses as a plain identifier.
+        "2024/quota" => Some((403, "QuotaExceeded")),
+        // A code that is itself backend text with an ARN in it.
+        "2024/odd-code" => Some((400, "arn:aws:iam::123456789012:root")),
+        _ => None,
+    }
+}
+
+/// A backend that answers every request the way AWS does when it refuses one: an XML
+/// error naming the caller's ARN, the account, the resource, and its own request and host
+/// ids, in the body and in the headers.
+async fn leaky_backend() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr: SocketAddr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut head = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                    if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).to_string();
+                let method = head
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                let target = head.split_whitespace().nth(1).unwrap_or_default();
+                let completes = method == "POST" && target.contains("uploadId=");
+                let path = target.split('?').next().unwrap_or_default();
+                let key = path.trim_start_matches("/reports/");
+                // A success names the backend's KMS key, an ARN carrying the account.
+                let ids = format!(
+                    "x-amz-request-id: {UPSTREAM_REQUEST_ID}\r\nx-amz-id-2: {UPSTREAM_HOST_ID}\r\n\
+                     x-amz-server-side-encryption: aws:kms\r\n\
+                     x-amz-server-side-encryption-aws-kms-key-id: \
+                     arn:aws:kms:eu-west-1:{UPSTREAM_ACCOUNT}:key/{UPSTREAM_TENANT}\r\n\
+                     x-amz-server-side-encryption-context: \
+                     eyJhd3M6czM6YXJuIjoiYXJuOmF3czpzMzo6OnJlcG9ydHMifQ==\r\n"
+                );
+                let resp = match upstream_answer(key) {
+                    Some((status, code)) => {
+                        let body = format!(
+                            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>{code}</Code>\
+                             <Message>User: arn:aws:iam::{UPSTREAM_ACCOUNT}:user/{UPSTREAM_TENANT} \
+                             is not authorized to perform: s3:GetObject on resource: \
+                             arn:aws:s3:::reports/{key}</Message>\
+                             <Resource>arn:aws:s3:::reports/{key}</Resource>\
+                             <RequestId>{UPSTREAM_REQUEST_ID}</RequestId>\
+                             <HostId>{UPSTREAM_HOST_ID}</HostId></Error>"
+                        );
+                        format!(
+                            "HTTP/1.1 {status} Upstream\r\ncontent-type: application/xml\r\n{ids}\
+                             content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    }
+                    None if completes => {
+                        let body = format!(
+                            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                             <CompleteMultipartUploadResult>\
+                             <Location>http://{UPSTREAM_ENDPOINT}:3900/reports/{key}</Location>\
+                             <Bucket>reports</Bucket><Key>{key}</Key><ETag>\"abc-2\"</ETag>\
+                             </CompleteMultipartUploadResult>"
+                        );
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/xml\r\n{ids}\
+                             content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    }
+                    None => format!(
+                        "HTTP/1.1 200 OK\r\n{ids}etag: \"abc\"\r\ncontent-length: 5\r\n\
+                         connection: close\r\n\r\nhello"
+                    ),
+                };
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+fn get_object(key: &str) -> GetObjectInput {
+    GetObjectInput {
+        bucket: "reports".into(),
+        key: key.into(),
+        ..Default::default()
+    }
+}
+
+/// The typed path: each backend refusal comes back with the backend's code and status,
+/// the gateway's message, and the gateway's request id, which is the decision id of the
+/// request's own audit record.
+#[tokio::test]
+async fn a_backend_error_is_reminted_with_its_code_and_status_and_none_of_its_text() {
+    use s3s::S3;
+    let backend = leaky_backend().await;
+    let fx = common::fixture_with_backend("remint-typed", common::alice_bundle(), &backend);
+    let access = GatewayAccess::new(fx.gw.clone());
+    let s3 = s0::proxy::GatewayS3::new(Arc::new(s0::proxy::S3GatewayState::new(
+        fx.gw.registry.clone(),
+        fx.gw.limits.clone(),
+    )));
+
+    let cases: [(&str, S3ErrorCode, u16); 5] = [
+        ("2024/denied", S3ErrorCode::AccessDenied, 403),
+        ("2024/missing", S3ErrorCode::NoSuchKey, 404),
+        ("2024/precondition", S3ErrorCode::PreconditionFailed, 412),
+        (
+            "2024/quota",
+            S3ErrorCode::Custom("QuotaExceeded".into()),
+            403,
+        ),
+        ("2024/odd-code", S3ErrorCode::InternalError, 400),
+    ];
+    let mut request_ids = Vec::new();
+    for (key, code, status) in cases {
+        let mut req = fx.request("GetObject", get_object(key), Method::GET);
+        access
+            .get_object(&mut req)
+            .await
+            .expect("alice may read under 2024/");
+        let Err(err) = s3.get_object(req).await else {
+            panic!("{key}: the backend refused this read")
+        };
+        assert_eq!(*err.code(), code, "{key}");
+        assert_eq!(
+            err.status_code().map(|s| s.as_u16()),
+            Some(status),
+            "{key}: the backend's status must be preserved"
+        );
+        let message = err.message().expect("the gateway's message").to_string();
+        let request_id = err
+            .request_id()
+            .expect("the gateway's request id")
+            .to_string();
+        for marker in leak_markers() {
+            assert!(
+                !message.contains(marker),
+                "{key}: {marker:?} in {message:?}"
+            );
+            assert!(
+                !request_id.contains(marker),
+                "{key}: {marker:?} in {request_id:?}"
+            );
+        }
+        assert!(
+            err.headers().is_none(),
+            "{key}: no backend header may ride along"
+        );
+        request_ids.push(request_id);
+    }
+
+    // Positive control: the same backend's success passes, with its ids replaced.
+    let mut req = fx.request("GetObject", get_object("2024/ok"), Method::GET);
+    access.get_object(&mut req).await.expect("allowed");
+    let resp = s3
+        .get_object(req)
+        .await
+        .expect("the backend serves this one");
+    assert!(
+        resp.headers.get("x-amz-id-2").is_none(),
+        "{:?}",
+        resp.headers
+    );
+    let ok_id = resp
+        .headers
+        .get("x-amz-request-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("the gateway's request id")
+        .to_string();
+    assert_ne!(ok_id, UPSTREAM_REQUEST_ID);
+    request_ids.push(ok_id);
+
+    // Each request id names the decision record of its own request.
+    let records = fx.await_audit_records(request_ids.len()).await;
+    let decision_ids: Vec<&str> = records.iter().map(|r| r.decision_id.as_str()).collect();
+    for id in &request_ids {
+        assert!(
+            decision_ids.contains(&id.as_str()),
+            "{id} in {decision_ids:?}"
+        );
+    }
+}
+
+/// Signed GET over TCP, returning the status, every response header, and the body.
+async fn send_get(base: &str, path: &str) -> (u16, String, String) {
+    let host = base.trim_start_matches("http://").to_string();
+    let r = RawRequest::new("GET", path.to_string());
+    let headers = r.sign(&host, common::ACCESS_KEY, common::SECRET_KEY);
+    let mut builder = reqwest::Client::new()
+        .get(r.url(base))
+        .timeout(Duration::from_secs(10));
+    for (k, v) in &headers {
+        builder = builder.header(k.as_str(), v.as_str());
+    }
+    let resp = builder.send().await.expect("the gateway must answer");
+    let status = resp.status().as_u16();
+    let headers = format!("{:?}", resp.headers());
+    (status, headers, resp.text().await.unwrap_or_default())
+}
+
+/// The same property on the wire, where the whole response is visible: an ARN, an account
+/// id, a resource, a request id or a host id from the backend appears nowhere in what the
+/// client receives, and the status is the backend's.
+#[tokio::test]
+async fn no_backend_arn_account_or_id_reaches_the_client_on_the_wire() {
+    let backend = leaky_backend().await;
+    let fx = common::fixture_with_backend("remint-wire", common::alice_bundle(), &backend);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr: SocketAddr = listener.local_addr().expect("addr");
+    drop(listener);
+    let gw = fx.gw.clone();
+    tokio::spawn(async move {
+        let _ = s0::server::serve_with_shutdown(gw, addr, std::future::pending::<()>()).await;
+    });
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let base = format!("http://{addr}");
+
+    for (key, code, status) in [
+        ("2024/denied", "AccessDenied", 403),
+        ("2024/missing", "NoSuchKey", 404),
+        ("2024/quota", "QuotaExceeded", 403),
+        ("2024/odd-code", "InternalError", 400),
+    ] {
+        let (got, headers, body) = send_get(&base, &format!("/reports/{key}")).await;
+        assert_eq!(got, status, "{key}: {body}");
+        assert!(
+            body.contains(&format!("<Code>{code}</Code>")),
+            "{key}: {body}"
+        );
+        assert!(
+            body.contains("<RequestId>"),
+            "{key}: the gateway's id must be there: {body}"
+        );
+        for marker in leak_markers().into_iter().chain(["HostId"]) {
+            assert!(
+                !body.contains(marker),
+                "{key}: {marker:?} in the body: {body}"
+            );
+            assert!(
+                !headers.contains(marker),
+                "{key}: {marker:?} in the headers: {headers}"
+            );
+        }
+    }
+
+    // Positive control: a success is served, and still carries no backend id — nor the
+    // backend's KMS key ARN, though it still says the object is encrypted.
+    let (status, headers, body) = send_get(&base, "/reports/2024/ok").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, "hello");
+    assert!(headers.contains("x-amz-request-id"), "{headers}");
+    assert!(headers.contains("aws:kms"), "{headers}");
+    for marker in leak_markers().into_iter().chain(["kms-key-id"]) {
+        assert!(!headers.contains(marker), "{marker:?} in {headers}");
+    }
+}
+
+/// A successful write names no backend identifier either: not the KMS key ARN (and its
+/// account id) or encryption context of a PutObject, and not the `Location` of a
+/// CompleteMultipartUpload, which is the object's URL on the backend's own host.
+#[tokio::test]
+async fn a_successful_answer_names_no_backend_key_or_endpoint() {
+    use s3s::S3;
+    let backend = leaky_backend().await;
+    let fx = common::fixture_with_backend("scrub-success", common::alice_bundle(), &backend);
+    let access = GatewayAccess::new(fx.gw.clone());
+    let s3 = s0::proxy::GatewayS3::new(Arc::new(s0::proxy::S3GatewayState::new(
+        fx.gw.registry.clone(),
+        fx.gw.limits.clone(),
+    )));
+
+    let mut req = fx.request(
+        "PutObject",
+        PutObjectInput {
+            bucket: "reports".into(),
+            key: "2024/ok".into(),
+            content_length: Some(5),
+            body: Some(StreamingBlob::from(s3s::Body::from(b"hello".to_vec()))),
+            ..Default::default()
+        },
+        Method::PUT,
+    );
+    access
+        .put_object(&mut req)
+        .await
+        .expect("alice writes under 2024/");
+    let out = s3.put_object(req).await.expect("stored").output;
+    assert!(out.server_side_encryption.is_some(), "{out:?}");
+    assert_eq!(out.ssekms_key_id, None, "{out:?}");
+    assert_eq!(out.ssekms_encryption_context, None, "{out:?}");
+
+    let mut req = fx.request(
+        "CompleteMultipartUpload",
+        CompleteMultipartUploadInput {
+            bucket: "reports".into(),
+            key: "2024/big".into(),
+            upload_id: "upload-1".into(),
+            ..Default::default()
+        },
+        Method::POST,
+    );
+    access
+        .complete_multipart_upload(&mut req)
+        .await
+        .expect("alice writes under 2024/");
+    let out = s3
+        .complete_multipart_upload(req)
+        .await
+        .expect("completed")
+        .output;
+    assert_eq!(out.key.as_deref(), Some("2024/big"), "{out:?}");
+    assert_eq!(out.location, None, "{out:?}");
+    assert_eq!(out.ssekms_key_id, None, "{out:?}");
+    let rendered = format!("{out:?}");
+    for marker in leak_markers() {
+        assert!(!rendered.contains(marker), "{marker:?} in {rendered}");
+    }
+}

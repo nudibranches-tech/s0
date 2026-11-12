@@ -125,7 +125,7 @@ mod tests {
             },
             backend: Backend {
                 id: "b1".into(),
-                kind: BackendKind::RemoteS3,
+                kind: BackendKind::S3,
             },
             tenant: "acme".into(),
             organization_id: "org-acme".into(),

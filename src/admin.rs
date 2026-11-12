@@ -26,6 +26,7 @@ use tokio::net::TcpListener;
 
 use crate::audit::{AuditMetrics, AuditSink};
 use crate::bundle_refresh::BundleHealth;
+use crate::cors::{CorsMetrics, Denial};
 use crate::error::Result;
 use crate::mint::MintMetrics;
 use crate::pdp::BundleStore;
@@ -49,6 +50,10 @@ pub struct AdminState {
     /// SFTP (ADR-012 D1: published as a metric series, no new route). Set once, after
     /// the front has loaded its host keys.
     sftp: std::sync::OnceLock<SftpAdmin>,
+    /// The CORS layer's counters, when this process serves them. `Option` for the same
+    /// reason as `mint`: a state built without them reports no `s0_cors_*` series rather
+    /// than a flat zero.
+    cors: Option<Arc<CorsMetrics>>,
     instance: String,
     shutting_down: AtomicBool,
 }
@@ -68,6 +73,7 @@ impl AdminState {
             bundles,
             mint: None,
             sftp: std::sync::OnceLock::new(),
+            cors: None,
             instance: crate::config::instance_id(),
             shutting_down: AtomicBool::new(false),
         }
@@ -89,6 +95,14 @@ impl AdminState {
         metrics: Arc<crate::sftp::SftpMetrics>,
     ) {
         let _ = self.sftp.set(SftpAdmin { host_keys, metrics });
+    }
+
+    /// Publish the CORS layer's counters. Unlike the mint's, these are always live: CORS has
+    /// no switch, so every gateway that serves S3 answers preflights.
+    #[must_use]
+    pub fn with_cors_metrics(mut self, metrics: Arc<CorsMetrics>) -> Self {
+        self.cors = Some(metrics);
+        self
     }
 
     /// Start failing readiness. Call on the shutdown signal, *before* the data plane
@@ -263,6 +277,22 @@ fn prometheus(state: &AdminState) -> Response<Full<Bytes>> {
     );
     metric(
         &mut out,
+        "s0_audit_summarized_total",
+        "counter",
+        "Allowed reads and lists of a subject the bundle lists in \
+         org_settings.audit_summary_subjects, recorded through a summary rather than \
+         their own record. NOT dropped: each is counted in the summary that stands for it.",
+        m.summarized.load(Ordering::Relaxed),
+    );
+    metric(
+        &mut out,
+        "s0_audit_summaries_emitted_total",
+        "counter",
+        "Summary records handed on for shipping, one per subject, verb, bucket and window.",
+        m.summaries_emitted.load(Ordering::Relaxed),
+    );
+    metric(
+        &mut out,
         "s0_audit_spill_replayed_total",
         "counter",
         "Audit records recovered from the spill file and shipped.",
@@ -390,6 +420,51 @@ fn prometheus(state: &AdminState) -> Response<Full<Bytes>> {
         }
     }
 
+    // The CORS layer. Preflights are unauthenticated and authorize nothing, so they are
+    // counted here rather than audited; the reason label is what separates "the bucket has
+    // no rule" from "the browser sent no credential" when uploads fail.
+    if let Some(c) = &state.cors {
+        out.push_str(
+            "# HELP s0_cors_preflight_total CORS preflights (OPTIONS) answered, by result. A \
+             refusal is always the same 403 on the wire; reason says which check failed.\n\
+             # TYPE s0_cors_preflight_total counter\n",
+        );
+        out.push_str(&format!(
+            "s0_cors_preflight_total{{result=\"allowed\"}} {}\n",
+            c.preflight_allowed()
+        ));
+        for denial in Denial::ALL {
+            out.push_str(&format!(
+                "s0_cors_preflight_total{{result=\"denied\",reason=\"{}\"}} {}\n",
+                denial.reason(),
+                c.preflight_denied(denial)
+            ));
+        }
+        metric(
+            &mut out,
+            "s0_cors_responses_decorated_total",
+            "counter",
+            "Responses to browser requests that were given CORS headers.",
+            c.responses_decorated(),
+        );
+        metric(
+            &mut out,
+            "s0_cors_backend_lookups_total",
+            "counter",
+            "Reads of a bucket's CORS configuration from the backend: every cache miss.",
+            c.backend_lookups(),
+        );
+        metric(
+            &mut out,
+            "s0_cors_backend_lookup_failures_total",
+            "counter",
+            "Backend reads of a bucket's CORS configuration that failed for a reason other \
+             than a missing bucket or a missing configuration. Sustained increase usually \
+             means the tenant's backend credential may not read bucket CORS.",
+            c.backend_lookup_failures(),
+        );
+    }
+
     out.push_str("# HELP s0_build_info Build and instance identity.\n");
     out.push_str("# TYPE s0_build_info gauge\n");
     out.push_str(&format!(
@@ -495,6 +570,82 @@ mod tests {
         // No `sts_mint` on this state ⇒ no mint series at all. See `AdminState::mint`:
         // a flat 0 would claim a bounded mint on a pod that serves none.
         assert!(!text.contains("s0_mint_"), "{text}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn metrics_expose_the_cors_counters_by_result_and_reason() {
+        let dir = tmpdir();
+        let (st, _h) = state(false, &dir);
+        let scrape = |st: &Arc<AdminState>| {
+            let body = prometheus(st).into_body();
+            async move {
+                String::from_utf8(
+                    http_body_util::BodyExt::collect(body)
+                        .await
+                        .unwrap()
+                        .to_bytes()
+                        .to_vec(),
+                )
+                .unwrap()
+            }
+        };
+        // Not attached ⇒ no series at all, as with the mint.
+        assert!(!scrape(&st).await.contains("s0_cors_"));
+
+        let cors = Arc::new(CorsMetrics::default());
+        cors.record_preflight_allowed();
+        cors.record_preflight_denied(Denial::NotAllowed);
+        cors.record_preflight_denied(Denial::NotAllowed);
+        cors.record_preflight_denied(Denial::NoCredential);
+        cors.record_response_decorated();
+        cors.record_backend_lookup();
+        cors.record_backend_lookup();
+        cors.record_backend_lookup_failure();
+        let st = Arc::new(
+            Arc::try_unwrap(st)
+                .unwrap_or_else(|_| panic!("sole owner"))
+                .with_cors_metrics(cors),
+        );
+        let text = scrape(&st).await;
+
+        assert!(
+            text.contains("\ns0_cors_preflight_total{result=\"allowed\"} 1\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "\ns0_cors_preflight_total{result=\"denied\",reason=\"not_allowed\"} 2\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "\ns0_cors_preflight_total{result=\"denied\",reason=\"no_credential\"} 1\n"
+            ),
+            "{text}"
+        );
+        // Every reason is exported, at zero when it has not happened, so a rate() over it
+        // exists before the first refusal.
+        for denial in Denial::ALL {
+            assert!(
+                text.contains(&format!("reason=\"{}\"", denial.reason())),
+                "{text}"
+            );
+        }
+        assert_eq!(text.matches("# TYPE s0_cors_preflight_total").count(), 1);
+        assert!(
+            text.contains("\ns0_cors_responses_decorated_total 1\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\ns0_cors_backend_lookups_total 2\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\ns0_cors_backend_lookup_failures_total 1\n"),
+            "{text}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

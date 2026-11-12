@@ -88,7 +88,8 @@ async fn main() -> Result<()> {
     // Probes and metrics come up first: a pod that is starting must be able to report
     // "not ready" rather than refuse the connection.
     let admin_state = {
-        let state = AdminState::new(&gateway.audit, health, gateway.bundles.clone());
+        let state = AdminState::new(&gateway.audit, health, gateway.bundles.clone())
+            .with_cors_metrics(gateway.cors.metrics());
         // Only when a mint is actually served — see `AdminState::mint`.
         let state = if config.sts_mint.is_some() {
             state.with_mint_metrics(mint_metrics.clone())

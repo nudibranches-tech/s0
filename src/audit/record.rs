@@ -33,6 +33,9 @@ pub const GATE_PATH: &str = "s3/authz/gate";
 
 /// The `path` of an SFTP connection-level event (ADR-012 D13): the third record shape.
 pub const SESSION_PATH: &str = "sftp/session";
+/// The `path` of a summary record (ADR-011). Its own path, like a gate record's, so a
+/// consumer that predates summaries cannot count one as a single request unawares.
+pub const SUMMARY_PATH: &str = "s3/authz/summary";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditRecord {
@@ -63,6 +66,21 @@ pub struct AuditRecord {
     pub labels: BTreeMap<String, String>,
     /// S3-specific fields the decision-log extractor consumes beyond the OPA envelope.
     pub gateway: GatewayMeta,
+    /// Set only when the bundle lists the principal for summaries (ADR-011). Never on
+    /// the wire: the sink reads it, and a shipped record either is a summary or is not.
+    #[serde(skip)]
+    pub(crate) summary_scope: Option<SummaryScope>,
+}
+
+/// What, beyond who, where and which verb, keeps two requests in different summaries.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct SummaryScope {
+    /// The s3s operation (`GetObject`, `HeadObject`…).
+    pub operation: String,
+    /// The access-key id the request was signed with: one per session.
+    pub access_key_id: Option<String>,
+    /// Signed by a presigned URL rather than by the client holding the session.
+    pub presigned: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +106,18 @@ pub struct GatewayMeta {
     /// why the success path cannot fill this in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_status: Option<u16>,
+    /// The control plane's own name for `input.bucket` (`object_name`), as published by a
+    /// bundle that places buckets: an S3 name is unique only per backend, so this is what
+    /// the record joins to. Absent below bundle v3 and for a bucket the bundle does not
+    /// place — never derived from the S3 name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_name: Option<String>,
+    /// The same, for a copy's source bucket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_source_object_name: Option<String>,
+    /// Present on a summary record only: the requests it stands for (ADR-011).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<AccessSummary>,
     /// The SFTP session this decision belongs to. Absent on S3 records (ADR-012 D13).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<SessionBlock>,
@@ -179,6 +209,21 @@ pub struct SessionEvent {
     /// Budgeted events this replica did not record since the last one it did.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub suppressed_since_last: u64,
+}
+
+/// Allowed requests of one operation, by one session of one subject, on one bucket,
+/// folded into one record. The record's `input` is the first request's, without its
+/// object, prefix, query or headers, and its `result` carries no obligations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccessSummary {
+    pub operation: String,
+    pub requests: u64,
+    /// RFC3339 UTC: the earliest and the latest decision time among them.
+    pub first_at: String,
+    pub last_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_key_id: Option<String>,
+    pub presigned: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -308,6 +353,7 @@ impl AuditRecord {
             gate: None,
             session_event: None,
             result,
+            summary_scope: None,
         }
     }
 
@@ -341,6 +387,7 @@ impl AuditRecord {
             input: None,
             gate: None,
             session_event: Some(event),
+            summary_scope: None,
             result,
             requested_by,
             timestamp,
@@ -353,6 +400,9 @@ impl AuditRecord {
                 backend: BackendOutcome::NotAttempted,
                 backend_status: None,
                 session: None,
+                object_name: None,
+                copy_source_object_name: None,
+                summary: None,
             },
         }
     }
@@ -392,8 +442,35 @@ impl AuditRecord {
                 backend: BackendOutcome::NotAttempted,
                 backend_status: None,
                 session: None,
+                object_name: None,
+                copy_source_object_name: None,
+                summary: None,
             },
+            summary_scope: None,
         }
+    }
+
+    /// The first record of a summary: what it says about one request alone is dropped,
+    /// so it cannot be read as naming the one object or listing it covers.
+    pub(crate) fn into_summary(mut self, scope: SummaryScope) -> Self {
+        if let Some(input) = self.input.as_mut() {
+            input.object = None;
+            input.prefix = None;
+            input.request.params = None;
+            input.request.headers_subset.clear();
+        }
+        self.path = SUMMARY_PATH.to_string();
+        self.result.obligations = Default::default();
+        self.gateway.denied_keys.clear();
+        self.gateway.summary = Some(AccessSummary {
+            operation: scope.operation,
+            requests: 1,
+            first_at: self.timestamp.clone(),
+            last_at: self.timestamp.clone(),
+            access_key_id: scope.access_key_id,
+            presigned: scope.presigned,
+        });
+        self
     }
 
     /// Record what the forward leg did. Called once, post-forward, by
@@ -452,6 +529,9 @@ mod tests {
             backend: BackendOutcome::NotAttempted,
             backend_status: None,
             session: None,
+            object_name: None,
+            copy_source_object_name: None,
+            summary: None,
         }
     }
 
@@ -490,6 +570,59 @@ mod tests {
         assert!(back.input.is_some() && back.gate.is_none());
     }
 
+    /// ADR-011 must not change a record nobody summarises: same path, same keys, nothing
+    /// of the summary on the wire, and a scope set in memory never serialised.
+    #[test]
+    fn a_record_nobody_summarises_is_unchanged_on_the_wire() {
+        let mut rec = AuditRecord::new(
+            "dec-1".into(),
+            "2026-07-15T00:00:00Z".into(),
+            sample_input(),
+            Decision::allow("grant matched"),
+            meta(Outcome::Allowed, vec![]),
+            &labels(),
+        );
+        rec.summary_scope = Some(SummaryScope {
+            operation: "GetObject".into(),
+            access_key_id: Some("AKIA-EXAMPLE".into()),
+            presigned: false,
+        });
+        let json = serde_json::to_value(&rec).unwrap();
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "decision_id",
+                "gateway",
+                "input",
+                "labels",
+                "path",
+                "requested_by",
+                "result",
+                "timestamp"
+            ]
+        );
+        assert_eq!(json["path"], DECISION_PATH);
+        let mut gateway: Vec<&str> = json["gateway"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        gateway.sort_unstable();
+        assert_eq!(
+            gateway,
+            ["backend", "backend_id", "backend_kind", "outcome"]
+        );
+        assert!(!json.to_string().contains("AKIA-EXAMPLE"));
+    }
+
     #[test]
     fn multi_delete_denied_keys_serialize() {
         let rec = AuditRecord::new(
@@ -502,6 +635,43 @@ mod tests {
         );
         let json = serde_json::to_value(&rec).unwrap();
         assert_eq!(json["gateway"]["denied_keys"][0], "secret/x");
+    }
+
+    #[test]
+    fn object_names_are_recorded_when_published_and_absent_otherwise() {
+        let mut named = meta(Outcome::Allowed, vec![]);
+        named.object_name = Some("reports.archive".into());
+        named.copy_source_object_name = Some("raw.archive".into());
+        let rec = AuditRecord::new(
+            "dec-6".into(),
+            "2026-07-15T00:00:00Z".into(),
+            sample_input(),
+            Decision::allow("grant matched"),
+            named,
+            &labels(),
+        );
+        let json = serde_json::to_value(&rec).unwrap();
+        assert_eq!(json["gateway"]["object_name"], "reports.archive");
+        assert_eq!(json["gateway"]["copy_source_object_name"], "raw.archive");
+        let back: AuditRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(back.gateway.object_name.as_deref(), Some("reports.archive"));
+
+        // Unpublished: omitted, so a record from a bundle that places nothing is the
+        // record it always was.
+        let rec = AuditRecord::new(
+            "dec-7".into(),
+            "2026-07-15T00:00:00Z".into(),
+            sample_input(),
+            Decision::allow("grant matched"),
+            meta(Outcome::Allowed, vec![]),
+            &labels(),
+        );
+        let json = serde_json::to_value(&rec).unwrap();
+        assert!(json["gateway"].get("object_name").is_none(), "{json}");
+        assert!(
+            json["gateway"].get("copy_source_object_name").is_none(),
+            "{json}"
+        );
     }
 
     #[test]
