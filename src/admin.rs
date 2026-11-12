@@ -46,7 +46,7 @@ pub struct AdminState {
     /// dashboard where the honest answer is "this pod has no mint".
     mint: Option<Arc<MintMetrics>>,
     /// The SFTP front's host-key fingerprints and counters, when this process serves
-    /// SFTP (ADR-009 D1: published as a metric series, no new route). Set once, after
+    /// SFTP (ADR-012 D1: published as a metric series, no new route). Set once, after
     /// the front has loaded its host keys.
     sftp: std::sync::OnceLock<SftpAdmin>,
     instance: String,

@@ -122,7 +122,7 @@ pub struct Bundle {
     /// Whether the bundle carried its own policy module. Decides which **key space** the
     /// module in force reads subjects by — the prefixed `sa:`/`user:` key for a pushed
     /// module, the raw `sub` for the compiled-in default — which a PEP-side membership
-    /// check must follow (ADR-009 D5, [`subject_lookup_key`]).
+    /// check must follow (ADR-012 D5, [`subject_lookup_key`]).
     #[serde(default)]
     pub policy_module: bool,
 }
@@ -150,7 +150,7 @@ impl Bundle {
 /// A control-plane module reads the prefixed key; the compiled-in default reads the raw
 /// `input.principal.sub`. A login check reading one space while the PDP reads the other
 /// would refuse every account or deny every operation, so the PEP follows the module
-/// (ADR-009 D5). `None` when `subject_key` has no recognized prefix.
+/// (ADR-012 D5). `None` when `subject_key` has no recognized prefix.
 pub fn subject_lookup_key(policy_module: bool, subject_key: &str) -> Option<String> {
     let (_, sub) = split_subject_key(subject_key)?;
     Some(if policy_module {
@@ -279,7 +279,7 @@ pub fn bundle_knows_service_account(
 pub struct BundleStore {
     current: ArcSwap<Bundle>,
     /// The installed revision, published **after** the swap. Long-lived sessions (the
-    /// SFTP front) subscribe to re-validate credentials on every change (ADR-009 D5); the
+    /// SFTP front) subscribe to re-validate credentials on every change (ADR-012 D5); the
     /// S3 front ignores it.
     installed: tokio::sync::watch::Sender<String>,
 }

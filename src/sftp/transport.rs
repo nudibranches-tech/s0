@@ -1,4 +1,4 @@
-//! The SSH transport: russh, pinned, with a code-constant algorithm floor (ADR-009 D3).
+//! The SSH transport: russh, pinned, with a code-constant algorithm floor (ADR-012 D3).
 //!
 //! **Every `Handler` method is overridden.** russh's defaults answer `exec`, `shell`,
 //! `env`, `pty-req` and `subsystem` with `Ok(())` **without replying** (E5), the same
@@ -570,7 +570,7 @@ impl russh::server::Handler for SshHandler {
     /// `SendEnv LANG LC_*`). Closing the channel here would lock every such partner out.
     /// No variable is set — there is no process to set it in — and the refusal is
     /// explicit (`SSH_MSG_CHANNEL_FAILURE`, sent when the client asked for a reply), so
-    /// nothing relies on a russh default (E5). Deviation from ADR-009 D3, which closes the
+    /// nothing relies on a russh default (E5). Deviation from ADR-012 D3, which closes the
     /// channel on every non-`sftp` request.
     async fn env_request(
         &mut self,

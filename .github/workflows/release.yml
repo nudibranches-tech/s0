@@ -113,7 +113,7 @@ jobs:
         with:
           tool: cargo-about@0.9.3
 
-      # The licence texts and copyright notices of every crate in the binary (ADR-009:
+      # The licence texts and copyright notices of every crate in the binary (ADR-012:
       # the BSD-3-Clause and ISC notices ship with s0). Offline (`--frozen`) over the
       # crates fetched for Cargo.lock, so the same lockfile yields the same file as the
       # image's /usr/share/doc/s0/THIRD_PARTY_NOTICES. See about.toml.

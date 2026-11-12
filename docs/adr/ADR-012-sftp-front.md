@@ -1,4 +1,4 @@
-# ADR-009: SFTP front — a second protocol on the gateway core
+# ADR-012: SFTP front — a second protocol on the gateway core
 
 - **Status**: Accepted — implemented (src/sftp/)
 - **Date**: 2026-09-29

@@ -1,4 +1,4 @@
-//! ADR-009 D3 / E5: every russh `Handler` method is overridden.
+//! ADR-012 D3 / E5: every russh `Handler` method is overridden.
 //!
 //! russh 0.63.3's defaults answer `exec`, `shell`, `env`, `pty-req` and `subsystem` with
 //! `Ok(())` **without replying** — the fail-open shape the s3s hooks have. Rust cannot

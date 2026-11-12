@@ -1,4 +1,4 @@
-//! The virtual root, and paths that cannot escape it (ADR-009 D6).
+//! The virtual root, and paths that cannot escape it (ADR-012 D6).
 //!
 //! An account is confined to one `(bucket, prefix)`. The bucket is never a path component:
 //! `/` is the root and nothing a client sends can name another bucket. Every path argument
@@ -132,7 +132,7 @@ impl Home {
     }
 
     /// The child of a listed directory, from a backend key or common prefix. `None` when
-    /// the name could not be reached by path (ADR-009 D6): such entries are omitted from
+    /// the name could not be reached by path (ADR-012 D6): such entries are omitted from
     /// `READDIR` and counted.
     pub fn child_name<'a>(&self, listed_prefix: &str, key: &'a str) -> Option<&'a str> {
         let rest = key.strip_prefix(listed_prefix)?;

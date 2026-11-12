@@ -1,4 +1,4 @@
-//! Limits and abuse resistance for the SFTP front (ADR-009 D12).
+//! Limits and abuse resistance for the SFTP front (ADR-012 D12).
 //!
 //! Everything here is **per replica**. Counters live in memory, so a restart forgets them
 //! and an attacker spread across `R` replicas gets `R` times the budget — a bound written
@@ -283,7 +283,7 @@ impl PreauthRate {
     }
 }
 
-/// The process-wide transfer-memory budget (ADR-009 D9). A write OPEN reserves its
+/// The process-wide transfer-memory budget (ADR-012 D9). A write OPEN reserves its
 /// transfer's worst case up front, so a transfer can never run out of memory halfway.
 pub struct MemoryBudget {
     sem: Arc<Semaphore>,
@@ -309,7 +309,7 @@ impl MemoryBudget {
     }
 }
 
-/// The optional process-wide bandwidth cap (ADR-009 D12,
+/// The optional process-wide bandwidth cap (ADR-012 D12,
 /// `limits.sftp.process_bandwidth_bytes_per_sec`): one bucket per direction, shared by
 /// every session of the replica, so uploads and downloads are each held to the rate.
 #[derive(Default)]

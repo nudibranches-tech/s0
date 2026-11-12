@@ -1,4 +1,4 @@
-# cargo-fuzz targets (ADR-009 T2). Needs a nightly toolchain and cargo-fuzz:
+# cargo-fuzz targets (ADR-012 T2). Needs a nightly toolchain and cargo-fuzz:
 #
 #     cargo +nightly fuzz run sftp_codec -- -max_total_time=60
 #     cargo +nightly fuzz run proxy_v2_header -- -max_total_time=60

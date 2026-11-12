@@ -1,4 +1,4 @@
-//! `create_objects` over S3 (ADR-009 F1): a write that cannot overwrite — `PutObject` or
+//! `create_objects` over S3 (ADR-012 F1): a write that cannot overwrite — `PutObject` or
 //! `CompleteMultipartUpload` carrying `If-None-Match: *` — is authorized by the drop-box
 //! verb, and the multipart steps that make nothing visible follow it.
 //!

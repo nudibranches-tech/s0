@@ -535,7 +535,7 @@ audit_has '"abort.bin" in json.dumps(r) and "\"commit\": \"aborted\"" in json.du
   || fail "the transfer is audited as aborted" "see $STATE/audit-spill.ndjson"
 
 echo ""; echo "-- conditional create: the native conformance probe --------"
-# ADR-009 D8: `native` is an operator assertion that the backend honours If-None-Match: *.
+# ADR-012 D8: `native` is an operator assertion that the backend honours If-None-Match: *.
 # Before relying on it: two conditional writes to one fresh key, the second must be 412,
 # for PutObject and for CompleteMultipartUpload, directly against MinIO.
 native_ok=1
@@ -660,7 +660,7 @@ s = c.open_sftp()
 s.put("/work/paramiko.csv", "paramiko.csv", confirm=False)   # confirm=True would stat
 s.get("paramiko.csv", "/work/paramiko.dl")
 assert "paramiko.csv" in s.listdir("."), s.listdir(".")
-# ADR-009 D3's floor: an AEAD cipher, or else an encrypt-then-MAC MAC.
+# ADR-012 D3's floor: an AEAD cipher, or else an encrypt-then-MAC MAC.
 aead = {"chacha20-poly1305@openssh.com", "aes256-gcm@openssh.com", "aes128-gcm@openssh.com"}
 floor = all(ci in aead or (mac or "").endswith("-etm@openssh.com")
             for ci, mac in ((t.local_cipher, t.local_mac), (t.remote_cipher, t.remote_mac)))

@@ -1,4 +1,4 @@
-# cargo-deny configuration (ADR-009: "PR 1 adds a `cargo deny` licence check").
+# cargo-deny configuration (ADR-012: "PR 1 adds a `cargo deny` licence check").
 #
 # CI gates on `cargo deny check licenses` only (ci.yml, job `licenses`). The other sections
 # are configured so `cargo deny check` is useful locally, but are not a merge gate yet.

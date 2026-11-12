@@ -155,7 +155,7 @@ pub struct CopySource {
     pub key: String,
 }
 
-/// Which data-plane front asked the question (ADR-009 D7).
+/// Which data-plane front asked the question (ADR-012 D7).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Protocol {

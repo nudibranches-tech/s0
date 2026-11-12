@@ -1,4 +1,4 @@
-//! The protocol-neutral half of the enforce path (ADR-009 D2).
+//! The protocol-neutral half of the enforce path (ADR-012 D2).
 //!
 //! Everything here is independent of how a request arrived: the single PDP call site with
 //! its golden-capture tap, the `must_understand` check, audit-record assembly, the
@@ -166,7 +166,7 @@ impl Enforcer {
         AuthzProof::mint(operation)
     }
 
-    /// Mint an SFTP forward proof licensing exactly `licenses` (ADR-009 D2).
+    /// Mint an SFTP forward proof licensing exactly `licenses` (ADR-012 D2).
     ///
     /// Takes the [`Decision`]s that justify it and refuses unless **every one** is an
     /// allow carrying no unimplemented obligation: a proof cannot be produced from a

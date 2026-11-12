@@ -10,9 +10,9 @@ use serde::{Deserialize, Serialize};
 /// Deliberately coarser than the 99 S3 ops: every enforced op maps onto exactly one of
 /// these (`PutObject` to `write_objects`, `HeadBucket` to `read`), except `CopyObject`,
 /// which maps to two. [`Action::CreateObjects`] is asked by the SFTP front for every
-/// upload (ADR-009 D7), and by the S3 front for a write that cannot overwrite — a
+/// upload (ADR-012 D7), and by the S3 front for a write that cannot overwrite — a
 /// `PutObject` or `CompleteMultipartUpload` carrying `If-None-Match: *`, and the multipart
-/// steps leading to one — when `write_objects` is denied (ADR-009 F1). The set is a
+/// steps leading to one — when `write_objects` is denied (ADR-012 F1). The set is a
 /// contract with whatever control plane projects grants.
 ///
 /// **The gateway is data-plane only**, so there is no verb for acting on a bucket as a
@@ -24,7 +24,7 @@ pub enum Action {
     // object-scoped: the decision is made against a bucket + one key
     ReadObjects,
     WriteObjects,
-    /// Write a key **that does not exist** — the drop-box verb (ADR-009 D7).
+    /// Write a key **that does not exist** — the drop-box verb (ADR-012 D7).
     ///
     /// `write_objects` implies it (overwrite ⊇ create); the implication lives in the
     /// policy module, which is the normative definition of what a grant means. A

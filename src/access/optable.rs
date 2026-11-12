@@ -1013,7 +1013,7 @@ mod tests {
             gateway.len(),
             7,
             "the projected vocabulary is seven verbs (six settled 2026-08-08, plus \
-             create_objects for the SFTP front, ADR-009 D7)"
+             create_objects for the SFTP front, ADR-012 D7)"
         );
     }
 

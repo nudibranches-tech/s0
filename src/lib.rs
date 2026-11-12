@@ -20,7 +20,7 @@
 //! - [`mint`]     — the OIDC badge desk, on a listener of its own.
 //! - [`webidentity`] — `AssumeRoleWithWebIdentity` in the AWS STS wire protocol, on the
 //!   mint's listener: the door every S3 SDK can open with stock configuration.
-//! - [`sftp`]     — the SFTP front (ADR-009): a second protocol on the same core, enabled
+//! - [`sftp`]     — the SFTP front (ADR-012): a second protocol on the same core, enabled
 //!   in its own config section.
 //! - [`shutdown`] — the one signal every listener drains on.
 //! - [`secret`]   — `Secret<T>`: a configured credential that cannot be printed.

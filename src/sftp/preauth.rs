@@ -1,5 +1,5 @@
 //! What happens on a connection before russh sees a byte: the PROXY v2 header and the
-//! strict-KEX requirement (ADR-009 D3, D12).
+//! strict-KEX requirement (ADR-012 D3, D12).
 //!
 //! **Strict KEX (Terrapin).** russh 0.63.3 negotiates `kex-strict-*-v00@openssh.com` when
 //! both sides offer it, but exposes no way for a server to *require* it: the negotiated

@@ -1,4 +1,4 @@
-//! The SFTP version 3 wire format (draft-ietf-secsh-filexfer-02), in-tree (ADR-009 D4).
+//! The SFTP version 3 wire format (draft-ietf-secsh-filexfer-02), in-tree (ADR-012 D4).
 //!
 //! Pure functions over bytes: [`parse`] turns one packet body into a [`Request`], and
 //! [`Response::encode`] turns a reply into a framed packet. Nothing here allocates on the
@@ -91,7 +91,7 @@ pub struct Attrs {
 
 impl Attrs {
     /// True when no attribute was requested at all — the one SETSTAT that is answered OK
-    /// (ADR-009 D11).
+    /// (ADR-012 D11).
     pub fn is_empty(&self) -> bool {
         self.size.is_none()
             && self.uid_gid.is_none()
@@ -441,7 +441,7 @@ pub fn parse(body: Bytes) -> Result<Request, CodecError> {
     }
     let id = match r.u32() {
         Ok(id) => id,
-        // ADR-009 D2: a type outside the request set is answered OP_UNSUPPORTED even when
+        // ADR-012 D2: a type outside the request set is answered OP_UNSUPPORTED even when
         // it is too short to carry an id (the reply then uses id 0). A known type without
         // an id is malformed, and that ends the session.
         Err(_) if !is_request_kind(kind) => return Ok(Request::Unknown { kind, id: None }),

@@ -39,7 +39,7 @@ against the SFTP front, with the host key pinned in `known_hosts`:
 | `native` probe: two `PutObject` and two `CompleteMultipartUpload` with `If-None-Match: *` on one fresh key each, straight to MinIO | the second of each is `412 PreconditionFailed` (the image passes) |
 | tenant `beta` on a backend declared `conditional_create: "native"`: create-only upload, then over an existing key | created; then refused, original intact |
 | the same, but the key is created by another writer while the upload streams (6 MiB single PUT, 16 MiB multipart) | refused at `CLOSE` by the conditional commit; the other writer's object survives; no upload left; MinIO's trace shows `If-None-Match: *` on the `PutObject` and the `CompleteMultipartUpload` |
-| lftp (`alpine` package) and paramiko (pinned pip release), in containers, host key pinned | login + put + get + ls; paramiko's negotiated cipher/MAC meets ADR-009 D3 (AEAD, or EtM) |
+| lftp (`alpine` package) and paramiko (pinned pip release), in containers, host key pinned | login + put + get + ls; paramiko's negotiated cipher/MAC meets ADR-012 D3 (AEAD, or EtM) |
 | an idle session whose account the next bundle removes | closed by the gateway before the client sends anything; audited `disconnected` with `credential_revoked`; the key cannot log in again |
 | `auth_failed` session records | `outcome: denied` |
 
@@ -47,7 +47,7 @@ The ban scenario runs last among them: it bans the test address on the SFTP fron
 
 The client matrix stops at OpenSSH, lftp and paramiko. WinSCP and FileZilla are GUI
 clients with no headless mode worth driving in CI, and the JVM clients (JSch, Apache MINA
-SSHD) would need a harness of their own; their settings in ADR-009's client matrix are
+SSHD) would need a harness of their own; their settings in ADR-012's client matrix are
 documented, not exercised here.
 
 ## Running locally

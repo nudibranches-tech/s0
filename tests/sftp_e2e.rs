@@ -1,4 +1,4 @@
-//! The SFTP front, end to end (ADR-009): a real SSH client (russh) speaking SFTP v3 to the
+//! The SFTP front, end to end (ADR-012): a real SSH client (russh) speaking SFTP v3 to the
 //! real front, deciding through the real PDP, forwarding through the real re-signing proxy
 //! to an in-memory S3 backend served by s3s over HTTP.
 //!
@@ -2395,7 +2395,7 @@ async fn the_process_bandwidth_cap_holds_concurrent_sessions_together() {
     assert!(h.metrics.process_bandwidth_wait_ms.load(Ordering::Relaxed) > 0);
 }
 
-// ── ADR-009 test plan: security regressions on the key path ──────────────────
+// ── ADR-012 test plan: security regressions on the key path ──────────────────
 
 /// A 3072-bit RSA key — the size floor the original requirement named — so a refusal
 /// can only be about the algorithm, never the size.
@@ -2580,7 +2580,7 @@ async fn a_key_probe_flood_is_disconnected_and_counts_toward_the_ban() {
     );
 }
 
-// ── ADR-009 D2: a login and an operation in both key spaces ──────────────────
+// ── ADR-012 D2: a login and an operation in both key spaces ──────────────────
 
 /// The fixture bundle's tenant data re-keyed the way a control plane projects it:
 /// `sa:<client id>` / `user:<sub>`.
@@ -2621,7 +2621,7 @@ fn prefixed_module() -> String {
     )
 }
 
-/// ADR-009 D2: the login check reads the key space the PDP reads — prefixed under a
+/// ADR-012 D2: the login check reads the key space the PDP reads — prefixed under a
 /// pushed module, raw `sub` under the compiled-in default — so a login **and** an
 /// allowed operation succeed under both. The crossed combinations are refused, which is
 /// what makes the two passes discriminating.
@@ -2707,7 +2707,7 @@ async fn a_login_and_an_operation_succeed_in_both_key_spaces() {
     }
 }
 
-// ── ADR-009 D11: the rows `every_unsupported_request_gets_its_documented_answer`
+// ── ADR-012 D11: the rows `every_unsupported_request_gets_its_documented_answer`
 //    does not reach ─────────────────────────────────────────────────────────────
 
 fn attrs(b: &mut BytesMut, which: &str) {

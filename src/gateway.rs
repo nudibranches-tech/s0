@@ -168,7 +168,7 @@ fn build_identity(
 
 fn build_sts(cfg: &GatewayConfig) -> Result<StsAuthority> {
     let Some(sts) = cfg.sts() else {
-        // An SFTP-only process (ADR-009 D1): no listener here mints or verifies an STS
+        // An SFTP-only process (ADR-012 D1): no listener here mints or verifies an STS
         // session, so no STS key material is configured. `Identity` still needs an
         // authority to hold, so it gets one keyed with fresh process-local randomness that
         // nothing can mint against and nothing ever sees — every `HFST*` key it could be

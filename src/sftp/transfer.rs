@@ -1,4 +1,4 @@
-//! The data path: an object store behind a file protocol (ADR-009 D8, D9, D14).
+//! The data path: an object store behind a file protocol (ADR-012 D8, D9, D14).
 //!
 //! **Uploads** stream to multipart with no local disk. A write handle fills an in-memory
 //! part buffer; a full part is sent as `UploadPart` with a bounded number outstanding; a
@@ -57,7 +57,7 @@ pub enum WriteError {
     Failure(String),
 }
 
-/// The extension point reserved for content inspection (ADR-009 D14).
+/// The extension point reserved for content inspection (ADR-012 D14).
 pub trait CommitGate: Send + Sync {
     fn before_commit(&self, cx: &TransferContext<'_>) -> CommitVerdict;
 }
@@ -92,7 +92,7 @@ impl CommitGate for AlwaysCommit {
 }
 
 /// Per-process registry of keys being uploaded right now. A second create-only OPEN on a
-/// key already in flight in this replica is refused (ADR-009 D8). Across replicas only a
+/// key already in flight in this replica is refused (ADR-012 D8). Across replicas only a
 /// `native` backend closes the race.
 #[derive(Default)]
 pub struct InflightKeys {
@@ -502,7 +502,7 @@ impl Upload {
 /// A chunk the read-ahead task has pulled, with the budget it holds until consumed.
 type Prefetched = (Result<Bytes, String>, Option<OwnedSemaphorePermit>);
 
-/// Download read-ahead (ADR-009 D9): a task pulls the `GetObject` stream ahead of the
+/// Download read-ahead (ADR-012 D9): a task pulls the `GetObject` stream ahead of the
 /// client's READs, holding at most `budget` bytes. The budget is a semaphore: the task
 /// takes permits for a chunk before handing it over, and the reader releases them only
 /// once the chunk is fully served, so a slow client stops the task rather than growing

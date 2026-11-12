@@ -169,7 +169,7 @@ fn every_rego_input_reference_appears_in_a_captured_input() {
 
 #[test]
 fn the_captured_corpus_covers_every_protocol_the_gateway_decides_for() {
-    // `input.request.protocol` is part of the contract (ADR-009): a policy may branch on
+    // `input.request.protocol` is part of the contract (ADR-012): a policy may branch on
     // it, and every check above is only as good as the protocols the corpus spans. Both
     // fronts decide through `Enforcer::decide`, so both must be in the recording.
     let mut by_protocol: std::collections::BTreeMap<String, BTreeSet<String>> = Default::default();

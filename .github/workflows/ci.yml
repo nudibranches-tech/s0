@@ -63,7 +63,7 @@ jobs:
   # S3 protocol conformance against a live backend is scaffolded in conformance.yml
   # (manual trigger, harness not yet wired). Fold it in here once it is.
 
-  # ADR-009: "PR 1 adds a `cargo deny` licence check". Every crate in Cargo.lock must be
+  # ADR-012: "PR 1 adds a `cargo deny` licence check". Every crate in Cargo.lock must be
   # under a licence `deny.toml` allows. Only the licences check gates here: advisories
   # depend on a database that changes under a fixed lockfile, so they are not a merge gate.
   licenses:
@@ -75,7 +75,7 @@ jobs:
         with:
           command: check licenses
 
-  # ADR-009 T2: the SFTP codec and the PROXY v2 parser are fuzzed in CI. libFuzzer needs
+  # ADR-012 T2: the SFTP codec and the PROXY v2 parser are fuzzed in CI. libFuzzer needs
   # nightly; the fuzz crate is its own workspace (fuzz/Cargo.toml), so the stable jobs
   # above never build it. Each target runs for a bounded time from an empty corpus; a
   # crash fails the job and its reproducer is uploaded.

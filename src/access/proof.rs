@@ -137,7 +137,7 @@ impl SftpLicense {
 }
 
 /// Evidence that the enforce path allowed an SFTP request, and **which backend calls it
-/// licenses** (ADR-009 D2). A create-only upload's proof licenses `HeadObject`,
+/// licenses** (ADR-012 D2). A create-only upload's proof licenses `HeadObject`,
 /// `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`,
 /// `AbortMultipartUpload` and `PutObject` on one key, and nothing else.
 ///

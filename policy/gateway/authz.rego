@@ -18,7 +18,7 @@
 # ── input ──────────────────────────────────────────────────────────────────────
 #   input.principal.{sub,type,attributes.groups,attributes.<extra>}
 #   input.backend.{id,kind}   input.tenant   input.organization_id
-#   input.action  ∈ the 7 settled verbs (2026-08-08 six; `create_objects` 2026-09, ADR-009):
+#   input.action  ∈ the 7 settled verbs (2026-08-08 six; `create_objects` 2026-09, ADR-012):
 #       object-scoped : read_objects write_objects create_objects delete_objects
 #                       write_object_tags
 #       listing       : list_objects
@@ -208,9 +208,9 @@ action_matches(g) if input.action in g.actions
 action_matches(g) if "*" in g.actions
 
 # `write_objects` implies `create_objects` (overwrite ⊇ create). `create_objects` writes a
-# key that does not exist — the drop-box verb. The SFTP front asks it for uploads (ADR-009
+# key that does not exist — the drop-box verb. The SFTP front asks it for uploads (ADR-012
 # D7); the S3 front asks it for a write carrying `If-None-Match: *` when `write_objects`
-# is denied, on a backend declared `conditional_create: native` (ADR-009 F1). The
+# is denied, on a backend declared `conditional_create: native` (ADR-012 F1). The
 # implication lives HERE, in the module, because the module is the normative definition
 # of what a grant means: a pushed module must mirror it, and a corpus case pins it.
 action_matches(g) if {

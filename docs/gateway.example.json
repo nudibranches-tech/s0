@@ -1,7 +1,7 @@
 {
   "listen": "0.0.0.0:8014",
   "admin_listen": "0.0.0.0:8016",
-  "_frontends_note": "Each data-plane front is switched on in its own section under `frontends` (ADR-009 D1). An absent `frontends.s3` means the S3 front is on; its listener is the top-level `listen` (or `frontends.s3.listen`, not both). `frontends.sftp` binds nothing unless `enabled` is true; production runs SFTP as its own Deployment from the same image with `frontends.s3.enabled: false` (then `listen` and `sts` are omitted).",
+  "_frontends_note": "Each data-plane front is switched on in its own section under `frontends` (ADR-012 D1). An absent `frontends.s3` means the S3 front is on; its listener is the top-level `listen` (or `frontends.s3.listen`, not both). `frontends.sftp` binds nothing unless `enabled` is true; production runs SFTP as its own Deployment from the same image with `frontends.s3.enabled: false` (then `listen` and `sts` are omitted).",
   "frontends": {
     "s3": { "enabled": true },
     "sftp": {

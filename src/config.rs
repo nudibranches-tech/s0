@@ -23,7 +23,7 @@ use crate::secret::Secret;
 pub struct GatewayConfig {
     /// The S3 data-plane listener, at its historical top-level place. Equivalent to
     /// `frontends.s3.listen`; setting both is refused. Required iff the S3 front is enabled
-    /// (ADR-009 D1): an SFTP-only process binds no S3 port. Read it through
+    /// (ADR-012 D1): an SFTP-only process binds no S3 port. Read it through
     /// [`Self::s3_listen`].
     #[serde(default)]
     pub listen: Option<SocketAddr>,
@@ -46,7 +46,7 @@ pub struct GatewayConfig {
     pub admin_listen: SocketAddr,
     /// The STS key material. Required iff something in this process mints or verifies
     /// STS sessions: the S3 front, the mint, or the internal API. An SFTP-only process
-    /// carries none (ADR-009 D1). Read it through [`Self::sts`].
+    /// carries none (ADR-012 D1). Read it through [`Self::sts`].
     #[serde(default)]
     pub sts: Option<StsConfig>,
     /// Optional key ring for **derived long-lived per-principal keys**. Absent ⇒ the
@@ -99,7 +99,7 @@ pub struct GatewayConfig {
     pub internal: Option<InternalApiConfig>,
 }
 
-/// The data-plane fronts (ADR-009 D1). Each is switched on in its own section, next to
+/// The data-plane fronts (ADR-012 D1). Each is switched on in its own section, next to
 /// the settings it switches.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -125,7 +125,7 @@ pub struct S3FrontConfig {
     pub listen: Option<SocketAddr>,
 }
 
-/// How a backend closes the create-only check-then-write race (ADR-009 D8).
+/// How a backend closes the create-only check-then-write race (ADR-012 D8).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConditionalCreate {
@@ -138,7 +138,7 @@ pub enum ConditionalCreate {
     CheckThenWrite,
 }
 
-/// PROXY protocol v2 reception (ADR-009 D12).
+/// PROXY protocol v2 reception (ADR-012 D12).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProxyProtocolConfig {
@@ -147,7 +147,7 @@ pub struct ProxyProtocolConfig {
     pub trusted_cidrs: Vec<String>,
 }
 
-/// The SFTP front's listener (ADR-009 D1, D3). Only `listen`, `host_keys` and
+/// The SFTP front's listener (ADR-012 D1, D3). Only `listen`, `host_keys` and
 /// `proxy_protocol` need a restart; the limits are in [`LimitsConfig::sftp`].
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -172,7 +172,7 @@ fn default_sftp_drain_secs() -> u64 {
     20
 }
 
-/// The SFTP front's hot-reloadable limits (ADR-009 D12). Defaults are the ADR's.
+/// The SFTP front's hot-reloadable limits (ADR-012 D12). Defaults are the ADR's.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SftpLimits {
@@ -685,7 +685,7 @@ pub struct LimitsConfig {
     /// objects known-small.
     #[serde(default)]
     pub backend_read_timeout_secs: u64,
-    /// The SFTP front's limits (ADR-009 D12). Defaulted as a block, so a `limits` section
+    /// The SFTP front's limits (ADR-012 D12). Defaulted as a block, so a `limits` section
     /// written before the SFTP front stays valid.
     #[serde(default)]
     pub sftp: SftpLimits,
@@ -734,7 +734,7 @@ pub struct BackendConfig {
     #[serde(default = "default_true")]
     pub force_path_style: bool,
     /// How a create-only write (`create_objects`) is kept from overwriting on this
-    /// backend (ADR-009 D8). `native` asserts that the backend honours `If-None-Match: *`
+    /// backend (ADR-012 D8). `native` asserts that the backend honours `If-None-Match: *`
     /// on `PutObject` and `CompleteMultipartUpload`; s0 never assumes it. Absent ⇒
     /// `check_then_write`. Read by both fronts: the S3 front authorizes a conditional
     /// write as `create_objects` only on a `native` backend.
@@ -970,7 +970,7 @@ impl GatewayConfig {
         v
     }
 
-    /// The per-front `enabled` switches (ADR-009 D1), and the fields that became
+    /// The per-front `enabled` switches (ADR-012 D1), and the fields that became
     /// conditional on them.
     fn validate_fronts(&self) -> Result<()> {
         for (name, present) in [
@@ -1030,7 +1030,7 @@ impl GatewayConfig {
         if s3 && sftp {
             tracing::warn!(
                 "both the S3 and the SFTP fronts are enabled in one process; this is for \
-                 development — production runs SFTP as its own Deployment (ADR-009 D1)"
+                 development — production runs SFTP as its own Deployment (ADR-012 D1)"
             );
         }
         Ok(())

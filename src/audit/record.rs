@@ -31,7 +31,7 @@ pub const DECISION_PATH: &str = "s3/authz/decision";
 /// evaluated, so claiming the decision entrypoint ran would be false.
 pub const GATE_PATH: &str = "s3/authz/gate";
 
-/// The `path` of an SFTP connection-level event (ADR-009 D13): the third record shape.
+/// The `path` of an SFTP connection-level event (ADR-012 D13): the third record shape.
 pub const SESSION_PATH: &str = "sftp/session";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,7 +49,7 @@ pub struct AuditRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<GateContext>,
     /// Present exactly when neither `input` nor `gate` is: an SFTP connection-level event
-    /// (ADR-009 D13). Exactly one of the three is present on every record.
+    /// (ADR-012 D13). Exactly one of the three is present on every record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_event: Option<SessionEvent>,
     /// The verdict. For a gate record this is the gate's own deny, not a PDP answer.
@@ -88,12 +88,12 @@ pub struct GatewayMeta {
     /// why the success path cannot fill this in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_status: Option<u16>,
-    /// The SFTP session this decision belongs to. Absent on S3 records (ADR-009 D13).
+    /// The SFTP session this decision belongs to. Absent on S3 records (ADR-012 D13).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<SessionBlock>,
 }
 
-/// `gateway.session` on an SFTP decision record (ADR-009 D13).
+/// `gateway.session` on an SFTP decision record (ADR-012 D13).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionBlock {
     pub protocol: String,
@@ -108,7 +108,7 @@ pub struct SessionBlock {
     pub open_flags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transfer: Option<TransferBlock>,
-    /// Listing entries omitted because no path could reach them (ADR-009 D6).
+    /// Listing entries omitted because no path could reach them (ADR-012 D6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub omitted_entries: Option<u64>,
 }
@@ -124,7 +124,7 @@ pub struct TransferBlock {
     pub reason: Option<String>,
 }
 
-/// The connection-level event kinds (ADR-009 D13).
+/// The connection-level event kinds (ADR-012 D13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionEventKind {
@@ -311,7 +311,7 @@ impl AuditRecord {
         }
     }
 
-    /// Build an SFTP connection-level record (ADR-009 D13).
+    /// Build an SFTP connection-level record (ADR-012 D13).
     ///
     /// `organization_id` is `Some` only for an authenticated session: a failed
     /// authentication is attributed to no organization, as gate records are, because the

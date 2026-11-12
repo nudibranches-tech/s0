@@ -52,7 +52,7 @@ pub struct RouteSnapshot {
     /// The gateway's AUTHORITATIVE tenant→org binding — never the credential's
     /// self-declared org, so audit attribution is not drift-able.
     pub organization_id: String,
-    /// Whether this backend honours `If-None-Match: *` (an operator assertion, ADR-009
+    /// Whether this backend honours `If-None-Match: *` (an operator assertion, ADR-012
     /// D8). Decides whether a create-only write can be forwarded at all over S3, and how
     /// the SFTP front closes the create race.
     pub conditional_create: crate::config::ConditionalCreate,

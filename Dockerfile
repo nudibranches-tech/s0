@@ -13,7 +13,7 @@ RUN cargo install --locked --features cli cargo-about@0.9.3
 # The cache mounts keep the registry and target dir warm across rebuilds.
 #
 # Then collect the licence texts and copyright notices of every crate in the binary
-# (ADR-009: the BSD-3-Clause and ISC notices ship with the image). `--frozen` reads only
+# (ADR-012: the BSD-3-Clause and ISC notices ship with the image). `--frozen` reads only
 # Cargo.lock and the crate sources the build just fetched: no network lookups, so a given
 # lockfile always yields the same file (`cargo fetch` first: cargo-about reads the
 # manifest of every package in the lockfile, not only those built for this target). See

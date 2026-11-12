@@ -372,7 +372,7 @@ fn the_write_set_matches_the_shipped_rego() {
         4,
         "the write set is 4 verbs: create_bucket, delete_bucket and \
          write_bucket_config left the vocabulary, and write_object_acl with them; \
-         create_objects joined it (ADR-009 D7) so freeze_writes covers SFTP drops"
+         create_objects joined it (ADR-012 D7) so freeze_writes covers SFTP drops"
     );
 }
 

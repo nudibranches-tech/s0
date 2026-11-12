@@ -41,7 +41,7 @@ per-verb, with object-prefix scopes.
 | `write_objects` | `PutObject`, `PostObject`, `CopyObject`, `CreateMultipartUpload`, `UploadPart`, `UploadPartCopy`, `CompleteMultipartUpload`, `AbortMultipartUpload` |
 | `delete_objects` | `DeleteObject`, `DeleteObjects` |
 | `write_object_tags` | `PutObjectTagging`, `DeleteObjectTagging` |
-| `create_objects` | write a key that does **not** exist, implied by `write_objects`. Over S3: `PutObject` and `CompleteMultipartUpload` carrying `If-None-Match: *`, plus `CreateMultipartUpload`, `UploadPart`, `UploadPartCopy` and `AbortMultipartUpload`, which make nothing visible on their own — asked only when `write_objects` is denied, and only on a backend declared `conditional_create: native`. Over SFTP: every upload ([ADR-009](docs/adr/ADR-009-sftp-front.md)) |
+| `create_objects` | write a key that does **not** exist, implied by `write_objects`. Over S3: `PutObject` and `CompleteMultipartUpload` carrying `If-None-Match: *`, plus `CreateMultipartUpload`, `UploadPart`, `UploadPartCopy` and `AbortMultipartUpload`, which make nothing visible on their own — asked only when `write_objects` is denied, and only on a backend declared `conditional_create: native`. Over SFTP: every upload ([ADR-012](docs/adr/ADR-012-sftp-front.md)) |
 
 That covers ordinary object storage: get/put/head/delete, multipart upload, server-side
 copy, listing, and object tagging.
@@ -188,7 +188,7 @@ anonymously. `GatewayConfig::validate` refuses a config in which any two share a
 | `admin_listen` (8016) | `/healthz` `/readyz` `/metrics` | **none, by construction** — a kubelet probe cannot present a secret | probes and scraping only; never the ingress |
 | `sts_mint.listen` (8015) | `AssumeRoleWithWebIdentity` (AWS STS wire protocol) + a legacy bearer-OIDC exchange | **none, by design** — a valid web identity token *is* the credential, exactly as at `sts.amazonaws.com` | optional; absent unless configured. Own hostname when present. |
 | `internal.listen` (8017) | `POST /internal/v1/sts/sessions` | `X-Shared-Secret`, constant-time | control plane only; never the ingress, never the data plane |
-| `frontends.sftp.listen` (2222) | the SFTP data plane ([ADR-009](docs/adr/ADR-009-sftp-front.md)) | SSH public key or OpenSSH user certificate, matched against the bundle's `data.sftp`; per-operation authorization | optional; its own Deployment in production |
+| `frontends.sftp.listen` (2222) | the SFTP data plane ([ADR-012](docs/adr/ADR-012-sftp-front.md)) | SSH public key or OpenSSH user certificate, matched against the bundle's `data.sftp`; per-operation authorization | optional; its own Deployment in production |
 
 Each data-plane front is switched on **in its own section under `frontends`**. An absent
 `frontends.s3` means the S3 front is on, so every existing config is unchanged;

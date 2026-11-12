@@ -5,7 +5,7 @@
 //! through — driven by the real typed hooks; every captured document must survive the
 //! round-trip gate (`to_value(from_value::<OpaInput>(raw)?) == raw`), which catches a
 //! renamed or dropped field; and every `Coverage::Enforced` op contributes a capture.
-//! The SFTP front (ADR-009) decides through the same funnel, so a representative SFTP
+//! The SFTP front (ADR-012) decides through the same funnel, so a representative SFTP
 //! session is captured into the same corpus, with `request.protocol: "sftp"`.
 //!
 //! Regenerate with `S0_CAPTURE_REGENERATE=1 cargo test --test golden_capture`, and read
@@ -195,7 +195,7 @@ async fn decide_is_the_only_pdp_call_site_and_every_capture_round_trips() {
 
 #[tokio::test]
 async fn sftp_inputs_are_captured_with_their_protocol() {
-    // ADR-009 test plan: SFTP-shaped inputs captured at the `Enforcer` funnel, so
+    // ADR-012 test plan: SFTP-shaped inputs captured at the `Enforcer` funnel, so
     // `fixture_drift` sees `input.request.protocol`.
     let corpus = sftp::capture().await;
     assert!(!corpus.is_empty());
@@ -332,7 +332,7 @@ async fn a_corpus_input_is_a_real_decision_when_replayed() {
     assert!(replayed > 0, "the corpus is empty");
 }
 
-// ── SFTP: the same funnel, the other protocol (ADR-009) ──────────────────────
+// ── SFTP: the same funnel, the other protocol (ADR-012) ──────────────────────
 
 /// The SFTP front decides through the same `Enforcer::decide`, so its questions are
 /// captured by the same tap. They differ from every S3 capture in

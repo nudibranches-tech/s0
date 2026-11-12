@@ -47,7 +47,7 @@ impl PendingAudit {
     }
 
     /// Settle with a last edit to the record — the SFTP front fills in `gateway.session`
-    /// with the transfer outcome (ADR-009 D13). Idempotent like [`Self::settle`].
+    /// with the transfer outcome (ADR-012 D13). Idempotent like [`Self::settle`].
     pub fn settle_with(
         &self,
         backend: BackendOutcome,

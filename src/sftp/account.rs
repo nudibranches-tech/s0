@@ -1,4 +1,4 @@
-//! Bundle-driven SFTP authentication (ADR-009 D5).
+//! Bundle-driven SFTP authentication (ADR-012 D5).
 //!
 //! An SFTP principal is an **existing bundle subject**. What the `data.sftp` section adds is
 //! a way to *reach* a subject over SSH: an account keyed by login, naming its tenant, its

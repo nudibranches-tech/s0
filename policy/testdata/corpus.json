@@ -285,7 +285,7 @@
       }
     },
     "dropbox": {
-      "_comment": "The drop-box posture (ADR-009 D7): `drop` holds ONLY create_objects on inbound/partner-x/. It can write a key that does not exist and nothing else - not overwrite, not read, not list. The SFTP front asks create_objects; write_objects implies it (overwrite contains create), pinned against bob in the default bundle.",
+      "_comment": "The drop-box posture (ADR-012 D7): `drop` holds ONLY create_objects on inbound/partner-x/. It can write a key that does not exist and nothing else - not overwrite, not read, not list. The SFTP front asks create_objects; write_objects implies it (overwrite contains create), pinned against bob in the default bundle.",
       "org_settings": {
         "freeze_writes": false
       },

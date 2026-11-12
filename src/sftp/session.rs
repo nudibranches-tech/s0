@@ -1,4 +1,4 @@
-//! One SFTP session: request dispatch over the closed operation table (ADR-009 D2, D7,
+//! One SFTP session: request dispatch over the closed operation table (ADR-012 D2, D7,
 //! D10, D11).
 //!
 //! Every request that touches storage takes at least one decision through the shared

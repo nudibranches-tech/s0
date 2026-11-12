@@ -1,4 +1,4 @@
-//! The SFTP front's only way to reach a backend (ADR-009 D2).
+//! The SFTP front's only way to reach a backend (ADR-012 D2).
 //!
 //! Every call goes through `BackendRegistry::proxy_for(route)` — the same per-tenant
 //! re-signing client the S3 front uses, under the tenant backend credential — and every

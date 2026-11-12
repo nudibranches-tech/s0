@@ -1,6 +1,6 @@
 # cargo-about configuration: generates THIRD_PARTY_NOTICES (the licence texts and
 # copyright notices of every crate compiled into the s0 binary) for the image and the
-# release archives. ADR-009: the BSD-3-Clause and ISC notices must ship with the image.
+# release archives. ADR-012: the BSD-3-Clause and ISC notices must ship with the image.
 #
 #     cargo fetch --locked
 #     cargo about generate --frozen --fail -o THIRD_PARTY_NOTICES about.hbs

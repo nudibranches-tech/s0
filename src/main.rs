@@ -1,7 +1,7 @@
 //! Gateway entrypoint: load config, build the gateway, start its listeners, and serve.
 //!
 //! Up to five listeners on five ports, four auth postures: the S3 data plane (SigV4), the
-//! SFTP data plane (SSH public key, ADR-009; enabled in its own section), the
+//! SFTP data plane (SSH public key, ADR-012; enabled in its own section), the
 //! admin listener (unauthenticated probes and metrics), the STS mint (unauthenticated by
 //! design — the OIDC/web-identity token IS the credential) and the internal API (shared
 //! secret). Authentication is a property of the socket, never of the path.
@@ -219,7 +219,7 @@ async fn main() -> Result<()> {
         None => None,
     };
 
-    // The data-plane fronts. Each is switched on in its own section (ADR-009 D1); both
+    // The data-plane fronts. Each is switched on in its own section (ADR-012 D1); both
     // drain on the same signal, and both are awaited before the audit worker drains.
     let sftp_task = match config.sftp_enabled() {
         Some(sftp_cfg) => {
