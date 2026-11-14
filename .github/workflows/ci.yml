@@ -60,5 +60,17 @@ jobs:
       - name: test (unit + typed-hook e2e + golden corpus + dual-engine parity)
         run: cargo test --all-targets
 
+  # Reported, never gating: a red job means "a new advisory to triage", not "this change
+  # broke something". Accepted advisories are listed, with a reason, in deny.toml.
+  advisories:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: EmbarkStudios/cargo-deny-action@v2.1.1
+        with:
+          command: check advisories
+
   # S3 protocol conformance against a live backend is scaffolded in conformance.yml
   # (manual trigger, harness not yet wired). Fold it in here once it is.
