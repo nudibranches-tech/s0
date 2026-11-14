@@ -6,8 +6,8 @@ and submit changes.
 
 ## Prerequisites
 
-- A stable Rust toolchain. The crate uses **edition 2024**, so the minimum
-  supported Rust version (MSRV) is **1.85**.
+- A stable Rust toolchain. The minimum supported Rust version (MSRV) is **1.87**:
+  edition 2024 needs 1.85, and `ctutils` >= 0.4.4 (RUSTSEC-2026-0385) needs 1.87.
 - [Open Policy Agent](https://www.openpolicyagent.org/) (`opa`) **1.13.1** on your
   `PATH` — the same version production deploys, and the version CI installs. The
   dual-engine parity test ([`tests/parity.rs`](tests/parity.rs)) replays the golden
