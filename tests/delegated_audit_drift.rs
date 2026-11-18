@@ -12,8 +12,8 @@
 //! Regenerate with `S0_DELEGATED_FIXTURE_REGENERATE=1 cargo test --test
 //! delegated_audit_drift`, and review the diff as a change to a published contract. The
 //! shape test reads the files the other two write, so run it a second time without the
-//! variable. `result.allow` is `true` for every answered status but `403 AccessDenied`, so
-//! the ingest must key on `gateway.outcome`.
+//! variable. `result.allow` is `true` only for a 2xx answer; `gateway.outcome` tells a
+//! `403 AccessDenied` denial from every other failure.
 
 mod common;
 

@@ -288,7 +288,7 @@ async fn control_backend_errors_pass_through_with_the_gateway_request_id() {
         assert_eq!(d.control_status, Some(*status), "{op}");
         assert_eq!(d.control_error.as_deref(), Some(code.as_str()), "{op}");
         assert_eq!(rec.gateway.outcome, Outcome::Error, "{op}");
-        assert!(rec.result.allow, "{op}: only AccessDenied is a denial");
+        assert!(!rec.result.allow, "{op}: only a 2xx is recorded as allowed");
     }
 }
 

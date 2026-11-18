@@ -68,7 +68,7 @@ pub struct AuditRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegated: Option<DelegationContext>,
     /// The verdict. For a gate record this is the gate's own deny, not a PDP answer. For a
-    /// delegated record `allow` is the control backend's authorization answer.
+    /// delegated record `allow` is `true` only when the control backend answered a 2xx.
     pub result: Decision,
     /// Principal subject — the end-user identity, never a service identity. Empty on a
     /// gate record that was refused before the identity was resolved.
@@ -449,9 +449,9 @@ impl AuditRecord {
     /// by [`crate::audit::PendingAudit`]. `gateway.backend` stays `not_attempted`: the
     /// storage backend was never contacted.
     ///
-    /// `allow` is the control backend's authorization answer, not an s0 verdict: `false`
-    /// for `403 AccessDenied` and when no answer came back. Any other answered status
-    /// leaves it `true` and names the control backend and its error code in the reason.
+    /// `allow` is `true` only when the control backend answered a 2xx: an error answer or
+    /// no answer at all is never recorded as allowed. `gateway.outcome` tells a denial
+    /// (`403 AccessDenied`) from every other failure.
     pub fn settle_delegated(&mut self, status: Option<u16>, error_code: Option<String>) {
         let Some(delegated) = self.delegated.as_mut() else {
             return;
@@ -476,7 +476,7 @@ impl AuditRecord {
             ),
             (Some(_), code) => (
                 Outcome::Error,
-                Decision::allow(format!(
+                Decision::deny(format!(
                     "control backend answered {}",
                     code.unwrap_or("an error")
                 )),
@@ -832,11 +832,11 @@ mod tests {
 
         let other_403 = settle(Some(403), Some("SignatureDoesNotMatch"));
         assert_eq!(other_403.gateway.outcome, Outcome::Error);
-        assert!(other_403.result.allow);
+        assert!(!other_403.result.allow);
 
         let conflict = settle(Some(409), Some("OperationAborted"));
         assert_eq!(conflict.gateway.outcome, Outcome::Error);
-        assert!(conflict.result.allow);
+        assert!(!conflict.result.allow);
         assert!(conflict.result.reason.contains("OperationAborted"));
         let d = conflict.delegated.as_ref().unwrap();
         assert_eq!(
