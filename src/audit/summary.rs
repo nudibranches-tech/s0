@@ -229,6 +229,8 @@ mod tests {
                 backend_status: None,
                 object_name: None,
                 copy_source_object_name: None,
+                versions: vec![],
+                denied_versions: vec![],
                 summary: None,
             },
             &LabelPolicy::default(),

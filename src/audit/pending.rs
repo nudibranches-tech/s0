@@ -46,6 +46,45 @@ impl PendingAudit {
         self.sink.emit(record);
     }
 
+    /// Emit the delegated record, enriched with what the control backend answered.
+    /// Idempotent, like [`Self::settle`].
+    pub fn settle_delegated(&self, status: Option<u16>, error_code: Option<String>) {
+        let Some(mut record) = self.take() else {
+            return;
+        };
+        record.settle_delegated(status, error_code);
+        self.sink.emit(record);
+    }
+
+    /// Write what the control backend answered onto the held record without emitting it,
+    /// so a request that ends before it is settled is audited with the answer it got.
+    pub fn note_control_answer(&self, status: Option<u16>, error_code: Option<String>) {
+        self.with_held(|record| record.settle_delegated(status, error_code));
+    }
+
+    /// Note on the held record how the placement wait (CreateBucket) or removal wait
+    /// (DeleteBucket) ended.
+    pub fn note_placement_wait(&self, outcome: crate::bundle_refresh::PlacementWaitOutcome) {
+        self.with_held(|record| record.note_placement_wait(outcome));
+    }
+
+    /// Note on the held record that the control backend call is starting, so a request
+    /// that ends mid-call is not recorded as having ended before the call.
+    pub fn mark_delegation_dispatched(&self) {
+        self.with_held(AuditRecord::mark_delegation_dispatched);
+    }
+
+    fn with_held(&self, f: impl FnOnce(&mut AuditRecord)) {
+        if let Some(record) = self
+            .record
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            f(record);
+        }
+    }
+
     /// The id of the record this request is audited under, while it is still held. The
     /// forward path hands it to the client as the request id, so a reported error leads
     /// straight to its decision record.
@@ -137,6 +176,8 @@ mod tests {
                 backend_kind: "ceph".into(),
                 outcome: Outcome::Allowed,
                 denied_keys: vec![],
+                versions: vec![],
+                denied_versions: vec![],
                 backend: BackendOutcome::NotAttempted,
                 backend_status: None,
                 object_name: None,

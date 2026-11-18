@@ -5,11 +5,12 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The grant vocabulary the gateway authorizes against — the **six projected verbs**.
+/// The grant vocabulary the gateway authorizes against — the **seven projected verbs**.
 ///
 /// Deliberately coarser than the 99 S3 ops: every enforced op maps onto exactly one of
 /// these (`PutObject` to `write_objects`, `HeadBucket` to `read`), except `CopyObject`,
-/// which maps to two. The set is a contract with whatever control plane projects grants.
+/// which maps to two, and `DeleteObject`/`DeleteObjects`, decided under
+/// `delete_object_versions` when a version is named. The set is a contract with whatever control plane projects grants.
 ///
 /// **The gateway is data-plane only**, so there is no verb for acting on a bucket as a
 /// *managed resource*: existence, policy, CORS and quota *settings* are control-plane
@@ -24,6 +25,10 @@ pub enum Action {
     ReadObjects,
     WriteObjects,
     DeleteObjects,
+    /// A delete that names a version (`DeleteObject` with a `versionId`, a `DeleteObjects`
+    /// entry carrying one). Kept separate from [`Action::DeleteObjects`]: a grant of one
+    /// never confers the other (AWS `s3:DeleteObjectVersion` parity).
+    DeleteObjectVersions,
     /// Kept **deliberately separate** from [`Action::WriteObjects`]. `OpaInput::object_tags`
     /// lets a policy key on tags; merging the two would let a principal holding both grant
     /// itself whatever the policy keys on, a trap that springs when tag-driven ABAC is on.
@@ -50,6 +55,7 @@ impl Action {
         Action::ReadObjects,
         Action::WriteObjects,
         Action::DeleteObjects,
+        Action::DeleteObjectVersions,
         Action::WriteObjectTags,
         Action::ListObjects,
         Action::Read,
@@ -60,6 +66,7 @@ impl Action {
             Action::ReadObjects => "read_objects",
             Action::WriteObjects => "write_objects",
             Action::DeleteObjects => "delete_objects",
+            Action::DeleteObjectVersions => "delete_object_versions",
             Action::WriteObjectTags => "write_object_tags",
             Action::ListObjects => "list_objects",
             Action::Read => "read",
@@ -76,7 +83,10 @@ impl Action {
     pub const fn is_write(self) -> bool {
         matches!(
             self,
-            Action::WriteObjects | Action::DeleteObjects | Action::WriteObjectTags
+            Action::WriteObjects
+                | Action::DeleteObjects
+                | Action::DeleteObjectVersions
+                | Action::WriteObjectTags
         )
     }
 
