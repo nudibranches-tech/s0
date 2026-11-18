@@ -59,38 +59,29 @@ impl PendingAudit {
     /// Write what the control backend answered onto the held record without emitting it,
     /// so a request that ends before it is settled is audited with the answer it got.
     pub fn note_control_answer(&self, status: Option<u16>, error_code: Option<String>) {
-        if let Some(record) = self
-            .record
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_mut()
-        {
-            record.settle_delegated(status, error_code);
-        }
+        self.with_held(|record| record.settle_delegated(status, error_code));
     }
 
-    /// Note on the held record how the placement wait (CreateBucket) or removal wait (DeleteBucket) ended.
+    /// Note on the held record how the placement wait (CreateBucket) or removal wait
+    /// (DeleteBucket) ended.
     pub fn note_placement_wait(&self, outcome: crate::bundle_refresh::PlacementWaitOutcome) {
-        if let Some(record) = self
-            .record
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_mut()
-        {
-            record.note_placement_wait(outcome);
-        }
+        self.with_held(|record| record.note_placement_wait(outcome));
     }
 
     /// Note on the held record that the control backend call is starting, so a request
     /// that ends mid-call is not recorded as having ended before the call.
     pub fn mark_delegation_dispatched(&self) {
+        self.with_held(AuditRecord::mark_delegation_dispatched);
+    }
+
+    fn with_held(&self, f: impl FnOnce(&mut AuditRecord)) {
         if let Some(record) = self
             .record
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_mut()
         {
-            record.mark_delegation_dispatched();
+            f(record);
         }
     }
 

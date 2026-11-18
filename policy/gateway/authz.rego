@@ -27,8 +27,10 @@
 #     THE GATEWAY IS DATA-PLANE ONLY. `create_bucket`, `delete_bucket`,
 #     `read_bucket_config` and `write_bucket_config` are gone: each was a way to make,
 #     unmake or re-configure a bucket with no record in the control plane that owns it —
-#     unmanaged, unquota'd, invisible. That authority belongs to the control plane, and
-#     the six S3 ops that carried it are refused at the gate before deserialization.
+#     unmanaged, unquota'd, invisible. That authority belongs to the control plane. The
+#     S3 ops that carried it never reach this policy: with a control backend configured
+#     (ADR-012) they are delegated to it after authentication, otherwise they are refused
+#     at the gate before deserialization.
 #     `write_object_acl` is gone with no successor: an object ACL grants access no
 #     projection emitted and none can revoke, so conferring one is refused in code
 #     (`s0::access::headers`).

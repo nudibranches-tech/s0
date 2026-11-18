@@ -18,7 +18,7 @@
   "path": "s3/authz/delegated",
   "requested_by": "alice",
   "result": {
-    "allow": true,
+    "allow": false,
     "obligations": {},
     "reason": "control backend unreachable"
   },

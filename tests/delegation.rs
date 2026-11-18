@@ -330,6 +330,7 @@ async fn an_unreachable_control_backend_answers_503() {
     assert_eq!(d.control_error, None);
     assert_eq!(rec.gateway.outcome, Outcome::Error);
     assert_eq!(rec.result.reason, "control backend unreachable");
+    assert!(!rec.result.allow);
     assert!(answer.body.contains(&rec.decision_id), "{}", answer.body);
 }
 

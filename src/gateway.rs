@@ -165,7 +165,8 @@ impl Gateway {
             && !control.serves(&cfg.tenants)
         {
             return Err(GatewayError::Config(
-                "the re-applied tenants are not all bound to the (organization, backend) the                  control backend serves; one control credential is bound to one"
+                "the re-applied tenants are not all bound to the (organization, backend) the \
+                 control backend serves; one control credential is bound to one"
                     .into(),
             ));
         }

@@ -450,8 +450,8 @@ impl AuditRecord {
     /// storage backend was never contacted.
     ///
     /// `allow` is the control backend's authorization answer, not an s0 verdict: `false`
-    /// only for `403 AccessDenied`. Any other answered status leaves it `true` and names
-    /// the control backend and its error code in the reason.
+    /// for `403 AccessDenied` and when no answer came back. Any other answered status
+    /// leaves it `true` and names the control backend and its error code in the reason.
     pub fn settle_delegated(&mut self, status: Option<u16>, error_code: Option<String>) {
         let Some(delegated) = self.delegated.as_mut() else {
             return;
@@ -459,7 +459,7 @@ impl AuditRecord {
         delegated.control_status = status;
         delegated.control_error = error_code.clone();
         let (outcome, result) = match (status, error_code.as_deref()) {
-            (None, _) => (Outcome::Error, Decision::allow(CONTROL_UNREACHABLE)),
+            (None, _) => (Outcome::Error, Decision::deny(CONTROL_UNREACHABLE)),
             (Some(s), Some(code)) if (200..300).contains(&s) => (
                 Outcome::Error,
                 Decision::allow(format!(
@@ -851,6 +851,7 @@ mod tests {
         let down = settle(None, None);
         assert_eq!(down.gateway.outcome, Outcome::Error);
         assert_eq!(down.result.reason, "control backend unreachable");
+        assert!(!down.result.allow);
         assert!(down.delegated.as_ref().unwrap().control_status.is_none());
         assert_eq!(down.gateway.backend, BackendOutcome::NotAttempted);
     }

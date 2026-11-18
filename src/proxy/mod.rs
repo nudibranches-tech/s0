@@ -603,63 +603,49 @@ impl GatewayS3 {
             &operation,
             &status.map_or_else(|| "none".to_string(), |s| format!("{}xx", s / 100)),
         );
-        if result.is_ok() {
-            pending.note_control_answer(status, None);
+        let error_code = result
+            .as_ref()
+            .err()
+            .and_then(|e| status.map(|_| e.code().as_str().to_string()));
+        pending.note_control_answer(status, error_code);
+        if let AfterDelegation::DropCors { bucket } | AfterDelegation::AwaitRemoval { bucket } =
+            &after
+        {
+            let denied = matches!(&result, Err(e) if status == Some(403)
+                && e.code().as_str() == "AccessDenied");
+            if let (Some(cors), false) = (&self.state.cors, denied) {
+                cors.invalidate(&route, bucket).await;
+            }
+            cors_guard.disarm();
         }
-        match &after {
-            AfterDelegation::Nothing => {}
-            AfterDelegation::DropCors { bucket } => {
-                if let Some(cors) = &self.state.cors {
-                    if !matches!(&result, Err(e) if status == Some(403)
-                        && e.code().as_str() == "AccessDenied")
-                    {
-                        cors.invalidate(&route, bucket).await;
-                    }
-                }
-                cors_guard.disarm();
+        let awaited = match &after {
+            AfterDelegation::AwaitPlacement { bucket } => Some((bucket, true)),
+            AfterDelegation::AwaitRemoval { bucket } => Some((bucket, false)),
+            AfterDelegation::Nothing | AfterDelegation::DropCors { .. } => None,
+        };
+        if let (Some((bucket, placing)), Ok(_), Some(wait)) =
+            (awaited, &result, &self.state.placement_wait)
+        {
+            let budget = control
+                .placement_wait()
+                .min(DELEGATED_DEADLINE.saturating_sub(checked_at.elapsed()));
+            let (backend, tenant) = (&route.backend_id.0, &route.tenant);
+            let outcome = if placing {
+                wait.wait_until_placed(backend, tenant, bucket, budget)
+                    .await
+            } else {
+                wait.wait_until_removed(backend, tenant, bucket, budget)
+                    .await
+            };
+            if outcome == PlacementWaitOutcome::TimedOut {
+                let why = if placing {
+                    "the created bucket is not in the bundle yet; answering anyway"
+                } else {
+                    "the deleted bucket is still in the bundle; answering anyway"
+                };
+                tracing::warn!(tenant = %route.tenant, %bucket, "{why}");
             }
-            AfterDelegation::AwaitRemoval { bucket } => {
-                if let Some(cors) = &self.state.cors {
-                    if !matches!(&result, Err(e) if status == Some(403)
-                        && e.code().as_str() == "AccessDenied")
-                    {
-                        cors.invalidate(&route, bucket).await;
-                    }
-                }
-                cors_guard.disarm();
-                if let (Ok(_), Some(wait)) = (&result, &self.state.placement_wait) {
-                    let budget = control
-                        .placement_wait()
-                        .min(DELEGATED_DEADLINE.saturating_sub(checked_at.elapsed()));
-                    let outcome = wait
-                        .wait_until_removed(&route.backend_id.0, &route.tenant, bucket, budget)
-                        .await;
-                    if outcome == PlacementWaitOutcome::TimedOut {
-                        tracing::warn!(
-                            tenant = %route.tenant, %bucket,
-                            "the deleted bucket is still in the bundle; answering anyway"
-                        );
-                    }
-                    pending.note_placement_wait(outcome);
-                }
-            }
-            AfterDelegation::AwaitPlacement { bucket } => {
-                if let (Ok(_), Some(wait)) = (&result, &self.state.placement_wait) {
-                    let budget = control
-                        .placement_wait()
-                        .min(DELEGATED_DEADLINE.saturating_sub(checked_at.elapsed()));
-                    let outcome = wait
-                        .wait_until_placed(&route.backend_id.0, &route.tenant, bucket, budget)
-                        .await;
-                    if outcome == PlacementWaitOutcome::TimedOut {
-                        tracing::warn!(
-                            tenant = %route.tenant, %bucket,
-                            "the created bucket is not in the bundle yet; answering anyway"
-                        );
-                    }
-                    pending.note_placement_wait(outcome);
-                }
-            }
+            pending.note_placement_wait(outcome);
         }
         match result {
             Ok(mut resp) => {

@@ -601,7 +601,16 @@ impl GatewayAccess {
     /// `deny: …`/`allow: …`, so an unprefixed one would read as a policy verdict for a
     /// question no policy was asked.
     fn refuse(&self, input: OpaInput, reason: String) -> S3Error {
-        self.deny(input, format!("deny (gateway): {reason}"))
+        self.refuse_versions(input, reason, VersionedAudit::default())
+    }
+
+    fn refuse_versions(
+        &self,
+        input: OpaInput,
+        reason: String,
+        versions: VersionedAudit,
+    ) -> S3Error {
+        self.deny_versions(input, format!("deny (gateway): {reason}"), versions)
     }
 
     /// Record a refusal against `input` and answer 403, with the reason verbatim.
@@ -611,8 +620,12 @@ impl GatewayAccess {
     /// `write_object_tags` its inline `x-amz-tagging` requires). Prefixing those would
     /// claim the gateway made a call the PDP actually made.
     fn deny(&self, input: OpaInput, reason: String) -> S3Error {
+        self.deny_versions(input, reason, VersionedAudit::default())
+    }
+
+    fn deny_versions(&self, input: OpaInput, reason: String, versions: VersionedAudit) -> S3Error {
         let decision = Decision::deny(reason.clone());
-        self.audit_denied(input, &decision, vec![]);
+        self.audit_denied_versions(input, &decision, vec![], versions);
         s3_error!(AccessDenied, "{reason}")
     }
 
@@ -620,7 +633,16 @@ impl GatewayAccess {
     /// version of it ([`PlacementRefusal::client_message`]), under the code
     /// [`PlacementRefusal::s3_code`].
     fn deny_placement(&self, input: OpaInput, refusal: &PlacementRefusal) -> S3Error {
-        self.audit_denied(input, &Decision::deny(refusal.reason()), vec![]);
+        self.deny_placement_versions(input, refusal, VersionedAudit::default())
+    }
+
+    fn deny_placement_versions(
+        &self,
+        input: OpaInput,
+        refusal: &PlacementRefusal,
+        versions: VersionedAudit,
+    ) -> S3Error {
+        self.audit_denied_versions(input, &Decision::deny(refusal.reason()), vec![], versions);
         S3Error::with_message(refusal.s3_code(), refusal.client_message())
     }
 
@@ -715,19 +737,19 @@ impl GatewayAccess {
             Err(why) => {
                 let mut input = cx.base_input(action, bucket);
                 input.object = Some(object);
-                return Err(self.refuse(input, why));
+                return Err(self.refuse_versions(input, why, versions));
             }
         };
         let input = cx.write_input(action, bucket, object, &riders);
         // Ahead of the riders, whose own decision would otherwise be the one recorded.
         if let Some(refusal) = cx.placement_refusal(&input) {
-            return Err(self.deny_placement(input, &refusal));
+            return Err(self.deny_placement_versions(input, &refusal, versions));
         }
         if let Err(why) = self.screen_riders(&riders) {
-            return Err(self.refuse(input, why));
+            return Err(self.refuse_versions(input, why, versions));
         }
         if let Some(why) = self.authorize_riders(cx, &input, &riders).await {
-            return Err(self.deny(input, why));
+            return Err(self.deny_versions(input, why, versions));
         }
         self.enforce_charged(cx, input, charge, versions).await
     }
@@ -1245,7 +1267,14 @@ impl S3Access for GatewayAccess {
         // reason, and the record would then say only "all delete keys denied".
         let placement_input = cx.base_input(batch_action, bucket.clone());
         if let Some(refusal) = cx.placement_refusal(&placement_input) {
-            return Err(self.deny_placement(placement_input, &refusal));
+            return Err(self.deny_placement_versions(
+                placement_input,
+                &refusal,
+                VersionedAudit {
+                    requested: versions,
+                    refused: vec![],
+                },
+            ));
         }
         // Refused through the audit path like every other cap, rather than with an early
         // `Err` above `ReqCtx` that would leave no record. `delete_keys` is deliberately
@@ -1272,7 +1301,14 @@ impl S3Access for GatewayAccess {
                     ..RequestRiders::default()
                 })
                 .expect_err("a bypass rider is always refused");
-            return Err(self.refuse(input, why));
+            return Err(self.refuse_versions(
+                input,
+                why,
+                VersionedAudit {
+                    requested: versions,
+                    refused: vec![],
+                },
+            ));
         }
 
         // Decided per entry, under the entry's own verb, and kept by position: one key may
@@ -2117,8 +2153,6 @@ fn unimplemented_obligations(decision: &Decision) -> Option<String> {
     ))
 }
 
-/// The verb a delete is decided under: naming a version, `"null"` included, is a versioned
-/// delete.
 /// The versioned entries of a delete, for the decision record: what the request named and
 /// what policy refused of it.
 #[derive(Default)]
@@ -2127,6 +2161,8 @@ struct VersionedAudit {
     refused: Vec<VersionedKey>,
 }
 
+/// The verb a delete is decided under: naming a version, `"null"` included, is a versioned
+/// delete.
 fn delete_action(version_id: Option<&str>) -> Action {
     if version_id.is_some() {
         Action::DeleteObjectVersions

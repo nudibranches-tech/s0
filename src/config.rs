@@ -124,7 +124,14 @@ impl PartialEq for ControlBackendConfig {
             && self.region == other.region
             && self.access_key_id == other.access_key_id
             && self.secret_access_key.expose() == other.secret_access_key.expose()
-            && self.operations == other.operations
+            && self
+                .operations
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                == other
+                    .operations
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
             && self.connect_timeout_secs == other.connect_timeout_secs
             && self.call_timeout_secs == other.call_timeout_secs
             && self.create_bucket_placement_wait_secs == other.create_bucket_placement_wait_secs
