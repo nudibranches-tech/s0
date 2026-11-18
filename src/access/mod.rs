@@ -1093,7 +1093,8 @@ impl S3Access for GatewayAccess {
             (&gate, &self.gw.refresher, &self.gw.control)
         {
             let bucket = cx.s3_path().get_bucket_name().map(str::to_string);
-            let missing = bucket.is_some_and(|bucket| {
+            let source = copy_source_bucket(&op, cx.headers());
+            let missing = bucket.into_iter().chain(source).any(|bucket| {
                 matches!(
                     placement.refusal(&route.backend_id.0, &principal.tenant, &bucket),
                     Some(PlacementRefusal::NotOnBackend)
@@ -2019,6 +2020,19 @@ fn as_copy_source_error(err: S3Error) -> S3Error {
     }
     named.set_source(Box::new(err));
     named
+}
+
+/// The source bucket a CopyObject or UploadPartCopy names in `x-amz-copy-source`, for
+/// the placement-miss refresh only: the typed hook parses and authorizes the source.
+fn copy_source_bucket(op: &str, headers: &http::HeaderMap) -> Option<String> {
+    if !matches!(op, "CopyObject" | "UploadPartCopy") {
+        return None;
+    }
+    let header = headers.get("x-amz-copy-source")?.to_str().ok()?;
+    match CopySource::parse(header).ok()? {
+        CopySource::Bucket { bucket, .. } => Some(bucket.into()),
+        _ => None,
+    }
 }
 
 /// The length of an `x-amz-copy-source-range` (`bytes=first-last`, both inclusive), or

@@ -747,6 +747,41 @@ async fn a_replica_refusing_bucket_not_on_this_backend_refreshes_once_and_decide
 }
 
 #[tokio::test]
+async fn a_copy_from_a_bucket_not_on_this_backend_refreshes_once() {
+    let mut fx = common::fixture_with_control(
+        "deleg-copy-miss",
+        placing_bundle(&["dst"]),
+        "http://127.0.0.1:2",
+    );
+    let bundles =
+        BundleServer::start(vec![placing_bundle(&["dst", "reports"])], Duration::ZERO).await;
+    let refresher = install_refresher(&mut fx, &bundles);
+    let base = serve(&fx).await;
+
+    let host = base.trim_start_matches("http://").to_string();
+    let req =
+        RawRequest::new("PUT", "/dst/copy.txt").header("x-amz-copy-source", "/reports/2024/a.txt");
+    let answer = send_raw(&base, &host, req, ACCESS_KEY, SECRET_KEY).await;
+    assert_ne!(
+        answer.status, 404,
+        "source refused as not on this backend after the refresh: {}",
+        answer.body
+    );
+    assert_eq!(bundles.fetches(), 1);
+    assert_eq!(refresher.on_demand_total().get("miss", "reloaded"), 1);
+
+    fx.await_audit_records(1).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let records = fx.audit_log.all();
+    assert!(
+        records
+            .iter()
+            .all(|r| !r.result.reason.contains("not on this backend")),
+        "{records:#?}"
+    );
+}
+
+#[tokio::test]
 async fn a_gateway_without_a_control_backend_does_not_refresh_on_a_miss() {
     let mut fx = common::fixture_with_backend(
         "deleg-no-control",

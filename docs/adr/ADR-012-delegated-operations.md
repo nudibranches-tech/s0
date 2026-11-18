@@ -235,7 +235,8 @@ Four things make a delegated write visible to the next request, each bounded:
   to be placed before answering the client. The outcome is recorded in `delegated.placement_wait`.
   A timeout is not an error: the bucket exists, and the next request refreshes on a miss.
 - **Refresh on miss.** An enforced request refused because the pinned bundle does not place the
-  path bucket on this backend triggers, in `check` and before any hook, at most one bundle
+  path bucket on this backend, or for a `CopyObject` or `UploadPartCopy` the bucket named by
+  `x-amz-copy-source`, triggers, in `check` and before any hook, at most one bundle
   refresh, and only after authentication and route resolution. The refresh happens only when a
   `control_backend` is configured. The decision is made on a fetch that started after the
   request arrived, never on one already running. Fetches triggered by a miss start at most once
