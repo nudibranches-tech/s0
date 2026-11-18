@@ -111,6 +111,8 @@ s0 **refuses to load** the configuration when any of these holds:
 - the tenants span more than one organization or more than one backend: one control credential
   is bound to one (organization, backend), so a gateway serving several has no single identity to
   present;
+- no tenant is configured: the binding is taken from the tenants at startup, and a control
+  backend with none would accept any tenants a reload brings;
 - the endpoint is unparseable, equals a storage backend's endpoint, or equals the bundle URL;
 - the credential is empty.
 

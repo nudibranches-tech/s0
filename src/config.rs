@@ -800,6 +800,13 @@ impl GatewayConfig {
             .collect();
         let backends: std::collections::BTreeSet<&str> =
             self.tenants.iter().map(|t| t.backend_id.as_str()).collect();
+        if organizations.is_empty() {
+            return Err(refuse(
+                "no tenant is configured; the control credential must be bound to one \
+                 (organization, backend)"
+                    .into(),
+            ));
+        }
         if organizations.len() > 1 || backends.len() > 1 {
             return Err(refuse(format!(
                 "the tenants span {} organization(s) and {} backend(s); one control \
@@ -2042,6 +2049,13 @@ mod tests {
         // The same two tenants without a control backend are the supported topology.
         cfg.as_object_mut().unwrap().remove("control_backend");
         assert!(GatewayConfig::from_json(&cfg.to_string()).is_ok());
+    }
+
+    #[test]
+    fn a_control_backend_without_a_tenant_refuses_to_load() {
+        let mut cfg = example();
+        cfg["tenants"] = serde_json::json!([]);
+        assert!(refusal(&cfg).contains("no tenant is configured"));
     }
 
     #[test]

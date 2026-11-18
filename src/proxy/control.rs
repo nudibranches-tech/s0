@@ -83,10 +83,10 @@ impl ControlBackend {
     }
 
     /// Whether every tenant of `tenants` is bound to the (organization, backend) this
-    /// control backend was built for.
+    /// control backend was built for. Unbound, it serves no tenant.
     pub fn serves(&self, tenants: &[crate::config::TenantConfig]) -> bool {
         match &self.binding {
-            None => true,
+            None => tenants.is_empty(),
             Some((org, backend)) => tenants
                 .iter()
                 .all(|t| &t.organization_id == org && &t.backend_id == backend),

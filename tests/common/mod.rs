@@ -373,10 +373,13 @@ fn fixture_from_config(
         cors: Arc::new(s0::cors::CorsState::new()),
         quota: Arc::new(s0::quota::QuotaLedger::new()),
         capture: Some(capture.clone()),
-        control: cfg
-            .control_backend
-            .as_ref()
-            .map(|c| Arc::new(ControlBackend::from_config(c).expect("control backend"))),
+        control: cfg.control_backend.as_ref().map(|c| {
+            Arc::new(
+                ControlBackend::from_config(c)
+                    .expect("control backend")
+                    .bound_to(&cfg.tenants),
+            )
+        }),
         refresher: None,
     });
     Fixture {
