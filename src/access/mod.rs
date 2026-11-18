@@ -1094,14 +1094,20 @@ impl S3Access for GatewayAccess {
         {
             let bucket = cx.s3_path().get_bucket_name().map(str::to_string);
             let source = copy_source_bucket(&op, cx.headers());
-            let missing = bucket.into_iter().chain(source).any(|bucket| {
-                matches!(
-                    placement.refusal(&route.backend_id.0, &principal.tenant, &bucket),
-                    Some(PlacementRefusal::NotOnBackend)
-                )
-            });
-            if missing {
-                refresher.refresh_on_miss().await;
+            let missing: Vec<String> = bucket
+                .into_iter()
+                .chain(source)
+                .filter(|bucket| {
+                    matches!(
+                        placement.refusal(&route.backend_id.0, &principal.tenant, bucket),
+                        Some(PlacementRefusal::NotOnBackend)
+                    )
+                })
+                .collect();
+            if !missing.is_empty() {
+                refresher
+                    .refresh_on_miss(&route.backend_id.0, &principal.tenant, &missing)
+                    .await;
                 placement = self.gw.bundles.current().placement().clone();
             }
         }

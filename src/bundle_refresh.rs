@@ -6,6 +6,7 @@
 //! file. The engine is reloaded *before* the revision is advertised, so no request ever
 //! sees a new revision backed by the old policy.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -24,6 +25,14 @@ pub const ON_DEMAND_MIN_INTERVAL: Duration = Duration::from_secs(1);
 /// The longest a request waits for an on-demand fetch before it is decided with whatever
 /// placement is current.
 pub const ON_MISS_WAIT: Duration = Duration::from_secs(2);
+/// The longest a bucket that miss-triggered fetches kept finding unplaced answers its
+/// misses without a fetch. Below the default 30 s poll, so a client retrying a deleted
+/// bucket costs at most about twice the polling rate.
+pub const MISS_SKIP_MAX: Duration = Duration::from_secs(16);
+/// How long a bucket's run of unplaced confirmations is remembered after its last one.
+const MISS_MEMORY: Duration = Duration::from_secs(60);
+/// The most buckets whose confirmations are remembered at once: callers choose the names.
+const MISS_MEMORY_CAP: usize = 4096;
 const WAIT_BACKOFF_START: Duration = Duration::from_millis(250);
 const WAIT_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
@@ -272,6 +281,30 @@ pub trait PlacementWait: Send + Sync {
 struct OnDemand {
     /// When the latest on-demand fetch was allowed to start.
     last_started: Option<Instant>,
+    /// Buckets that miss-triggered fetches left unplaced, by (backend, tenant, bucket).
+    unplaced: HashMap<(String, String, String), Unplaced>,
+}
+
+/// A run of miss-triggered fetches that found a bucket still unplaced.
+struct Unplaced {
+    /// Consecutive fetches that came back unchanged with the bucket unplaced.
+    streak: u32,
+    /// The number of the latest of those fetches, so callers sharing it count it once.
+    fetch: u64,
+    at: Instant,
+}
+
+impl Unplaced {
+    /// No skip after the first confirmation, so a bucket probed, then created through
+    /// another replica, is found on the next miss; then 2 s, 4 s, 8 s, up to
+    /// [`MISS_SKIP_MAX`].
+    fn skips_until(&self) -> Instant {
+        let window = match self.streak {
+            0 | 1 => Duration::ZERO,
+            n => Duration::from_secs(1u64 << (n - 1).min(8)).min(MISS_SKIP_MAX),
+        };
+        self.at + window
+    }
 }
 
 /// The fetch behind [`BundleRefresher::last`]: its start number and its answer.
@@ -354,6 +387,14 @@ impl BundleRefresher {
 
     /// `since`: when set, only a fetch numbered above it may answer.
     async fn fetch(self: &Arc<Self>, since: Option<u64>) -> Result<Refreshed, String> {
+        self.fetch_numbered(since).await.1
+    }
+
+    /// [`Self::fetch`], with the number of the fetch that answered.
+    async fn fetch_numbered(
+        self: &Arc<Self>,
+        since: Option<u64>,
+    ) -> (u64, Result<Refreshed, String>) {
         let completed_at_arrival = self.completed.load(Ordering::SeqCst);
         let guard = self.gate.clone().lock_owned().await;
         {
@@ -363,12 +404,12 @@ impl BundleRefresher {
                 None => self.completed.load(Ordering::SeqCst) != completed_at_arrival,
             };
             if reusable {
-                return last.result.clone();
+                return (last.started, last.result.clone());
             }
         }
         let number = self.started.fetch_add(1, Ordering::SeqCst) + 1;
         let this = self.clone();
-        tokio::spawn(async move {
+        let result = tokio::spawn(async move {
             let result = refresh_once(&this.pdp, &this.bundles, &this.source).await;
             match &result {
                 Ok(_) => this.health.record_success(),
@@ -383,7 +424,8 @@ impl BundleRefresher {
             result
         })
         .await
-        .unwrap_or_else(|e| Err(format!("bundle refresh task failed: {e}")))
+        .unwrap_or_else(|e| Err(format!("bundle refresh task failed: {e}")));
+        (number, result)
     }
 
     /// Fetch now because a request was refused for a bucket the bundle does not place.
@@ -394,7 +436,33 @@ impl BundleRefresher {
     /// waits for it to pass and shares the fetch of every other miss waiting with it. A
     /// request waits at most [`ON_MISS_WAIT`]. Returns whether a fetch finished in that
     /// time.
-    pub async fn refresh_on_miss(self: &Arc<Self>) -> bool {
+    ///
+    /// `buckets` are the buckets of `tenant` the request named that are not on `backend`.
+    /// When fetches kept finding every one of them unplaced, the miss is answered at once
+    /// without a fetch, for a window that grows with the run (see [`Unplaced`]): a client
+    /// retrying a deleted bucket does not re-download the bundle every second.
+    pub async fn refresh_on_miss(
+        self: &Arc<Self>,
+        backend: &str,
+        tenant: &str,
+        buckets: &[String],
+    ) -> bool {
+        let key = |bucket: &String| (backend.to_string(), tenant.to_string(), bucket.clone());
+        {
+            let state = self.on_demand.lock().unwrap_or_else(|e| e.into_inner());
+            let now = Instant::now();
+            let skip = !buckets.is_empty()
+                && buckets.iter().all(|bucket| {
+                    state
+                        .unplaced
+                        .get(&key(bucket))
+                        .is_some_and(|u| u.skips_until() > now)
+                });
+            if skip {
+                self.on_demand_total.increment("miss", "skipped");
+                return false;
+            }
+        }
         let arrived = self.started.load(Ordering::SeqCst);
         let work = async {
             let slot = {
@@ -415,7 +483,11 @@ impl BundleRefresher {
                     state.last_started = Some(at);
                 }
             }
-            self.fetch(Some(arrived)).await
+            let (number, result) = self.fetch_numbered(Some(arrived)).await;
+            if let Ok(refreshed) = &result {
+                self.note_unplaced(backend, tenant, buckets, number, *refreshed);
+            }
+            result
         };
         match tokio::time::timeout(ON_MISS_WAIT, work).await {
             Ok(Ok(Refreshed::Reloaded)) => {
@@ -434,6 +506,59 @@ impl BundleRefresher {
             Err(_) => {
                 self.on_demand_total.increment("miss", "timed_out");
                 false
+            }
+        }
+    }
+
+    /// After fetch `number`: extend the run of each bucket still not on `backend`, or
+    /// start it again after a reload; forget the buckets that are placed now.
+    fn note_unplaced(
+        &self,
+        backend: &str,
+        tenant: &str,
+        buckets: &[String],
+        number: u64,
+        refreshed: Refreshed,
+    ) {
+        let bundle = self.bundles.current();
+        let placement = bundle.placement();
+        let now = Instant::now();
+        let mut state = self.on_demand.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .unplaced
+            .retain(|_, u| now.duration_since(u.at) < MISS_MEMORY);
+        for bucket in buckets {
+            let key = (backend.to_string(), tenant.to_string(), bucket.clone());
+            let unplaced = matches!(
+                placement.refusal(backend, tenant, bucket),
+                Some(PlacementRefusal::NotOnBackend)
+            );
+            if !unplaced {
+                state.unplaced.remove(&key);
+                continue;
+            }
+            let room = state.unplaced.len() < MISS_MEMORY_CAP;
+            match state.unplaced.get_mut(&key) {
+                Some(u) if u.fetch == number => {}
+                Some(u) => {
+                    u.streak = match refreshed {
+                        Refreshed::Unchanged => u.streak.saturating_add(1),
+                        Refreshed::Reloaded => 1,
+                    };
+                    u.fetch = number;
+                    u.at = now;
+                }
+                None if room => {
+                    state.unplaced.insert(
+                        key,
+                        Unplaced {
+                            streak: 1,
+                            fetch: number,
+                            at: now,
+                        },
+                    );
+                }
+                None => {}
             }
         }
     }
@@ -767,21 +892,88 @@ mod tests {
         refresher.placed("bay-1", "acme", bucket)
     }
 
+    fn miss(bucket: &str) -> Vec<String> {
+        vec![bucket.to_string()]
+    }
+
+    #[tokio::test]
+    async fn a_bucket_retried_while_unplaced_stops_costing_a_fetch_each_time() {
+        let (url, served) = scripted_server(vec![bundle_body(&["a"])], Duration::ZERO).await;
+        let refresher = refresher_for(url);
+        assert!(
+            refresher
+                .refresh_on_miss("bay-1", "acme", &miss("gone"))
+                .await
+        );
+        assert!(
+            refresher
+                .refresh_on_miss("bay-1", "acme", &miss("gone"))
+                .await
+        );
+        assert_eq!(served.load(Ordering::SeqCst), 2);
+
+        let started = Instant::now();
+        assert!(
+            !refresher
+                .refresh_on_miss("bay-1", "acme", &miss("gone"))
+                .await
+        );
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(served.load(Ordering::SeqCst), 2);
+        assert_eq!(refresher.on_demand_total().get("miss", "skipped"), 1);
+
+        assert!(
+            refresher
+                .refresh_on_miss("bay-1", "acme", &miss("other"))
+                .await
+        );
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            3,
+            "another bucket was suppressed"
+        );
+        assert!(
+            refresher
+                .refresh_on_miss("bay-1", "acme", &["gone".into(), "other".into()])
+                .await,
+            "a request naming a bucket outside its window was suppressed"
+        );
+    }
+
+    #[test]
+    fn the_skip_window_grows_from_nothing_and_stops_at_the_cap() {
+        let at = Instant::now();
+        let window = |streak| {
+            Unplaced {
+                streak,
+                fetch: 0,
+                at,
+            }
+            .skips_until()
+                - at
+        };
+        assert_eq!(window(1), Duration::ZERO);
+        assert_eq!(window(2), Duration::from_secs(2));
+        assert_eq!(window(3), Duration::from_secs(4));
+        assert_eq!(window(5), MISS_SKIP_MAX);
+        assert_eq!(window(u32::MAX), MISS_SKIP_MAX);
+    }
+
     #[tokio::test]
     async fn misses_are_spaced_by_the_interval_and_share_a_fetch() {
         let (url, served) = scripted_server(vec![bundle_body(&["a"])], Duration::ZERO).await;
         let refresher = refresher_for(url);
-        assert!(refresher.refresh_on_miss().await);
+        assert!(refresher.refresh_on_miss("bay-1", "acme", &miss("b")).await);
         assert_eq!(served.load(Ordering::SeqCst), 1);
         assert_eq!(refresher.on_demand_total().get("miss", "reloaded"), 1);
 
         let second = tokio::spawn({
             let r = refresher.clone();
-            async move { r.refresh_on_miss().await }
+            async move { r.refresh_on_miss("bay-1", "acme", &miss("b")).await }
         });
         let third = tokio::spawn({
             let r = refresher.clone();
-            async move { r.refresh_on_miss().await }
+            async move { r.refresh_on_miss("bay-1", "acme", &miss("b")).await }
         });
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(
@@ -804,7 +996,9 @@ mod tests {
             (0..8)
                 .map(|_| {
                     let r = refresher.clone();
-                    tokio::spawn(async move { r.refresh_on_miss().await })
+                    tokio::spawn(
+                        async move { r.refresh_on_miss("bay-1", "acme", &miss("b")).await },
+                    )
                 })
                 .collect(),
         )
@@ -821,10 +1015,10 @@ mod tests {
         )
         .await;
         let refresher = refresher_for(url);
-        assert!(refresher.refresh_on_miss().await);
+        assert!(refresher.refresh_on_miss("bay-1", "acme", &miss("b")).await);
         assert!(!places(&refresher, "b"));
         tokio::time::sleep(Duration::from_millis(500)).await;
-        assert!(refresher.refresh_on_miss().await);
+        assert!(refresher.refresh_on_miss("bay-1", "acme", &miss("b")).await);
         assert!(places(&refresher, "b"), "the second miss was refused");
         assert_eq!(served.load(Ordering::SeqCst), 2);
     }
@@ -842,7 +1036,7 @@ mod tests {
             async move { r.refresh().await }
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(refresher.refresh_on_miss().await);
+        assert!(refresher.refresh_on_miss("bay-1", "acme", &miss("b")).await);
         assert!(places(&refresher, "b"), "decided on the older fetch");
         assert_eq!(served.load(Ordering::SeqCst), 2);
         assert!(poll.await.expect("task").is_ok());

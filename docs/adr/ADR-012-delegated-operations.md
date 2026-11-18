@@ -244,7 +244,12 @@ Four things make a delegated write visible to the next request, each bounded:
   request arrived, never on one already running. Fetches triggered by a miss start at most once
   per second per replica: a miss arriving inside that interval waits for it to pass and shares
   the fetch of the misses waiting with it. The caller waits at most 2 s, then decides with
-  whatever placement is current. The hook then decides once against the re-pinned
+  whatever placement is current. A bucket that miss-triggered fetches keep finding unplaced, with
+  the bundle unchanged, stops costing one: after the second such fetch in a row its misses are
+  answered at once, with no fetch, for 2 s, then 4 s, 8 s and at most 16 s, below the default
+  30 s poll. The first such fetch skips nothing, so a bucket probed, then created through another
+  replica, is still found on the next miss. A reload or the bucket appearing ends the run; at
+  most 4096 buckets are remembered, for 60 s after their last fetch. The hook then decides once against the re-pinned
   placement, so the request has one decision and one audit record. The `CreateBucket` placement
   wait's fetches go through the same single-flight gate as every other fetch and are shared
   with any fetch that starts after the wait began; they use their own 250 ms to 1 s backoff and
