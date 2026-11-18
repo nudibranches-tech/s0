@@ -11,4 +11,6 @@ ignore = [
     { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5: secret-dependent paths only. jsonwebtoken's p256/p384 verify public inputs; aws-sigv4 signs with them only for SigV4a (multi-region access points), and s3s rejects ARN bucket names. No 0.5.x fix." },
     { id = "RUSTSEC-2026-0441", reason = "pin-utils: unmaintained, no known vulnerability. Pulled by aws-smithy-http." },
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml: unmaintained, no known vulnerability. Pulled by serde_yaml under regorus 0.10; regorus 0.12 moves to yaml_serde." },
+    { id = "RUSTSEC-2026-0543", reason = "chrono: unmaintained, no known vulnerability. Pulled by s3s (still a hard dependency in 0.17) and by regorus's `time` builtins, so replacing s0's own use would not remove it." },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz: unmaintained, no known vulnerability. Pulled by regorus's `time` feature (the `time.*` builtins bundles may call), still in regorus 0.15." },
 ]
