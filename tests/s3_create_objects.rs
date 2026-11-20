@@ -270,3 +270,15 @@ async fn copy_object_is_never_create_only() {
         "CopyObject has no destination condition (E4): it can overwrite"
     );
 }
+
+#[tokio::test]
+async fn a_create_capable_write_granted_neither_verb_is_recorded_as_the_write() {
+    // `create_objects` is only the fallback. When it is denied too, the request was
+    // refused the question it needed first, and the record says so.
+    let fx = native("s3-create-neither");
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request_as("reader", "PutObject", put("drop/a.csv", true), Method::PUT);
+    assert!(access.put_object(&mut req).await.is_err());
+    assert!(!proved(&req));
+    assert_eq!(last_input(&fx).await.action.as_str(), "write_objects");
+}

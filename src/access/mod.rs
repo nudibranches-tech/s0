@@ -478,7 +478,9 @@ impl GatewayAccess {
     /// thing that stops the commit from overwriting, and a backend that silently ignores
     /// it would turn create-only into overwrite with no error anywhere.
     ///
-    /// One request, one record: the record carries the input that decided it.
+    /// One request, one record: the record carries the input that decided it — the
+    /// `create_objects` one when the fallback was granted, the `write_objects` one when
+    /// neither was.
     async fn enforce_write_or_create(
         &self,
         cx: &mut ReqCtx<'_>,
@@ -494,14 +496,19 @@ impl GatewayAccess {
         if let Some(refusal) = cx.placement_refusal(&input) {
             return Err(self.deny_placement_versions(input, &refusal, versions));
         }
-        let decision = self.decide(cx, &input).await;
-        if decision.allow {
-            return self.settle(cx, input, decision, charge, versions).await;
+        let write = self.decide(cx, &input).await;
+        if write.allow {
+            return self.settle(cx, input, write, charge, versions).await;
         }
-        let mut create = input;
+        let mut create = input.clone();
         create.action = Action::CreateObjects;
         let decision = self.decide(cx, &create).await;
-        if decision.allow && cx.route.conditional_create != ConditionalCreate::Native {
+        if !decision.allow {
+            // Neither verb granted: the request needed `write_objects` first, so the record
+            // and the client carry that question and its reason, not the fallback's.
+            return self.settle(cx, input, write, charge, versions).await;
+        }
+        if cx.route.conditional_create != ConditionalCreate::Native {
             return Err(self.refuse_versions(
                 create,
                 format!(
