@@ -3,7 +3,7 @@
 - **Status**: Accepted — implemented (src/sftp/)
 - **Date**: 2026-09-29
 - **Extends**: ADR-002 (a new record shape and an optional `gateway.session` block, D13) and
-  ADR-006 (a new verb and `grant_schema_version: 3`, D5, D7). Both stay in force; this ADR
+  ADR-006 (a new verb and `grant_schema_version: 4`, D5, D7). Both stay in force; this ADR
   adds to their contracts and does not edit them.
 - **Owners**: gateway team (this repository); projecting SFTP accounts, SSH keys and user CAs
   into the bundle is control-plane integration (out of scope for this repository)
@@ -328,7 +328,7 @@ PEP-side like `s3_key_epoch` and `reserved_tag_keys`.
 
 ```jsonc
 {
-  "grant_schema_version": 3,
+  "grant_schema_version": 4,
   "sftp": {
     "version": 1,
     "user_cas": {
@@ -430,15 +430,20 @@ contract; only the lookup follows the module. The STS door's membership check
 That asymmetry predates this ADR and is out of its scope.
 
 **Schema version and absence.** This is a contract change: `create_objects` (D7) and the
-`sftp` section define **`grant_schema_version: 3`**. The pushed module's exact-match gate (E3)
-makes the switch atomic, because data and module ship in the same document. s0 adds its own
+`sftp` section define **`grant_schema_version: 4`**. Version 3 is already taken by bucket
+placement (ADR-009): a control plane serving 3 projects placement and no `create_objects`, so
+gating SFTP on 3 would accept bundles that cannot express a drop-box grant. 4 keeps
+everything 3 means (placement applies from 3 up, pinned by
+`tests/bundle_v3.rs::a_v4_bundle_places_buckets_as_v3_does`) and adds `create_objects` and
+`data.sftp`. The pushed module's exact-match gate (E3) makes the switch atomic, because data
+and module ship in the same document. s0 adds its own
 PEP gate, which fails closed on every degenerate input:
 
 | Bundle | SFTP authentication |
 |---|---|
 | no `sftp` section | every login rejected |
 | `sftp.version` absent or `≠ 1` | every login rejected; `error` log once per revision |
-| `grant_schema_version` present and `< 3` | every login rejected (a v2 module predates `create_objects`) |
+| `grant_schema_version` present and `< 4` | every login rejected (a v3 projection is placement alone and predates `create_objects`) |
 | `grant_schema_version` absent (a hand-written bundle on the compiled-in module) | governed by `sftp.version` alone; the key space still follows the module in force (D5, key spaces) |
 | account present but malformed (bad login, bad `subject_key`, empty or `/`-containing `home.bucket`, `home.prefix` not `/`-terminated or not canonical — a leading `/`, `//`, `.` or `..` —, a fingerprint without `SHA256:`, a non-array `allowed_source_cidrs`) | that account rejected, others unaffected; `error` log |
 | account naming a tenant s0 does not know or the subject is not a member of | loads; every login refused at authentication (audited, not counted toward the ban, D3) |
@@ -533,9 +538,11 @@ read it.
 - `create_objects` joins `write_actions` in the rego and `Action::is_write` in the PEP, so
   `freeze_writes` covers it. `the_write_set_matches_the_shipped_rego` enforces the equality.
 - It joins `GATEWAY_VERBS`, `Action::ALL`, the README verb table and
-  `tests/readme_optable.rs`. The verb count is pinned to seven in
-  `tests/op_coverage.rs::the_gateway_vocabulary_is_the_seven_projected_verbs`, the README's
-  "one of seven grant verbs" and the doc comment on `Action` in `src/model.rs`.
+  `tests/readme_optable.rs`. With `delete_object_versions` (ADR-013), which landed
+  alongside, the vocabulary is **eight verbs**, pinned in
+  `tests/op_coverage.rs::the_gateway_vocabulary_is_the_eight_projected_verbs`, the README's
+  "one of eight grant verbs" and the doc comment on `Action` in `src/model.rs`. The two
+  verbs are independent: neither implies the other.
 
   `create_objects` is the first verb no enforced S3 operation names. Any test assuming every
   verb has an operation is amended to say so explicitly, rather than weakened. Both fronts
@@ -549,7 +556,7 @@ read it.
 equal to the target key (or `dir/` for a listing), not as `read_objects`. A `list_objects`
 holder already sees the name, size and modification time of every key through
 `ListObjectsV2`. A stat reveals exactly that and nothing more, so metadata visibility never
-implies download, without a sixth object verb. A drop-box principal holding only
+implies download, without another object verb. A drop-box principal holding only
 `create_objects` can stat nothing but its virtual root (see below), which is the intended
 posture.
 
@@ -1030,7 +1037,7 @@ against client timeouts.
 | T15 | Partial upload committed on client interrupt | Atomic commit; disconnect without CLOSE aborts (D9). | CLOSE after an interrupt commits a short file, as on POSIX. |
 | T16 | Existence oracle through create-only | Inherent: create-only must refuse an existing key. Limited to keys inside the create grant. | 1 bit per probed key, audited. |
 | T17 | Filename collisions through lossy decoding | No lossy decoding: invalid UTF-8 is refused (D4, D6, E7). | NFC vs NFD names are distinct keys, as on the backend. |
-| T18 | Policy/PEP skew: new verb on an old module or binary | `grant_schema_version: 3` gate in the module; PEP gate on `sftp.version` and the schema version (D5); binary ships first (rollout). | None — skew fails closed. |
+| T18 | Policy/PEP skew: new verb on an old module or binary | `grant_schema_version: 4` gate in the module; PEP gate on `sftp.version` and the schema version (D5); binary ships first (rollout). | None — skew fails closed. |
 | T19 | A russh default opens a channel type or request | Every `Handler` method overridden; the method list pinned per russh version (D3). | None known. |
 | T20 | SFTP load starves the S3 front | Separate processes in production (D1). | Shared backend capacity: a backend-side concern. |
 
@@ -1058,7 +1065,7 @@ against client timeouts.
 - **A6 — Create-only in code, with no verb.** Rejected. It would make "this principal may
   drop but not overwrite" invisible to the control plane and to anyone reading grants.
 - **A7 — A `stat_objects` verb.** Rejected. `list_objects` already discloses exactly what a
-  stat returns (D7). A sixth object verb would double the grant surface for no difference in
+  stat returns (D7). Another object verb would double the grant surface for no difference in
   disclosure.
 - **A8 — Virtual mkdir held in session memory.** Rejected. Directories would vanish between
   sessions and be invisible to S3 tools. Markers are the convention consoles already use.
@@ -1167,7 +1174,7 @@ expected behaviour, to be checked by hand. The expected settings are:
   - overwrite without `write_objects`;
   - content read through stat or readdir;
   - a write after a key is revoked mid-session;
-  - a bundle without `sftp`, with the wrong version, and with `grant_schema_version: 2`;
+  - a bundle without `sftp`, with the wrong version, and with `grant_schema_version: 2` or `3`;
   - oversized packets, malformed length fields, truncated strings;
   - a non-strict-KEX client, an RSA client key, an SHA-1 signature attempt (refused at the
     probe; server-sig-algs advertises no RSA algorithm, so no SHA-1 signature is ever
@@ -1225,7 +1232,7 @@ The control plane must:
   - `home.prefix` must be `/`-terminated or empty.
   - Fingerprints must be `SHA256:` base64 without padding, as OpenSSH prints them.
   - CA scopes must be explicit.
-- **Emit `create_objects`** as a grantable verb, and bump to `grant_schema_version: 3` with a
+- **Emit `create_objects`** as a grantable verb, and bump to `grant_schema_version: 4` with a
   module that implements it, including the write-implies-create rule, and ignores
   `input.request.protocol` unless it deliberately conditions on it.
 - **Revoke** by removing keys or accounts, or by adding `revoked_serials` /

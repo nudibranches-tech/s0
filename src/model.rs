@@ -5,15 +5,16 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The grant vocabulary the gateway authorizes against — the **seven projected verbs**.
+/// The grant vocabulary the gateway authorizes against — the **eight projected verbs**.
 ///
 /// Deliberately coarser than the 99 S3 ops: every enforced op maps onto exactly one of
 /// these (`PutObject` to `write_objects`, `HeadBucket` to `read`), except `CopyObject`,
-/// which maps to two. [`Action::CreateObjects`] is asked by the SFTP front for every
-/// upload (ADR-014 D7), and by the S3 front for a write that cannot overwrite — a
-/// `PutObject` or `CompleteMultipartUpload` carrying `If-None-Match: *`, and the multipart
-/// steps leading to one — when `write_objects` is denied (ADR-014 F1). The set is a
-/// contract with whatever control plane projects grants.
+/// which maps to two, and `DeleteObject`/`DeleteObjects`, decided under
+/// `delete_object_versions` when a version is named (ADR-013). [`Action::CreateObjects`] is
+/// asked by the SFTP front for every upload (ADR-014 D7), and by the S3 front for a write
+/// that cannot overwrite — a `PutObject` or `CompleteMultipartUpload` carrying
+/// `If-None-Match: *`, and the multipart steps leading to one — when `write_objects` is
+/// denied (ADR-014 F1). The set is a contract with whatever control plane projects grants.
 ///
 /// **The gateway is data-plane only**, so there is no verb for acting on a bucket as a
 /// *managed resource*: existence, policy, CORS and quota *settings* are control-plane
@@ -34,6 +35,10 @@ pub enum Action {
     /// principal holding only `create_objects` can drop files and cannot overwrite them.
     CreateObjects,
     DeleteObjects,
+    /// A delete that names a version (`DeleteObject` with a `versionId`, a `DeleteObjects`
+    /// entry carrying one). Kept separate from [`Action::DeleteObjects`]: a grant of one
+    /// never confers the other (AWS `s3:DeleteObjectVersion` parity).
+    DeleteObjectVersions,
     /// Kept **deliberately separate** from [`Action::WriteObjects`]. `OpaInput::object_tags`
     /// lets a policy key on tags; merging the two would let a principal holding both grant
     /// itself whatever the policy keys on, a trap that springs when tag-driven ABAC is on.
@@ -61,6 +66,7 @@ impl Action {
         Action::WriteObjects,
         Action::CreateObjects,
         Action::DeleteObjects,
+        Action::DeleteObjectVersions,
         Action::WriteObjectTags,
         Action::ListObjects,
         Action::Read,
@@ -72,6 +78,7 @@ impl Action {
             Action::WriteObjects => "write_objects",
             Action::CreateObjects => "create_objects",
             Action::DeleteObjects => "delete_objects",
+            Action::DeleteObjectVersions => "delete_object_versions",
             Action::WriteObjectTags => "write_object_tags",
             Action::ListObjects => "list_objects",
             Action::Read => "read",
@@ -91,6 +98,7 @@ impl Action {
             Action::WriteObjects
                 | Action::CreateObjects
                 | Action::DeleteObjects
+                | Action::DeleteObjectVersions
                 | Action::WriteObjectTags
         )
     }

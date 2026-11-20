@@ -66,6 +66,16 @@
             {
               "bucket": "acme-000000-warehouse",
               "actions": [
+                "delete_object_versions"
+              ],
+              "prefixes": [
+                "team-a/scratch/"
+              ],
+              "conditions": []
+            },
+            {
+              "bucket": "acme-000000-warehouse",
+              "actions": [
                 "read_objects"
               ],
               "prefixes": [

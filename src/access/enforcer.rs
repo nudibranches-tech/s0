@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use crate::audit::{
     AuditRecord, BackendOutcome, GateContext, GateStage, GatewayMeta, Outcome, PendingAudit,
+    VersionedKey,
 };
 use crate::authz::{Decision, OpaInput};
 use crate::gateway::Gateway;
@@ -131,6 +132,20 @@ impl Enforcer {
         outcome: Outcome,
         denied_keys: Vec<String>,
     ) -> AuditRecord {
+        self.record_versions(input, decision, outcome, denied_keys, vec![], vec![])
+    }
+
+    /// [`Self::record`] for a decision that names object versions (ADR-013): the versions
+    /// the request named, and those policy refused.
+    pub fn record_versions(
+        &self,
+        input: OpaInput,
+        decision: &Decision,
+        outcome: Outcome,
+        denied_keys: Vec<String>,
+        versions: Vec<VersionedKey>,
+        denied_versions: Vec<VersionedKey>,
+    ) -> AuditRecord {
         // The live revision rather than the request's pinned one: this names, it never
         // decides, and a bucket keeps its object name for as long as it exists.
         let bundle = self.gw.bundles.current();
@@ -140,6 +155,8 @@ impl Enforcer {
             backend_kind: input.backend.kind.as_str().to_string(),
             outcome,
             denied_keys,
+            versions,
+            denied_versions,
             backend: BackendOutcome::NotAttempted,
             backend_status: None,
             session: None,

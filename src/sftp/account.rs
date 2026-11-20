@@ -7,7 +7,7 @@
 //! PDP on every operation.
 //!
 //! Every degenerate input fails closed ([`Directory::gate`]): no section, a wrong
-//! `sftp.version`, a `grant_schema_version` below 3, a malformed account. The one
+//! `sftp.version`, a `grant_schema_version` below 4, a malformed account. The one
 //! "absent means unrestricted" field is `allowed_source_cidrs`, because it restricts on top
 //! of key possession rather than granting anything.
 
@@ -26,8 +26,10 @@ use crate::pdp::{Bundle, split_subject_key, subject_lookup_key};
 
 /// The `data.sftp.version` this binary understands.
 pub const SFTP_SECTION_VERSION: u64 = 1;
-/// The lowest `grant_schema_version` that defines `create_objects` and `data.sftp`.
-pub const MIN_GRANT_SCHEMA_VERSION: u64 = 3;
+/// The lowest `grant_schema_version` that defines `create_objects` and `data.sftp`
+/// (ADR-014 D5). Version 3 is bucket placement (ADR-009) and predates both: a control
+/// plane serving 3 projects no `create_objects`, so a v3 bundle cannot serve SFTP.
+pub const MIN_GRANT_SCHEMA_VERSION: u64 = 4;
 
 /// `^[a-z0-9][a-z0-9._-]{0,63}$` — excludes `@` and `:`, the separators clients and the
 /// subject-key space already use.
@@ -220,8 +222,8 @@ impl Directory {
             }
         }
         // Absent ⇒ a hand-written bundle on the compiled-in module: governed by
-        // `sftp.version` alone. Present and below 3 ⇒ a module that predates
-        // `create_objects`.
+        // `sftp.version` alone. Present and below 4 ⇒ a projection that predates
+        // `create_objects` (3 is bucket placement alone).
         if let Some(v) = data.get("grant_schema_version") {
             match v.as_u64() {
                 Some(v) if v >= MIN_GRANT_SCHEMA_VERSION => {}
@@ -868,6 +870,14 @@ mod tests {
         v3.data["grant_schema_version"] = serde_json::json!(3);
         assert!(
             Directory::from_bundle(&v3)
+                .authenticate("acme-partner-drop", &cred, ip(), 0)
+                .is_err(),
+            "3 is bucket placement alone: no create_objects in that projection"
+        );
+        let mut v4 = bundle(section(&fp, serde_json::json!({})), true);
+        v4.data["grant_schema_version"] = serde_json::json!(4);
+        assert!(
+            Directory::from_bundle(&v4)
                 .authenticate("acme-partner-drop", &cred, ip(), 0)
                 .is_ok()
         );

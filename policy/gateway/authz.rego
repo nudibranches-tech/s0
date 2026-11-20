@@ -18,8 +18,8 @@
 # ── input ──────────────────────────────────────────────────────────────────────
 #   input.principal.{sub,type,attributes.groups,attributes.<extra>}
 #   input.backend.{id,kind}   input.tenant   input.organization_id
-#   input.action  ∈ the 7 settled verbs (2026-08-08 six; `create_objects` 2026-09, ADR-014):
-#       object-scoped : read_objects write_objects create_objects delete_objects
+#   input.action  ∈ the 8 verbs (ADR-006; `create_objects` ADR-014, `delete_object_versions` ADR-013):
+#       object-scoped : read_objects write_objects create_objects delete_objects delete_object_versions
 #                       write_object_tags
 #       listing       : list_objects
 #       bucket/account: read
@@ -27,8 +27,10 @@
 #     THE GATEWAY IS DATA-PLANE ONLY. `create_bucket`, `delete_bucket`,
 #     `read_bucket_config` and `write_bucket_config` are gone: each was a way to make,
 #     unmake or re-configure a bucket with no record in the control plane that owns it —
-#     unmanaged, unquota'd, invisible. That authority belongs to the control plane, and
-#     the six S3 ops that carried it are refused at the gate before deserialization.
+#     unmanaged, unquota'd, invisible. That authority belongs to the control plane. The
+#     S3 ops that carried it never reach this policy: with a control backend configured
+#     (ADR-012) they are delegated to it after authentication, otherwise they are refused
+#     at the gate before deserialization.
 #     `write_object_acl` is gone with no successor: an object ACL grants access no
 #     projection emitted and none can revoke, so conferring one is refused in code
 #     (`s0::access::headers`).
@@ -198,6 +200,7 @@ write_actions := {
 	"write_objects",
 	"create_objects",
 	"delete_objects",
+	"delete_object_versions",
 	"write_object_tags",
 }
 

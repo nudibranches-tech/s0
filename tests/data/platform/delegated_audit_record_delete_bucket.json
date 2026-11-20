@@ -1,0 +1,29 @@
+{
+  "decision_id": "00000000-0000-0000-0000-000000000000",
+  "delegated": {
+    "bucket": "reports",
+    "control_status": 204,
+    "operation": "DeleteBucket",
+    "placement_wait": "removed",
+    "subject": "sa:alice",
+    "tenant": "acme"
+  },
+  "gateway": {
+    "backend": "not_attempted",
+    "backend_id": "bay-1",
+    "backend_kind": "ceph",
+    "object_name": "reports.bay-1",
+    "outcome": "allowed"
+  },
+  "labels": {
+    "s0/organization-id": "org-acme"
+  },
+  "path": "s3/authz/delegated",
+  "requested_by": "alice",
+  "result": {
+    "allow": true,
+    "obligations": {},
+    "reason": "delegated to the control backend"
+  },
+  "timestamp": "2026-11-02T00:00:00Z"
+}

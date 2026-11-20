@@ -3030,7 +3030,7 @@ async fn the_remaining_d11_rows_get_their_documented_answers() {
 
 // ── bucket placement (ADR-009) ──────────────────────────────────────────────────
 
-/// [`bundle`] at `grant_schema_version` 3, projected for backend `backend_id`, with the
+/// [`bundle`] at `grant_schema_version` 4 (placement, plus the SFTP contract), projected for backend `backend_id`, with the
 /// home bucket `inbound` placed under `owner`. `globex` is a second tenant of the org.
 fn placed(
     drop_key: &PrivateKey,
@@ -3039,7 +3039,7 @@ fn placed(
     owner: &str,
 ) -> serde_json::Value {
     let mut b = bundle(drop_key, ops_key);
-    b["grant_schema_version"] = serde_json::json!(3);
+    b["grant_schema_version"] = serde_json::json!(4);
     b["backend"] = serde_json::json!({ "id": backend_id, "kind": "ceph" });
     b["tenants"]["globex"] = serde_json::json!({
         "user_attributes": {}, "bucket_attributes": {}, "s3_grants": {}, "group_grants": {}
