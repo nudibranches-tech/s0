@@ -559,7 +559,7 @@ pinned to the **exact** version (`s3s = "=0.14.1"`) so upgrades are deliberate e
 methods `s3s-aws`'s generated `Proxy` overrides. A patch bump that overrode one more would
 open a forwarding path with no test failing. Guarded by `tests/op_coverage.rs`.
 
-`russh` is pinned exactly too (`russh = "=0.63.3"`): the SFTP front's safety argument is
+`russh` is pinned exactly too (`russh = "=0.65.1"`): the SFTP front's safety argument is
 a claim about which `Handler` methods exist and what their defaults do, and several
 defaults accept a channel request without replying. `tests/sftp_transport.rs` holds the
 pinned method list against the overrides in `src/sftp/transport.rs`.

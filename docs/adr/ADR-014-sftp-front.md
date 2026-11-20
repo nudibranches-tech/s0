@@ -64,8 +64,8 @@ and decides around it rather than working around it silently.
 | E2 | `excluded_prefixes` is **not implemented** by s0. It is not in `IMPLEMENTED_OBLIGATIONS`; a pushed module that emits it with `must_understand` gets a denial, on S3 today. | `src/authz/decision.rs` (`IMPLEMENTED_OBLIGATIONS`); `tests/security_regressions.rs` | "excluded_prefixes apply to SFTP as to S3" holds literally: both **deny**. Neither front filters. D7 records it. |
 | E3 | The `grant_schema_version` gate lives in the **pushed module** (exact match on 2). s0 itself only reads the field to warn about a module-less platform bundle. | `tests/data/platform/s3_gateway_bundle.json` (`schema_ok`); `src/pdp/bundle.rs` (`is_platform_data_missing_its_module`) | Bumping the version is a contract change the module enforces; s0 adds its own PEP-side gate on the SFTP section (D5). |
 | E4 | s3s 0.14.1 carries `if_none_match` on `PutObjectInput` and `CompleteMultipartUploadInput`, and s3s-aws 0.14.1 converts both. `CopyObjectInput` carries only `copy_source_if_none_match`, a condition on the **source**. | `s3s-0.14.1/src/dto/generated.rs` (`CompleteMultipartUploadInput`, `PutObjectInput`, `CopyObjectInput`); `s3s-aws-0.14.1/src/conv/generated.rs` (`CompleteMultipartUploadInput`, `PutObjectInput` impls) | A conditional *create* is expressible for uploads, and for renames only as a multipart copy (D8). |
-| E5 | russh 0.63.3 implements strict KEX (`kex-strict-s-v00@openssh.com`), `max_auth_attempts`, and rejects a channel-open whose handle is dropped. But `exec`, `shell`, `env`, `pty-req` and `subsystem` default to `Ok(())` **without replying**, like the s3s hooks default to `Ok(())`. | `russh-0.63.3/src/kex/mod.rs`, `src/server/mod.rs` (`Handler` defaults), `src/lib_inner.rs` (`ChannelOpenHandleInner::drop`), `src/server/encrypted.rs` | Every `Handler` method is overridden and pinned by a table test (D3). |
-| E6 | russh 0.63.3's server public-key path hands the handler the **key only**. The signature algorithm the client used (`ssh-rsa` = SHA-1, or `rsa-sha2-256/512`) is verified but never exposed, and no check against a server preference list is visible on that path. For certificates, russh checks the validity window and the CA signature, and nothing else. | `russh-0.63.3/src/server/encrypted.rs`, `server_read_auth_request_pk` | "RSA-SHA2 only, no SHA-1" is **not enforceable** on the pinned API. RSA client keys are refused in v1 (D3). Every certificate property except those two is s0's to check (D5). |
+| E5 | russh 0.63.3 (re-checked on 0.65.1, same `Handler` methods and defaults) implements strict KEX (`kex-strict-s-v00@openssh.com`), `max_auth_attempts`, and rejects a channel-open whose handle is dropped. But `exec`, `shell`, `env`, `pty-req` and `subsystem` default to `Ok(())` **without replying**, like the s3s hooks default to `Ok(())`. | `russh-0.63.3/src/kex/mod.rs`, `src/server/mod.rs` (`Handler` defaults), `src/lib_inner.rs` (`ChannelOpenHandleInner::drop`), `src/server/encrypted.rs` | Every `Handler` method is overridden and pinned by a table test (D3). |
+| E6 | russh 0.63.3's server public-key path hands the handler the **key only**. The signature algorithm the client used (`ssh-rsa` = SHA-1, or `rsa-sha2-256/512`) is verified but never exposed, and no check against a server preference list is visible on that path. For certificates, russh checks the validity window and the CA signature, and nothing else. | `russh-0.63.3/src/server/encrypted.rs`, `server_read_auth_request_pk` | "RSA-SHA2 only, no SHA-1" is **not enforceable** on the 0.63.3 API. RSA client keys are refused in v1 (D3). Since 0.64 russh checks the signature against the negotiated algorithm, and 0.65 hands it to the handler (`VerifiedPublicKey::algorithm`), so RSA-SHA2 could now be accepted; v1 still refuses RSA. Every certificate property except those two is s0's to check (D5). |
 | E7 | russh-sftp 3.0.1 decodes every protocol string with `String::from_utf8_lossy`; on any per-packet error its loop logs and keeps reading the same stream; it processes one request at a time. | `russh-sftp-3.0.1/src/buf.rs` (`try_get_string`); `src/server/mod.rs` (`run_with_config`) | Non-UTF-8 paths cannot be rejected (two different byte strings collapse onto one key), and an oversized or malformed packet desynchronizes the stream instead of ending it. An in-tree SFTP v3 codec is chosen (D4). |
 | E8 | russh 0.63.3 pulls `rsa 0.10.0-rc.18` and `ssh-key 0.7.0-rc.11` (pre-releases) and `aws-lc-rs` (C, built by `aws-lc-sys`). RUSTSEC-2023-0071 (timing side channel) concerns **private-key** operations of the `rsa` crate. | `cargo metadata` over a probe crate depending on `russh = "0.63.3"`, `russh-sftp = "3.0.1"` | No RSA host keys, so s0 performs no RSA private-key operation (D3). Licence review below. |
 
@@ -196,13 +196,13 @@ exists to avoid.
 
 ### D3 — SSH transport: russh, pinned, with a code-constant algorithm floor
 
-**Library.** `russh = "=0.63.3"`, pinned exactly, for the reason `s3s` is: the safety
+**Library.** `russh = "=0.65.1"`, pinned exactly, for the reason `s3s` is: the safety
 argument depends on which `Handler` methods exist and what their defaults do (E5). A
-`tests/data/russh-0.63.3-handler.txt` lists every `Handler` method of the pinned version.
+`tests/data/russh-0.65.1-handler.txt` lists every `Handler` method of the pinned version.
 Rust cannot reject a default method that was left in place, so the guarantee is a test, in
 the style of `tests/op_coverage.rs`:
 
-- `russh_is_pinned_exactly` asserts the `=0.63.3` pin in `Cargo.toml`, and the list holds
+- `russh_is_pinned_exactly` asserts the `=0.65.1` pin in `Cargo.toml`, and the list holds
   exactly 34 methods;
 - the list is compared against the `Handler` trait in the pinned russh source when that
   source is in the local cargo registry (the comparison is skipped otherwise);
@@ -224,7 +224,7 @@ ships with a release:
 
 - **Terrapin.** Strict KEX is **required**: a client that does not advertise
   `kex-strict-c-v00@openssh.com` is disconnected before authentication. Every client in the
-  matrix below has shipped strict KEX since the 2023-12 disclosure. russh 0.63.3 gives a
+  matrix below has shipped strict KEX since the 2023-12 disclosure. russh 0.65.1 gives a
   server no way to require it, so s0 enforces it in-tree: `sftp::preauth::StrictKexGuard`
   reads the client's cleartext KEXINIT before any byte reaches russh and closes the
   connection unless `kex-strict-c-v00@openssh.com` is advertised, recording

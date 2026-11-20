@@ -14,8 +14,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use russh::keys::{Algorithm, Certificate, EcdsaCurve, HashAlg, PrivateKey, PublicKey};
-use russh::server::{Auth, Msg, Session};
+use russh::keys::{Algorithm, Certificate, EcdsaCurve, HashAlg, PrivateKey};
+use russh::server::{Auth, Msg, PublicKeyOffer, Session, VerifiedPublicKey};
 use russh::{Channel, ChannelId, ChannelOpenFailure, MethodKind, MethodSet, Preferred};
 
 use super::account::{Credential, Refusal, client_key_allowed};
@@ -313,8 +313,9 @@ impl russh::server::Handler for SshHandler {
     async fn auth_publickey_offered(
         &mut self,
         user: &str,
-        public_key: &PublicKey,
+        offer: PublicKeyOffer<'_>,
     ) -> Result<Auth, Self::Error> {
+        let public_key = offer.public_key;
         self.probes += 1;
         let max = self.shared.gw.limits().sftp.max_key_probes;
         if self.probes > max {
@@ -336,8 +337,9 @@ impl russh::server::Handler for SshHandler {
     async fn auth_publickey(
         &mut self,
         user: &str,
-        public_key: &PublicKey,
+        verified: VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
+        let public_key = verified.public_key;
         self.check(
             user,
             Credential::PublicKey {

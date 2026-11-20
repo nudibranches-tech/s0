@@ -1458,7 +1458,9 @@ async fn every_channel_type_and_request_other_than_sftp_is_refused() {
 
     // exec / shell / pty on a session channel: an explicit failure, never a silent Ok.
     // (`env` is refused without closing the channel: see `env_then_sftp_works_like_stock_openssh`.)
-    for which in ["exec", "shell", "pty", "subsystem-other"] {
+    // Agent forwarding is refused by closing the channel; the failure russh then sends
+    // (on the channel since 0.64) may arrive after the close, so the close is the refusal.
+    for which in ["exec", "shell", "pty", "subsystem-other", "agent"] {
         let cfg = Arc::new(russh::client::Config::default());
         let mut session = russh::client::connect(cfg, h.addr, Client).await.unwrap();
         assert!(
@@ -1479,9 +1481,10 @@ async fn every_channel_type_and_request_other_than_sftp_is_refused() {
                 .request_pty(true, "xterm", 80, 24, 0, 0, &[])
                 .await
                 .unwrap(),
+            "agent" => ch.agent_forward(true).await.unwrap(),
             _ => ch.request_subsystem(true, "shell").await.unwrap(),
         }
-        let mut saw_failure = false;
+        let (mut saw_failure, mut closed) = (false, false);
         while let Some(msg) = tokio::time::timeout(Duration::from_secs(5), ch.wait())
             .await
             .ok()
@@ -1490,11 +1493,18 @@ async fn every_channel_type_and_request_other_than_sftp_is_refused() {
             match msg {
                 russh::ChannelMsg::Failure => saw_failure = true,
                 russh::ChannelMsg::Success => panic!("{which} was accepted"),
-                russh::ChannelMsg::Close => break,
+                russh::ChannelMsg::Close => {
+                    closed = true;
+                    break;
+                }
                 _ => {}
             }
         }
-        assert!(saw_failure, "{which} must get SSH_MSG_CHANNEL_FAILURE");
+        if which == "agent" {
+            assert!(saw_failure || closed, "agent forwarding must be refused");
+        } else {
+            assert!(saw_failure, "{which} must get SSH_MSG_CHANNEL_FAILURE");
+        }
     }
 }
 
@@ -2516,7 +2526,7 @@ fn auth_failures(recs: &[AuditRecord]) -> Vec<&AuditRecord> {
 /// algorithm is not part of KEX, so the host-key and KEX floors do not stop a client
 /// from *offering* `ssh-rsa`. What the server does is (a) advertise no RSA algorithm
 /// at all in `server-sig-algs`, and (b) refuse the key at the probe, so no SHA-1
-/// signature is ever verified. russh 0.63.3 also routes a signed request that skips
+/// signature is ever verified. russh 0.65.1 also routes a signed request that skips
 /// the probe through `auth_publickey_offered`, the same refusal; and the account layer
 /// refuses RSA again at authentication
 /// (`account::tests::a_listed_rsa_key_is_refused_as_a_credential_mismatch`).

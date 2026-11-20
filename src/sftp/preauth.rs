@@ -1,7 +1,7 @@
 //! What happens on a connection before russh sees a byte: the PROXY v2 header and the
 //! strict-KEX requirement (ADR-014 D3, D12).
 //!
-//! **Strict KEX (Terrapin).** russh 0.63.3 negotiates `kex-strict-*-v00@openssh.com` when
+//! **Strict KEX (Terrapin).** russh 0.65.1 negotiates `kex-strict-*-v00@openssh.com` when
 //! both sides offer it, but exposes no way for a server to *require* it: the negotiated
 //! flag is private to the session and no `Handler` method runs before authentication. The
 //! client's first `SSH_MSG_KEXINIT` is sent in the clear, though, so [`StrictKexGuard`]
