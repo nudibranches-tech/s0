@@ -66,6 +66,11 @@ pub fn delegable_body(op: &str) -> Vec<u8> {
             <ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm>\
             </ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>"
         }
+        "PutObjectLockConfiguration" => {
+            "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>\
+            <Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>1</Days></DefaultRetention>\
+            </Rule></ObjectLockConfiguration>"
+        }
         _ => "",
     }
     .as_bytes()

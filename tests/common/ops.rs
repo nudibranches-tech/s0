@@ -534,5 +534,21 @@ macro_rules! each_delegable_op {
                 ..Default::default()
             }
         );
+        $probe!(
+            get_object_lock_configuration,
+            "GetObjectLockConfiguration",
+            s3s::dto::GetObjectLockConfigurationInput {
+                bucket: "reports".into(),
+                ..Default::default()
+            }
+        );
+        $probe!(
+            put_object_lock_configuration,
+            "PutObjectLockConfiguration",
+            s3s::dto::PutObjectLockConfigurationInput {
+                bucket: "reports".into(),
+                ..Default::default()
+            }
+        );
     }};
 }

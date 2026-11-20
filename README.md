@@ -21,7 +21,7 @@ Operations it does not own are denied, not passed through.
 
 s0 knows all **99** operations in the `s3s` 0.14.1 surface. **28** are enforced and
 forwarded; the other **71** are refused with `403 AccessDenied`, unless a control backend
-is configured: **16** of those can be delegated to it and answered there instead (below).
+is configured: **18** of those can be delegated to it and answered there instead (below).
 An operation with no entry in the table cannot reach a backend, and one that is delegated
 never reaches the storage backend either.
 
@@ -62,7 +62,7 @@ by s0 so a policy can cap a period without a clock, and s0 itself caps nothing
 ([ADR-015](docs/adr/ADR-015-object-lock.md)). The vocabulary is published as
 [`docs/verbs.json`](docs/verbs.json) for a control plane to vendor.
 
-### Delegated (16)
+### Delegated (18)
 
 Bucket creation, deletion and bucket configuration cannot be answered by the storage backend alone:
 on a platform that owns its buckets through a control plane, a bucket is a declared
@@ -77,6 +77,12 @@ S3 endpoint and returns its answer; without it they are refused like any other.
 | Tags | `GetBucketTagging`, `PutBucketTagging`, `DeleteBucketTagging` |
 | Versioning | `GetBucketVersioning`, `PutBucketVersioning` |
 | Default encryption | `GetBucketEncryption`, `PutBucketEncryption`, `DeleteBucketEncryption` |
+| Object Lock configuration | `GetObjectLockConfiguration`, `PutObjectLockConfiguration` |
+
+A `CreateBucket` carrying `x-amz-bucket-object-lock-enabled` reaches the control backend
+with the flag in its typed input; whether a bucket may be created locked is the control
+backend's answer. A gateway older than 0.6.1 refuses to load a configuration listing the
+two lock-configuration operations, so a control plane renders them only for 0.6.1 or later.
 
 Whatever s0 forwards to the storage backend, s0 authorizes; **whatever it delegates, the
 control backend authorizes.** For these operations s0 authenticates the caller, resolves the
@@ -126,7 +132,7 @@ with nothing upstream knowing. Those five verbs (`create_bucket`, `delete_bucket
 `read_bucket_config`, `write_bucket_config`, `write_object_acl`) are held in
 `NON_GATEWAY_VERBS` as a classification only — three tests hold that set disjoint from the
 grantable vocabulary, so flipping one of these operations to enforced does not quietly
-compile. The 16 operations of the section above are the exception, and only when a
+compile. The 18 operations of the section above are the exception, and only when a
 control backend answers them; without one they are in this list too.
 
 **Object-level operations outside the model — 6 operations.**

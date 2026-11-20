@@ -582,7 +582,9 @@ pub const OP_TABLE: &[OpSpec] = &[
         DangerTier::Routine,
         &["version_id (an old version's hold reads under the current key's grant)"],
     ),
-    denied(
+    // Bucket posture owned by the control plane, like versioning (ADR-015 D1): it knows
+    // whether the bucket was created locked and the platform's retention limits.
+    delegable(
         "GetObjectLockConfiguration",
         "read_bucket_config",
         ResourceShape::Bucket,
@@ -893,7 +895,7 @@ pub const OP_TABLE: &[OpSpec] = &[
         DangerTier::PostureAltering,
         &["version_id (a hold on an old version is decided under the current key's grant)"],
     ),
-    denied(
+    delegable(
         "PutObjectLockConfiguration",
         "write_bucket_config",
         ResourceShape::Bucket,
@@ -1213,7 +1215,9 @@ mod tests {
         }
     }
 
-    const ADR_0056_OPS: [&str; 16] = [
+    /// The sixteen operations of ADR-012 / ADR-0056 and the two lock-configuration
+    /// operations of ADR-015.
+    const DELEGABLE_OPS: [&str; 18] = [
         "CreateBucket",
         "DeleteBucket",
         "GetBucketCors",
@@ -1230,6 +1234,8 @@ mod tests {
         "GetBucketEncryption",
         "PutBucketEncryption",
         "DeleteBucketEncryption",
+        "GetObjectLockConfiguration",
+        "PutObjectLockConfiguration",
     ];
 
     fn names(ops: &[&str]) -> Vec<String> {
@@ -1237,8 +1243,8 @@ mod tests {
     }
 
     #[test]
-    fn the_delegable_set_is_sixteen() {
-        let mut expected = ADR_0056_OPS.to_vec();
+    fn the_delegable_set_is_eighteen() {
+        let mut expected = DELEGABLE_OPS.to_vec();
         let mut actual = delegable_ops();
         expected.sort_unstable();
         actual.sort_unstable();
@@ -1256,7 +1262,7 @@ mod tests {
 
     #[test]
     fn a_delegable_operation_is_refused_unless_configured() {
-        for op in ADR_0056_OPS {
+        for op in DELEGABLE_OPS {
             assert_eq!(
                 gate(op, &DelegatedOps::none()),
                 Err(GateDenial::NotEnforced),
@@ -1305,7 +1311,7 @@ mod tests {
         }
         assert!(DelegatedOps::from_names(&[]).is_err());
         assert!(DelegatedOps::from_names(&names(&["GetBucketCors", "GetBucketCors"])).is_err());
-        assert!(DelegatedOps::from_names(&names(&ADR_0056_OPS)).is_ok());
+        assert!(DelegatedOps::from_names(&names(&DELEGABLE_OPS)).is_ok());
     }
 
     #[test]
@@ -1377,7 +1383,6 @@ mod tests {
             "GetBucketAccelerateConfiguration",
             "GetBucketRequestPayment",
             "GetBucketReplication",
-            "GetObjectLockConfiguration",
         ] {
             assert!(refusal_is_not_implemented(op), "{op}");
         }
@@ -1390,6 +1395,9 @@ mod tests {
             "GetBucketCors",
             "CreateBucket",
             "GetObject",
+            // Delegable since ADR-015: an unconfigured gateway answers AccessDenied, as
+            // for every delegable row.
+            "GetObjectLockConfiguration",
             "NoSuchOp",
         ] {
             assert!(!refusal_is_not_implemented(op), "{op}");

@@ -1794,7 +1794,7 @@ impl S3Access for GatewayAccess {
 
     // ── delegated operations ────────────────────────────────────────────────────
     //
-    // The 16 `Coverage::Delegable` operations. Each hook only demands the
+    // The 18 `Coverage::Delegable` operations. Each hook only demands the
     // `DelegationProof` that `check` mints for a request it admitted as delegated, because
     // the s3s default would answer `Ok(())` and a hook that did nothing would read as an
     // authorization. They never reach the policy engine: the control backend authorizes
@@ -1890,6 +1890,22 @@ impl S3Access for GatewayAccess {
     async fn delete_bucket_encryption(
         &self,
         req: &mut S3Request<DeleteBucketEncryptionInput>,
+    ) -> S3Result<()> {
+        delegation::require(req)
+    }
+
+    // The bucket's lock configuration is bucket posture (ADR-015 D1). The per-object
+    // retention and legal hold are enforced, below.
+    async fn get_object_lock_configuration(
+        &self,
+        req: &mut S3Request<GetObjectLockConfigurationInput>,
+    ) -> S3Result<()> {
+        delegation::require(req)
+    }
+
+    async fn put_object_lock_configuration(
+        &self,
+        req: &mut S3Request<PutObjectLockConfigurationInput>,
     ) -> S3Result<()> {
         delegation::require(req)
     }

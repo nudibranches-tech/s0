@@ -85,9 +85,10 @@ const NEVER_DELEGABLE: [(&str, &str); 2] = [
     ),
 ];
 
-/// The 16 operations ADR-0056 hands to a control backend: refused unless
-/// `control_backend.operations` lists them, answered by the control backend when it does.
-const DELEGABLE_ADR_0056: [&str; 16] = [
+/// The 18 operations a control backend may answer — the 16 of ADR-0056 and the two
+/// lock-configuration operations of ADR-015: refused unless `control_backend.operations`
+/// lists them, answered by the control backend when it does.
+const DELEGABLE_ADR_0056: [&str; 18] = [
     "CreateBucket",
     "DeleteBucket",
     "DeleteBucketCors",
@@ -104,6 +105,8 @@ const DELEGABLE_ADR_0056: [&str; 16] = [
     "PutBucketLifecycleConfiguration",
     "PutBucketTagging",
     "PutBucketVersioning",
+    "GetObjectLockConfiguration",
+    "PutObjectLockConfiguration",
 ];
 
 fn s3s_op_names() -> Vec<&'static str> {
@@ -200,7 +203,7 @@ fn the_non_delegable_ops_are_not_quietly_enforced_or_delegated() {
 }
 
 #[test]
-fn the_delegable_ops_are_exactly_the_adr_0056_sixteen() {
+fn the_delegable_ops_are_exactly_the_eighteen() {
     let mut named: Vec<&str> = DELEGABLE_ADR_0056.to_vec();
     named.sort_unstable();
     let mut delegable = delegable_ops();

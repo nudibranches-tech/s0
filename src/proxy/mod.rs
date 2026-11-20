@@ -1170,7 +1170,7 @@ impl S3 for GatewayS3 {
 
     // ── delegated operations ────────────────────────────────────────────────────
     //
-    // The 16 `Coverage::Delegable` operations, answered by the control backend under a
+    // The 18 `Coverage::Delegable` operations, answered by the control backend under a
     // `DelegationProof` (`GatewayS3::delegate`). Everything else in the bucket family has
     // no arm rather than an `AccessDenied` stub: a stub still proves the op is routable,
     // and the next person to add a `forward` to it has no gate to trip over. With no arm
@@ -1349,6 +1349,26 @@ impl S3 for GatewayS3 {
     ) -> S3Result<S3Response<DeleteBucketEncryptionOutput>> {
         self.delegate(req, |c, r| async move {
             c.proxy().delete_bucket_encryption(r).await
+        })
+        .await
+    }
+
+    async fn get_object_lock_configuration(
+        &self,
+        req: S3Request<GetObjectLockConfigurationInput>,
+    ) -> S3Result<S3Response<GetObjectLockConfigurationOutput>> {
+        self.delegate(req, |c, r| async move {
+            c.proxy().get_object_lock_configuration(r).await
+        })
+        .await
+    }
+
+    async fn put_object_lock_configuration(
+        &self,
+        req: S3Request<PutObjectLockConfigurationInput>,
+    ) -> S3Result<S3Response<PutObjectLockConfigurationOutput>> {
+        self.delegate(req, |c, r| async move {
+            c.proxy().put_object_lock_configuration(r).await
         })
         .await
     }

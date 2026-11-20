@@ -245,7 +245,7 @@ async fn every_denied_op_403s_over_real_http() {
         checked.len(),
         71,
         "99 operations minus the 28 enforced. The two never-delegable control-plane ops \
-         (the bucket policy pair) and the 16 delegable ones, which this \
+         (the bucket policy pair) and the 18 delegable ones, which this \
          fixture leaves unconfigured, are among them, and this is the test that proves the \
          refusal reaches the WIRE, not just the table"
     );
