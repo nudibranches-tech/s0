@@ -1,4 +1,4 @@
-//! The SFTP front: a second protocol on the gateway core (ADR-012).
+//! The SFTP front: a second protocol on the gateway core (ADR-014).
 //!
 //! The client holds an SSH key and nothing else — no S3 power at all. The stat an upload
 //! needs is issued **by s0**, with the tenant backend credential, after an authorization
@@ -220,7 +220,7 @@ impl Shared {
         }
     }
 
-    /// Emit an `sftp/session` record (ADR-012 D13).
+    /// Emit an `sftp/session` record (ADR-014 D13).
     ///
     /// `authed` carries the account and tenant of an authenticated session, which is the
     /// only case that earns an org label; everything else is unattributed.
@@ -1032,7 +1032,7 @@ struct Sent {
     close: Option<&'static str>,
 }
 
-/// The bandwidth caps (ADR-012 D12), applied after each reply: the per-session cap and
+/// The bandwidth caps (ADR-014 D12), applied after each reply: the per-session cap and
 /// the optional process-wide one. Both are unlimited by default; the session waits for
 /// the longer of the two holds.
 ///

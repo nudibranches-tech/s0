@@ -1,4 +1,4 @@
-//! Limits and abuse resistance for the SFTP front (ADR-012 D12).
+//! Limits and abuse resistance for the SFTP front (ADR-014 D12).
 //!
 //! Everything here is **per replica**. Counters live in memory, so a restart forgets them
 //! and an attacker spread across `R` replicas gets `R` times the budget — a bound written
@@ -96,7 +96,7 @@ pub fn any_contains(cidrs: &[Cidr], ip: IpAddr) -> bool {
 }
 
 /// The client address as far as a source-address check may rely on it
-/// (`frontends.sftp.source_address`, ADR-012 D12).
+/// (`frontends.sftp.source_address`, ADR-014 D12).
 ///
 /// `Untrusted` is a datapath that may rewrite the source (SNAT without PROXY v2): the
 /// peer address is still recorded, but no check that grants or refuses by address may
@@ -301,7 +301,7 @@ impl PreauthRate {
     }
 }
 
-/// The process-wide transfer-memory budget (ADR-012 D9). A write OPEN reserves its
+/// The process-wide transfer-memory budget (ADR-014 D9). A write OPEN reserves its
 /// transfer's worst case up front, so a transfer can never run out of memory halfway.
 pub struct MemoryBudget {
     sem: Arc<Semaphore>,
@@ -327,7 +327,7 @@ impl MemoryBudget {
     }
 }
 
-/// The optional process-wide bandwidth cap (ADR-012 D12,
+/// The optional process-wide bandwidth cap (ADR-014 D12,
 /// `limits.sftp.process_bandwidth_bytes_per_sec`): one bucket per direction, shared by
 /// every session of the replica, so uploads and downloads are each held to the rate.
 #[derive(Default)]

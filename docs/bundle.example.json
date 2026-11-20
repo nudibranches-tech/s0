@@ -6,7 +6,7 @@
   "backend": { "id": "backend-eu-1", "kind": "ceph" },
   "org_settings": { "freeze_writes": false },
   "sftp": {
-    "_note": "SFTP accounts (ADR-012 D5). An account reaches an EXISTING subject and confers nothing: authority still comes only from grants. Keyed by the SSH login. On the compiled-in default policy (this bare file) subjects are looked up by raw `sub`; with a pushed module, by the prefixed key. `subject_key` is always prefixed. Fingerprints are `SHA256:` base64 as OpenSSH prints them; the bundle never carries key blobs. A drop-box grant is `create_objects` on the home prefix.",
+    "_note": "SFTP accounts (ADR-014 D5). An account reaches an EXISTING subject and confers nothing: authority still comes only from grants. Keyed by the SSH login. On the compiled-in default policy (this bare file) subjects are looked up by raw `sub`; with a pushed module, by the prefixed key. `subject_key` is always prefixed. Fingerprints are `SHA256:` base64 as OpenSSH prints them; the bundle never carries key blobs. A drop-box grant is `create_objects` on the home prefix.",
     "version": 1,
     "user_cas": {},
     "accounts": {

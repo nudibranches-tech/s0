@@ -217,7 +217,7 @@ impl<'a> ReqCtx<'a> {
 
 pub struct GatewayAccess {
     gw: Arc<Gateway>,
-    /// The protocol-neutral decision funnel (ADR-012 D2). Every PDP question, audit
+    /// The protocol-neutral decision funnel (ADR-014 D2). Every PDP question, audit
     /// record and forward proof of the S3 front goes through it.
     enforcer: Enforcer,
 }
@@ -377,7 +377,7 @@ impl GatewayAccess {
 
     /// The write decision for a request that **cannot overwrite** — a `PutObject` or
     /// `CompleteMultipartUpload` carrying `If-None-Match: *`, or a multipart step whose
-    /// object only becomes visible through such a commit (ADR-012 F1).
+    /// object only becomes visible through such a commit (ADR-014 F1).
     ///
     /// `write_objects` is asked first, so a writer's request asks exactly the question it
     /// always did. Only when that is denied is `create_objects` asked — the drop-box verb,
@@ -1016,7 +1016,7 @@ impl S3Access for GatewayAccess {
             max_tags,
         );
         // `If-None-Match: *` makes the write unable to overwrite, so `create_objects`
-        // can authorize it (ADR-012 F1).
+        // can authorize it (ADR-014 F1).
         let create_capable = if_none_match_any(req.input.if_none_match.as_ref());
         let mut cx = ReqCtx::new(req)?;
         self.enforce_object_write(
@@ -1323,7 +1323,7 @@ impl S3Access for GatewayAccess {
             .await
     }
 
-    /// The commit. Create-only exactly when it carries `If-None-Match: *` (ADR-012 F1);
+    /// The commit. Create-only exactly when it carries `If-None-Match: *` (ADR-014 F1);
     /// without it the commit may overwrite and needs `write_objects`. It adds no bytes (its
     /// parts were charged as they arrived), but it is still a write: charged at zero, it is
     /// refused only once a level is already over its limit.
