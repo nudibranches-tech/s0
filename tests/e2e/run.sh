@@ -580,34 +580,21 @@ audit_has '"abort.bin" in json.dumps(r) and "\"commit\": \"aborted\"" in json.du
 
 echo ""; echo "-- conditional create: the native conformance probe --------"
 # ADR-014 D8: `native` is an operator assertion that the backend honours If-None-Match: *.
-# Before relying on it: two conditional writes to one fresh key, the second must be 412,
-# for PutObject and for CompleteMultipartUpload, directly against MinIO.
+# The same probe an operator runs against a real backend before declaring it native
+# (scripts/probe-conditional-create.sh): PutObject and CompleteMultipartUpload, onto a fresh
+# key, a key it created, and a key another writer created.
 native_ok=1
-probe_mpu() { # key — one conditional multipart upload of a single part
-  local id et
-  id=$(aws_backend s3api create-multipart-upload --bucket native --key "$1" \
-    --query UploadId --output text) || return 1
-  et=$(aws_backend s3api upload-part --bucket native --key "$1" --upload-id "$id" \
-    --part-number 1 --body /work/small.csv --query ETag --output text) || return 1
-  aws_backend s3api complete-multipart-upload --bucket native --key "$1" --upload-id "$id" \
-    --multipart-upload "Parts=[{ETag=$et,PartNumber=1}]" --if-none-match '*' || {
-    rc=$?; aws_backend s3api abort-multipart-upload --bucket native --key "$1" \
-      --upload-id "$id" >/dev/null 2>&1; return $rc; }
-}
-probe() { # label <command...> — 1st must succeed, 2nd must be 412
-  local label=$1 out rc; shift
-  out=$("$@" 2>&1); rc=$?
-  if [ $rc -ne 0 ]; then fail "$label: first conditional write" "rc=$rc: $out"; native_ok=0; return; fi
-  out=$("$@" 2>&1); rc=$?
-  if [ $rc -ne 0 ] && echo "$out" | grep -q "PreconditionFailed"; then
-    pass "$label: second conditional write is 412 PreconditionFailed"
-  else
-    fail "$label: second conditional write is 412 PreconditionFailed" "rc=$rc: $out"; native_ok=0
-  fi
-}
-probe "MinIO PutObject If-None-Match: *" \
-  aws_backend s3api put-object --bucket native --key probe/put --body /work/small.csv --if-none-match '*'
-probe "MinIO CompleteMultipartUpload If-None-Match: *" probe_mpu probe/mpu
+probe_out=$(ENDPOINT="$MINIO_ENDPOINT" BUCKET=native AWS_ACCESS_KEY_ID="$BACKEND_AK" \
+  AWS_SECRET_ACCESS_KEY="$BACKEND_SK" AWSCLI_IMAGE="$AWSCLI_IMAGE" \
+  bash "$ROOT/scripts/probe-conditional-create.sh" 2>&1)
+probe_rc=$?
+echo "$probe_out" | sed 's/^/    /'
+if [ $probe_rc -eq 0 ]; then
+  pass "MinIO honours If-None-Match: * on PutObject and CompleteMultipartUpload"
+else
+  fail "MinIO honours If-None-Match: * on PutObject and CompleteMultipartUpload" "probe exit $probe_rc"
+  native_ok=0
+fi
 info "MinIO ($MINIO_IMAGE) If-None-Match: * conformance: $([ $native_ok = 1 ] && echo PASS || echo FAIL)"
 
 echo ""; echo "-- SFTP: create-only on a conditional_create: native backend --"

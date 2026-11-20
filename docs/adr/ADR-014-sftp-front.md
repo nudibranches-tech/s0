@@ -650,17 +650,32 @@ fronts; the old `sftp.conditional_create` map is refused, not ignored):
 
 `native` is an operator **assertion**. A backend that silently ignores `If-None-Match` turns
 create-only into overwrite with no error anywhere, so s0 never assumes support. The
-conformance probe — two conditional writes to one fresh key, where the second must fail with
-412 — is part of `tests/e2e/run.sh`, and the ADR's matrix is updated with its
-results:
+conformance probe is `scripts/probe-conditional-create.sh`. It runs against any S3 endpoint
+and checks, for `PutObject` and for `CompleteMultipartUpload`, that a conditional write onto a
+fresh key is accepted, and that one onto a key it created itself, or that **another writer
+created without a condition**, is answered 412 with the object untouched. `tests/e2e/run.sh`
+runs it against MinIO. Run it against the exact backend version before declaring `native`,
+and again after every upgrade. The matrix records its results:
 
 | Backend | `PutObject` + `If-None-Match: *` | `CompleteMultipartUpload` + `If-None-Match: *` | Destination condition on `CopyObject` | Verified in this repository |
 |---|---|---|---|---|
 | s3s / s3s-aws 0.14.1 (the forward path) | carried | carried | **not expressible** | yes (E4) |
 | AWS S3 | documented by AWS | documented by AWS | — | no (no AWS in CI) |
 | MinIO (e2e image `pgsty/silo`) | **verified** (412 on the second write) | **verified** (412 on the second commit) | — | yes — the `run.sh` probe, and SFTP create-only uploads against a backend declared `native` |
-| Ceph RGW | reported | unverified, version-dependent | — | conformance harness (scaffolded, not yet wired) |
+| Ceph RGW 19.2.6 squid (`quay.io/ceph/ceph:v19.2.6-20260818`) | **verified** (412, object untouched) | **IGNORED**: the commit is accepted and **overwrites** the existing object | — | yes, the probe (2026-11-20). **Never `native`** |
+| Ceph RGW 20.2.4 tentacle (`quay.io/ceph/ceph:v20.2.4-20260818`) | **verified** | **verified** | — | yes, the probe (2026-11-20) |
 | any other S3 backend | unknown | unknown | — | run the probe before declaring `native` |
+
+The Ceph rows were measured on a single-node cluster (one mon, one memstore OSD, radosgw with
+the RADOS driver) built from the image named, which is the code path that answers the
+condition. A site should still run the probe through its own endpoint (Rook service, ingress),
+since a proxy in front of RGW could drop the header.
+
+**Partial support is no support.** On squid, `PutObject` honours the condition and
+`CompleteMultipartUpload` does not. s0 commits a file smaller than `part_size` with
+`PutObject` and a larger one with a multipart commit (D9). Declaring such a backend `native`
+would protect small drops and silently let large ones overwrite. Such a backend is
+`check_then_write`, and so is every backend whose probe has any failure.
 
 ### D9 — The data path: an object store behind a file protocol
 
