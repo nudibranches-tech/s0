@@ -918,19 +918,39 @@ impl GatewayAccess {
         });
         let mut src_input = cx.base_input(Action::ReadObjects, src_bucket);
         src_input.object = Some(src_key);
-        let src_allow = self.decide(cx, &src_input).await.allow;
+        let src_decision = self.decide(cx, &src_input).await;
+        let src_allow = src_decision.allow;
 
-        let mut dst_allow = self.decide(cx, &dst_input).await.allow;
+        let mut dst_decision = self.decide(cx, &dst_input).await;
         // A part copy creates nothing visible: only a conditional commit can, so a
         // create-only principal may write it (see `enforce_write_or_create`).
-        if !dst_allow && create_capable && cx.route.conditional_create == ConditionalCreate::Native
+        if !dst_decision.allow
+            && create_capable
+            && cx.route.conditional_create == ConditionalCreate::Native
         {
             let mut create = dst_input.clone();
             create.action = Action::CreateObjects;
-            if self.decide(cx, &create).await.allow {
+            let decision = self.decide(cx, &create).await;
+            if decision.allow {
                 dst_input = create;
-                dst_allow = true;
+                dst_decision = decision;
             }
+        }
+        let dst_allow = dst_decision.allow;
+
+        // As in `settle`: an obligation either half declared mandatory and this binary
+        // cannot apply is a denial. Each half is checked only when both were allowed, so a
+        // copy the policy refused keeps its own reason on the record.
+        if src_allow
+            && dst_allow
+            && let Some(why) = unimplemented_obligations(&src_decision)
+                .map(|r| format!("copy source read: {r}"))
+                .or_else(|| {
+                    unimplemented_obligations(&dst_decision)
+                        .map(|r| format!("copy destination write: {r}"))
+                })
+        {
+            return Err(self.deny(dst_input, why));
         }
 
         if src_allow
