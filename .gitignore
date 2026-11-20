@@ -6,3 +6,4 @@ gateway.json
 /audit-spill.ndjson
 e2e/out/
 .idea
+/THIRD_PARTY_NOTICES

@@ -1,0 +1,26 @@
+{
+  "acl_grants": [],
+  "action": "delete_objects",
+  "backend": {
+    "id": "bay-1",
+    "kind": "ceph"
+  },
+  "bucket": "inbound",
+  "bypass_governance": false,
+  "object": "in/a.csv",
+  "organization_id": "org-acme",
+  "principal": {
+    "attributes": {
+      "groups": [
+        "operators"
+      ]
+    },
+    "sub": "ops",
+    "type": "user"
+  },
+  "request": {
+    "method": "RENAME",
+    "protocol": "sftp"
+  },
+  "tenant": "acme"
+}

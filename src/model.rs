@@ -5,12 +5,16 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The grant vocabulary the gateway authorizes against — the **seven projected verbs**.
+/// The grant vocabulary the gateway authorizes against — the **eight projected verbs**.
 ///
 /// Deliberately coarser than the 99 S3 ops: every enforced op maps onto exactly one of
 /// these (`PutObject` to `write_objects`, `HeadBucket` to `read`), except `CopyObject`,
 /// which maps to two, and `DeleteObject`/`DeleteObjects`, decided under
-/// `delete_object_versions` when a version is named. The set is a contract with whatever control plane projects grants.
+/// `delete_object_versions` when a version is named (ADR-013). [`Action::CreateObjects`] is
+/// asked by the SFTP front for every upload (ADR-014 D7), and by the S3 front for a write
+/// that cannot overwrite — a `PutObject` or `CompleteMultipartUpload` carrying
+/// `If-None-Match: *`, and the multipart steps leading to one — when `write_objects` is
+/// denied (ADR-014 F1). The set is a contract with whatever control plane projects grants.
 ///
 /// **The gateway is data-plane only**, so there is no verb for acting on a bucket as a
 /// *managed resource*: existence, policy, CORS and quota *settings* are control-plane
@@ -24,6 +28,12 @@ pub enum Action {
     // object-scoped: the decision is made against a bucket + one key
     ReadObjects,
     WriteObjects,
+    /// Write a key **that does not exist** — the drop-box verb (ADR-014 D7).
+    ///
+    /// `write_objects` implies it (overwrite ⊇ create); the implication lives in the
+    /// policy module, which is the normative definition of what a grant means. A
+    /// principal holding only `create_objects` can drop files and cannot overwrite them.
+    CreateObjects,
     DeleteObjects,
     /// A delete that names a version (`DeleteObject` with a `versionId`, a `DeleteObjects`
     /// entry carrying one). Kept separate from [`Action::DeleteObjects`]: a grant of one
@@ -54,6 +64,7 @@ impl Action {
     pub const ALL: &'static [Action] = &[
         Action::ReadObjects,
         Action::WriteObjects,
+        Action::CreateObjects,
         Action::DeleteObjects,
         Action::DeleteObjectVersions,
         Action::WriteObjectTags,
@@ -65,6 +76,7 @@ impl Action {
         match self {
             Action::ReadObjects => "read_objects",
             Action::WriteObjects => "write_objects",
+            Action::CreateObjects => "create_objects",
             Action::DeleteObjects => "delete_objects",
             Action::DeleteObjectVersions => "delete_object_versions",
             Action::WriteObjectTags => "write_object_tags",
@@ -84,6 +96,7 @@ impl Action {
         matches!(
             self,
             Action::WriteObjects
+                | Action::CreateObjects
                 | Action::DeleteObjects
                 | Action::DeleteObjectVersions
                 | Action::WriteObjectTags

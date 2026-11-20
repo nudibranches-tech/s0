@@ -1,8 +1,44 @@
-# cargo-deny configuration. CI runs `cargo deny check advisories` (ci.yml, job `advisories`)
-# as a report, never a gate: the advisory database changes under a fixed lockfile.
+# cargo-deny configuration.
+#
+# CI gates on `cargo deny check licenses` (ci.yml, job `licenses`; ADR-014: "PR 1 adds a
+# `cargo deny` licence check"). It runs `cargo deny check advisories` (job `advisories`)
+# as a report, never a gate: the advisory database changes under a fixed lockfile. The other
+# sections are configured so `cargo deny check` is useful locally.
 
 [graph]
 all-features = true
+
+[licenses]
+# Every licence a crate in Cargo.lock is (or may be chosen to be) distributed under. A new
+# dependency under anything else fails CI until it is reviewed and added here. Permissive
+# licences only: the image ships the binary, so a copyleft licence is a decision, not a
+# drive-by.
+#
+# The BSD-3-Clause and ISC notices (curve25519-dalek, ed25519-dalek, subtle, ring, rustls,
+# untrusted, ...) must ship with the image: cargo-about (about.toml, about.hbs) generates
+# THIRD_PARTY_NOTICES, which the Dockerfile and the release archives carry. Keep its
+# `accepted` list in step with this one.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.93
+exceptions = [
+    # s0 itself.
+    { crate = "s0", allow = ["BUSL-1.1"] },
+]
 
 [advisories]
 # Accepted only when no compatible fix exists and the affected path is unreachable.
@@ -14,3 +50,13 @@ ignore = [
     { id = "RUSTSEC-2026-0543", reason = "chrono: unmaintained, no known vulnerability. Pulled by s3s (still a hard dependency in 0.17) and by regorus's `time` builtins, so replacing s0's own use would not remove it." },
     { id = "RUSTSEC-2026-0555", reason = "chrono-tz: unmaintained, no known vulnerability. Pulled by regorus's `time` feature (the `time.*` builtins bundles may call), still in regorus 0.15." },
 ]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

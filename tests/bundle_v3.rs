@@ -360,6 +360,21 @@ async fn a_bucket_of_another_tenant_is_still_access_denied() {
     );
 }
 
+/// Version 4 adds the SFTP contract (ADR-014 D5) on top of placement: it must place
+/// exactly as 3 does, or moving the control plane to 4 would open every tenant's buckets.
+#[tokio::test]
+async fn a_v4_bundle_places_buckets_as_v3_does() {
+    let fx = common::fixture("v4-cross-tenant", placed_bundle(4, BACKEND));
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request_as("wild", "GetObject", get("ledger", "k"), Method::GET);
+    assert_refused(
+        "GetObject on globex's bucket under a v4 bundle",
+        access.get_object(&mut req).await,
+        BUCKET_OF_ANOTHER_TENANT,
+    );
+    assert_eq!(fx.pdp_calls(), 0, "the PDP must never be asked about it");
+}
+
 /// Every record names the bundle's object name for each bucket it is about, so a
 /// consumer can join it to the bucket without re-deriving one name from the other — and
 /// names nothing the bundle did not publish.

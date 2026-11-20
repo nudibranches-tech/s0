@@ -21,7 +21,8 @@ pub(crate) use record::SummaryScope;
 pub use record::{
     AccessSummary, AuditRecord, BackendOutcome, DECISION_PATH, DEFAULT_ORG_LABEL_KEY,
     DELEGATED_PATH, DelegationContext, GATE_PATH, GateContext, GateStage, GatewayMeta, LabelPolicy,
-    Outcome, SUMMARY_PATH, VersionedKey,
+    Outcome, SESSION_PATH, SUMMARY_PATH, SessionBlock, SessionEvent, SessionEventKind,
+    TransferBlock, VersionedKey,
 };
 pub use sink::{
     AuditBackendKind, AuditConfig, AuditHandle, AuditMetrics, AuditSink, spawn, spawn_with_backend,

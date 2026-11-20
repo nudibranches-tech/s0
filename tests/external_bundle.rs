@@ -55,6 +55,7 @@ fn input(object: &str) -> s0::authz::OpaInput {
         acl_grants: vec![],
         bypass_governance: false,
         request: RequestMeta {
+            protocol: Default::default(),
             method: "GET".into(),
             params: None,
             headers_subset: Default::default(),

@@ -1,7 +1,7 @@
 name: e2e
 
-# Real-stack end-to-end: aws-cli -> s0 gateway -> MinIO backend, embedded
-# OPA (regorus). Proves the security properties (including the copy-source
+# Real-stack end-to-end: aws-cli and OpenSSH sftp -> s0 gateway -> MinIO
+# backend, embedded OPA (regorus) or a sidecar. Proves the security properties (including the copy-source
 # authorization that closes the Ceph RGW-OPA gap, per-key multi-delete
 # filtering, list narrowing, and live revocation) against an off-the-shelf S3
 # client and a real S3-compatible backend, not mocks.

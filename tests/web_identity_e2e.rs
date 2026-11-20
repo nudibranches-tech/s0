@@ -376,7 +376,7 @@ async fn a_service_account_token_mints_a_credential_that_works_against_s3() {
          data plane: {body}"
     );
 
-    // 2. THE DECISION DOCUMENT, read from the tap inside `GatewayAccess::decide` — the
+    // 2. THE DECISION DOCUMENT, read from the tap inside `Enforcer::decide` — the
     //    document the PDP was handed, not a reconstruction of it.
     let input = last_opa_input(&h);
     assert_eq!(

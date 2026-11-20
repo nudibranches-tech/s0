@@ -79,7 +79,7 @@ pub enum DangerTier {
     NeverImplement,
 }
 
-/// The grant vocabulary the gateway can actually decide against: the seven verbs a control
+/// The grant vocabulary the gateway can actually decide against: the eight verbs a control
 /// plane's grant projection emits.
 ///
 /// Held as strings rather than [`Action`] because the table classifies *denied* ops too;
@@ -89,6 +89,7 @@ pub const GATEWAY_VERBS: &[&str] = &[
     "read_objects",
     "list_objects",
     "write_objects",
+    "create_objects",
     "delete_objects",
     "delete_object_versions",
     "write_object_tags",
@@ -1172,7 +1173,12 @@ mod tests {
         typed.sort_unstable();
         gateway.sort_unstable();
         assert_eq!(typed, gateway);
-        assert_eq!(gateway.len(), 7, "the projected vocabulary is seven verbs");
+        assert_eq!(
+            gateway.len(),
+            8,
+            "the projected vocabulary is eight verbs (ADR-006, plus create_objects for the SFTP \
+             front, ADR-014 D7, and delete_object_versions, ADR-013)"
+        );
     }
 
     #[test]

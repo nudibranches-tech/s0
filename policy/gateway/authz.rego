@@ -18,8 +18,8 @@
 # ── input ──────────────────────────────────────────────────────────────────────
 #   input.principal.{sub,type,attributes.groups,attributes.<extra>}
 #   input.backend.{id,kind}   input.tenant   input.organization_id
-#   input.action  ∈ the 7 verbs (ADR-006, ADR-013):
-#       object-scoped : read_objects write_objects delete_objects delete_object_versions
+#   input.action  ∈ the 8 verbs (ADR-006; `create_objects` ADR-014, `delete_object_versions` ADR-013):
+#       object-scoped : read_objects write_objects create_objects delete_objects delete_object_versions
 #                       write_object_tags
 #       listing       : list_objects
 #       bucket/account: read
@@ -66,6 +66,10 @@
 #                         field is carried for the audit record and for a policy that
 #                         wants to see what was attempted — never as the thing that
 #                         stops it. A policy cannot re-permit an ACL; there is no verb.
+#   input.request.protocol  ALWAYS present: "s3" or "sftp" — which front asked. This
+#                         module does not read it; a pushed module may (e.g. to confine a
+#                         subject to SFTP). input.request.method carries the HTTP method
+#                         for S3 and the SFTP request name (OPEN, RENAME, …) for SFTP.
 #   input.bypass_governance  ALWAYS present. x-amz-bypass-governance-retention. The PEP
 #                         refuses it unconditionally (no verb in the vocabulary
 #                         expresses "may override object-lock retention"); it is on the
@@ -194,6 +198,7 @@ placement_refused if bucket_not_placed
 # extracts this literal and compares it, so a divergence fails the build.
 write_actions := {
 	"write_objects",
+	"create_objects",
 	"delete_objects",
 	"delete_object_versions",
 	"write_object_tags",
@@ -277,6 +282,17 @@ bucket_matches(g) if {
 action_matches(g) if input.action in g.actions
 
 action_matches(g) if "*" in g.actions
+
+# `write_objects` implies `create_objects` (overwrite ⊇ create). `create_objects` writes a
+# key that does not exist — the drop-box verb. The SFTP front asks it for uploads (ADR-014
+# D7); the S3 front asks it for a write carrying `If-None-Match: *` when `write_objects`
+# is denied, on a backend declared `conditional_create: native` (ADR-014 F1). The
+# implication lives HERE, in the module, because the module is the normative definition
+# of what a grant means: a pushed module must mirror it, and a corpus case pins it.
+action_matches(g) if {
+	input.action == "create_objects"
+	"write_objects" in g.actions
+}
 
 # A grant with no `prefixes` (or an empty one) scopes the whole bucket.
 whole_bucket(g) if not g.prefixes

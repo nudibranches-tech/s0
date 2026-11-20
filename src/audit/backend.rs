@@ -175,6 +175,7 @@ mod tests {
                 denied_versions: vec![],
                 backend: BackendOutcome::NotAttempted,
                 backend_status: None,
+                session: None,
                 object_name: None,
                 copy_source_object_name: None,
                 summary: None,

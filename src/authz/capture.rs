@@ -2,7 +2,7 @@
 //! rather than a guess at it. A fixture written by hand can carry fields no producer
 //! sends, leaving the policy correct about a request that does not exist.
 //!
-//! The tap sits at [`crate::access::GatewayAccess::decide`], the sole caller of
+//! The tap sits at [`crate::access::Enforcer::decide`], the sole caller of
 //! `Pdp::decide` on the request path, so it sees both halves of a copy and every key of
 //! a multi-delete. It records the emitted `&OpaInput`, and [`round_trip`] re-checks it
 //! at record time so a renamed or dropped field cannot reach a fixture. A sink retains
@@ -76,7 +76,7 @@ impl CaptureSink {
 
     /// Record the document about to be handed to the PDP.
     ///
-    /// `pub(crate)` so the only producer is the tap in `GatewayAccess::decide`: a test
+    /// `pub(crate)` so the only producer is the tap in `Enforcer::decide`: a test
     /// able to push a hand-made document into the sink would reintroduce the class of
     /// fixture this module exists to abolish.
     pub(crate) fn record(&self, operation: &str, input: &OpaInput) {

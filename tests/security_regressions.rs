@@ -903,6 +903,41 @@ async fn a_must_understand_obligation_this_gateway_cannot_apply_denies() {
         .expect("an implemented obligation named as mandatory is honored, not refused");
 }
 
+#[tokio::test]
+async fn a_copy_whose_destination_demands_an_unknown_obligation_is_denied() {
+    // A copy is two questions. Reading only `allow` from each and inventing a fresh
+    // decision dropped the obligations of both, so a `must_understand` this binary
+    // cannot apply let the copy through — the fail-open every other path refuses.
+    let fx = common::fixture("sec-must-understand-copy", bundle());
+    let access = GatewayAccess::new(fx.gw.clone());
+
+    const DEST_DEMANDS_THE_FUTURE: &str = concat!(
+        "package s3.authz\n\n",
+        "decision := {\"allow\": true, \"reason\": \"allowed\", ",
+        "\"obligations\": {\"must_understand\": [\"excluded_prefixes\"]}} ",
+        "if input.action == \"write_objects\"\n",
+        "decision := {\"allow\": true, \"reason\": \"allowed\"} ",
+        "if input.action != \"write_objects\"\n"
+    );
+    fx.gw
+        .pdp
+        .reload(Some(DEST_DEMANDS_THE_FUTURE), &bundle())
+        .await
+        .expect("valid rego");
+    let mut req = fx.request_as("copyist", "CopyObject", copy_object_input(), Method::PUT);
+    let err = access
+        .copy_object(&mut req)
+        .await
+        .expect_err("the destination's mandatory obligation cannot be applied");
+    assert_eq!(*err.code(), S3ErrorCode::AccessDenied);
+    assert!(
+        format!("{err}").contains("copy destination write")
+            && format!("{err}").contains("excluded_prefixes"),
+        "the refusal names the half and what is missing: {err}"
+    );
+    assert!(req.extensions.get::<AuthzProof>().is_none());
+}
+
 // ── the audit record must agree with what the client was told ───────────────────
 
 #[tokio::test]
