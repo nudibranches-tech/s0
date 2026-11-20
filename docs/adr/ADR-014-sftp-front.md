@@ -937,8 +937,9 @@ closes.
 `session_id` is a gateway-generated UUID, not the SSH exchange hash, which is a protocol value
 rather than an identifier. `sftp_op` sits next to the verb in `input.action`.
 
-**Connection-level events** are a third record shape beside decision and gate records.
-Exactly one of `input`, `gate` or `session_event` is present, and `path` is `sftp/session`:
+**Connection-level events** are a record shape of their own beside decision, gate and
+delegated (ADR-012) records. Exactly one of `input`, `gate`, `delegated` or `session_event`
+is present, and `path` is `sftp/session`:
 
 A `session_event` carries the event kind, `protocol`, `session_id`, `client_ip` (with
 `client_ip_untrusted: true` when `source_address` is `untrusted`, D12), and when
@@ -981,7 +982,18 @@ s3/authz/decision` and are ingested with no change.
 
 A failed authentication is attributed to no organization, as gate records are (ADR-002 R6):
 the login is a client claim, and a scanner that guesses logins must not be able to write
-records into a chosen organization's trail. Unauthenticated events share the gate budget, so
+records into a chosen organization's trail.
+
+That rule is about the **claimed login**: s0 never derives an organization from it. A
+deployment whose SFTP process serves a single organization may stamp that organization in
+`audit.extra_labels`, as the platform operator does for both fronts. Every record of that
+process, failed logins and pre-authentication refusals included, is then attributed to the
+organization whose **endpoint** received the connection. The endpoint is not a client claim,
+so this does not let a scanner choose whose trail it writes into. A consumer must still
+expect `sftp/session` records with no organization label from a multi-organization
+deployment.
+
+Unauthenticated events share the gate budget, so
 a pre-authentication flood cannot evict decision records. Suppression is counted, as for
 gate records.
 
