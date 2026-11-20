@@ -74,6 +74,7 @@
       "host_keys": [
         "/tmp/s0-e2e/ssh_host_ed25519_key"
       ],
+      "source_address": "preserved",
       "drain_secs": 2
     }
   },

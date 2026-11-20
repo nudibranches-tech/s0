@@ -847,6 +847,7 @@ mod sftp {
             "enabled": true,
             "listen": "127.0.0.1:0",
             "host_keys": [host_path],
+            "source_address": "preserved",
             "drain_secs": 1
         }))
         .unwrap();

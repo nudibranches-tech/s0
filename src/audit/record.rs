@@ -130,6 +130,10 @@ pub struct SessionBlock {
     /// Gateway-generated, not the SSH exchange hash.
     pub session_id: String,
     pub client_ip: String,
+    /// Set when `frontends.sftp.source_address` is `untrusted`: `client_ip` is the peer
+    /// as seen by s0, possibly a node or load balancer standing in for many clients.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub client_ip_untrusted: bool,
     pub login: String,
     pub auth: crate::sftp::AuthInfo,
     /// The SFTP request, next to the verb in `input.action`.
@@ -183,6 +187,10 @@ pub struct SessionEvent {
     pub protocol: String,
     pub session_id: String,
     pub client_ip: String,
+    /// Set when `frontends.sftp.source_address` is `untrusted`: `client_ip` is the peer
+    /// as seen by s0, possibly a node or load balancer standing in for many clients.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub client_ip_untrusted: bool,
     /// The login the client claimed. On a failure this is a client claim, which is why
     /// such records carry no org label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -761,6 +769,7 @@ mod tests {
             protocol: "sftp".into(),
             session_id: "s".into(),
             client_ip: "192.0.2.1".into(),
+            client_ip_untrusted: false,
             login: None,
             auth: None,
             tenant: None,

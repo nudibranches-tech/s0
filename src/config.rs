@@ -147,8 +147,35 @@ pub struct ProxyProtocolConfig {
     pub trusted_cidrs: Vec<String>,
 }
 
-/// The SFTP front's listener (ADR-012 D1, D3). Only `listen`, `host_keys` and
-/// `proxy_protocol` need a restart; the limits are in [`LimitsConfig::sftp`].
+/// How the client address reaches the SFTP listener (ADR-012 D12). s0 cannot tell a
+/// rewritten source from a real one, so the deployment declares it; nothing is inferred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceAddressMode {
+    /// The datapath keeps the client address (pass-through TCP, no SNAT).
+    Preserved,
+    /// A load balancer in `proxy_protocol.trusted_cidrs` sends the address in a PROXY v2
+    /// header. Requires the `proxy_protocol` section.
+    ProxyProtocol,
+    /// The address may be rewritten (SNAT): every client can appear as one address.
+    /// Per-address limits and bans are off, and every source-address restriction
+    /// (`allowed_source_cidrs`, a certificate's `source-address`) refuses the login.
+    Untrusted,
+}
+
+impl SourceAddressMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SourceAddressMode::Preserved => "preserved",
+            SourceAddressMode::ProxyProtocol => "proxy_protocol",
+            SourceAddressMode::Untrusted => "untrusted",
+        }
+    }
+}
+
+/// The SFTP front's listener (ADR-012 D1, D3). Only `listen`, `host_keys`,
+/// `source_address` and `proxy_protocol` need a restart; the limits are in
+/// [`LimitsConfig::sftp`].
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SftpConfig {
@@ -160,6 +187,8 @@ pub struct SftpConfig {
     /// required; an ECDSA P-256 key is optional. Never generated: a missing, unreadable,
     /// world-readable, encrypted, RSA or duplicate key refuses startup.
     pub host_keys: Vec<PathBuf>,
+    /// Required, no default: whether the client address can be relied on.
+    pub source_address: SourceAddressMode,
     #[serde(default)]
     pub proxy_protocol: Option<ProxyProtocolConfig>,
     /// On SIGTERM, how long open sessions get to finish in-flight commands before every
@@ -1084,6 +1113,30 @@ impl GatewayConfig {
                 )));
             }
         }
+        match (s.source_address, &s.proxy_protocol) {
+            (SourceAddressMode::ProxyProtocol, None) => {
+                return Err(GatewayError::Config(
+                    "frontends.sftp.source_address is proxy_protocol but there is no \
+                     frontends.sftp.proxy_protocol section"
+                        .into(),
+                ));
+            }
+            (SourceAddressMode::ProxyProtocol, Some(p)) if p.trusted_cidrs.is_empty() => {
+                return Err(GatewayError::Config(
+                    "frontends.sftp.proxy_protocol.trusted_cidrs is empty; no peer could \
+                     send the client address"
+                        .into(),
+                ));
+            }
+            (mode @ (SourceAddressMode::Preserved | SourceAddressMode::Untrusted), Some(_)) => {
+                return Err(GatewayError::Config(format!(
+                    "frontends.sftp.proxy_protocol is set but source_address is {}; set \
+                     source_address: proxy_protocol or remove the section",
+                    mode.as_str()
+                )));
+            }
+            _ => {}
+        }
         if let Some(p) = &s.proxy_protocol {
             for c in &p.trusted_cidrs {
                 crate::sftp::limits::Cidr::parse(c).map_err(|e| {
@@ -1523,7 +1576,8 @@ mod tests {
         serde_json::json!({
             "enabled": enabled,
             "listen": "127.0.0.1:2222",
-            "host_keys": ["/etc/s0/sftp/ssh_host_ed25519_key"]
+            "host_keys": ["/etc/s0/sftp/ssh_host_ed25519_key"],
+            "source_address": "preserved"
         })
     }
 
@@ -1664,6 +1718,7 @@ mod tests {
         bad["host_keys"] = serde_json::json!([]);
         assert!(with(bad, serde_json::json!({})).is_err());
         let mut bad = sftp(false);
+        bad["source_address"] = serde_json::json!("proxy_protocol");
         bad["proxy_protocol"] = serde_json::json!({ "trusted_cidrs": ["not-a-cidr"] });
         assert!(with(bad, serde_json::json!({})).is_err());
         let mut bad = sftp(false);
@@ -1672,6 +1727,46 @@ mod tests {
             with(bad, serde_json::json!({})).is_err(),
             "conditional_create moved to the backend; the old place is refused, not ignored"
         );
+    }
+
+    #[test]
+    fn the_source_address_mode_is_required_and_agrees_with_proxy_protocol() {
+        let with =
+            |sftp: serde_json::Value| fronts(serde_json::json!({ "frontends": { "sftp": sftp } }));
+        let mut s = sftp(true);
+        s.as_object_mut().unwrap().remove("source_address");
+        assert!(
+            with(s).is_err(),
+            "never inferred: a front without it does not load"
+        );
+        for mode in ["preserved", "untrusted"] {
+            let mut s = sftp(true);
+            s["source_address"] = serde_json::json!(mode);
+            assert!(with(s.clone()).is_ok(), "{mode}");
+            s["proxy_protocol"] = serde_json::json!({ "trusted_cidrs": ["198.51.100.0/28"] });
+            let e = with(s).unwrap_err();
+            assert!(e.to_string().contains("source_address is"), "{mode}: {e}");
+        }
+        let mut s = sftp(true);
+        s["source_address"] = serde_json::json!("proxy_protocol");
+        assert!(
+            with(s.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("no frontends.sftp.proxy_protocol")
+        );
+        s["proxy_protocol"] = serde_json::json!({ "trusted_cidrs": [] });
+        assert!(
+            with(s.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("is empty")
+        );
+        s["proxy_protocol"] = serde_json::json!({ "trusted_cidrs": ["198.51.100.0/28"] });
+        assert!(with(s).is_ok());
+        let mut s = sftp(true);
+        s["source_address"] = serde_json::json!("auto");
+        assert!(with(s).is_err());
     }
 
     #[test]

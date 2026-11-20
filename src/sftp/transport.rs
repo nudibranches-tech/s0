@@ -261,7 +261,7 @@ impl SshHandler {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let auth = match dir.authenticate_classified(login, &credential, self.conn.client_ip, now) {
+        let auth = match dir.authenticate_classified(login, &credential, self.conn.source(), now) {
             Ok(a) => a,
             Err(Refusal::Credential(r)) => return self.fail(login, r),
             Err(Refusal::Gateway(r)) => return self.refuse(login, r),

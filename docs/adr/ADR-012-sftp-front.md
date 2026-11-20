@@ -94,8 +94,8 @@ unnoticed.
   - `frontends.s3` — **absent ⇒ the S3 front is enabled**, so every existing config keeps
     its behaviour. Present, it is `{ "enabled": bool, "listen"?: addr }`.
   - `frontends.sftp` — **absent ⇒ no SFTP listener**, exactly as with `sts_mint` and
-    `internal`. Present, it carries `enabled`, `listen`, `host_keys`, `proxy_protocol` and
-    `drain_secs`. A section kept with `enabled: false` binds nothing, but its shape is
+    `internal`. Present, it carries `enabled`, `listen`, `host_keys`, `source_address`,
+    `proxy_protocol` and `drain_secs`. A section kept with `enabled: false` binds nothing, but its shape is
     still validated, so flipping the switch later cannot be the moment a typo is found.
   - Both enabled is for development only and logged at `warn`. Both disabled is refused:
     the process would serve nothing.
@@ -136,6 +136,7 @@ unnoticed.
       "enabled": true,
       "listen": "0.0.0.0:2222",
       "host_keys": ["/etc/s0/sftp/ssh_host_ed25519_key", "/etc/s0/sftp/ssh_host_ecdsa_key"],
+      "source_address": "proxy_protocol",
       "proxy_protocol": { "trusted_cidrs": ["198.51.100.0/28"] },
       "drain_secs": 20
     }
@@ -385,7 +386,8 @@ iff **all** of the following hold:
    design rules out;
 5. the validity window holds (russh checks it, and s0 re-checks with the same clock);
 6. the serial is not in `revoked_serials` and the key id is not in `revoked_key_ids`;
-7. critical options: `source-address` is enforced against the client address;
+7. critical options: `source-address` is enforced against the client address (and refuses
+   the login when `source_address` is `untrusted`, D12);
    `force-command` is accepted only with the value `internal-sftp`; **any other critical
    option refuses the certificate**, as OpenSSH requires for options it does not understand;
    extensions are ignored;
@@ -806,7 +808,8 @@ the point of use, per `Gateway::limits`). They apply to new connections and new 
 without a restart, with two exceptions fixed when the listener starts, because they live in
 russh's server config: `max_auth_attempts`, and russh's inactivity backstop
 (`idle_timeout_secs` + 60 s; the session's own idle check reads the live value). Of the
-listener settings, `frontends.sftp.listen`, `host_keys`, `proxy_protocol` and `drain_secs`
+listener settings, `frontends.sftp.listen`, `host_keys`, `source_address`, `proxy_protocol`
+and `drain_secs`
 need a restart.
 
 | Limit | Default | Scope |
@@ -844,10 +847,21 @@ The bundle is the only fleet-wide state channel s0 has, and it is reused rather 
 one added.
 
 **The client source IP** is needed for bans, per-IP limits, `allowed_source_cidrs`, the
-certificate `source-address` option and audit. It reaches s0 in one of two ways:
+certificate `source-address` option and audit. Whether the address s0 sees is the client's
+depends on the datapath in front of it (the load balancer, the CNI's SNAT), which s0 cannot
+observe: a rewritten source looks like any other address. So the deployment **declares** it in
+`frontends.sftp.source_address`, which is required and has no default:
 
-- **Preserved source address** at the load balancer: pass-through TCP, with no SNAT of the
-  client address.
+| `source_address` | What reaches s0 | Per-IP rate, caps, bans | `allowed_source_cidrs`, cert `source-address` |
+|---|---|---|---|
+| `preserved` | The client address: pass-through TCP, no SNAT. | enforced | enforced |
+| `proxy_protocol` | The address in a PROXY v2 header from a peer in `proxy_protocol.trusted_cidrs`. | enforced | enforced |
+| `untrusted` | Possibly a node or load balancer standing in for many clients. | **off** | **refuse the login** |
+
+`proxy_protocol` requires the `proxy_protocol` section with a non-empty `trusted_cidrs`, and
+the section is refused under the other two modes, so the two settings cannot disagree. Under
+it:
+
 - **PROXY protocol v2**, binary form only (v1 text is refused), accepted **only** from peers
   in `sftp.proxy_protocol.trusted_cidrs`:
   - a trusted peer that does not send the header is disconnected;
@@ -855,8 +869,26 @@ certificate `source-address` option and audit. It reaches s0 in one of two ways:
   - a `LOCAL` command (a load-balancer health check) is closed without an SSH banner;
   - the header parser is in-tree, bounded, and fuzzed alongside the SFTP codec.
 
-With neither, every client appears as the load balancer. Bans then become a self-inflicted
-denial of service, so a deployment that cannot preserve the source must configure PROXY v2.
+**`untrusted` is the safe mode for a datapath not yet known to keep the address.** With a
+shared address, per-address protections turn against the clients: every partner behind it
+would share one rate and one connection cap, and one partner's failed logins would ban them
+all. So under `untrusted`:
+
+- the pre-auth rate, `max_connections_per_ip` and bans are not applied, and failures are not
+  counted toward a ban. `max_connections`, `max_sessions_per_subject`, the handshake timeout,
+  `max_auth_attempts` and `max_key_probes` still bound the front. Credentials are keys or
+  certificates only (D3), so losing the ban does not open a password-guessing path;
+- an account with `allowed_source_cidrs` (even one that would allow everything) and a
+  certificate carrying `source-address` are **refused**, as the gateway's refusal
+  (`credential_mismatch: false`): the client may be inside the range, there is no way to
+  tell, and a restriction that cannot be checked must not pass;
+- the bundle's `denied_source_cidrs` is still checked against the peer at accept time: it can
+  only refuse;
+- every `sftp/session` record and `gateway.session` block carries `client_ip_untrusted: true`
+  (D13), so a consumer does not read the node's address as the partner's.
+
+A control plane that knows its datapath should render `preserved` or `proxy_protocol`, and
+refuse to create source-restricted accounts while it renders `untrusted`.
 
 ### D13 — Audit
 
@@ -901,7 +933,8 @@ rather than an identifier. `sftp_op` sits next to the verb in `input.action`.
 **Connection-level events** are a third record shape beside decision and gate records.
 Exactly one of `input`, `gate` or `session_event` is present, and `path` is `sftp/session`:
 
-A `session_event` carries the event kind, `protocol`, `session_id`, `client_ip`, and when
+A `session_event` carries the event kind, `protocol`, `session_id`, `client_ip` (with
+`client_ip_untrusted: true` when `source_address` is `untrusted`, D12), and when
 known `login`, `auth` and `tenant`; `disconnected` adds the duration, operation count and
 bytes in each direction, and `auth_failed` adds `credential_mismatch`.
 
@@ -986,10 +1019,10 @@ against client timeouts.
 | T4 | Overwrite or destroy existing drops | `create_objects` in policy. Existence refused at OPEN. Conditional commit, or re-check plus in-flight registry (D8). Delete requires `delete_objects`. | `check_then_write` backends: a one-round-trip cross-replica race. |
 | T5 | Reading other drops through stat, readdir or rename | Stat and readdir need `list_objects`. Rename needs `read_objects` on the source. Internal HEADs return no content (D7). | A `list_objects` holder sees names, sizes and times, by design. |
 | T6 | A revoked key keeps a session | Per-operation credential re-check, a re-check by every session on each bundle change, transfer re-decision (D5). | Up to one poll interval. |
-| T7 | Pre-auth flood, brute force | Per-IP rate, connection caps, handshake timeout, constant-time rejection, auth-attempt and key-probe caps, bans, bundle-distributed CIDR denylist (D12). | Bans are per replica: an `R`× budget across `R` replicas. |
+| T7 | Pre-auth flood, brute force | Per-IP rate, connection caps, handshake timeout, constant-time rejection, auth-attempt and key-probe caps, bans, bundle-distributed CIDR denylist (D12). | Bans are per replica: an `R`× budget across `R` replicas. Under `source_address: untrusted`, no per-IP rate, cap or ban: only the process and per-subject caps bound a flood, and keys-only credentials bound guessing. |
 | T8 | Resource exhaustion by pipelined writes, many handles or slow clients | Up-front memory reservation, bounded reorder window, handle caps, idle timeouts, SSH flow control (D9, D12). | None beyond configured bounds. |
 | T9 | Orphaned multipart parts consuming storage | Abort on every error path (D9). | A hard kill leaves parts; a lifecycle rule is an operator obligation. |
-| T10 | Spoofed client IP | PROXY v2 only from trusted CIDRs, and required from them (D12). | s0 cannot detect a load balancer that rewrites the source without PROXY v2; that is a documented deployment requirement. |
+| T10 | Spoofed or rewritten client IP | PROXY v2 only from trusted CIDRs, and required from them. The datapath is declared (`source_address`), never inferred; `untrusted` turns every address-based decision off or closed (D12). | A deployment that declares `preserved` on a datapath that SNATs gets per-IP limits and bans on the shared address: the declaration is the operator's responsibility. |
 | T11 | Host-key substitution (MITM) | Mounted host keys only, never generated. Fingerprints published as a metric and logged (D1, D3). | Partners who skip pinning. |
 | T12 | Algorithm downgrade (Terrapin, SHA-1, CBC) | Code-constant AEAD-only lists; strict KEX required; RSA client keys refused until SHA-1 is excludable (D3, E6). | None known. |
 | T13 | A CA of tenant A vouching for tenant B's login | The CA must be named by the account **and** scoped to its tenant; the principal must equal the login; empty principals refused (D5). | A compromised CA can impersonate every login that names it. Revoke the CA in the bundle. |
@@ -1067,6 +1100,8 @@ against client timeouts.
 
 - `check_then_write` backends keep a one-round-trip cross-replica create race (D8).
 - Bans are per replica (D12).
+- Under `source_address: untrusted`, there are no per-IP limits or bans, and source-restricted
+  accounts cannot log in (D12).
 - Orphaned parts after a hard kill need a lifecycle rule (D9).
 - Rename is not atomic (D9).
 - `excluded_prefixes` still denies on both fronts (E2).
@@ -1203,8 +1238,9 @@ Deployment assumptions:
 
 - SFTP runs as its own Deployment from the same image, with `frontends.s3.enabled: false`
   and an enabled `frontends.sftp` section.
-- The load balancer preserves the client source address, or speaks PROXY v2 from the
-  configured CIDRs.
+- `frontends.sftp.source_address` matches the datapath: `preserved` only where the client
+  address survives every hop (no SNAT, including a cross-node hop), `proxy_protocol` where the
+  load balancer speaks PROXY v2 from the configured CIDRs, `untrusted` otherwise.
 - Host keys are mounted secrets.
 - Every home bucket carries an `AbortIncompleteMultipartUpload` lifecycle rule.
 - The tenant backend credential already configured for the S3 front is sufficient: SFTP uses

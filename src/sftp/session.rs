@@ -23,6 +23,7 @@ use super::codec::{
     self, Attrs, NameEntry, Request, Response, SSH_FXF_APPEND, SSH_FXF_CREAT, SSH_FXF_EXCL,
     SSH_FXF_READ, SSH_FXF_TRUNC, SSH_FXF_WRITE, StatusCode,
 };
+use super::limits::SourceAddr;
 use super::paths::{Mapped, PathError, realpath};
 use super::transfer::{Commit, Download, Upload, UploadLimits, UploadQuota, WriteError};
 use super::{SessionCounters, Shared};
@@ -70,8 +71,21 @@ pub enum Next {
 pub struct SessionIdentity {
     pub session_id: String,
     pub client_ip: IpAddr,
+    /// Whether `client_ip` can be relied on (`frontends.sftp.source_address`).
+    pub ip_trusted: bool,
     pub login: String,
     pub credential: Credential,
+}
+
+impl SessionIdentity {
+    /// The client address as a source-address check may use it.
+    pub fn source(&self) -> SourceAddr {
+        if self.ip_trusted {
+            SourceAddr::Trusted(self.client_ip)
+        } else {
+            SourceAddr::Untrusted
+        }
+    }
 }
 
 struct Decided {
@@ -264,7 +278,7 @@ impl SftpSession {
             return Ok(());
         }
         let dir = self.shared.directory.get(&bundle);
-        let auth = dir.authenticate(&self.id.login, &self.id.credential, self.id.client_ip, now)?;
+        let auth = dir.authenticate(&self.id.login, &self.id.credential, self.id.source(), now)?;
         if auth.account.tenant != self.current.account.tenant
             || auth.account.subject_key != self.current.account.subject_key
             || auth.account.home != self.current.account.home
@@ -342,6 +356,7 @@ impl SftpSession {
             protocol: "sftp".into(),
             session_id: self.id.session_id.clone(),
             client_ip: self.id.client_ip.to_string(),
+            client_ip_untrusted: !self.id.ip_trusted,
             login: self.id.login.clone(),
             auth: self.current.auth.clone(),
             sftp_op: op.to_string(),

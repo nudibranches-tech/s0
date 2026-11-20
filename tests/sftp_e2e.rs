@@ -518,6 +518,16 @@ fn sftp_limits(c: &mut serde_json::Value, fields: serde_json::Value) {
 
 /// [`harness`], with `edit` applied to the gateway config (e.g. `limits.sftp`).
 async fn harness_with(tag: &str, mode: &str, edit: impl FnOnce(&mut serde_json::Value)) -> Harness {
+    harness_front(tag, mode, "preserved", edit).await
+}
+
+/// [`harness_with`], declaring `frontends.sftp.source_address`.
+async fn harness_front(
+    tag: &str,
+    mode: &str,
+    source_address: &str,
+    edit: impl FnOnce(&mut serde_json::Value),
+) -> Harness {
     let mem = Arc::new(Mem::default());
     let url = serve_backend(mem.clone()).await;
     let drop_key = ed25519();
@@ -542,6 +552,7 @@ async fn harness_with(tag: &str, mode: &str, edit: impl FnOnce(&mut serde_json::
         "enabled": true,
         "listen": "127.0.0.1:0",
         "host_keys": [host_path],
+        "source_address": source_address,
         "drain_secs": 1
     }))
     .unwrap();
@@ -1888,6 +1899,91 @@ async fn a_wrong_key_before_the_right_one_does_not_ban_and_failed_connections_st
     assert!(
         banned,
         "ten unauthenticated connections with failures ban the address"
+    );
+}
+
+#[tokio::test]
+async fn an_untrusted_source_address_limits_and_bans_nobody_by_address() {
+    // Per-address budgets far below what the test needs: on an untrusted address
+    // (SNAT, every client is the node) they would lock every partner out together.
+    let h = harness_front("sftp-untrusted", "native", "untrusted", |c| {
+        sftp_limits(
+            c,
+            serde_json::json!({
+                "max_connections_per_ip": 2,
+                "preauth_burst_per_ip": 3,
+                "preauth_rate_per_ip_per_min": 1
+            }),
+        );
+    })
+    .await;
+    let mut held = Vec::new();
+    for i in 0..4 {
+        held.push(
+            connect(h.addr, "acme-partner-drop", &h.drop_key)
+                .await
+                .unwrap_or_else(|e| panic!("session {i} past the per-address cap: {e}")),
+        );
+    }
+    drop(held);
+    // Past the ban threshold (10 in 5 min) of connections that never authenticate.
+    let stranger = ed25519();
+    for _ in 0..12 {
+        assert!(
+            connect(h.addr, "acme-partner-drop", &stranger)
+                .await
+                .is_err()
+        );
+    }
+    connect(h.addr, "acme-partner-drop", &h.drop_key)
+        .await
+        .expect("an untrusted address is never banned");
+    let events: Vec<_> =
+        h.fx.audit_log
+            .all()
+            .into_iter()
+            .filter_map(|x| x.session_event)
+            .collect();
+    assert!(
+        !events.iter().any(|e| e.event == SessionEventKind::Banned),
+        "no ban was recorded"
+    );
+    assert!(
+        events.iter().all(|e| e.client_ip_untrusted),
+        "every record says its client_ip cannot be relied on"
+    );
+}
+
+#[tokio::test]
+async fn an_untrusted_source_address_refuses_accounts_restricted_by_source() {
+    let h = harness_front("sftp-untrusted-cidr", "native", "untrusted", |_| {}).await;
+    // The client is inside the account's CIDRs, but s0 cannot know it.
+    let mut b = bundle(&h.drop_key, &h.ops_key);
+    b["sftp"]["accounts"]["acme-partner-drop"]["allowed_source_cidrs"] =
+        serde_json::json!(["127.0.0.0/8", "::1/128"]);
+    h.fx.gw.bundles.store(s0::pdp::Bundle::new("rev-cidr", b));
+    assert!(
+        connect(h.addr, "acme-partner-drop", &h.drop_key)
+            .await
+            .is_err(),
+        "a source restriction fails closed on an untrusted address"
+    );
+    connect(h.addr, "acme-ops", &h.ops_key)
+        .await
+        .expect("an unrestricted account still logs in");
+    let refused: Vec<_> =
+        h.fx.audit_log
+            .all()
+            .into_iter()
+            .filter_map(|x| x.session_event)
+            .filter(|e| e.event == SessionEventKind::AuthFailed)
+            .collect();
+    assert!(!refused.is_empty());
+    assert!(
+        refused
+            .iter()
+            .all(|e| e.credential_mismatch == Some(false) && e.client_ip_untrusted),
+        "the gateway's refusal, not the client's mistake: {refused:?}"
     );
 }
 

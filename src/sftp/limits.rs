@@ -95,6 +95,24 @@ pub fn any_contains(cidrs: &[Cidr], ip: IpAddr) -> bool {
     cidrs.iter().any(|c| c.contains(ip))
 }
 
+/// The client address as far as a source-address check may rely on it
+/// (`frontends.sftp.source_address`, ADR-012 D12).
+///
+/// `Untrusted` is a datapath that may rewrite the source (SNAT without PROXY v2): the
+/// peer address is still recorded, but no check that grants or refuses by address may
+/// use it, since every client may appear as the same address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceAddr {
+    Trusted(IpAddr),
+    Untrusted,
+}
+
+impl From<IpAddr> for SourceAddr {
+    fn from(ip: IpAddr) -> Self {
+        SourceAddr::Trusted(ip)
+    }
+}
+
 /// Process-wide and per-IP connection counts. The guard releases on drop.
 #[derive(Default)]
 pub struct ConnectionTracker {

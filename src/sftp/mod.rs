@@ -40,13 +40,13 @@ pub use account::{AuthInfo, CertInfo};
 use crate::access::Enforcer;
 use crate::audit::{AuditRecord, SessionEvent, SessionEventKind};
 use crate::authz::Decision;
-use crate::config::SftpConfig;
+use crate::config::{SftpConfig, SourceAddressMode};
 use crate::error::{GatewayError, Result};
 use crate::gateway::Gateway;
 use account::{Authenticated, Credential, DirectoryCache};
 use limits::{
     BanPolicy, BanTable, Cidr, ConnectionTracker, MemoryBudget, PreauthRate, ProcessBandwidth,
-    SubjectGuard, SubjectSessions,
+    SourceAddr, SubjectGuard, SubjectSessions,
 };
 use preauth::{KillSwitch, ProxyHeader, StrictKexGuard};
 use session::{Next, SessionIdentity, SftpSession};
@@ -170,6 +170,9 @@ pub struct Shared {
     pub metrics: Arc<SftpMetrics>,
     pub commit_gate: Arc<dyn CommitGate>,
     pub trusted_proxies: Vec<Cidr>,
+    /// `frontends.sftp.source_address`: `false` for `untrusted`, where nothing may limit,
+    /// ban, allow or refuse by address.
+    pub source_trusted: bool,
     pub drain: Duration,
     shutdown: tokio::sync::watch::Sender<bool>,
 }
@@ -194,7 +197,8 @@ impl Shared {
     /// rejections are audited, but a connection that then logs in is a legitimate client,
     /// and counting them would ban a NAT'd partner after a few routine connections.
     fn settle_auth_failures(&self, conn: &ConnState) {
-        if conn.is_authenticated() {
+        // An untrusted address may be every client at once: banning it bans them all.
+        if conn.is_authenticated() || !conn.ip_trusted {
             return;
         }
         let failures = conn.auth_failures.load(Ordering::Relaxed);
@@ -275,6 +279,7 @@ impl Shared {
             protocol: "sftp".into(),
             session_id: conn.session_id.clone(),
             client_ip: conn.client_ip.to_string(),
+            client_ip_untrusted: !conn.ip_trusted,
             login: login.map(str::to_string),
             auth: authed.map(|(a, _)| a.auth.clone()),
             tenant: authed.map(|(_, t)| t.to_string()),
@@ -324,6 +329,8 @@ impl Shared {
 pub struct ConnState {
     pub session_id: String,
     pub client_ip: IpAddr,
+    /// Whether `client_ip` can be relied on (`frontends.sftp.source_address`).
+    pub ip_trusted: bool,
     pub started: Instant,
     pub counters: Arc<SessionCounters>,
     authenticated: AtomicBool,
@@ -354,10 +361,11 @@ struct AuthSlot {
 }
 
 impl ConnState {
-    fn new(client_ip: IpAddr) -> Self {
+    fn new(client_ip: IpAddr, ip_trusted: bool) -> Self {
         ConnState {
             session_id: uuid::Uuid::new_v4().to_string(),
             client_ip,
+            ip_trusted,
             started: Instant::now(),
             counters: Arc::new(SessionCounters::default()),
             authenticated: AtomicBool::new(false),
@@ -367,6 +375,15 @@ impl ConnState {
             sftp_task: Mutex::new(None),
             teardown: tokio::sync::Notify::new(),
             kill_switch: KillSwitch::default(),
+        }
+    }
+
+    /// The client address as a source-address check may use it.
+    pub fn source(&self) -> SourceAddr {
+        if self.ip_trusted {
+            SourceAddr::Trusted(self.client_ip)
+        } else {
+            SourceAddr::Untrusted
         }
     }
 
@@ -484,6 +501,7 @@ impl SftpFront {
             metrics: Arc::new(SftpMetrics::default()),
             commit_gate: Arc::new(AlwaysCommit),
             trusted_proxies,
+            source_trusted: cfg.source_address != SourceAddressMode::Untrusted,
             drain: Duration::from_secs(cfg.drain_secs),
             shutdown,
             gw,
@@ -588,12 +606,12 @@ async fn handle_connection(
             Ok(Ok(ProxyHeader::Local)) => return,
             Ok(Ok(ProxyHeader::Proxied { source })) => source.ip(),
             Ok(Err(e)) => {
-                let conn = ConnState::new(peer.ip());
+                let conn = ConnState::new(peer.ip(), true);
                 shared.preauth_reject(&conn, &format!("PROXY header: {e}"));
                 return;
             }
             Err(_) => {
-                let conn = ConnState::new(peer.ip());
+                let conn = ConnState::new(peer.ip(), true);
                 shared.preauth_reject(&conn, "PROXY header timeout");
                 return;
             }
@@ -601,34 +619,45 @@ async fn handle_connection(
     } else {
         peer.ip()
     };
-    let conn = Arc::new(ConnState::new(client_ip));
+    let conn = Arc::new(ConnState::new(client_ip, shared.source_trusted));
     let now = Instant::now();
     {
+        // Kept on an untrusted address: it can only refuse, and a denylisted node or load
+        // balancer is a configuration the operator chose.
         let dir = shared.directory.get(&shared.gw.bundles.current());
         if dir.is_source_denied(client_ip) {
             shared.preauth_reject(&conn, "source address on the bundle denylist");
             return;
         }
     }
-    if shared.bans.is_banned(client_ip, now) {
-        shared.preauth_reject(&conn, "address banned for repeated authentication failures");
-        return;
+    // Per-address bans, rate and caps only where the address is the client's. On an
+    // untrusted one they would make every client share one budget; the process cap, the
+    // per-subject cap and the handshake timeout still bound the front.
+    if conn.ip_trusted {
+        if shared.bans.is_banned(client_ip, now) {
+            shared.preauth_reject(&conn, "address banned for repeated authentication failures");
+            return;
+        }
+        if !shared.preauth.allow(
+            client_ip,
+            now,
+            limits.preauth_rate_per_ip_per_min,
+            limits.preauth_burst_per_ip,
+            limits.ban_table_size,
+        ) {
+            shared.preauth_reject(&conn, "pre-authentication rate limit");
+            return;
+        }
     }
-    if !shared.preauth.allow(
-        client_ip,
-        now,
-        limits.preauth_rate_per_ip_per_min,
-        limits.preauth_burst_per_ip,
-        limits.ban_table_size,
-    ) {
-        shared.preauth_reject(&conn, "pre-authentication rate limit");
-        return;
-    }
-    let _guard = match shared.connections.admit(
-        client_ip,
-        limits.max_connections,
-        limits.max_connections_per_ip,
-    ) {
+    let per_ip_cap = if conn.ip_trusted {
+        limits.max_connections_per_ip
+    } else {
+        usize::MAX
+    };
+    let _guard = match shared
+        .connections
+        .admit(client_ip, limits.max_connections, per_ip_cap)
+    {
         Ok(g) => g,
         Err(why) => {
             shared.preauth_reject(&conn, why);
@@ -819,6 +848,7 @@ pub(crate) async fn run_sftp(
         SessionIdentity {
             session_id: conn.session_id.clone(),
             client_ip: conn.client_ip,
+            ip_trusted: conn.ip_trusted,
             login,
             credential,
         },

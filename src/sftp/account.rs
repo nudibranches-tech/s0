@@ -19,7 +19,7 @@ use russh::keys::ssh_key::certificate::CertType;
 use russh::keys::ssh_key::public::KeyData;
 use russh::keys::{Algorithm, Certificate, EcdsaCurve, HashAlg};
 
-use super::limits::{Cidr, any_contains};
+use super::limits::{Cidr, SourceAddr, any_contains};
 use super::paths::Home;
 use crate::model::PrincipalType;
 use crate::pdp::{Bundle, split_subject_key, subject_lookup_key};
@@ -111,6 +111,12 @@ pub struct Directory {
     /// `tenants[t].user_attributes`, kept for the membership and groups check.
     user_attributes: HashMap<String, serde_json::Map<String, serde_json::Value>>,
 }
+
+/// The refusals of a source-address restriction when the address cannot be relied on.
+const UNTRUSTED_CIDRS: &str = "account restricts source addresses, which \
+     frontends.sftp.source_address: untrusted cannot check";
+const UNTRUSTED_CERT: &str = "certificate carries source-address, which \
+     frontends.sftp.source_address: untrusted cannot check";
 
 /// Why [`Directory::authenticate_classified`] refused a login.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,10 +306,10 @@ impl Directory {
         &self,
         login: &str,
         credential: &Credential,
-        client_ip: IpAddr,
+        client: impl Into<SourceAddr>,
         now_unix: u64,
     ) -> Result<Authenticated, String> {
-        self.authenticate_classified(login, credential, client_ip, now_unix)
+        self.authenticate_classified(login, credential, client, now_unix)
             .map_err(Refusal::into_reason)
     }
 
@@ -315,11 +321,16 @@ impl Directory {
         &self,
         login: &str,
         credential: &Credential,
-        client_ip: IpAddr,
+        client: impl Into<SourceAddr>,
         now_unix: u64,
     ) -> Result<Authenticated, Refusal> {
+        let client = client.into();
         self.gate().map_err(|e| Refusal::Gateway(e.to_string()))?;
-        if self.is_source_denied(client_ip) {
+        // An untrusted address was screened against the denylist at accept time, as the
+        // peer; it cannot be matched against anything here.
+        if let SourceAddr::Trusted(ip) = client
+            && self.is_source_denied(ip)
+        {
             return Err(Refusal::Gateway(
                 "source address is on the bundle denylist".into(),
             ));
@@ -328,12 +339,27 @@ impl Directory {
             .accounts
             .get(login)
             .ok_or_else(|| Refusal::Credential("unknown login".into()))?;
-        if let Some(allowed) = &account.allowed_source_cidrs
-            && !any_contains(allowed, client_ip)
+        if let Some(allowed) = &account.allowed_source_cidrs {
+            match client {
+                SourceAddr::Trusted(ip) if any_contains(allowed, ip) => {}
+                SourceAddr::Trusted(_) => {
+                    return Err(Refusal::Credential(
+                        "source address not allowed for this account".into(),
+                    ));
+                }
+                // Fail closed, and as the gateway's refusal: the client may well be
+                // inside the account's CIDRs, there is no way to tell.
+                SourceAddr::Untrusted => return Err(Refusal::Gateway(UNTRUSTED_CIDRS.into())),
+            }
+        }
+        if client == SourceAddr::Untrusted
+            && let Credential::Certificate { cert } = credential
+            && cert
+                .critical_options()
+                .iter()
+                .any(|(name, _)| name == "source-address")
         {
-            return Err(Refusal::Credential(
-                "source address not allowed for this account".into(),
-            ));
+            return Err(Refusal::Gateway(UNTRUSTED_CERT.into()));
         }
         if !client_key_allowed(credential.key()) {
             return Err(Refusal::Credential(format!(
@@ -358,7 +384,7 @@ impl Directory {
                 }
             }
             Credential::Certificate { cert } => self
-                .check_certificate(account, cert, client_ip, now_unix)
+                .check_certificate(account, cert, client, now_unix)
                 .map_err(Refusal::Credential)?,
         };
         // The credential matched: a membership the bundle cannot resolve is the bundle's
@@ -399,7 +425,7 @@ impl Directory {
         &self,
         account: &Account,
         cert: &Certificate,
-        client_ip: IpAddr,
+        client: SourceAddr,
         now_unix: u64,
     ) -> Result<AuthInfo, String> {
         // 1
@@ -461,8 +487,13 @@ impl Directory {
                         value.split(',').map(|c| Cidr::parse(c.trim())).collect();
                     let allowed = allowed
                         .map_err(|_| "certificate source-address does not parse".to_string())?;
-                    if !any_contains(&allowed, client_ip) {
-                        return Err("certificate source-address excludes the client".into());
+                    match client {
+                        SourceAddr::Trusted(ip) if any_contains(&allowed, ip) => {}
+                        SourceAddr::Trusted(_) => {
+                            return Err("certificate source-address excludes the client".into());
+                        }
+                        // Refused before this call, as the gateway's refusal.
+                        SourceAddr::Untrusted => return Err(UNTRUSTED_CERT.into()),
                     }
                 }
                 "force-command" if value == "internal-sftp" => {}
@@ -1108,6 +1139,56 @@ mod tests {
             try_cert(cert(&other_ca, &user, &["acme-partner-drop"], 1, "a", &[]))
                 .unwrap_err()
                 .contains("not trusted")
+        );
+    }
+
+    #[test]
+    fn an_untrusted_address_refuses_every_source_restriction_as_the_gateway() {
+        let ca = ed25519();
+        let user = ed25519();
+        let dir = Directory::from_bundle(&ca_bundle(&ca, serde_json::json!(["acme"])));
+        let with = |opts: &[(&str, &str)]| {
+            dir.authenticate_classified(
+                "acme-partner-drop",
+                &Credential::Certificate {
+                    cert: Box::new(cert(&ca, &user, &["acme-partner-drop"], 1, "a", opts)),
+                },
+                SourceAddr::Untrusted,
+                1_000,
+            )
+        };
+        assert!(with(&[]).is_ok(), "no restriction, nothing to check");
+        assert!(matches!(
+            with(&[("source-address", "0.0.0.0/0,::/0")]),
+            Err(Refusal::Gateway(r)) if r.contains("untrusted")
+        ));
+
+        let k = ed25519();
+        let fp = fingerprint(k.public_key().key_data());
+        let cred = Credential::PublicKey {
+            key: k.public_key().key_data().clone(),
+        };
+        let restricted = Directory::from_bundle(&bundle(
+            section(
+                &fp,
+                serde_json::json!({ "allowed_source_cidrs": ["0.0.0.0/0"] }),
+            ),
+            true,
+        ));
+        assert!(matches!(
+            restricted.authenticate_classified("acme-partner-drop", &cred, SourceAddr::Untrusted, 0),
+            Err(Refusal::Gateway(r)) if r.contains("untrusted")
+        ));
+        assert!(
+            restricted
+                .authenticate_classified("acme-partner-drop", &cred, ip(), 0)
+                .is_ok(),
+            "the same account from a trusted address inside its CIDRs"
+        );
+        let open = Directory::from_bundle(&bundle(section(&fp, serde_json::json!({})), true));
+        assert!(
+            open.authenticate_classified("acme-partner-drop", &cred, SourceAddr::Untrusted, 0)
+                .is_ok()
         );
     }
 
