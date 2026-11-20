@@ -399,22 +399,19 @@ impl SftpSession {
     ///
     /// `labels` name each question for the denial reason ("rename source read: …"); a
     /// single labelled question gets its label too.
+    ///
+    /// `route` is the caller's: the one its inputs were built from and its backend client
+    /// will forward on, so the placement is screened against the route the request takes.
     async fn authorize(
         &mut self,
         op: &str,
+        route: &RouteSnapshot,
         inputs: Vec<OpaInput>,
         labels: &[&str],
         flags: Vec<String>,
         id: u32,
     ) -> Result<Vec<Decided>, Next> {
-        let Some(route) = self.route() else {
-            return Err(status(
-                id,
-                StatusCode::PermissionDenied,
-                "tenant not routable",
-            ));
-        };
-        match self.decide_all(op, &route, inputs, labels).await {
+        match self.decide_all(op, route, inputs, labels).await {
             Ok(decided) => Ok(decided),
             Err(refused) => {
                 let denial = Decision::deny(refused.reason);
@@ -698,7 +695,10 @@ impl SftpSession {
             return status(id, StatusCode::PermissionDenied, "tenant not routable");
         };
         let input = self.list_input(&route, op, &m.key);
-        let decided = match self.authorize(op, vec![input], &[], vec![], id).await {
+        let decided = match self
+            .authorize(op, &route, vec![input], &[], vec![], id)
+            .await
+        {
             Ok(d) => d,
             Err(n) => return n,
         };
@@ -809,7 +809,7 @@ impl SftpSession {
         let prefix = m.dir_prefix();
         let input = self.list_input(&route, op, &prefix);
         let decided = match self
-            .authorize(op, vec![input.clone()], &[], vec![], id)
+            .authorize(op, &route, vec![input.clone()], &[], vec![], id)
             .await
         {
             Ok(d) => d,
@@ -959,7 +959,16 @@ impl SftpSession {
         // by the scope of the first decision: a new decision that scopes it differently
         // cannot be honoured by this handle, so the listing is refused.
         if h.decided_rev != self.checked_rev {
-            match self.authorize(op, h.inputs.clone(), &[], vec![], id).await {
+            // A re-decision screens the current route: a tenant that stopped being
+            // routable since OPENDIR is refused here.
+            let Some(route) = self.route() else {
+                h.audit.settle(BackendOutcome::NotAttempted, None);
+                return status(id, StatusCode::PermissionDenied, "tenant not routable");
+            };
+            match self
+                .authorize(op, &route, h.inputs.clone(), &[], vec![], id)
+                .await
+            {
                 Ok(d) if granted_prefixes(&d[0].decision.obligations) == h.granted => {
                     h.decided_rev = self.checked_rev.clone();
                 }
@@ -1122,7 +1131,7 @@ impl SftpSession {
         let flags = flag_names(pflags);
         let input = self.object_input(&route, op, Action::ReadObjects, &m.key);
         let decided = match self
-            .authorize(op, vec![input.clone()], &[], flags.clone(), id)
+            .authorize(op, &route, vec![input.clone()], &[], flags.clone(), id)
             .await
         {
             Ok(d) => d,
@@ -1219,7 +1228,7 @@ impl SftpSession {
         };
         let first = self.object_input(&route, op, first_action, &key);
         let decided = match self
-            .authorize(op, vec![first.clone()], &[], flags.clone(), id)
+            .authorize(op, &route, vec![first.clone()], &[], flags.clone(), id)
             .await
         {
             Ok(d) => d,
@@ -1277,6 +1286,7 @@ impl SftpSession {
                 let mut d = match self
                     .authorize(
                         op,
+                        &route,
                         vec![w],
                         &["file exists and overwrite is not granted"],
                         flags.clone(),
@@ -1657,7 +1667,7 @@ impl SftpSession {
         };
         let input = self.object_input(&route, op, Action::DeleteObjects, &m.key);
         let decided = match self
-            .authorize(op, vec![input.clone()], &[], vec![], id)
+            .authorize(op, &route, vec![input.clone()], &[], vec![], id)
             .await
         {
             Ok(d) => d,
@@ -1712,7 +1722,7 @@ impl SftpSession {
         let marker = m.dir_prefix();
         let input = self.object_input(&route, op, Action::CreateObjects, &marker);
         let decided = match self
-            .authorize(op, vec![input.clone()], &[], vec![], id)
+            .authorize(op, &route, vec![input.clone()], &[], vec![], id)
             .await
         {
             Ok(d) => d,
@@ -1781,6 +1791,7 @@ impl SftpSession {
         let decided = match self
             .authorize(
                 op,
+                &route,
                 vec![del.clone(), list],
                 &["rmdir marker delete", "rmdir emptiness list"],
                 vec![],
@@ -1885,6 +1896,7 @@ impl SftpSession {
         let decided = match self
             .authorize(
                 op,
+                &route,
                 vec![write.clone(), read, del],
                 &[
                     "rename target write",
