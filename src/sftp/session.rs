@@ -93,6 +93,14 @@ struct Decided {
     decision: Decision,
 }
 
+/// A request [`SftpSession::decide_all`] refused: the input its record carries, the reason
+/// the record states and the one the client is told (they differ for a placement refusal).
+struct Refused {
+    primary: Box<OpaInput>,
+    reason: String,
+    client: String,
+}
+
 enum Handle {
     Dir(DirHandle),
     Read(ReadHandle),
@@ -139,7 +147,6 @@ struct WriteHandle {
     inputs: Vec<OpaInput>,
     decided_rev: String,
     audit: Arc<PendingAudit>,
-    flags: Vec<String>,
 }
 
 pub struct SftpSession {
@@ -392,13 +399,6 @@ impl SftpSession {
     ///
     /// `labels` name each question for the denial reason ("rename source read: …"); a
     /// single labelled question gets its label too.
-    ///
-    /// Every input is screened by the bucket placement first (ADR-009), against one bundle
-    /// revision and one route for the whole request, exactly as the S3 front pins them in
-    /// `check`. The home is fixed by the bundle, so this is the gateway's own check on the
-    /// control plane: a home on another tenant's bucket, a bundle projected for another
-    /// backend, or tenants sharing an upstream identity under a bundle that places nothing
-    /// are refused whatever the policy says.
     async fn authorize(
         &mut self,
         op: &str,
@@ -414,10 +414,61 @@ impl SftpSession {
                 "tenant not routable",
             ));
         };
+        match self.decide_all(op, &route, inputs, labels).await {
+            Ok(decided) => Ok(decided),
+            Err(refused) => {
+                let denial = Decision::deny(refused.reason);
+                self.emit_denied(*refused.primary, &denial, self.block(op, flags));
+                self.counters.denied.fetch_add(1, Ordering::Relaxed);
+                Err(status(id, StatusCode::PermissionDenied, refused.client))
+            }
+        }
+    }
+
+    /// Re-ask an open transfer's questions against the current bundle (D14 step 4, and on
+    /// every READ/WRITE after a revision change). A denial writes **no record of its own**:
+    /// the transfer is one record, from OPEN to CLOSE, and it is that record the caller
+    /// settles as `denied` with the returned reason (ADR-014, "A file transfer is one
+    /// operation"). The denial is still counted once.
+    async fn reauthorize(
+        &mut self,
+        op: &str,
+        inputs: Vec<OpaInput>,
+        id: u32,
+    ) -> Result<(), (String, Next)> {
+        let (reason, client) = match self.route() {
+            None => (
+                "tenant not routable".to_string(),
+                "tenant not routable".to_string(),
+            ),
+            Some(route) => match self.decide_all(op, &route, inputs, &[]).await {
+                Ok(_) => return Ok(()),
+                Err(refused) => (refused.reason, refused.client),
+            },
+        };
+        self.counters.denied.fetch_add(1, Ordering::Relaxed);
+        Err((reason, status(id, StatusCode::PermissionDenied, client)))
+    }
+
+    /// Every question of one request, answered or refused; records nothing.
+    ///
+    /// Every input is screened by the bucket placement first (ADR-009), against one bundle
+    /// revision and one route for the whole request, exactly as the S3 front pins them in
+    /// `check`. The home is fixed by the bundle, so this is the gateway's own check on the
+    /// control plane: a home on another tenant's bucket, a bundle projected for another
+    /// backend, or tenants sharing an upstream identity under a bundle that places nothing
+    /// are refused whatever the policy says.
+    async fn decide_all(
+        &self,
+        op: &str,
+        route: &RouteSnapshot,
+        inputs: Vec<OpaInput>,
+        labels: &[&str],
+    ) -> Result<Vec<Decided>, Refused> {
         let placement = self.shared.gw.bundles.current().placement().clone();
         let gate = PlacementGate {
             placement: &placement,
-            route: &route,
+            route,
         };
         // Ahead of any decision, so the client gets the placement's client message and the
         // record its full reason — the same split as the S3 front's `deny_placement`.
@@ -427,14 +478,11 @@ impl SftpSession {
             .find_map(|(n, input)| gate.refusal(input).map(|r| (n, r)))
         {
             let primary = if labels.len() > 1 { 0 } else { n };
-            let denial = Decision::deny(refusal.reason());
-            self.emit_denied(inputs[primary].clone(), &denial, self.block(op, flags));
-            self.counters.denied.fetch_add(1, Ordering::Relaxed);
-            return Err(status(
-                id,
-                StatusCode::PermissionDenied,
-                refusal.client_message(),
-            ));
+            return Err(Refused {
+                primary: Box::new(inputs[primary].clone()),
+                reason: refusal.reason(),
+                client: refusal.client_message(),
+            });
         }
         let mut out = Vec::with_capacity(inputs.len());
         for (n, input) in inputs.into_iter().enumerate() {
@@ -449,7 +497,6 @@ impl SftpSession {
                     Some(l) => format!("{l}: {}", decision.reason),
                     None => decision.reason.clone(),
                 };
-                let denial = Decision::deny(reason.clone());
                 // The record carries the primary input (a rename's destination, with its
                 // copy source), so one request produces one record.
                 let primary = out
@@ -457,9 +504,11 @@ impl SftpSession {
                     .map(|d: &Decided| d.input.clone())
                     .filter(|_| labels.len() > 1)
                     .unwrap_or(input);
-                self.emit_denied(primary, &denial, self.block(op, flags));
-                self.counters.denied.fetch_add(1, Ordering::Relaxed);
-                return Err(status(id, StatusCode::PermissionDenied, reason));
+                return Err(Refused {
+                    primary: Box::new(primary),
+                    client: reason.clone(),
+                    reason,
+                });
             }
             out.push(Decided { input, decision });
         }
@@ -1316,7 +1365,6 @@ impl SftpSession {
             inputs: vec![record_input],
             decided_rev: self.checked_rev.clone(),
             audit,
-            flags,
         })));
         Next::Reply(Response::Handle { id, handle: h })
     }
@@ -1336,26 +1384,23 @@ impl SftpSession {
             unreachable!("checked above");
         };
         if h.decided_rev != self.checked_rev {
-            match self.authorize(op, h.inputs.clone(), &[], vec![], id).await {
-                Ok(_) => h.decided_rev = self.checked_rev.clone(),
-                Err(n) => {
+            match self.reauthorize(op, h.inputs.clone(), id).await {
+                Ok(()) => h.decided_rev = self.checked_rev.clone(),
+                Err((why, n)) => {
                     let bytes = h.dl.bytes_sent;
+                    let reason = format!("denied mid-transfer at byte offset {offset}: {why}");
                     h.audit
                         .settle_with(BackendOutcome::SucceededStatusUnknown, None, |r| {
                             // As for an upload denied mid-transfer (`settle_transfer`): the
                             // record states the denial, not the original allow.
-                            r.result = Decision::deny(format!(
-                                "denied mid-transfer at byte offset {offset}"
-                            ));
+                            r.result = Decision::deny(reason.clone());
                             r.gateway.outcome = Outcome::Denied;
                             if let Some(s) = r.gateway.session.as_mut() {
                                 s.transfer = Some(TransferBlock {
                                     bytes,
                                     parts: 0,
                                     commit: "denied".into(),
-                                    reason: Some(format!(
-                                        "denied mid-transfer at byte offset {offset}"
-                                    )),
+                                    reason: Some(reason.clone()),
                                 });
                             }
                         });
@@ -1392,17 +1437,16 @@ impl SftpSession {
         };
         let len = data.len() as u64;
         if h.decided_rev != self.checked_rev {
-            match self
-                .authorize(op, h.inputs.clone(), &[], h.flags.clone(), id)
-                .await
-            {
-                Ok(_) => h.decided_rev = self.checked_rev.clone(),
-                Err(n) => {
+            match self.reauthorize(op, h.inputs.clone(), id).await {
+                Ok(()) => h.decided_rev = self.checked_rev.clone(),
+                Err((why, n)) => {
                     h.up.abort().await;
                     Self::settle_transfer(
                         &h,
                         Commit::Denied,
-                        Some(format!("denied mid-transfer at byte offset {offset}")),
+                        Some(format!(
+                            "denied mid-transfer at byte offset {offset}: {why}"
+                        )),
                     );
                     self.shared
                         .metrics
@@ -1507,14 +1551,15 @@ impl SftpSession {
             }
             Handle::Write(mut w) => {
                 // Final re-authorization against the current bundle (D14 step 4).
-                match self
-                    .authorize(op, w.inputs.clone(), &[], w.flags.clone(), id)
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(n) => {
+                match self.reauthorize(op, w.inputs.clone(), id).await {
+                    Ok(()) => {}
+                    Err((why, n)) => {
                         w.up.abort().await;
-                        Self::settle_transfer(&w, Commit::Denied, Some("denied at close".into()));
+                        Self::settle_transfer(
+                            &w,
+                            Commit::Denied,
+                            Some(format!("denied at close: {why}")),
+                        );
                         self.shared
                             .metrics
                             .transfers_aborted

@@ -3169,6 +3169,82 @@ async fn an_upload_in_flight_when_the_placement_is_withdrawn_commits_nothing() {
     assert_eq!(code(&w), PERMISSION_DENIED, "{w:?}");
     assert_eq!(status_text(&w), s0::pdp::BUNDLE_UNUSABLE);
     assert_eq!(h.mem.get("inbound", "late.csv"), None, "nothing committed");
+
+    // A file transfer is one record (ADR-014): the OPEN's, settled as denied. The
+    // re-authorization that refused it writes none of its own.
+    let recs = records(&h.fx, |r| !transfer_records(r, "late.csv").is_empty()).await;
+    let late = transfer_records(&recs, "late.csv");
+    assert_eq!(late.len(), 1, "one record per transfer: {late:#?}");
+    let r = late[0];
+    assert_eq!(r.gateway.outcome, Outcome::Denied);
+    let t = r
+        .gateway
+        .session
+        .as_ref()
+        .unwrap()
+        .transfer
+        .as_ref()
+        .unwrap();
+    assert_eq!(t.commit, "denied");
+    assert!(
+        r.result
+            .reason
+            .starts_with("denied mid-transfer at byte offset 0: "),
+        "the record names the offset and keeps the gateway's reason: {r:#?}"
+    );
+}
+
+#[tokio::test]
+async fn an_upload_denied_at_close_is_one_denied_record() {
+    let h = harness_with("sftp-close-denied", "native", share_acmes_identity).await;
+    install(
+        &h,
+        "rev-placed",
+        placed(&h.drop_key, &h.ops_key, "bay-1", "acme"),
+    )
+    .await;
+    let mut c = connect(h.addr, "acme-ops", &h.ops_key)
+        .await
+        .expect("connect");
+    let handle = match c
+        .open(
+            "/closing.csv",
+            SSH_FXF_WRITE | SSH_FXF_CREAT | SSH_FXF_TRUNC,
+        )
+        .await
+    {
+        Reply::Handle(h) => h,
+        other => panic!("open: {other:?}"),
+    };
+    assert_eq!(code(&c.write(&handle, 0, b"data").await), OK);
+    install(&h, "rev-v2", bundle(&h.drop_key, &h.ops_key)).await;
+    let r = c.close(&handle).await;
+    assert_eq!(code(&r), PERMISSION_DENIED, "{r:?}");
+    assert_eq!(
+        h.mem.get("inbound", "closing.csv"),
+        None,
+        "nothing committed"
+    );
+
+    let recs = records(&h.fx, |r| !transfer_records(r, "closing.csv").is_empty()).await;
+    let closing = transfer_records(&recs, "closing.csv");
+    assert_eq!(closing.len(), 1, "one record per transfer: {closing:#?}");
+    let r = closing[0];
+    assert_eq!(r.gateway.outcome, Outcome::Denied);
+    assert!(r.result.reason.starts_with("denied at close: "), "{r:#?}");
+}
+
+/// Every SFTP record naming an object whose key ends in `name`.
+fn transfer_records<'a>(recs: &'a [AuditRecord], name: &str) -> Vec<&'a AuditRecord> {
+    recs.iter()
+        .filter(|r| {
+            r.gateway.session.is_some()
+                && r.input
+                    .as_ref()
+                    .and_then(|i| i.object.as_deref())
+                    .is_some_and(|o| o.ends_with(name))
+        })
+        .collect()
 }
 
 /// Gateway config edit: a second tenant, `globex`, re-signed with acme's own credential.
