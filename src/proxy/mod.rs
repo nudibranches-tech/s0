@@ -787,6 +787,8 @@ answers_without_backend_identifiers!(
     DeleteObjectsOutput,
     GetBucketLocationOutput,
     GetObjectAttributesOutput,
+    GetObjectLegalHoldOutput,
+    GetObjectRetentionOutput,
     GetObjectTaggingOutput,
     HeadBucketOutput,
     ListBucketsOutput,
@@ -795,6 +797,8 @@ answers_without_backend_identifiers!(
     ListObjectVersionsOutput,
     ListObjectsV2Output,
     ListPartsOutput,
+    PutObjectLegalHoldOutput,
+    PutObjectRetentionOutput,
     PutObjectTaggingOutput,
 );
 
@@ -1380,6 +1384,40 @@ impl S3 for GatewayS3 {
         req: S3Request<GetObjectAttributesInput>,
     ) -> S3Result<S3Response<GetObjectAttributesOutput>> {
         self.forward(req, |p, r| async move { p.get_object_attributes(r).await })
+            .await
+    }
+
+    // ── object lock: retention and legal hold (ADR-015) ─────────────────────────
+
+    async fn get_object_retention(
+        &self,
+        req: S3Request<GetObjectRetentionInput>,
+    ) -> S3Result<S3Response<GetObjectRetentionOutput>> {
+        self.forward(req, |p, r| async move { p.get_object_retention(r).await })
+            .await
+    }
+
+    async fn put_object_retention(
+        &self,
+        req: S3Request<PutObjectRetentionInput>,
+    ) -> S3Result<S3Response<PutObjectRetentionOutput>> {
+        self.forward(req, |p, r| async move { p.put_object_retention(r).await })
+            .await
+    }
+
+    async fn get_object_legal_hold(
+        &self,
+        req: S3Request<GetObjectLegalHoldInput>,
+    ) -> S3Result<S3Response<GetObjectLegalHoldOutput>> {
+        self.forward(req, |p, r| async move { p.get_object_legal_hold(r).await })
+            .await
+    }
+
+    async fn put_object_legal_hold(
+        &self,
+        req: S3Request<PutObjectLegalHoldInput>,
+    ) -> S3Result<S3Response<PutObjectLegalHoldOutput>> {
+        self.forward(req, |p, r| async move { p.put_object_legal_hold(r).await })
             .await
     }
 }

@@ -18,9 +18,10 @@
 # ── input ──────────────────────────────────────────────────────────────────────
 #   input.principal.{sub,type,attributes.groups,attributes.<extra>}
 #   input.backend.{id,kind}   input.tenant   input.organization_id
-#   input.action  ∈ the 8 verbs (ADR-006; `create_objects` ADR-014, `delete_object_versions` ADR-013):
+#   input.action  ∈ the 10 verbs (ADR-006; `create_objects` ADR-014, `delete_object_versions` ADR-013,
+#                   `write_object_retention` / `write_object_legal_hold` ADR-015):
 #       object-scoped : read_objects write_objects create_objects delete_objects delete_object_versions
-#                       write_object_tags
+#                       write_object_tags write_object_retention write_object_legal_hold
 #       listing       : list_objects
 #       bucket/account: read
 #
@@ -71,9 +72,27 @@
 #                         subject to SFTP). input.request.method carries the HTTP method
 #                         for S3 and the SFTP request name (OPEN, RENAME, …) for SFTP.
 #   input.bypass_governance  ALWAYS present. x-amz-bypass-governance-retention. The PEP
-#                         refuses it unconditionally (no verb in the vocabulary
-#                         expresses "may override object-lock retention"); it is on the
-#                         wire so the attempt is on the audit record.
+#                         refuses it unconditionally on DeleteObject(s) and
+#                         PutObjectRetention (no verb in the vocabulary expresses "may
+#                         override object-lock retention"); it is on the wire so the
+#                         attempt is on the audit record.
+#   input.requested_retention?  {mode?, retain_until?, retain_days?, legal_hold?} — the
+#                         object-lock state a PutObjectRetention / PutObjectLegalHold, or a
+#                         write carrying inline x-amz-object-lock-* headers, asks for
+#                         (ADR-015). ABSENT on every request that names no lock field.
+#                         `retain_days` is computed by the PEP (whole days from the
+#                         request time to retain_until, rounded up) so a policy can cap a
+#                         period with no clock. This default module does not cap it: the
+#                         deploying platform's pushed module does.
+#
+#     OBJECT LOCK (ADR-015). `write_object_retention` and `write_object_legal_hold` are
+#     their own verbs, independent of `write_objects` in both directions: a grant of
+#     either confers neither of the others. A write carrying inline lock headers is
+#     decided a second time by the PEP under the matching lock verb (a rider). Both are
+#     writes, so `freeze_writes` covers them. This default module has no action-scoped
+#     DENY grants (only the per-bucket denylist, which covers every verb); a pushed
+#     module that has them must make a deny on `write_objects` also deny both lock
+#     verbs, as a deny on `delete_objects` denies `delete_object_versions`.
 #
 # ── data / grant contract ──────────────────────────────────────────────────────
 #   data.org_settings.freeze_writes : bool
@@ -202,6 +221,8 @@ write_actions := {
 	"delete_objects",
 	"delete_object_versions",
 	"write_object_tags",
+	"write_object_retention",
+	"write_object_legal_hold",
 }
 
 # The verbs decided against a NAMED bucket with no object key. They carry no key, so

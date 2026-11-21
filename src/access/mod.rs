@@ -73,6 +73,22 @@ macro_rules! object_acl_fields {
     };
 }
 
+/// The inline object-lock fields of an object-shaped s3s input, as
+/// [`headers::ObjectLockFields`] (ADR-015 D3). A macro for the reason
+/// [`object_acl_fields`] is one.
+macro_rules! object_lock_fields {
+    ($i:expr) => {
+        crate::access::headers::ObjectLockFields {
+            mode: $i.object_lock_mode.as_ref().map(|m| m.as_str()),
+            retain_until: $i.object_lock_retain_until_date.as_ref(),
+            legal_hold: $i
+                .object_lock_legal_hold_status
+                .as_ref()
+                .map(|s| s.as_str()),
+        }
+    };
+}
+
 /// The exact s3s operation name for this request. Only reachable in `check`
 /// (`cx.s3_op()`), so `check` stashes it and the typed hooks read it from there
 /// rather than each hardcoding its own name.
@@ -183,6 +199,7 @@ impl<'a> ReqCtx<'a> {
             requested_tags: None,
             acl_grants: vec![],
             bypass_governance: false,
+            requested_retention: None,
             request: self.meta.clone(),
         }
     }
@@ -203,6 +220,7 @@ impl<'a> ReqCtx<'a> {
         input.acl_grants = riders.acl.clone();
         input.requested_tags = riders.tags.clone();
         input.bypass_governance = riders.bypass_governance;
+        input.requested_retention = riders.object_lock.clone();
         input
     }
 
@@ -685,9 +703,10 @@ impl GatewayAccess {
     /// may authorize:
     ///
     /// 1. **`x-amz-bypass-governance-retention`.** No verb in the grant vocabulary
-    ///    expresses "may defeat WORM", so no grant could authorize it. The attempt is
-    ///    still recorded (`input.bypass_governance`) — a regulated deployment has to be
-    ///    able to ask who tried.
+    ///    expresses "may defeat WORM", so no grant could authorize it — not on a delete,
+    ///    and not on `PutObjectRetention`, where it shortens or lifts a GOVERNANCE
+    ///    retention (ADR-015 D4). The attempt is still recorded (`input.bypass_governance`)
+    ///    — a regulated deployment has to be able to ask who tried.
     /// 2. **Any conferring ACL**, public *or* named: it grants access the control plane
     ///    cannot show or revoke. Both come back as [`headers::AclDisposition::refusal`],
     ///    so a tier added to that enum later is screened without this line changing.
@@ -719,6 +738,15 @@ impl GatewayAccess {
     /// and must go through `write_object_tags` because a tag can satisfy an ABAC
     /// condition — which is also why that verb is not merged into `write_objects`.
     ///
+    /// Inline object-lock headers are decided the same way (ADR-015 D3): a mode and
+    /// retain-until date under `write_object_retention`, a legal hold under
+    /// `write_object_legal_hold`, a request carrying both takes both decisions. Without
+    /// them every `write_objects` holder could make data undeletable for years.
+    ///
+    /// A rider whose verb **is** the primary decision's (the retention of a
+    /// `PutObjectRetention`, the hold of a `PutObjectLegalHold`) is not asked twice: the
+    /// primary decision is that question.
+    ///
     /// `Some(reason)` ⇒ refuse. Returns rather than denying inline so the caller records
     /// **one** audit entry against the primary input: a request produces one record,
     /// whatever it decomposed into.
@@ -739,12 +767,39 @@ impl GatewayAccess {
                 );
             }
         }
+        if let Some(lock) = &riders.object_lock {
+            if lock.sets_retention() && input.action != Action::WriteObjectRetention {
+                let mut lock_input = input.clone();
+                lock_input.action = Action::WriteObjectRetention;
+                if !self.decide(cx, &lock_input).await.allow {
+                    return Some(
+                        "deny: the request carries an object-lock retention \
+                         (x-amz-object-lock-mode / x-amz-object-lock-retain-until-date), \
+                         which requires write_object_retention on this object; no grant \
+                         matches"
+                            .to_string(),
+                    );
+                }
+            }
+            if lock.sets_legal_hold() && input.action != Action::WriteObjectLegalHold {
+                let mut hold_input = input.clone();
+                hold_input.action = Action::WriteObjectLegalHold;
+                if !self.decide(cx, &hold_input).await.allow {
+                    return Some(
+                        "deny: the request carries a legal hold \
+                         (x-amz-object-lock-legal-hold), which requires \
+                         write_object_legal_hold on this object; no grant matches"
+                            .to_string(),
+                    );
+                }
+            }
+        }
         None
     }
 
     /// The write path for an object op that can carry riders: screen them, authorize them
     /// as their own verbs, then decide the write itself. A request with no ACL, no inline
-    /// tags and no bypass header costs exactly one decision.
+    /// tags, no object-lock header and no bypass header costs exactly one decision.
     #[allow(clippy::too_many_arguments)]
     async fn enforce_object_write(
         &self,
@@ -1215,7 +1270,8 @@ impl S3Access for GatewayAccess {
             req.input.tagging.as_deref(),
             false,
             max_tags,
-        );
+        )
+        .and_then(|r| r.with_object_lock(object_lock_fields!(req.input), chrono::Utc::now()));
         // `If-None-Match: *` makes the write unable to overwrite, so `create_objects`
         // can authorize it (ADR-014 F1).
         let create_capable = if_none_match_any(req.input.if_none_match.as_ref());
@@ -1246,12 +1302,15 @@ impl S3Access for GatewayAccess {
     async fn post_object(&self, req: &mut S3Request<PostObjectInput>) -> S3Result<()> {
         let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
         let max_tags = self.gw.limits().max_tag_count;
+        // The object-lock form fields ride the signed POST policy like `acl`, so they are
+        // decided rather than stripped.
         let riders = RequestRiders::parse(
             object_acl_fields!(req.input),
             req.input.tagging.as_deref(),
             false,
             max_tags,
-        );
+        )
+        .and_then(|r| r.with_object_lock(object_lock_fields!(req.input), chrono::Utc::now()));
         // s3s sizes the form's file from the body it already aggregated, and leaves the
         // length unset only for an empty one.
         let charge = Charge::Body(Some(req.input.content_length.unwrap_or(0)));
@@ -1454,7 +1513,11 @@ impl S3Access for GatewayAccess {
             (true, None) => Some(""),
             (false, t) => t,
         };
-        let riders = RequestRiders::parse(object_acl_fields!(req.input), tagging, false, max_tags);
+        // Lock headers on a copy set the DESTINATION's lock, decided like a plain write's.
+        // Whether the backend copies the source's retention when none is named is not
+        // verified (ADR-015 residual); such a copy is decided under write_objects alone.
+        let riders = RequestRiders::parse(object_acl_fields!(req.input), tagging, false, max_tags)
+            .and_then(|r| r.with_object_lock(object_lock_fields!(req.input), chrono::Utc::now()));
         let sizing = CopySizing {
             range: None,
             sse_customer_algorithm: req.input.copy_source_sse_customer_algorithm.clone(),
@@ -1570,12 +1633,15 @@ impl S3Access for GatewayAccess {
         headers::strip_aws_chunked(&mut req.input.content_encoding);
         let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
         let max_tags = self.gw.limits().max_tag_count;
+        // The lock, like the ACL and the tags, is fixed at creation: this is the only hook
+        // of the multipart lifecycle where it can be decided.
         let riders = RequestRiders::parse(
             object_acl_fields!(req.input),
             req.input.tagging.as_deref(),
             false,
             max_tags,
-        );
+        )
+        .and_then(|r| r.with_object_lock(object_lock_fields!(req.input), chrono::Utc::now()));
         let mut cx = ReqCtx::new(req)?;
         // Creates nothing visible: only a conditional `CompleteMultipartUpload` can, so a
         // create-only principal may start the upload. No bytes yet: a multipart upload is
@@ -1936,6 +2002,118 @@ impl S3Access for GatewayAccess {
         let mut cx = ReqCtx::new(req)?;
         self.enforce_object(&mut cx, Action::ReadObjects, bucket, key)
             .await
+    }
+
+    // ── object lock: retention and legal hold (ADR-015 D2) ──────────────────────
+
+    /// `read_objects`: an object's retention is metadata of an object the principal may
+    /// already read.
+    async fn get_object_retention(
+        &self,
+        req: &mut S3Request<GetObjectRetentionInput>,
+    ) -> S3Result<()> {
+        let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
+        let mut cx = ReqCtx::new(req)?;
+        self.enforce_object(&mut cx, Action::ReadObjects, bucket, key)
+            .await
+    }
+
+    /// `read_objects`, as [`Self::get_object_retention`].
+    async fn get_object_legal_hold(
+        &self,
+        req: &mut S3Request<GetObjectLegalHoldInput>,
+    ) -> S3Result<()> {
+        let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
+        let mut cx = ReqCtx::new(req)?;
+        self.enforce_object(&mut cx, Action::ReadObjects, bucket, key)
+            .await
+    }
+
+    /// Set, extend or switch an object's retention, under `write_object_retention`.
+    ///
+    /// The requested mode, date and day count ride to the PDP as `requested_retention`,
+    /// so a policy can cap the period exactly as it caps an inline one. The governance
+    /// bypass — the way to SHORTEN or lift a GOVERNANCE retention — is refused in code,
+    /// as on a delete (ADR-008 Decision 3, ADR-015 D4): the verb does not express it.
+    /// Extending a retention or switching GOVERNANCE to COMPLIANCE needs no bypass; the
+    /// backend still refuses to shorten a COMPLIANCE one.
+    async fn put_object_retention(
+        &self,
+        req: &mut S3Request<PutObjectRetentionInput>,
+    ) -> S3Result<()> {
+        let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
+        let retention = req.input.retention.as_ref();
+        let fields = headers::ObjectLockFields {
+            mode: retention
+                .and_then(|r| r.mode.as_ref())
+                .map(ObjectLockRetentionMode::as_str),
+            retain_until: retention.and_then(|r| r.retain_until_date.as_ref()),
+            legal_hold: None,
+        };
+        // Always present on this op, `{}` for a body that names neither half: the policy
+        // sees a retention request with no period, not an input that looks like a plain
+        // write.
+        let riders = fields
+            .requested(chrono::Utc::now())
+            .map(|lock| RequestRiders {
+                bypass_governance: req.input.bypass_governance_retention.unwrap_or(false),
+                object_lock: Some(lock.unwrap_or_default()),
+                ..RequestRiders::default()
+            });
+        let mut cx = ReqCtx::new(req)?;
+        self.enforce_object_write(
+            &mut cx,
+            Action::WriteObjectRetention,
+            bucket,
+            key,
+            riders,
+            false,
+            (Charge::Nothing, VersionedAudit::default()),
+        )
+        .await
+    }
+
+    /// Place or lift a legal hold, under `write_object_legal_hold`, with the requested
+    /// state in `requested_retention.legal_hold`. A body naming no state is refused: the
+    /// gateway will not authorize a hold whose direction it cannot see.
+    async fn put_object_legal_hold(
+        &self,
+        req: &mut S3Request<PutObjectLegalHoldInput>,
+    ) -> S3Result<()> {
+        let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
+        let state = req
+            .input
+            .legal_hold
+            .as_ref()
+            .and_then(|h| h.status.as_ref())
+            .map(ObjectLockLegalHoldStatus::as_str);
+        let riders = match state {
+            None => Err(
+                "the request's legal hold names no status (ON or OFF); the gateway \
+                 will not authorize a hold whose direction it cannot see"
+                    .to_string(),
+            ),
+            Some(state) => headers::ObjectLockFields {
+                legal_hold: Some(state),
+                ..headers::ObjectLockFields::default()
+            }
+            .requested(chrono::Utc::now())
+            .map(|lock| RequestRiders {
+                object_lock: lock,
+                ..RequestRiders::default()
+            }),
+        };
+        let mut cx = ReqCtx::new(req)?;
+        self.enforce_object_write(
+            &mut cx,
+            Action::WriteObjectLegalHold,
+            bucket,
+            key,
+            riders,
+            false,
+            (Charge::Nothing, VersionedAudit::default()),
+        )
+        .await
     }
 }
 

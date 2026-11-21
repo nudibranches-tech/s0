@@ -24,13 +24,13 @@ const S3S_OPS: &str = include_str!("data/s3s-0.14.1-ops.txt");
 /// s0's own manifest, so a s3s bump cannot silently leave the reference list behind.
 const CARGO_TOML: &str = include_str!("../Cargo.toml");
 
-/// The reviewed enforced scope: 24 operations.
+/// The reviewed enforced scope: 28 operations.
 ///
 /// Checked in so the target is a diff against a written-down set rather than a number
 /// someone remembers, and so that flipping an op to `Enforced` that is NOT in this list
 /// is a visible, deliberate act. The ops deliberately kept out are named in
 /// `NEVER_DELEGABLE` or `DELEGABLE_ADR_0056` rather than silently absent.
-const TARGET_ENFORCED: [&str; 24] = [
+const TARGET_ENFORCED: [&str; 28] = [
     // the object data plane
     "AbortMultipartUpload",
     "CompleteMultipartUpload",
@@ -58,6 +58,12 @@ const TARGET_ENFORCED: [&str; 24] = [
     "ListBuckets",
     "PostObject",
     "PutObjectTagging",
+    // object lock, per object (ADR-015): reads under read_objects, writes under their own
+    // verbs
+    "GetObjectLegalHold",
+    "GetObjectRetention",
+    "PutObjectLegalHold",
+    "PutObjectRetention",
 ];
 
 /// The control-plane operations that no configuration delegates, each with its reason.
@@ -154,24 +160,24 @@ fn op_table_covers_every_s3s_operation_and_nothing_else() {
 }
 
 #[test]
-fn exactly_24_enforced_75_denied() {
-    // The gateway is data-plane only. The other 75 ops are refused at the gate, before
-    // deserialization.
+fn exactly_28_enforced_71_not() {
+    // The gateway is data-plane only. The other 71 ops are refused at the gate, before
+    // deserialization, or delegated to a control backend that lists them.
     let enforced = enforced_ops();
     let denied = OP_TABLE.len() - enforced.len();
     assert_eq!(
         enforced.len(),
-        24,
+        28,
         "enforced set changed to {enforced:?} — a Denied → Enforced flip needs two \
          reviewers, its hook, its dispatch arm, and this number updated"
     );
-    assert_eq!(denied, 75);
+    assert_eq!(denied, 71);
 }
 
 #[test]
 fn the_non_delegable_ops_are_not_quietly_enforced_or_delegated() {
     // The count above is the weak form of this claim: an edit could re-enforce
-    // `PutBucketPolicy` and deny something else to keep 24/75 true. Naming them also
+    // `PutBucketPolicy` and deny something else to keep 28/71 true. Naming them also
     // asserts they are refused by the TABLE rather than by a hook that returns an error.
     let target: BTreeSet<&str> = TARGET_ENFORCED.into_iter().collect();
     for (op, why) in NEVER_DELEGABLE {
@@ -216,11 +222,11 @@ fn every_enforced_op_is_in_the_target_scope() {
     // The target set is the review boundary: an op may only become Enforced if it was
     // already argued for. Adding one to TARGET_ENFORCED is the argument.
     let target: BTreeSet<&str> = TARGET_ENFORCED.into_iter().collect();
-    assert_eq!(target.len(), 24, "TARGET_ENFORCED has duplicates");
+    assert_eq!(target.len(), 28, "TARGET_ENFORCED has duplicates");
     for op in enforced_ops() {
         assert!(
             target.contains(op),
-            "{op} is Enforced but is not in the reviewed 24-op target scope"
+            "{op} is Enforced but is not in the reviewed 28-op target scope"
         );
     }
     for op in TARGET_ENFORCED {
@@ -316,7 +322,7 @@ fn op_table_verbs_are_grantable_or_explicitly_control_plane() {
             ),
             Some(v) => assert!(
                 GATEWAY_VERBS.contains(&v) || NON_GATEWAY_VERBS.contains(&v),
-                "{} maps to {v}, which is neither one of the eight projected grant verbs \
+                "{} maps to {v}, which is neither one of the ten projected grant verbs \
                  nor a recorded control-plane label",
                 s.name
             ),
@@ -336,7 +342,7 @@ fn op_table_verbs_are_grantable_or_explicitly_control_plane() {
 }
 
 #[test]
-fn the_gateway_vocabulary_is_the_eight_projected_verbs() {
+fn the_gateway_vocabulary_is_the_ten_projected_verbs() {
     // The vocabulary a control plane projects grants into. Changing it is a cross-repo
     // contract change, not a local edit.
     let mut verbs = GATEWAY_VERBS.to_vec();
@@ -350,6 +356,8 @@ fn the_gateway_vocabulary_is_the_eight_projected_verbs() {
             "list_objects",
             "read",
             "read_objects",
+            "write_object_legal_hold",
+            "write_object_retention",
             "write_object_tags",
             "write_objects",
         ],
@@ -418,11 +426,75 @@ fn the_write_set_matches_the_shipped_rego() {
     );
     assert_eq!(
         from_rust.len(),
-        5,
-        "the write set is 5 verbs: write_objects, create_objects (ADR-014 D7, so \
+        7,
+        "the write set is 7 verbs: write_objects, create_objects (ADR-014 D7, so \
          freeze_writes covers SFTP drops), delete_objects, delete_object_versions \
-         (ADR-013) and write_object_tags"
+         (ADR-013), write_object_tags, write_object_retention and write_object_legal_hold \
+         (ADR-015)"
     );
+}
+
+/// The vocabulary s0 publishes for a control plane to vendor (ADR-015 D2).
+const VERBS_JSON: &str = include_str!("../docs/verbs.json");
+
+#[test]
+fn verbs_json_matches_action_all() {
+    // A deployment that pushes its own policy module guards its OWN copy of the write set
+    // and the vocabulary; this file is what it vendors. It must say exactly what
+    // `Action` says, in the same order, with the same `is_write`.
+    let doc: serde_json::Value = serde_json::from_str(VERBS_JSON).expect("docs/verbs.json");
+    let listed: Vec<(String, bool)> = doc["verbs"]
+        .as_array()
+        .expect("a verbs array")
+        .iter()
+        .map(|v| {
+            let obj = v.as_object().expect("each verb is an object");
+            assert_eq!(
+                obj.keys().map(String::as_str).collect::<Vec<_>>(),
+                ["is_write", "verb"],
+                "each entry is exactly {{verb, is_write}}: {v}"
+            );
+            (
+                v["verb"].as_str().expect("verb").to_string(),
+                v["is_write"].as_bool().expect("is_write"),
+            )
+        })
+        .collect();
+    let typed: Vec<(String, bool)> = Action::ALL
+        .iter()
+        .map(|a| (a.as_str().to_string(), a.is_write()))
+        .collect();
+    assert_eq!(
+        listed, typed,
+        "docs/verbs.json and Action::ALL disagree — the published vocabulary is a \
+         contract a control plane tests its pushed module against"
+    );
+}
+
+#[test]
+fn the_lock_verbs_are_object_scoped_writes_independent_of_write_objects() {
+    for (op, verb) in [
+        ("PutObjectRetention", "write_object_retention"),
+        ("PutObjectLegalHold", "write_object_legal_hold"),
+    ] {
+        let s = spec(op).unwrap();
+        assert_eq!(s.coverage, Coverage::Enforced, "{op}");
+        assert_eq!(s.verb, Some(verb), "{op}");
+        assert_eq!(s.shape, s0::access::ResourceShape::Object, "{op}");
+        assert_eq!(s.tier, DangerTier::PostureAltering, "{op}");
+        let action = action_for(s).expect("expressible");
+        assert!(action.is_write(), "{op}: freeze_writes must cover {verb}");
+        assert!(
+            !action.is_bucket_scoped() && !action.is_account_scoped(),
+            "{op}"
+        );
+    }
+    for op in ["GetObjectRetention", "GetObjectLegalHold"] {
+        let s = spec(op).unwrap();
+        assert_eq!(s.coverage, Coverage::Enforced, "{op}");
+        assert_eq!(s.verb, Some("read_objects"), "{op}");
+        assert_eq!(s.tier, DangerTier::Routine, "{op}");
+    }
 }
 
 #[test]
@@ -608,17 +680,26 @@ fn the_acl_and_retention_blind_spots_are_closed_not_merely_unrecorded() {
         }
     }
 
-    // The two residuals that must stay on the record: object lock, and the tag set a
-    // COPY-directive copy inherits.
-    assert!(
-        spec("PutObject")
-            .unwrap()
-            .blind_spots
-            .iter()
-            .any(|b| b.contains("object-lock")),
-        "PutObject still forwards object-lock headers unauthorized; that residual has to \
-         stay on the record"
-    );
+    // The inline object-lock headers ARE inspected now (ADR-015 D3): each is a rider
+    // decided under its own lock verb, so no write row may still claim blindness to them.
+    for op in [
+        "PutObject",
+        "CopyObject",
+        "CreateMultipartUpload",
+        "PostObject",
+    ] {
+        for b in spec(op).unwrap().blind_spots {
+            let claim = b.to_ascii_lowercase();
+            assert!(
+                !claim.contains("object-lock"),
+                "{op} still claims the object-lock headers are uninspected; they are \
+                 decided under write_object_retention / write_object_legal_hold: {b}"
+            );
+        }
+    }
+
+    // The residual that must stay on the record: the tag set a COPY-directive copy
+    // inherits.
     assert!(
         spec("CopyObject")
             .unwrap()

@@ -76,6 +76,34 @@ pub fn put_object_tagging_input() -> PutObjectTaggingInput {
     }
 }
 
+/// A legal hold placed on `2024/x`.
+pub fn put_object_legal_hold_input() -> PutObjectLegalHoldInput {
+    PutObjectLegalHoldInput {
+        bucket: "reports".into(),
+        key: "2024/x".into(),
+        legal_hold: Some(ObjectLockLegalHold {
+            status: Some(ObjectLockLegalHoldStatus::from_static(
+                ObjectLockLegalHoldStatus::ON,
+            )),
+        }),
+        ..Default::default()
+    }
+}
+
+/// A retention request on `2024/x` with an empty `Retention` element.
+///
+/// No mode and no date on purpose: `requested_retention.retain_days` counts from the
+/// request time, so a dated probe would record a different input every day and the
+/// golden capture would drift. The dated shape is pinned by `tests/request_riders.rs`.
+pub fn put_object_retention_input() -> PutObjectRetentionInput {
+    PutObjectRetentionInput {
+        bucket: "reports".into(),
+        key: "2024/x".into(),
+        retention: Some(ObjectLockRetention::default()),
+        ..Default::default()
+    }
+}
+
 pub fn put_bucket_cors_input() -> PutBucketCorsInput {
     PutBucketCorsInput {
         bucket: "reports".into(),
@@ -249,6 +277,24 @@ macro_rules! each_enforced_op {
             }
         );
         $probe!(
+            get_object_legal_hold,
+            "GetObjectLegalHold",
+            s3s::dto::GetObjectLegalHoldInput {
+                bucket: "reports".into(),
+                key: "2024/x".into(),
+                ..Default::default()
+            }
+        );
+        $probe!(
+            get_object_retention,
+            "GetObjectRetention",
+            s3s::dto::GetObjectRetentionInput {
+                bucket: "reports".into(),
+                key: "2024/x".into(),
+                ..Default::default()
+            }
+        );
+        $probe!(
             head_bucket,
             "HeadBucket",
             s3s::dto::HeadBucketInput {
@@ -333,6 +379,16 @@ macro_rules! each_enforced_op {
                 key: "2024/x".into(),
                 ..Default::default()
             }
+        );
+        $probe!(
+            put_object_legal_hold,
+            "PutObjectLegalHold",
+            $crate::common::ops::put_object_legal_hold_input()
+        );
+        $probe!(
+            put_object_retention,
+            "PutObjectRetention",
+            $crate::common::ops::put_object_retention_input()
         );
         $probe!(
             put_object_tagging,

@@ -332,6 +332,7 @@ impl SftpSession {
             requested_tags: None,
             acl_grants: vec![],
             bypass_governance: false,
+            requested_retention: None,
             request: RequestMeta {
                 protocol: Protocol::Sftp,
                 method: op.to_string(),
