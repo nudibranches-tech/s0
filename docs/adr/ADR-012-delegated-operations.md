@@ -1,6 +1,7 @@
 # ADR-012: Delegated operations — bucket configuration answered by a control backend
 
-- **Status**: Proposed — amends ADR-009 (D8); implemented: D1 to D5 and D7 (`src/access/optable.rs`,
+- **Status**: Proposed — amends ADR-009 (D8); amended by ADR-015 (D1: `GetObjectLockConfiguration`
+  and `PutObjectLockConfiguration` join, eighteen delegable operations); implemented: D1 to D5 and D7 (`src/access/optable.rs`,
   `src/access/delegation.rs`, `src/proxy/control.rs`, `src/config.rs`, `src/audit/record.rs`)
   and D6, read-your-writes (`src/bundle_refresh.rs` for `BundleRefresher` and `PlacementWait`,
   `src/access/mod.rs` for the refresh on miss in `check`, `src/proxy/mod.rs` for

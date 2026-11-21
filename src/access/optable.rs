@@ -79,7 +79,7 @@ pub enum DangerTier {
     NeverImplement,
 }
 
-/// The grant vocabulary the gateway can actually decide against: the eight verbs a control
+/// The grant vocabulary the gateway can actually decide against: the ten verbs a control
 /// plane's grant projection emits.
 ///
 /// Held as strings rather than [`Action`] because the table classifies *denied* ops too;
@@ -93,6 +93,8 @@ pub const GATEWAY_VERBS: &[&str] = &[
     "delete_objects",
     "delete_object_versions",
     "write_object_tags",
+    "write_object_retention",
+    "write_object_legal_hold",
     "read",
 ];
 
@@ -269,8 +271,9 @@ pub const OP_TABLE: &[OpSpec] = &[
              policy conditions on can be moved onto a new key without a write_object_tags \
              decision. Only a REPLACE directive (or an explicit x-amz-tagging) is \
              authorized as a tag write",
-            "object-lock headers (mode, retain-until-date, legal-hold) are not inspected: \
-             a write grant can make the new object undeletable",
+            "whether the backend copies the SOURCE object's retention or legal hold onto a \
+             copy that names none is unverified (AWS does not); such a copy is decided \
+             under write_objects alone",
         ],
     ),
     // A bucket created through the gateway is unmanaged and absent from
@@ -295,10 +298,7 @@ pub const OP_TABLE: &[OpSpec] = &[
         "write_objects",
         ResourceShape::Object,
         DangerTier::Mutating,
-        &[
-            "object-lock headers (mode, retain-until-date, legal-hold) are not inspected: \
-             a write grant can make the completed object undeletable",
-        ],
+        &[],
     ),
     unauthorizable("CreateSession", ResourceShape::Bucket),
     // Delegated with `CreateBucket`: the control backend authorizes it and the backend's
@@ -575,23 +575,27 @@ pub const OP_TABLE: &[OpSpec] = &[
             "version_id (an old version's attributes read under the current key's grant)",
         ],
     ),
-    denied(
+    enforced(
         "GetObjectLegalHold",
         "read_objects",
         ResourceShape::Object,
         DangerTier::Routine,
+        &["version_id (an old version's hold reads under the current key's grant)"],
     ),
-    denied(
+    // Bucket posture owned by the control plane, like versioning (ADR-015 D1): it knows
+    // whether the bucket was created locked and the platform's retention limits.
+    delegable(
         "GetObjectLockConfiguration",
         "read_bucket_config",
         ResourceShape::Bucket,
         DangerTier::Routine,
     ),
-    denied(
+    enforced(
         "GetObjectRetention",
         "read_objects",
         ResourceShape::Object,
         DangerTier::Routine,
+        &["version_id (an old version's retention reads under the current key's grant)"],
     ),
     enforced(
         // `read_objects`, not a tag-specific verb: reading an object's tags is strictly
@@ -753,7 +757,6 @@ pub const OP_TABLE: &[OpSpec] = &[
              limits.post_object_max_file_size — not the decision — is what bounds an \
              unauthorized allocation",
             "success_action_redirect is forwarded as given",
-            "object-lock form fields are not inspected",
         ],
     ),
     denied(
@@ -875,11 +878,7 @@ pub const OP_TABLE: &[OpSpec] = &[
         "write_objects",
         ResourceShape::Object,
         DangerTier::Mutating,
-        &[
-            "object-lock headers (mode, retain-until-date, legal-hold) are not inspected: \
-             a write grant can make an object undeletable. Note the asymmetry — the \
-             opposite direction, destroying a retained object, is refused in code",
-        ],
+        &[],
     ),
     denied(
         "PutObjectAcl",
@@ -887,23 +886,32 @@ pub const OP_TABLE: &[OpSpec] = &[
         ResourceShape::Object,
         DangerTier::PostureAltering,
     ),
-    denied(
+    // Its own verb, not write_objects (ADR-015 D2): a hold is placed for litigation and
+    // must not be liftable by whoever may stamp retention or write data.
+    enforced(
         "PutObjectLegalHold",
-        "write_objects",
+        "write_object_legal_hold",
         ResourceShape::Object,
         DangerTier::PostureAltering,
+        &["version_id (a hold on an old version is decided under the current key's grant)"],
     ),
-    denied(
+    delegable(
         "PutObjectLockConfiguration",
         "write_bucket_config",
         ResourceShape::Bucket,
         DangerTier::PostureAltering,
     ),
-    denied(
+    // Its own verb, not write_objects (ADR-015 D2): retention can make data undeletable
+    // for years. The governance bypass that shortens one is refused in code.
+    enforced(
         "PutObjectRetention",
-        "write_objects",
+        "write_object_retention",
         ResourceShape::Object,
         DangerTier::PostureAltering,
+        &[
+            "version_id (a retention on an old version is decided under the current key's \
+             grant)",
+        ],
     ),
     enforced(
         "PutObjectTagging",
@@ -1175,9 +1183,10 @@ mod tests {
         assert_eq!(typed, gateway);
         assert_eq!(
             gateway.len(),
-            8,
-            "the projected vocabulary is eight verbs (ADR-006, plus create_objects for the SFTP \
-             front, ADR-014 D7, and delete_object_versions, ADR-013)"
+            10,
+            "the projected vocabulary is ten verbs (ADR-006, plus create_objects for the SFTP \
+             front, ADR-014 D7, delete_object_versions, ADR-013, and write_object_retention / \
+             write_object_legal_hold, ADR-015)"
         );
     }
 
@@ -1206,7 +1215,9 @@ mod tests {
         }
     }
 
-    const ADR_0056_OPS: [&str; 16] = [
+    /// The sixteen operations of ADR-012 / ADR-0056 and the two lock-configuration
+    /// operations of ADR-015.
+    const DELEGABLE_OPS: [&str; 18] = [
         "CreateBucket",
         "DeleteBucket",
         "GetBucketCors",
@@ -1223,6 +1234,8 @@ mod tests {
         "GetBucketEncryption",
         "PutBucketEncryption",
         "DeleteBucketEncryption",
+        "GetObjectLockConfiguration",
+        "PutObjectLockConfiguration",
     ];
 
     fn names(ops: &[&str]) -> Vec<String> {
@@ -1230,8 +1243,8 @@ mod tests {
     }
 
     #[test]
-    fn the_delegable_set_is_sixteen() {
-        let mut expected = ADR_0056_OPS.to_vec();
+    fn the_delegable_set_is_eighteen() {
+        let mut expected = DELEGABLE_OPS.to_vec();
         let mut actual = delegable_ops();
         expected.sort_unstable();
         actual.sort_unstable();
@@ -1249,7 +1262,7 @@ mod tests {
 
     #[test]
     fn a_delegable_operation_is_refused_unless_configured() {
-        for op in ADR_0056_OPS {
+        for op in DELEGABLE_OPS {
             assert_eq!(
                 gate(op, &DelegatedOps::none()),
                 Err(GateDenial::NotEnforced),
@@ -1298,7 +1311,7 @@ mod tests {
         }
         assert!(DelegatedOps::from_names(&[]).is_err());
         assert!(DelegatedOps::from_names(&names(&["GetBucketCors", "GetBucketCors"])).is_err());
-        assert!(DelegatedOps::from_names(&names(&ADR_0056_OPS)).is_ok());
+        assert!(DelegatedOps::from_names(&names(&DELEGABLE_OPS)).is_ok());
     }
 
     #[test]
@@ -1370,7 +1383,6 @@ mod tests {
             "GetBucketAccelerateConfiguration",
             "GetBucketRequestPayment",
             "GetBucketReplication",
-            "GetObjectLockConfiguration",
         ] {
             assert!(refusal_is_not_implemented(op), "{op}");
         }
@@ -1383,6 +1395,9 @@ mod tests {
             "GetBucketCors",
             "CreateBucket",
             "GetObject",
+            // Delegable since ADR-015: an unconfigured gateway answers AccessDenied, as
+            // for every delegable row.
+            "GetObjectLockConfiguration",
             "NoSuchOp",
         ] {
             assert!(!refusal_is_not_implemented(op), "{op}");

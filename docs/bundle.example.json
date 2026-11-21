@@ -2,6 +2,7 @@
   "_note": "Projected per-tenant policy data: user_attributes / bucket_attributes / org_settings.freeze_writes, plus the s3_grants / group_grants grant superset the control plane projects. The gateway's rego reads these by name. This object is the 'data'. To push the policy module alongside it, wrap it as { \"policy\": \"<rego source>\", \"data\": { ... } }; a bare object (this file) uses the gateway's compiled-in default policy.",
   "_v3_note": "From grant_schema_version 3 (src/pdp/bundle.rs, ADR-009) the bundle also PLACES buckets: data.backend.id names the backend this bundle was projected for, and bucket_attributes is keyed by S3 name with exactly one owning tenant per bucket. A request for a bucket not listed here, listed under another tenant, or routed to a backend_id that does not match data.backend.id, is refused by the gateway itself, before the policy is asked; ListBuckets is answered straight from this index. object_name is the control plane's own name for the bucket (carried into audit records); created_at (RFC 3339) backs ListBuckets' reported creation date. Below version 3 none of this is read: grant_schema_version, data.backend and quota are all ignored by an older gateway or an unversioned bundle (the shape this file shipped before 0.4.0).",
   "_quota_note": "Byte quotas (ADR-010, src/quota.rs) are also v3-only and optional at every level: data.backend.quota, tenants.<t>.quota, and tenants.<t>.bucket_attributes.<bucket>.quota. Each is { limit_bytes, used_bytes, collected_at }; used_bytes is the control plane's last collection and the gateway counts what each replica has accepted since collected_at on top of it, refusing a write that would cross limit_bytes at any level with QuotaExceeded (403). Omit quota at a level to enforce nothing there (e.g. a backend with its own native per-bucket quota).",
+  "_object_lock_note": "From 0.6.1 (ADR-015) a grant's actions may also name write_object_retention (PutObjectRetention, and the x-amz-object-lock-mode / -retain-until-date of a write) and write_object_legal_hold (PutObjectLegalHold, and x-amz-object-lock-legal-hold). Both are object- and prefix-scoped writes, covered by freeze_writes, and independent of write_objects in both directions. The full vocabulary, with which verbs are writes, is docs/verbs.json. The bundle schema does not change.",
   "grant_schema_version": 3,
   "backend": { "id": "backend-eu-1", "kind": "ceph" },
   "org_settings": { "freeze_writes": false },
@@ -48,7 +49,8 @@
       },
       "s3_grants": {
         "5f3a...oidc-sub-alice": [
-          { "bucket": "reports", "actions": ["read_objects", "list_objects"], "prefixes": ["2024/", "2025/"] }
+          { "bucket": "reports", "actions": ["read_objects", "list_objects"], "prefixes": ["2024/", "2025/"] },
+          { "bucket": "reports", "actions": ["write_object_retention"], "prefixes": ["2025/"] }
         ],
         "9c21...oidc-sub-bob": [
           { "bucket": "public", "actions": ["read_objects", "list_objects", "write_objects"], "prefixes": [] }

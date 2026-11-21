@@ -83,11 +83,11 @@ async fn a_delegated_operation_never_reaches_the_policy_engine() {
     );
     let mut seen: Vec<String> = stub.calls().into_iter().map(|c| c.operation).collect();
     seen.sort_unstable();
-    assert_eq!(seen.len(), 16, "{seen:?}");
+    assert_eq!(seen.len(), 18, "{seen:?}");
     assert_matches_delegable_set(seen.iter().map(String::as_str).collect());
 
-    let records = fx.await_audit_records(16).await;
-    assert_eq!(records.len(), 16, "{records:#?}");
+    let records = fx.await_audit_records(18).await;
+    assert_eq!(records.len(), 18, "{records:#?}");
     for rec in &records {
         assert_eq!(rec.path, DELEGATED_PATH);
         assert!(rec.input.is_none() && rec.gate.is_none(), "{rec:#?}");
@@ -165,6 +165,72 @@ async fn the_caller_identity_rides_in_signed_headers() {
         );
     }
     assert_eq!(call.s0_headers.len(), 5);
+}
+
+#[tokio::test]
+async fn a_create_bucket_object_lock_flag_reaches_the_control_backend() {
+    // ADR-015 D1: s0 changes nothing for a locked create, because the typed input it
+    // forwards already carries `object_lock_enabled_for_bucket`. This is the proof that
+    // the s3s parse and the s3s-aws re-issue keep it; the control backend decides.
+    let stub = ControlStub::start().await;
+    let fx =
+        common::fixture_with_control("deleg-lock-flag", common::alice_bundle(), &stub.endpoint);
+    let base = serve(&fx).await;
+    let host = base.trim_start_matches("http://").to_string();
+
+    let route = common::routes::route("CreateBucket");
+    let mut req = common::sigv4::RawRequest::new(route.method, "/locked-bucket")
+        .header("x-amz-bucket-object-lock-enabled", "true");
+    for (k, v) in &route.query {
+        req = req.query(k, v);
+    }
+    let answer =
+        common::wire::send_raw(&base, &host, req, common::ACCESS_KEY, common::SECRET_KEY).await;
+    assert_eq!(answer.status, 200, "{}", answer.body);
+
+    // Negative control: a plain create carries no flag, so the field is not a default the
+    // forward invents.
+    let answer = send_op(&base, "CreateBucket", "plain-bucket").await;
+    assert_eq!(answer.status, 200, "{}", answer.body);
+
+    let calls = stub.calls();
+    assert_eq!(calls.len(), 2, "{calls:#?}");
+    assert_eq!(calls[0].operation, "CreateBucket");
+    assert_eq!(
+        calls[0].object_lock_enabled_for_bucket,
+        Some(true),
+        "the object-lock flag was dropped between the client and the control backend"
+    );
+    assert_ne!(calls[1].object_lock_enabled_for_bucket, Some(true));
+    assert_eq!(
+        fx.pdp_calls(),
+        0,
+        "a delegated create asks no policy question"
+    );
+}
+
+#[tokio::test]
+async fn the_lock_configuration_is_delegated_and_left_the_not_implemented_list() {
+    // 0.6.0 answered GetObjectLockConfiguration with 501 and PutObjectLockConfiguration
+    // with 403. Now both are delegable: answered by the control backend when listed,
+    // AccessDenied (not 501) when not.
+    assert!(!s0::access::optable::refusal_is_not_implemented(
+        "GetObjectLockConfiguration"
+    ));
+    let stub = ControlStub::start().await;
+    let fx =
+        common::fixture_with_control("deleg-lock-config", common::alice_bundle(), &stub.endpoint);
+    let base = serve(&fx).await;
+    for op in ["GetObjectLockConfiguration", "PutObjectLockConfiguration"] {
+        let answer = send_op(&base, op, "reports").await;
+        assert_eq!(answer.status, 200, "{op}: {}", answer.body);
+    }
+    let ops: Vec<String> = stub.calls().into_iter().map(|c| c.operation).collect();
+    assert_eq!(
+        ops,
+        ["GetObjectLockConfiguration", "PutObjectLockConfiguration"]
+    );
+    assert_eq!(fx.pdp_calls(), 0);
 }
 
 #[tokio::test]

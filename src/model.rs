@@ -5,16 +5,18 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The grant vocabulary the gateway authorizes against — the **eight projected verbs**.
+/// The grant vocabulary the gateway authorizes against — the **ten projected verbs**.
 ///
 /// Deliberately coarser than the 99 S3 ops: every enforced op maps onto exactly one of
 /// these (`PutObject` to `write_objects`, `HeadBucket` to `read`), except `CopyObject`,
-/// which maps to two, and `DeleteObject`/`DeleteObjects`, decided under
-/// `delete_object_versions` when a version is named (ADR-013). [`Action::CreateObjects`] is
-/// asked by the SFTP front for every upload (ADR-014 D7), and by the S3 front for a write
-/// that cannot overwrite — a `PutObject` or `CompleteMultipartUpload` carrying
-/// `If-None-Match: *`, and the multipart steps leading to one — when `write_objects` is
-/// denied (ADR-014 F1). The set is a contract with whatever control plane projects grants.
+/// which maps to two, `DeleteObject`/`DeleteObjects`, decided under
+/// `delete_object_versions` when a version is named (ADR-013), and the writes carrying
+/// inline object-lock headers, which also take the lock verbs (ADR-015).
+/// [`Action::CreateObjects`] is asked by the SFTP front for every upload (ADR-014 D7), and
+/// by the S3 front for a write that cannot overwrite — a `PutObject` or
+/// `CompleteMultipartUpload` carrying `If-None-Match: *`, and the multipart steps leading to
+/// one — when `write_objects` is denied (ADR-014 F1). The set is a contract with whatever
+/// control plane projects grants.
 ///
 /// **The gateway is data-plane only**, so there is no verb for acting on a bucket as a
 /// *managed resource*: existence, policy, CORS and quota *settings* are control-plane
@@ -43,6 +45,20 @@ pub enum Action {
     /// lets a policy key on tags; merging the two would let a principal holding both grant
     /// itself whatever the policy keys on, a trap that springs when tag-driven ABAC is on.
     WriteObjectTags,
+    /// Set or extend an object's retention (`PutObjectRetention`, and the inline
+    /// `x-amz-object-lock-mode` / `x-amz-object-lock-retain-until-date` of a write).
+    ///
+    /// Kept **separate** from [`Action::WriteObjects`] (ADR-015 D2): retention can make
+    /// data undeletable for years, which is as destructive as the governance bypass the
+    /// gateway refuses in code. Neither verb implies the other.
+    WriteObjectRetention,
+    /// Place or lift a legal hold (`PutObjectLegalHold`, and the inline
+    /// `x-amz-object-lock-legal-hold` of a write).
+    ///
+    /// Kept apart from [`Action::WriteObjectRetention`] as AWS keeps
+    /// `s3:PutObjectLegalHold` apart from `s3:PutObjectRetention`: a key allowed to stamp
+    /// retention on new uploads must not be able to lift a hold an owner placed.
+    WriteObjectLegalHold,
     // listing: bucket + prefix, and the *response* is in scope
     ListObjects,
     /// The existence verb, and the ONE dual-plane permission in the family: it answers
@@ -68,6 +84,8 @@ impl Action {
         Action::DeleteObjects,
         Action::DeleteObjectVersions,
         Action::WriteObjectTags,
+        Action::WriteObjectRetention,
+        Action::WriteObjectLegalHold,
         Action::ListObjects,
         Action::Read,
     ];
@@ -80,6 +98,8 @@ impl Action {
             Action::DeleteObjects => "delete_objects",
             Action::DeleteObjectVersions => "delete_object_versions",
             Action::WriteObjectTags => "write_object_tags",
+            Action::WriteObjectRetention => "write_object_retention",
+            Action::WriteObjectLegalHold => "write_object_legal_hold",
             Action::ListObjects => "list_objects",
             Action::Read => "read",
         }
@@ -100,6 +120,8 @@ impl Action {
                 | Action::DeleteObjects
                 | Action::DeleteObjectVersions
                 | Action::WriteObjectTags
+                | Action::WriteObjectRetention
+                | Action::WriteObjectLegalHold
         )
     }
 

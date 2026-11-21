@@ -32,6 +32,7 @@ pub const OPA_INPUT_FIELDS: &[&str] = &[
     "requested_tags",
     "acl_grants",
     "bypass_governance",
+    "requested_retention",
     "request",
 ];
 
@@ -99,8 +100,58 @@ pub struct OpaInput {
     /// this outright; it is on the wire so the *attempt* is on the record.
     #[serde(default)]
     pub bypass_governance: bool,
+    /// The object-lock state this request asks the backend to install (ADR-015 D3).
+    ///
+    /// Filled on `PutObjectRetention` and `PutObjectLegalHold`, and on a `PutObject`,
+    /// `CopyObject`, `CreateMultipartUpload` or `PostObject` carrying the inline
+    /// `x-amz-object-lock-*` headers (or form fields) — the primary input and the rider
+    /// decisions alike, so a policy can cap a retention period whichever way it is asked
+    /// for. **Omitted when the request carries no lock field**, so every input that had
+    /// none before ADR-015 serializes exactly as it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_retention: Option<RequestedRetention>,
     #[serde(default)]
     pub request: RequestMeta,
+}
+
+/// What a request asks of an object's lock: a retention (mode and retain-until date,
+/// which s0 refuses to see apart) and/or a legal hold.
+///
+/// Spelled as the S3 wire spells it — `GOVERNANCE`/`COMPLIANCE`, `ON`/`OFF` — so a
+/// policy and an auditor read the values the backend reads. `retain_days` is computed by
+/// s0, so a policy can cap a period with no clock of its own.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestedRetention {
+    /// `GOVERNANCE` or `COMPLIANCE`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// The retain-until date, RFC 3339 in UTC with millisecond precision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retain_until: Option<String>,
+    /// Whole days from the request time to `retain_until`, rounded up (a date in the past
+    /// counts as `0` or less). Present exactly when `retain_until` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retain_days: Option<i64>,
+    /// `ON` or `OFF`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legal_hold: Option<String>,
+}
+
+impl RequestedRetention {
+    /// True when the request sets a retention (mode and date): the part decided under
+    /// `write_object_retention`.
+    #[must_use]
+    pub fn sets_retention(&self) -> bool {
+        self.mode.is_some() || self.retain_until.is_some()
+    }
+
+    /// True when the request places or lifts a legal hold: the part decided under
+    /// `write_object_legal_hold`.
+    #[must_use]
+    pub fn sets_legal_hold(&self) -> bool {
+        self.legal_hold.is_some()
+    }
 }
 
 /// One access-control grant a request asks the backend to install, normalized out of
@@ -267,6 +318,7 @@ mod tests {
             requested_tags: None,
             acl_grants: vec![],
             bypass_governance: false,
+            requested_retention: None,
             request: RequestMeta::default(),
         }
     }
@@ -294,6 +346,7 @@ mod tests {
             requested_tags,
             acl_grants,
             bypass_governance,
+            requested_retention,
             request,
         } = sample();
         let names = [
@@ -311,6 +364,7 @@ mod tests {
             stringify!(requested_tags),
             stringify!(acl_grants),
             stringify!(bypass_governance),
+            stringify!(requested_retention),
             stringify!(request),
         ];
         // Bind every destructured value so an unused-variable warning cannot be the
@@ -318,7 +372,7 @@ mod tests {
         let _ = (principal, backend, tenant, organization_id, action, bucket);
         let _ = (object, prefix, copy_source, delete_keys, object_tags);
         let _ = (requested_tags, request);
-        let _ = (acl_grants, bypass_governance);
+        let _ = (acl_grants, bypass_governance, requested_retention);
         assert_eq!(names.as_slice(), OPA_INPUT_FIELDS);
 
         // `resource_key` is a digest over the serialized input minus
@@ -415,6 +469,26 @@ mod tests {
         m.bypass_governance = true;
         assert_ne!(base, m.resource_key().unwrap(), "bypass_governance");
 
+        let mut m = sample();
+        m.requested_retention = Some(RequestedRetention {
+            mode: Some("COMPLIANCE".into()),
+            retain_until: Some("2030-01-01T00:00:00.000Z".into()),
+            retain_days: Some(1000),
+            legal_hold: None,
+        });
+        assert_ne!(base, m.resource_key().unwrap(), "requested_retention");
+        // Two periods are two questions: a policy capping retention must not have a short
+        // period's allow served to a long one.
+        let mut longer = m.clone();
+        if let Some(r) = longer.requested_retention.as_mut() {
+            r.retain_days = Some(4000);
+        }
+        assert_ne!(
+            m.resource_key().unwrap(),
+            longer.resource_key().unwrap(),
+            "two retention periods must not share a decision-cache entry"
+        );
+
         // Same destination, different source.
         let mut a = sample();
         a.action = Action::WriteObjects;
@@ -461,7 +535,12 @@ mod tests {
         // ACL-bearing write is served it without the PDP ever seeing the header.
         // Asserted against the derivation (is the field excluded?) and empirically,
         // because a future field is only safe if both stay true.
-        for field in ["acl_grants", "bypass_governance", "requested_tags"] {
+        for field in [
+            "acl_grants",
+            "bypass_governance",
+            "requested_tags",
+            "requested_retention",
+        ] {
             assert!(
                 !RESOURCE_KEY_EXCLUDED.contains(&field),
                 "{field} must not be excluded from the decision-cache key"
@@ -545,5 +624,45 @@ mod tests {
             .insert("op".into(), serde_json::json!("GetObject"));
         let err = serde_json::from_value::<OpaInput>(v).expect_err("unknown field must fail");
         assert!(format!("{err}").contains("op"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+
+    #[test]
+    fn an_input_without_a_lock_field_serializes_as_it_did_before_adr_014() {
+        // Captured inputs and pushed policies written before 0.6.1 must see the same
+        // document: the field is omitted, not `null`.
+        let v = serde_json::to_value(RequestedRetention::default()).expect("serialize");
+        assert_eq!(v, serde_json::json!({}));
+        let input: OpaInput = serde_json::from_value(serde_json::json!({
+            "principal": { "sub": "a", "type": "user", "attributes": { "groups": [] } },
+            "backend": { "id": "b", "kind": "ceph" },
+            "tenant": "t", "organization_id": "o", "action": "write_objects",
+            "bucket": "x", "object": "k", "acl_grants": [], "bypass_governance": false,
+            "request": { "method": "PUT" }
+        }))
+        .expect("a pre-0.6.1 input parses");
+        assert!(input.requested_retention.is_none());
+        let back = serde_json::to_value(&input).expect("serialize");
+        assert!(back.get("requested_retention").is_none(), "{back}");
+    }
+
+    #[test]
+    fn the_two_halves_are_told_apart() {
+        let hold = RequestedRetention {
+            legal_hold: Some("ON".into()),
+            ..Default::default()
+        };
+        assert!(hold.sets_legal_hold() && !hold.sets_retention());
+        let retention = RequestedRetention {
+            mode: Some("GOVERNANCE".into()),
+            retain_until: Some("2030-01-01T00:00:00.000Z".into()),
+            retain_days: Some(3),
+            legal_hold: None,
+        };
+        assert!(retention.sets_retention() && !retention.sets_legal_hold());
     }
 }

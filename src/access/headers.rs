@@ -1,5 +1,6 @@
-//! ACL, tagging and retention-bypass riders: the parts of an already-authorized write
-//! that confer access, install ABAC-visible metadata, or defeat retention.
+//! ACL, tagging, object-lock and retention-bypass riders: the parts of an
+//! already-authorized write that confer access, install ABAC-visible metadata, make data
+//! undeletable, or defeat retention.
 //!
 //! Writes are authorized on `(bucket, key)`, so without this screen an
 //! `x-amz-acl: public-read` header rides through to the backend and makes the object
@@ -11,7 +12,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::authz::AclGrant;
+use chrono::{DateTime, Utc};
+use s3s::dto::{Timestamp, TimestampFormat};
+
+use crate::authz::{AclGrant, RequestedRetention};
 
 /// Canned ACLs that grant nothing to anyone who did not already have it.
 ///
@@ -202,6 +206,9 @@ pub struct RequestRiders {
     pub tags: Option<BTreeMap<String, String>>,
     /// `x-amz-bypass-governance-retention`.
     pub bypass_governance: bool,
+    /// The inline object-lock headers (or POST form fields) — ADR-015 D3. `None` when the
+    /// request carries none of them.
+    pub object_lock: Option<RequestedRetention>,
 }
 
 impl RequestRiders {
@@ -223,15 +230,136 @@ impl RequestRiders {
             acl: acl.grants(),
             tags,
             bypass_governance,
+            object_lock: None,
         })
+    }
+
+    /// Attach the request's inline object-lock fields, refusing a pair the gateway and the
+    /// backend could read differently ([`ObjectLockFields::requested`]).
+    pub fn with_object_lock(
+        mut self,
+        lock: ObjectLockFields<'_>,
+        now: DateTime<Utc>,
+    ) -> Result<Self, String> {
+        self.object_lock = lock.requested(now)?;
+        Ok(self)
     }
 
     /// True when this request carries no rider at all — the common case, and the one that
     /// must stay free of extra decisions.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.acl.is_empty() && self.tags.is_none() && !self.bypass_governance
+        self.acl.is_empty()
+            && self.tags.is_none()
+            && !self.bypass_governance
+            && self.object_lock.is_none()
     }
+}
+
+/// The S3 retention modes. A closed list: a mode outside it is refused rather than
+/// forwarded for the backend to interpret.
+pub const RETENTION_MODES: &[&str] = &["GOVERNANCE", "COMPLIANCE"];
+
+/// The S3 legal-hold states, closed for the same reason.
+pub const LEGAL_HOLD_STATES: &[&str] = &["ON", "OFF"];
+
+/// The raw object-lock fields of one request, borrowed from the parsed s3s input: the
+/// `x-amz-object-lock-*` headers of a write (or the POST form fields of the same names),
+/// or the body of `PutObjectRetention` / `PutObjectLegalHold`.
+///
+/// A struct rather than three arguments for the reason [`AclFields`] is one: a hook that
+/// forgets a field fails to compile.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ObjectLockFields<'a> {
+    pub mode: Option<&'a str>,
+    pub retain_until: Option<&'a Timestamp>,
+    pub legal_hold: Option<&'a str>,
+}
+
+impl ObjectLockFields<'_> {
+    /// Normalize into the [`RequestedRetention`] the PDP and the audit record see, with
+    /// `retain_days` counted from `now`.
+    ///
+    /// `Ok(None)` when the request carries no lock field. Refused, before any decision:
+    ///
+    /// - a mode without a retain-until date, or a date without a mode. The backend could
+    ///   read such a half-pair differently from the gateway (apply a bucket default to the
+    ///   missing half, or ignore the other), which is a parser differential;
+    /// - a mode or a legal-hold state outside the S3 lists, for the same reason;
+    /// - a date the gateway cannot write back out.
+    pub fn requested(&self, now: DateTime<Utc>) -> Result<Option<RequestedRetention>, String> {
+        if self.mode.is_none() && self.retain_until.is_none() && self.legal_hold.is_none() {
+            return Ok(None);
+        }
+        let (mode, retain_until, retain_days) = match (self.mode, self.retain_until) {
+            (None, None) => (None, None, None),
+            (Some(mode), Some(until)) => {
+                if !RETENTION_MODES.contains(&mode) {
+                    return Err(format!(
+                        "the request names the object-lock mode {mode:?}; only GOVERNANCE \
+                         and COMPLIANCE are understood, and the gateway will not forward a \
+                         mode the backend may read differently"
+                    ));
+                }
+                let (text, days) = retain_until_and_days(until, now)?;
+                (Some(mode.to_string()), Some(text), Some(days))
+            }
+            (Some(_), None) => {
+                return Err(
+                    "the request names an object-lock mode without a retain-until \
+                     date; the gateway will not authorize a half-specified retention the \
+                     backend may complete differently"
+                        .to_string(),
+                );
+            }
+            (None, Some(_)) => {
+                return Err(
+                    "the request names an object-lock retain-until date without a \
+                     mode; the gateway will not authorize a half-specified retention the \
+                     backend may complete differently"
+                        .to_string(),
+                );
+            }
+        };
+        let legal_hold = match self.legal_hold {
+            None => None,
+            Some(state) if LEGAL_HOLD_STATES.contains(&state) => Some(state.to_string()),
+            Some(state) => {
+                return Err(format!(
+                    "the request names the legal-hold state {state:?}; only ON and OFF are \
+                     understood"
+                ));
+            }
+        };
+        Ok(Some(RequestedRetention {
+            mode,
+            retain_until,
+            retain_days,
+            legal_hold,
+        }))
+    }
+}
+
+const MILLIS_PER_DAY: i64 = 86_400_000;
+
+/// The retain-until date as RFC 3339, and the whole days from `now` to it, rounded up.
+fn retain_until_and_days(until: &Timestamp, now: DateTime<Utc>) -> Result<(String, i64), String> {
+    let unreadable = || {
+        "the request's object-lock retain-until date cannot be represented by the gateway"
+            .to_string()
+    };
+    let mut buf = Vec::new();
+    until
+        .format(TimestampFormat::DateTime, &mut buf)
+        .map_err(|_| unreadable())?;
+    let text = String::from_utf8(buf).map_err(|_| unreadable())?;
+    let parsed = DateTime::parse_from_rfc3339(&text).map_err(|_| unreadable())?;
+    let millis = parsed
+        .with_timezone(&Utc)
+        .signed_duration_since(now)
+        .num_milliseconds();
+    let days = millis.div_euclid(MILLIS_PER_DAY) + i64::from(millis.rem_euclid(MILLIS_PER_DAY) > 0);
+    Ok((text, days))
 }
 
 /// The `x-amz-tagging` header: a URL-encoded query string, `k1=v1&k2=v2`.
@@ -621,6 +749,111 @@ mod tests {
         // fact about the request and the record should say so.
         assert!(!r.is_empty());
         assert_eq!(classify(&r.acl), AclDisposition::NoGrant);
+    }
+
+    fn ts(rfc3339: &str) -> Timestamp {
+        Timestamp::parse(TimestampFormat::DateTime, rfc3339).expect("timestamp")
+    }
+
+    fn now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-11-20T12:00:00Z")
+            .expect("now")
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn no_lock_field_is_no_lock_rider() {
+        assert_eq!(ObjectLockFields::default().requested(now()), Ok(None));
+    }
+
+    #[test]
+    fn a_retention_carries_its_mode_date_and_days_rounded_up() {
+        let until = ts("2026-11-30T12:00:00.001Z");
+        let r = ObjectLockFields {
+            mode: Some("COMPLIANCE"),
+            retain_until: Some(&until),
+            legal_hold: None,
+        }
+        .requested(now())
+        .expect("valid")
+        .expect("a rider");
+        assert_eq!(r.mode.as_deref(), Some("COMPLIANCE"));
+        assert_eq!(r.retain_until.as_deref(), Some("2026-11-30T12:00:00.001Z"));
+        // Ten days and a millisecond: rounded up.
+        assert_eq!(r.retain_days, Some(11));
+        assert_eq!(r.legal_hold, None);
+
+        let exact = ts("2026-11-30T12:00:00Z");
+        let r = ObjectLockFields {
+            mode: Some("GOVERNANCE"),
+            retain_until: Some(&exact),
+            legal_hold: Some("ON"),
+        }
+        .requested(now())
+        .expect("valid")
+        .expect("a rider");
+        assert_eq!(r.retain_days, Some(10), "an exact day count is not rounded");
+        assert_eq!(r.legal_hold.as_deref(), Some("ON"));
+
+        let past = ts("2026-11-19T12:00:00Z");
+        let r = ObjectLockFields {
+            mode: Some("GOVERNANCE"),
+            retain_until: Some(&past),
+            legal_hold: None,
+        }
+        .requested(now())
+        .expect("valid")
+        .expect("a rider");
+        assert_eq!(r.retain_days, Some(-1));
+    }
+
+    #[test]
+    fn a_half_specified_retention_is_refused() {
+        let until = ts("2027-01-01T00:00:00Z");
+        let mode_only = ObjectLockFields {
+            mode: Some("COMPLIANCE"),
+            ..Default::default()
+        }
+        .requested(now())
+        .expect_err("a mode without a date");
+        assert!(mode_only.contains("without a retain-until"), "{mode_only}");
+        let date_only = ObjectLockFields {
+            retain_until: Some(&until),
+            ..Default::default()
+        }
+        .requested(now())
+        .expect_err("a date without a mode");
+        assert!(date_only.contains("without a mode"), "{date_only}");
+    }
+
+    #[test]
+    fn an_unknown_mode_or_hold_state_is_refused() {
+        let until = ts("2027-01-01T00:00:00Z");
+        assert!(
+            ObjectLockFields {
+                mode: Some("governance"),
+                retain_until: Some(&until),
+                legal_hold: None,
+            }
+            .requested(now())
+            .is_err()
+        );
+        assert!(
+            ObjectLockFields {
+                legal_hold: Some("on"),
+                ..Default::default()
+            }
+            .requested(now())
+            .is_err()
+        );
+        let hold = ObjectLockFields {
+            legal_hold: Some("OFF"),
+            ..Default::default()
+        }
+        .requested(now())
+        .expect("valid")
+        .expect("a rider");
+        assert!(hold.sets_legal_hold() && !hold.sets_retention());
     }
 
     #[test]

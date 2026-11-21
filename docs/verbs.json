@@ -1,0 +1,15 @@
+{
+  "_comment": "The closed grant vocabulary of this s0 release, for a control plane to vendor and test its projection and its pushed policy module against. `is_write` is the freeze_writes set: a pushed module's write_actions must equal the verbs marked true. Pinned to `Action::ALL` by tests/op_coverage.rs::verbs_json_matches_action_all.",
+  "verbs": [
+    { "verb": "read_objects", "is_write": false },
+    { "verb": "write_objects", "is_write": true },
+    { "verb": "create_objects", "is_write": true },
+    { "verb": "delete_objects", "is_write": true },
+    { "verb": "delete_object_versions", "is_write": true },
+    { "verb": "write_object_tags", "is_write": true },
+    { "verb": "write_object_retention", "is_write": true },
+    { "verb": "write_object_legal_hold", "is_write": true },
+    { "verb": "list_objects", "is_write": false },
+    { "verb": "read", "is_write": false }
+  ]
+}

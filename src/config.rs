@@ -2709,7 +2709,7 @@ mod tests {
     fn the_shipped_example_loads_its_control_backend() {
         let loaded = GatewayConfig::from_json(&example().to_string()).expect("loads");
         let control = loaded.control_backend.expect("section present");
-        assert_eq!(control.operations.len(), 16);
+        assert_eq!(control.operations.len(), 18);
         assert_eq!(control.call_timeout_secs, 35);
         assert_eq!(control.region, "us-east-1");
     }

@@ -1,4 +1,4 @@
-//! An in-process control backend: an s3s server that implements only the 16 delegable
+//! An in-process control backend: an s3s server that implements only the 18 delegable
 //! operations, verifies SigV4 against the control credential, and records what it saw.
 //!
 //! It records the operation, the `x-s0-*` header values, the raw `SignedHeaders` list and
@@ -31,6 +31,10 @@ pub struct StubCall {
     pub s0_headers: Vec<(String, String)>,
     /// The names listed in the request's `SignedHeaders=`.
     pub signed_headers: Vec<String>,
+    /// `CreateBucket`'s typed `object_lock_enabled_for_bucket`, as the stub parsed it:
+    /// what proves the forward keeps the field (ADR-015 D1). `None` for other operations
+    /// and for a create that did not carry it.
+    pub object_lock_enabled_for_bucket: Option<bool>,
 }
 
 impl StubCall {
@@ -66,6 +70,15 @@ struct StubS3(Arc<StubState>);
 
 impl StubS3 {
     async fn answer(&self, operation: &str, headers: &HeaderMap) -> S3Result<()> {
+        self.answer_with(operation, headers, None).await
+    }
+
+    async fn answer_with(
+        &self,
+        operation: &str,
+        headers: &HeaderMap,
+        object_lock_enabled_for_bucket: Option<bool>,
+    ) -> S3Result<()> {
         let s0_headers = headers
             .iter()
             .filter(|(n, _)| n.as_str().starts_with("x-s0-"))
@@ -87,6 +100,7 @@ impl StubS3 {
             operation: operation.to_string(),
             s0_headers,
             signed_headers,
+            object_lock_enabled_for_bucket,
         });
         let delay = self
             .0
@@ -122,7 +136,12 @@ impl S3 for StubS3 {
         &self,
         req: S3Request<CreateBucketInput>,
     ) -> S3Result<S3Response<CreateBucketOutput>> {
-        self.answer("CreateBucket", &req.headers).await?;
+        self.answer_with(
+            "CreateBucket",
+            &req.headers,
+            req.input.object_lock_enabled_for_bucket,
+        )
+        .await?;
         Ok(S3Response::new(CreateBucketOutput::default()))
     }
 
@@ -250,6 +269,24 @@ impl S3 for StubS3 {
     ) -> S3Result<S3Response<DeleteBucketEncryptionOutput>> {
         self.answer("DeleteBucketEncryption", &req.headers).await?;
         Ok(S3Response::new(DeleteBucketEncryptionOutput::default()))
+    }
+
+    async fn get_object_lock_configuration(
+        &self,
+        req: S3Request<GetObjectLockConfigurationInput>,
+    ) -> S3Result<S3Response<GetObjectLockConfigurationOutput>> {
+        self.answer("GetObjectLockConfiguration", &req.headers)
+            .await?;
+        Ok(S3Response::new(GetObjectLockConfigurationOutput::default()))
+    }
+
+    async fn put_object_lock_configuration(
+        &self,
+        req: S3Request<PutObjectLockConfigurationInput>,
+    ) -> S3Result<S3Response<PutObjectLockConfigurationOutput>> {
+        self.answer("PutObjectLockConfiguration", &req.headers)
+            .await?;
+        Ok(S3Response::new(PutObjectLockConfigurationOutput::default()))
     }
 }
 

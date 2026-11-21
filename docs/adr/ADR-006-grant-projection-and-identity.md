@@ -1,6 +1,6 @@
 # ADR-006: Grant projection contract and STS identity
 
-- **Status**: Accepted — implemented (src/auth/sts.rs, src/model.rs); amended by ADR-013 (a seventh verb, `delete_object_versions`)
+- **Status**: Accepted — implemented (src/auth/sts.rs, src/model.rs); amended by ADR-013 (a seventh verb, `delete_object_versions`) and ADR-015 (a ninth and tenth, `write_object_retention` and `write_object_legal_hold`, after ADR-014's `create_objects`)
 - **Date**: 2026-07-15
 - **Owners**: gateway team (this repository); the grant projection and the identity cutover are control-plane integration (out of scope for this repository)
 - **Scope**: Freezes the two external contracts the gateway consumes but does not build:

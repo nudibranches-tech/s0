@@ -787,6 +787,8 @@ answers_without_backend_identifiers!(
     DeleteObjectsOutput,
     GetBucketLocationOutput,
     GetObjectAttributesOutput,
+    GetObjectLegalHoldOutput,
+    GetObjectRetentionOutput,
     GetObjectTaggingOutput,
     HeadBucketOutput,
     ListBucketsOutput,
@@ -795,6 +797,8 @@ answers_without_backend_identifiers!(
     ListObjectVersionsOutput,
     ListObjectsV2Output,
     ListPartsOutput,
+    PutObjectLegalHoldOutput,
+    PutObjectRetentionOutput,
     PutObjectTaggingOutput,
 );
 
@@ -1166,7 +1170,7 @@ impl S3 for GatewayS3 {
 
     // ── delegated operations ────────────────────────────────────────────────────
     //
-    // The 16 `Coverage::Delegable` operations, answered by the control backend under a
+    // The 18 `Coverage::Delegable` operations, answered by the control backend under a
     // `DelegationProof` (`GatewayS3::delegate`). Everything else in the bucket family has
     // no arm rather than an `AccessDenied` stub: a stub still proves the op is routable,
     // and the next person to add a `forward` to it has no gate to trip over. With no arm
@@ -1349,6 +1353,26 @@ impl S3 for GatewayS3 {
         .await
     }
 
+    async fn get_object_lock_configuration(
+        &self,
+        req: S3Request<GetObjectLockConfigurationInput>,
+    ) -> S3Result<S3Response<GetObjectLockConfigurationOutput>> {
+        self.delegate(req, |c, r| async move {
+            c.proxy().get_object_lock_configuration(r).await
+        })
+        .await
+    }
+
+    async fn put_object_lock_configuration(
+        &self,
+        req: S3Request<PutObjectLockConfigurationInput>,
+    ) -> S3Result<S3Response<PutObjectLockConfigurationOutput>> {
+        self.delegate(req, |c, r| async move {
+            c.proxy().put_object_lock_configuration(r).await
+        })
+        .await
+    }
+
     // ── object tagging and attributes ───────────────────────────────────────────
 
     async fn get_object_tagging(
@@ -1380,6 +1404,40 @@ impl S3 for GatewayS3 {
         req: S3Request<GetObjectAttributesInput>,
     ) -> S3Result<S3Response<GetObjectAttributesOutput>> {
         self.forward(req, |p, r| async move { p.get_object_attributes(r).await })
+            .await
+    }
+
+    // ── object lock: retention and legal hold (ADR-015) ─────────────────────────
+
+    async fn get_object_retention(
+        &self,
+        req: S3Request<GetObjectRetentionInput>,
+    ) -> S3Result<S3Response<GetObjectRetentionOutput>> {
+        self.forward(req, |p, r| async move { p.get_object_retention(r).await })
+            .await
+    }
+
+    async fn put_object_retention(
+        &self,
+        req: S3Request<PutObjectRetentionInput>,
+    ) -> S3Result<S3Response<PutObjectRetentionOutput>> {
+        self.forward(req, |p, r| async move { p.put_object_retention(r).await })
+            .await
+    }
+
+    async fn get_object_legal_hold(
+        &self,
+        req: S3Request<GetObjectLegalHoldInput>,
+    ) -> S3Result<S3Response<GetObjectLegalHoldOutput>> {
+        self.forward(req, |p, r| async move { p.get_object_legal_hold(r).await })
+            .await
+    }
+
+    async fn put_object_legal_hold(
+        &self,
+        req: S3Request<PutObjectLegalHoldInput>,
+    ) -> S3Result<S3Response<PutObjectLegalHoldOutput>> {
+        self.forward(req, |p, r| async move { p.put_object_legal_hold(r).await })
             .await
     }
 }

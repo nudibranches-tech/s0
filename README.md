@@ -19,9 +19,9 @@ Operations it does not own are denied, not passed through.
 
 ## Supported operations
 
-s0 knows all **99** operations in the `s3s` 0.14.1 surface. **24** are enforced and
-forwarded; the other **75** are refused with `403 AccessDenied`, unless a control backend
-is configured: **16** of those can be delegated to it and answered there instead (below).
+s0 knows all **99** operations in the `s3s` 0.14.1 surface. **28** are enforced and
+forwarded; the other **71** are refused with `403 AccessDenied`, unless a control backend
+is configured: **18** of those can be delegated to it and answered there instead (below).
 An operation with no entry in the table cannot reach a backend, and one that is delegated
 never reaches the storage backend either.
 
@@ -30,26 +30,39 @@ of truth. `tests/gate_blackbox.rs` drives every refused operation as a signed HT
 request through the real gate, and `tests/readme_optable.rs` fails if the counts below
 drift from the table.
 
-### Enforced (24)
+### Enforced (28)
 
-Each is authorized against one of eight grant verbs. A grant is per-subject, per-bucket,
+Each is authorized against one of ten grant verbs. A grant is per-subject, per-bucket,
 per-verb, with object-prefix scopes.
 
 | Grant verb | Operations |
 |---|---|
 | `read` | `HeadBucket`, `GetBucketLocation`, `ListBuckets` |
-| `read_objects` | `GetObject`, `HeadObject`, `GetObjectAttributes`, `GetObjectTagging`, `ListParts` |
+| `read_objects` | `GetObject`, `HeadObject`, `GetObjectAttributes`, `GetObjectTagging`, `GetObjectRetention`, `GetObjectLegalHold`, `ListParts` |
 | `list_objects` | `ListObjects`, `ListObjectsV2`, `ListObjectVersions`, `ListMultipartUploads` |
 | `write_objects` | `PutObject`, `PostObject`, `CopyObject`, `CreateMultipartUpload`, `UploadPart`, `UploadPartCopy`, `CompleteMultipartUpload`, `AbortMultipartUpload` |
 | `delete_objects` | `DeleteObject`, `DeleteObjects` (entries with no `versionId`) |
 | `delete_object_versions` | `DeleteObject` with a `versionId`, and each `DeleteObjects` entry carrying one |
 | `write_object_tags` | `PutObjectTagging`, `DeleteObjectTagging` |
 | `create_objects` | write a key that does **not** exist, implied by `write_objects`. Over S3: `PutObject` and `CompleteMultipartUpload` carrying `If-None-Match: *`, plus `CreateMultipartUpload`, `UploadPart`, `UploadPartCopy` and `AbortMultipartUpload`, which make nothing visible on their own — asked only when `write_objects` is denied, and only on a backend declared `conditional_create: native`. Over SFTP: every upload ([ADR-014](docs/adr/ADR-014-sftp-front.md)) |
+| `write_object_retention` | `PutObjectRetention`, and a `PutObject`, `PostObject`, `CopyObject` or `CreateMultipartUpload` carrying `x-amz-object-lock-mode` / `x-amz-object-lock-retain-until-date` |
+| `write_object_legal_hold` | `PutObjectLegalHold`, and a write carrying `x-amz-object-lock-legal-hold` |
 
 That covers ordinary object storage: get/put/head/delete, multipart upload, server-side
-copy, listing, and object tagging.
+copy, listing, object tagging, and per-object retention and legal holds.
 
-### Delegated (16)
+The two object-lock verbs are independent of `write_objects` in both directions: a grant
+of one confers neither of the others, and a write carrying inline lock headers is decided
+once more under the matching lock verb (a mode without a retain-until date, or the
+reverse, is refused). Both are writes, so `freeze_writes` covers them. The
+`x-amz-bypass-governance-retention` header stays refused in code, on `PutObjectRetention`
+as on deletes. Each request under either verb carries `requested_retention` (`mode`,
+`retain_until`, `retain_days`, `legal_hold`) in the policy input; `retain_days` is computed
+by s0 so a policy can cap a period without a clock, and s0 itself caps nothing
+([ADR-015](docs/adr/ADR-015-object-lock.md)). The vocabulary is published as
+[`docs/verbs.json`](docs/verbs.json) for a control plane to vendor.
+
+### Delegated (18)
 
 Bucket creation, deletion and bucket configuration cannot be answered by the storage backend alone:
 on a platform that owns its buckets through a control plane, a bucket is a declared
@@ -64,6 +77,12 @@ S3 endpoint and returns its answer; without it they are refused like any other.
 | Tags | `GetBucketTagging`, `PutBucketTagging`, `DeleteBucketTagging` |
 | Versioning | `GetBucketVersioning`, `PutBucketVersioning` |
 | Default encryption | `GetBucketEncryption`, `PutBucketEncryption`, `DeleteBucketEncryption` |
+| Object Lock configuration | `GetObjectLockConfiguration`, `PutObjectLockConfiguration` |
+
+A `CreateBucket` carrying `x-amz-bucket-object-lock-enabled` reaches the control backend
+with the flag in its typed input; whether a bucket may be created locked is the control
+backend's answer. A gateway older than 0.6.1 refuses to load a configuration listing the
+two lock-configuration operations, so a control plane renders them only for 0.6.1 or later.
 
 Whatever s0 forwards to the storage backend, s0 authorizes; **whatever it delegates, the
 control backend authorizes.** For these operations s0 authenticates the caller, resolves the
@@ -98,13 +117,13 @@ minute. The fetches are counted in `s0_bundle_on_demand_refresh_total{trigger,re
 the delegated requests in `s0_delegated_requests_total{operation,status_class}`. See [ADR-012](docs/adr/ADR-012-delegated-operations.md) and `control_backend` in
 [`docs/gateway.example.json`](docs/gateway.example.json).
 
-### Not supported (75)
+### Not supported (71)
 
 **Bucket lifecycle and configuration — 63 operations.** Every `*BucketAcl`, `*BucketPolicy`,
 `*BucketCors`, `*BucketEncryption`, `*BucketVersioning`, `*BucketLifecycle`,
 `*BucketReplication`, `*BucketNotification`, `*BucketTagging`, `*PublicAccessBlock`,
-`*BucketWebsite`, `*BucketLogging`, inventory/metrics/analytics/tiering configuration,
-plus `CreateBucket` and `DeleteBucket`.
+`*BucketWebsite`, `*BucketLogging`, `*ObjectLockConfiguration`,
+inventory/metrics/analytics/tiering configuration, plus `CreateBucket` and `DeleteBucket`.
 
 This is a deliberate scope boundary, not a gap: **s0 is a data-plane gateway.** A bucket
 created or destroyed through S3 has no record in whatever control plane owns the bucket,
@@ -113,15 +132,14 @@ with nothing upstream knowing. Those five verbs (`create_bucket`, `delete_bucket
 `read_bucket_config`, `write_bucket_config`, `write_object_acl`) are held in
 `NON_GATEWAY_VERBS` as a classification only — three tests hold that set disjoint from the
 grantable vocabulary, so flipping one of these operations to enforced does not quietly
-compile. The 16 operations of the section above are the exception, and only when a
+compile. The 18 operations of the section above are the exception, and only when a
 control backend answers them; without one they are in this list too.
 
-**Object-level operations outside the model — 10 operations.**
+**Object-level operations outside the model — 6 operations.**
 
 | Operation(s) | Why |
 |---|---|
 | `PutObjectAcl`, `GetObjectAcl` | Per-object ACLs are a second authorization system s0 would have to keep consistent with the bundle. Conferring an ACL is refused in code on every write path. |
-| `PutObjectRetention`, `GetObjectRetention`, `PutObjectLegalHold`, `GetObjectLegalHold`, `PutObjectLockConfiguration`, `GetObjectLockConfiguration` | Object Lock / WORM. The grant vocabulary has no verb that could authorize defeating retention, so `x-amz-bypass-governance-retention` is refused unconditionally. |
 | `RestoreObject` | Glacier-class restore; no verb, no backend parity. |
 | `SelectObjectContent` | Server-side SQL over object contents — the response is a projection s0 cannot authorize at object granularity. |
 | `GetObjectTorrent` | Legacy. |
@@ -165,8 +183,9 @@ table, so no pushed policy can enable them:
   - `DeleteObjects` **keys** — authorizes *each* key, and strips denied keys from the
     forward rather than failing or allowing the batch;
   - `PostObject` form-upload **key**.
-- **Request riders**: canned ACLs and `x-amz-grant-*` headers, inline `x-amz-tagging`, and
-  `x-amz-bypass-governance-retention` are read and enforced rather than riding through
+- **Request riders**: canned ACLs and `x-amz-grant-*` headers, inline `x-amz-tagging`,
+  inline `x-amz-object-lock-*` headers, and `x-amz-bypass-governance-retention` are read
+  and enforced rather than riding through
   unexamined. The answer is a **denial, never a silent strip** — a strip answers `200` to
   a request whose intent was not honoured.
 - **List scoping, AWS-shaped**: an **unbounded** `ListObjectsV2` — no prefix at all — is
@@ -529,7 +548,7 @@ S0_CAPTURE_REGENERATE=1 cargo test --test golden_capture   # re-record the captu
 | the policy is tested against the *emitted* input, never a hand-written one | every fixture in [`tests/data/captured_inputs/`](tests/data/captured_inputs) is recorded at `Enforcer::decide`, the single funnel every PDP question from either front passes through |
 | a renamed or dropped input field fails the build | `OpaInput` carries `deny_unknown_fields`; every capture must round-trip, and adding a field is a compile error until `OPA_INPUT_FIELDS` is updated ([`tests/fixture_drift.rs`](tests/fixture_drift.rs)) |
 | a policy cannot read a field the gateway never sends | every `input.<path>` in the shipped rego must resolve in a captured input — the exact failure that once left 35 rego tests green over a deny-all production |
-| every refused operation is refused over real HTTP | all 75 are driven as signed requests through the real `check`, table-driven off s3s's own route table ([`tests/gate_blackbox.rs`](tests/gate_blackbox.rs)) |
+| every refused operation is refused over real HTTP | all 71 are driven as signed requests through the real `check`, table-driven off s3s's own route table ([`tests/gate_blackbox.rs`](tests/gate_blackbox.rs)) |
 | the embedded engine cannot be licensed by an absent oracle | the parity gate **fails** rather than skips when `opa` is missing, and the oracle version is pinned to production's in CI, docker-compose and the test itself ([`tests/parity.rs`](tests/parity.rs)) |
 | cursors and cache keys survive a rebuild | `content_revision` / `scope_hash` are SHA-256, pinned by [`tests/golden_hash.rs`](tests/golden_hash.rs) — `DefaultHasher` is not stable across toolchains |
 | a configured secret cannot be printed | every plaintext credential is a `Secret<String>` whose `Debug` renders `Secret(<redacted>)`, with no `Display` and no `Serialize` ([`src/secret.rs`](src/secret.rs)) |
@@ -597,7 +616,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md). Security reports: [`SECURITY.md`](SECU
 ## License
 
 Business Source License 1.1 (`BUSL-1.1`), converting to Apache-2.0 on the change
-date (`2030-11-18`, four years after this release). See [`LICENSE`](LICENSE);
+date (`2030-11-20`, four years after this release). See [`LICENSE`](LICENSE);
 the future Apache text is in [`LICENSE-APACHE-2.0.txt`](LICENSE-APACHE-2.0.txt).
 
 Until that date, in short:

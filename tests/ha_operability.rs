@@ -122,6 +122,7 @@ fn record(id: &str) -> AuditRecord {
             requested_tags: None,
             acl_grants: vec![],
             bypass_governance: false,
+            requested_retention: None,
             request: RequestMeta::default(),
         },
         Decision::allow("grant matched"),

@@ -1,5 +1,5 @@
 {
-  "_comment": "Golden decision corpus for policy/gateway/authz.rego. Engine-agnostic: replayed through BOTH regorus (fast path) and OPA (sidecar) by the dual-engine parity gate, and the seed of the conformance corpus. `expect` asserts allow + obligations; obligations.allowed_prefixes is compared order-insensitively. NOTE (2026-08-08): there are no cases for create_bucket / delete_bucket / read_bucket_config / write_bucket_config / write_object_acl and there cannot be \u2014 each case's `input` is deserialized as a real OpaInput, so a verb outside the settled six does not parse. That is deliberate: it means the corpus cannot document a decision for an authority the gateway no longer brokers. NOTE (2026-08-09): an UNBOUNDED list (no `prefix`, or `\"prefix\": \"\"`) by a principal holding only prefix-scoped grants is a DENY, not a narrowing \u2014 AWS parity, and a filtered listing that does not say it is filtered reads as the whole bucket. The four list cases that pin the change are the two `-> DENIED (AWS parity...)` cases, the explicit-empty-prefix case, and `list whole-bucket grant -> no narrowing`, which is the positive control: bob's unbounded list still ALLOWS, so the deny is about the grant shape and not about the absent prefix. Narrowing itself is untouched and is pinned by the two `WIDER-but-overlapping` cases.",
+  "_comment": "Golden decision corpus for policy/gateway/authz.rego. Engine-agnostic: replayed through BOTH regorus (fast path) and OPA (sidecar) by the dual-engine parity gate, and the seed of the conformance corpus. `expect` asserts allow + obligations; obligations.allowed_prefixes is compared order-insensitively. NOTE (2026-08-08): there are no cases for create_bucket / delete_bucket / read_bucket_config / write_bucket_config / write_object_acl and there cannot be \u2014 each case's `input` is deserialized as a real OpaInput, so a verb outside the settled six does not parse. That is deliberate: it means the corpus cannot document a decision for an authority the gateway no longer brokers. NOTE (2026-08-09): an UNBOUNDED list (no `prefix`, or `\"prefix\": \"\"`) by a principal holding only prefix-scoped grants is a DENY, not a narrowing \u2014 AWS parity, and a filtered listing that does not say it is filtered reads as the whole bucket. The four list cases that pin the change are the two `-> DENIED (AWS parity...)` cases, the explicit-empty-prefix case, and `list whole-bucket grant -> no narrowing`, which is the positive control: bob's unbounded list still ALLOWS, so the deny is about the grant shape and not about the absent prefix. Narrowing itself is untouched and is pinned by the two `WIDER-but-overlapping` cases. NOTE (2026-11-20, ADR-015): write_object_retention and write_object_legal_hold are their own verbs. The cases named after them pin that neither is conferred by write_objects, by the other, or confers write_objects; that a wildcard action confers both; and that freeze_writes and the per-bucket denylist stop both. This module has no action-scoped deny grants, so the 'deny on write_objects implies both lock verbs' rule belongs to a pushed module that has them.",
   "bundles": {
     "default": {
       "org_settings": {
@@ -43,12 +43,25 @@
             "gina": {
               "groups": [],
               "attributes": []
+            },
+            "hank": {
+              "groups": [],
+              "attributes": []
+            },
+            "ivy": {
+              "groups": [],
+              "attributes": []
+            },
+            "jill": {
+              "groups": [],
+              "attributes": []
             }
           },
           "bucket_attributes": {
             "reports": {
               "denylist": {
-                "bob": true
+                "bob": true,
+                "jill": true
               },
               "sensitivity": "high"
             },
@@ -138,6 +151,37 @@
                 "bucket": "reports",
                 "actions": [
                   "delete_objects"
+                ],
+                "prefixes": []
+              }
+            ],
+            "hank": [
+              {
+                "bucket": "reports",
+                "actions": [
+                  "write_object_retention"
+                ],
+                "prefixes": [
+                  "2024/"
+                ]
+              }
+            ],
+            "ivy": [
+              {
+                "bucket": "reports",
+                "actions": [
+                  "write_object_legal_hold"
+                ],
+                "prefixes": []
+              }
+            ],
+            "jill": [
+              {
+                "bucket": "reports",
+                "actions": [
+                  "write_objects",
+                  "write_object_retention",
+                  "write_object_legal_hold"
                 ],
                 "prefixes": []
               }
@@ -303,7 +347,9 @@
                 "actions": [
                   "read_objects",
                   "write_objects",
-                  "delete_object_versions"
+                  "delete_object_versions",
+                  "write_object_retention",
+                  "write_object_legal_hold"
                 ],
                 "prefixes": []
               }
@@ -3431,6 +3477,488 @@
         "request": {
           "protocol": "s3",
           "method": "DELETE"
+        }
+      },
+      "expect": {
+        "allow": false,
+        "reason_contains": "frozen"
+      }
+    },
+    {
+      "name": "write_object_retention inside its prefix grant",
+      "bundle": "default",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "hank",
+          "type": "user",
+          "attributes": {
+            "groups": []
+          }
+        },
+        "backend": {
+          "id": "bay-1",
+          "kind": "ceph"
+        },
+        "tenant": "acme",
+        "organization_id": "org-acme",
+        "action": "write_object_retention",
+        "bucket": "reports",
+        "object": "2024/a.csv",
+        "request": {
+          "protocol": "s3",
+          "method": "PUT"
+        }
+      },
+      "expect": {
+        "allow": true,
+        "reason_contains": "grant matched"
+      }
+    },
+    {
+      "name": "write_object_retention respects prefix scope (outside)",
+      "bundle": "default",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "hank",
+          "type": "user",
+          "attributes": {
+            "groups": []
+          }
+        },
+        "backend": {
+          "id": "bay-1",
+          "kind": "ceph"
+        },
+        "tenant": "acme",
+        "organization_id": "org-acme",
+        "action": "write_object_retention",
+        "bucket": "reports",
+        "object": "2023/a.csv",
+        "request": {
+          "protocol": "s3",
+          "method": "PUT"
+        }
+      },
+      "expect": {
+        "allow": false,
+        "reason_contains": "no grant"
+      }
+    },
+    {
+      "name": "write_objects does not confer write_object_retention",
+      "bundle": "default",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "bob",
+          "type": "user",
+          "attributes": {
+            "groups": []
+          }
+        },
+        "backend": {
+          "id": "bay-1",
+          "kind": "ceph"
+        },
+        "tenant": "acme",
+        "organization_id": "org-acme",
+        "action": "write_object_retention",
+        "bucket": "public",
+        "object": "x.bin",
+        "request": {
+          "protocol": "s3",
+          "method": "PUT"
+        }
+      },
+      "expect": {
+        "allow": false,
+        "reason_contains": "no grant"
+      }
+    },
+    {
+      "name": "write_objects does not confer write_object_legal_hold",
+      "bundle": "default",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "bob",
+          "type": "user",
+          "attributes": {
+            "groups": []
+          }
+        },
+        "backend": {
+          "id": "bay-1",
+          "kind": "ceph"
+        },
+        "tenant": "acme",
+        "organization_id": "org-acme",
+        "action": "write_object_legal_hold",
+        "bucket": "public",
+        "object": "x.bin",
+        "request": {
+          "protocol": "s3",
+          "method": "PUT"
+        }
+      },
+      "expect": {
+        "allow": false,
+        "reason_contains": "no grant"
+      }
+    },
+    {
+      "name": "write_object_retention does not confer write_object_legal_hold",
+      "bundle": "default",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "hank",
+          "type": "user",
+          "attributes": {
+            "groups": []
+          }
+        },
+        "backend": {
+          "id": "bay-1",
+          "kind": "ceph"
+        },
+        "tenant": "acme",
+        "organization_id": "org-acme",
+        "action": "write_object_legal_hold",
+        "bucket": "reports",
+        "object": "2024/a.csv",
+        "request": {
+          "protocol": "s3",
+          "method": "PUT"
+        }
+      },
+      "expect": {
+        "allow": false,
+        "reason_contains": "no grant"
+      }
+    },
+    {
+      "name": "write_object_retention does not confer write_objects",
+      "bundle": "default",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "hank",
+          "type": "user",
+          "attributes": {
+            "groups": []
+          }
+        },
+        "backend": {
+          "id": "bay-1",
+          "kind": "ceph"
+        },
+        "tenant": "acme",
+        "organization_id": "org-acme",
+        "action": "write_objects",
+        "bucket": "reports",
+        "object": "2024/a.csv",
+        "request": {
+          "protocol": "s3",
+          "method": "PUT"
+        }
+      },
+      "expect": {
+        "allow": false,
+        "reason_contains": "no grant"
+      }
+    },
+    {
+      "name": "write_object_legal_hold inside its grant",
+      "bundle": "default",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "ivy",
+          "type": "user",
+          "attributes": {
+            "groups": []
+          }
+        },
+        "backend": {
+          "id": "bay-1",
+          "kind": "ceph"
+        },
+        "tenant": "acme",
+        "organization_id": "org-acme",
+        "action": "write_object_legal_hold",
+        "bucket": "reports",
+        "object": "any/key",
+        "request": {
+          "protocol": "s3",
+          "method": "PUT"
+        }
+      },
+      "expect": {
+        "allow": true,
+        "reason_contains": "grant matched"
+      }
+    },
+    {
+      "name": "write_object_legal_hold does not confer write_object_retention",
+      "bundle": "default",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "ivy",
+          "type": "user",
+          "attributes": {
+            "groups": []
+          }
+        },
+        "backend": {
+          "id": "bay-1",
+          "kind": "ceph"
+        },
+        "tenant": "acme",
+        "organization_id": "org-acme",
+        "action": "write_object_retention",
+        "bucket": "reports",
+        "object": "any/key",
+        "request": {
+          "protocol": "s3",
+          "method": "PUT"
+        }
+      },
+      "expect": {
+        "allow": false,
+        "reason_contains": "no grant"
+      }
+    },
+    {
+      "name": "write_object_legal_hold does not confer write_objects",
+      "bundle": "default",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "ivy",
+          "type": "user",
+          "attributes": {
+            "groups": []
+          }
+        },
+        "backend": {
+          "id": "bay-1",
+          "kind": "ceph"
+        },
+        "tenant": "acme",
+        "organization_id": "org-acme",
+        "action": "write_objects",
+        "bucket": "reports",
+        "object": "any/key",
+        "request": {
+          "protocol": "s3",
+          "method": "PUT"
+        }
+      },
+      "expect": {
+        "allow": false,
+        "reason_contains": "no grant"
+      }
+    },
+    {
+      "name": "a wildcard action grant confers write_object_retention",
+      "bundle": "default",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "carol",
+          "type": "user",
+          "attributes": {
+            "groups": [
+              "admins"
+            ]
+          }
+        },
+        "backend": {
+          "id": "bay-1",
+          "kind": "ceph"
+        },
+        "tenant": "acme",
+        "organization_id": "org-acme",
+        "action": "write_object_retention",
+        "bucket": "reports",
+        "object": "2024/a.csv",
+        "request": {
+          "protocol": "s3",
+          "method": "PUT"
+        }
+      },
+      "expect": {
+        "allow": true
+      }
+    },
+    {
+      "name": "a wildcard action grant confers write_object_legal_hold",
+      "bundle": "default",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "carol",
+          "type": "user",
+          "attributes": {
+            "groups": [
+              "admins"
+            ]
+          }
+        },
+        "backend": {
+          "id": "bay-1",
+          "kind": "ceph"
+        },
+        "tenant": "acme",
+        "organization_id": "org-acme",
+        "action": "write_object_legal_hold",
+        "bucket": "reports",
+        "object": "2024/a.csv",
+        "request": {
+          "protocol": "s3",
+          "method": "PUT"
+        }
+      },
+      "expect": {
+        "allow": true
+      }
+    },
+    {
+      "name": "the bucket denylist denies write_object_retention",
+      "bundle": "default",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "jill",
+          "type": "user",
+          "attributes": {
+            "groups": []
+          }
+        },
+        "backend": {
+          "id": "bay-1",
+          "kind": "ceph"
+        },
+        "tenant": "acme",
+        "organization_id": "org-acme",
+        "action": "write_object_retention",
+        "bucket": "reports",
+        "object": "2024/a.csv",
+        "request": {
+          "protocol": "s3",
+          "method": "PUT"
+        }
+      },
+      "expect": {
+        "allow": false,
+        "reason_contains": "denylist"
+      }
+    },
+    {
+      "name": "the bucket denylist denies write_object_legal_hold",
+      "bundle": "default",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "jill",
+          "type": "user",
+          "attributes": {
+            "groups": []
+          }
+        },
+        "backend": {
+          "id": "bay-1",
+          "kind": "ceph"
+        },
+        "tenant": "acme",
+        "organization_id": "org-acme",
+        "action": "write_object_legal_hold",
+        "bucket": "reports",
+        "object": "2024/a.csv",
+        "request": {
+          "protocol": "s3",
+          "method": "PUT"
+        }
+      },
+      "expect": {
+        "allow": false,
+        "reason_contains": "denylist"
+      }
+    },
+    {
+      "name": "freeze_writes stops write_object_retention",
+      "bundle": "frozen",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "bob",
+          "type": "user",
+          "attributes": {
+            "groups": []
+          }
+        },
+        "backend": {
+          "id": "bay-1",
+          "kind": "ceph"
+        },
+        "tenant": "acme",
+        "organization_id": "org-acme",
+        "action": "write_object_retention",
+        "bucket": "public",
+        "object": "x.bin",
+        "request": {
+          "protocol": "s3",
+          "method": "PUT"
+        }
+      },
+      "expect": {
+        "allow": false,
+        "reason_contains": "frozen"
+      }
+    },
+    {
+      "name": "freeze_writes stops write_object_legal_hold",
+      "bundle": "frozen",
+      "input": {
+        "acl_grants": [],
+        "bypass_governance": false,
+        "principal": {
+          "sub": "bob",
+          "type": "user",
+          "attributes": {
+            "groups": []
+          }
+        },
+        "backend": {
+          "id": "bay-1",
+          "kind": "ceph"
+        },
+        "tenant": "acme",
+        "organization_id": "org-acme",
+        "action": "write_object_legal_hold",
+        "bucket": "public",
+        "object": "x.bin",
+        "request": {
+          "protocol": "s3",
+          "method": "PUT"
         }
       },
       "expect": {

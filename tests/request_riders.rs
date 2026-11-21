@@ -882,3 +882,654 @@ async fn no_strip_obligation_exists_and_a_policy_emitting_one_denies() {
     .expect_err("a strip obligation must not deserialize");
     assert!(format!("{err}").contains("strip_request_fields"), "{err}");
 }
+
+// ── object lock (ADR-015): two verbs, inline riders, the bypass on retention ────
+
+/// alice with `write_objects` (and `read_objects`) on `2024/`, plus whatever lock verbs
+/// `lock` names.
+fn lock_bundle(lock: &[&str]) -> serde_json::Value {
+    let mut actions = vec!["read_objects", "write_objects"];
+    actions.extend_from_slice(lock);
+    serde_json::json!({
+        "org_settings": { "freeze_writes": false, "reserved_tag_keys": ["acme/*"] },
+        "tenants": { "acme": {
+            "user_attributes": { "alice": { "groups": [], "attributes": [] } },
+            "bucket_attributes": { "reports": { "denylist": {} } },
+            "s3_grants": { "alice": [
+                { "bucket": "reports", "actions": actions, "prefixes": ["2024/"] }
+            ] },
+            "group_grants": {}
+        }}
+    })
+}
+
+fn retain_until(days_from_now: i64) -> Timestamp {
+    let at = chrono::Utc::now() + chrono::Duration::days(days_from_now);
+    Timestamp::parse(
+        TimestampFormat::DateTime,
+        &at.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+    )
+    .expect("timestamp")
+}
+
+fn compliance() -> Option<ObjectLockMode> {
+    Some(ObjectLockMode::from_static(ObjectLockMode::COMPLIANCE))
+}
+
+fn hold_on() -> Option<ObjectLockLegalHoldStatus> {
+    Some(ObjectLockLegalHoldStatus::from_static(
+        ObjectLockLegalHoldStatus::ON,
+    ))
+}
+
+/// One write of each rider-carrying shape, with the given inline lock fields.
+async fn each_lock_carrying_write(
+    fx: &common::Fixture,
+    mode: Option<ObjectLockMode>,
+    until: Option<Timestamp>,
+    hold: Option<ObjectLockLegalHoldStatus>,
+) -> Vec<(&'static str, Result<(), s3s::S3Error>, bool)> {
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut out = Vec::new();
+
+    let mut req = fx.request(
+        "PutObject",
+        PutObjectInput {
+            bucket: "reports".into(),
+            key: "2024/x".into(),
+            object_lock_mode: mode.clone(),
+            object_lock_retain_until_date: until.clone(),
+            object_lock_legal_hold_status: hold.clone(),
+            ..Default::default()
+        },
+        Method::PUT,
+    );
+    let r = access.put_object(&mut req).await;
+    out.push(("PutObject", r, req.extensions.get::<AuthzProof>().is_some()));
+
+    let mut req = fx.request(
+        "PostObject",
+        PostObjectInput {
+            bucket: "reports".into(),
+            key: "2024/x".into(),
+            object_lock_mode: mode.clone(),
+            object_lock_retain_until_date: until.clone(),
+            object_lock_legal_hold_status: hold.clone(),
+            ..Default::default()
+        },
+        Method::POST,
+    );
+    let r = access.post_object(&mut req).await;
+    out.push((
+        "PostObject",
+        r,
+        req.extensions.get::<AuthzProof>().is_some(),
+    ));
+
+    let mut req = fx.request(
+        "CreateMultipartUpload",
+        CreateMultipartUploadInput {
+            bucket: "reports".into(),
+            key: "2024/x".into(),
+            object_lock_mode: mode.clone(),
+            object_lock_retain_until_date: until.clone(),
+            object_lock_legal_hold_status: hold.clone(),
+            ..Default::default()
+        },
+        Method::POST,
+    );
+    let r = access.create_multipart_upload(&mut req).await;
+    out.push((
+        "CreateMultipartUpload",
+        r,
+        req.extensions.get::<AuthzProof>().is_some(),
+    ));
+
+    let mut input = common::ops::copy_object_input();
+    input.object_lock_mode = mode;
+    input.object_lock_retain_until_date = until;
+    input.object_lock_legal_hold_status = hold;
+    let mut req = fx.request("CopyObject", input, Method::PUT);
+    let r = access.copy_object(&mut req).await;
+    out.push((
+        "CopyObject",
+        r,
+        req.extensions.get::<AuthzProof>().is_some(),
+    ));
+    out
+}
+
+#[tokio::test]
+async fn an_inline_retention_needs_write_object_retention_on_every_write_shape() {
+    // Without the rider, every write_objects holder could make an object undeletable for
+    // years in COMPLIANCE mode — the mirror image of the governance bypass.
+    let fx = common::fixture("riders-lock-retention-denied", lock_bundle(&[]));
+    for (op, result, proved) in
+        each_lock_carrying_write(&fx, compliance(), Some(retain_until(30)), None).await
+    {
+        let err = result.expect_err(op);
+        assert_eq!(*err.code(), S3ErrorCode::AccessDenied, "{op}");
+        assert!(!proved, "{op} minted a proof for a refused write");
+    }
+    let records = fx.await_audit_records(4).await;
+    assert_eq!(records.len(), 4, "one record per request: {records:#?}");
+    for rec in &records {
+        assert!(!rec.result.allow, "{rec:#?}");
+        assert!(
+            rec.result.reason.contains("write_object_retention"),
+            "{rec:#?}"
+        );
+        let input = rec.input.as_ref().expect("an input");
+        let asked = input
+            .requested_retention
+            .as_ref()
+            .expect("the retention asked for");
+        assert_eq!(asked.mode.as_deref(), Some("COMPLIANCE"));
+        assert!(asked.retain_until.is_some());
+        let days = asked.retain_days.expect("retain_days");
+        assert!((30..=31).contains(&days), "{days}");
+    }
+
+    // Positive control: the same four writes with the retention verb granted.
+    let fx = common::fixture(
+        "riders-lock-retention-ok",
+        lock_bundle(&["write_object_retention"]),
+    );
+    for (op, result, proved) in
+        each_lock_carrying_write(&fx, compliance(), Some(retain_until(30)), None).await
+    {
+        result.unwrap_or_else(|e| panic!("{op} with write_object_retention: {e}"));
+        assert!(proved, "{op}");
+    }
+}
+
+#[tokio::test]
+async fn an_inline_legal_hold_needs_the_legal_hold_verb_not_the_retention_one() {
+    let fx = common::fixture(
+        "riders-lock-hold-denied",
+        lock_bundle(&["write_object_retention"]),
+    );
+    for (op, result, _) in each_lock_carrying_write(&fx, None, None, hold_on()).await {
+        let err = result.expect_err(op);
+        assert_eq!(*err.code(), S3ErrorCode::AccessDenied, "{op}");
+        assert!(
+            format!("{err}").contains("write_object_legal_hold"),
+            "{op}: {err}"
+        );
+    }
+
+    let fx = common::fixture(
+        "riders-lock-hold-ok",
+        lock_bundle(&["write_object_legal_hold"]),
+    );
+    for (op, result, _) in each_lock_carrying_write(&fx, None, None, hold_on()).await {
+        result.unwrap_or_else(|e| panic!("{op} with write_object_legal_hold: {e}"));
+    }
+
+    // Both riders on one write take both decisions: the hold verb alone is not enough
+    // for a write that also sets a retention.
+    let fx = common::fixture(
+        "riders-lock-both",
+        lock_bundle(&["write_object_legal_hold"]),
+    );
+    for (op, result, _) in
+        each_lock_carrying_write(&fx, compliance(), Some(retain_until(1)), hold_on()).await
+    {
+        assert!(result.is_err(), "{op}");
+    }
+}
+
+#[tokio::test]
+async fn a_lock_rider_is_one_more_decision_and_still_one_audit_record() {
+    let fx = common::fixture(
+        "riders-lock-cost",
+        lock_bundle(&["write_object_retention", "write_object_legal_hold"]),
+    );
+    let access = GatewayAccess::new(fx.gw.clone());
+
+    // A plain write costs exactly one decision.
+    let mut req = fx.request(
+        "PutObject",
+        PutObjectInput {
+            bucket: "reports".into(),
+            key: "2024/plain".into(),
+            ..Default::default()
+        },
+        Method::PUT,
+    );
+    access.put_object(&mut req).await.expect("plain write");
+    assert_eq!(
+        fx.pdp_calls(),
+        1,
+        "a write without lock headers costs one decision"
+    );
+    drop(req);
+
+    // A write with both riders: the write, the retention, the hold.
+    let mut req = fx.request(
+        "PutObject",
+        PutObjectInput {
+            bucket: "reports".into(),
+            key: "2024/locked".into(),
+            object_lock_mode: compliance(),
+            object_lock_retain_until_date: Some(retain_until(10)),
+            object_lock_legal_hold_status: hold_on(),
+            ..Default::default()
+        },
+        Method::PUT,
+    );
+    access.put_object(&mut req).await.expect("locked write");
+    assert_eq!(fx.pdp_calls(), 4);
+    drop(req);
+
+    let records = fx.await_audit_records(2).await;
+    assert_eq!(records.len(), 2, "one record per request: {records:#?}");
+    let locked = records
+        .iter()
+        .find(|r| r.input.as_ref().and_then(|i| i.object.as_deref()) == Some("2024/locked"))
+        .expect("the locked write's record");
+    let input = locked.input.as_ref().expect("input");
+    assert_eq!(
+        input.action,
+        s0::model::Action::WriteObjects,
+        "the record is against the primary input"
+    );
+    let asked = input
+        .requested_retention
+        .as_ref()
+        .expect("requested_retention");
+    assert_eq!(asked.legal_hold.as_deref(), Some("ON"));
+    let plain = records
+        .iter()
+        .find(|r| r.input.as_ref().and_then(|i| i.object.as_deref()) == Some("2024/plain"))
+        .expect("the plain write's record");
+    assert!(
+        plain
+            .input
+            .as_ref()
+            .expect("input")
+            .requested_retention
+            .is_none(),
+        "a write without a lock field carries no requested_retention"
+    );
+}
+
+#[tokio::test]
+async fn a_half_specified_inline_retention_is_refused_before_any_decision() {
+    let fx = common::fixture(
+        "riders-lock-malformed",
+        lock_bundle(&["write_object_retention", "write_object_legal_hold"]),
+    );
+    for (mode, until) in [
+        (compliance(), None),
+        (None, Some(retain_until(5))),
+        (
+            Some(ObjectLockMode::from_static("FOREVER")),
+            Some(retain_until(5)),
+        ),
+    ] {
+        for (op, result, proved) in each_lock_carrying_write(&fx, mode.clone(), until, None).await {
+            assert!(result.is_err(), "{op} {mode:?}");
+            assert!(!proved, "{op}");
+        }
+    }
+    assert_eq!(
+        fx.pdp_calls(),
+        0,
+        "a parser differential is refused in code"
+    );
+}
+
+fn put_retention(mode: &'static str, days: i64) -> PutObjectRetentionInput {
+    PutObjectRetentionInput {
+        bucket: "reports".into(),
+        key: "2024/x".into(),
+        retention: Some(ObjectLockRetention {
+            mode: Some(ObjectLockRetentionMode::from_static(mode)),
+            retain_until_date: Some(retain_until(days)),
+        }),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn put_object_retention_input_carries_requested_retention() {
+    let fx = common::fixture(
+        "riders-retention-input",
+        lock_bundle(&["write_object_retention"]),
+    );
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request(
+        "PutObjectRetention",
+        put_retention(ObjectLockRetentionMode::GOVERNANCE, 3650),
+        Method::PUT,
+    );
+    access
+        .put_object_retention(&mut req)
+        .await
+        .expect("granted");
+    assert_eq!(
+        fx.pdp_calls(),
+        1,
+        "the primary decision IS the retention one"
+    );
+    drop(req);
+    let records = fx.await_audit_records(1).await;
+    let input = records[0].input.as_ref().expect("input");
+    assert_eq!(input.action, s0::model::Action::WriteObjectRetention);
+    let asked = input
+        .requested_retention
+        .as_ref()
+        .expect("requested_retention");
+    assert_eq!(asked.mode.as_deref(), Some("GOVERNANCE"));
+    assert!(
+        asked
+            .retain_until
+            .as_deref()
+            .is_some_and(|d| d.ends_with('Z'))
+    );
+    let days = asked.retain_days.expect("retain_days");
+    assert!((3650..=3651).contains(&days), "{days}");
+    assert_eq!(asked.legal_hold, None);
+}
+
+#[tokio::test]
+async fn put_object_legal_hold_input_carries_the_legal_hold_only() {
+    let fx = common::fixture(
+        "riders-hold-input",
+        lock_bundle(&["write_object_legal_hold"]),
+    );
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request(
+        "PutObjectLegalHold",
+        common::ops::put_object_legal_hold_input(),
+        Method::PUT,
+    );
+    access
+        .put_object_legal_hold(&mut req)
+        .await
+        .expect("granted");
+    drop(req);
+    let records = fx.await_audit_records(1).await;
+    let input = records[0].input.as_ref().expect("input");
+    assert_eq!(input.action, s0::model::Action::WriteObjectLegalHold);
+    assert_eq!(
+        input.requested_retention,
+        Some(s0::authz::RequestedRetention {
+            legal_hold: Some("ON".into()),
+            ..Default::default()
+        })
+    );
+
+    // A hold with no status is refused: its direction is unknowable.
+    let fx = common::fixture(
+        "riders-hold-no-status",
+        lock_bundle(&["write_object_legal_hold"]),
+    );
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut input = common::ops::put_object_legal_hold_input();
+    input.legal_hold = Some(ObjectLockLegalHold { status: None });
+    let mut req = fx.request("PutObjectLegalHold", input, Method::PUT);
+    assert!(access.put_object_legal_hold(&mut req).await.is_err());
+    assert!(req.extensions.get::<AuthzProof>().is_none());
+}
+
+#[tokio::test]
+async fn the_lock_verbs_and_write_objects_confer_nothing_on_each_other() {
+    // write_objects alone: neither lock operation.
+    let fx = common::fixture("riders-lock-independent", lock_bundle(&[]));
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request(
+        "PutObjectRetention",
+        put_retention(ObjectLockRetentionMode::GOVERNANCE, 1),
+        Method::PUT,
+    );
+    assert!(access.put_object_retention(&mut req).await.is_err());
+    let mut req = fx.request(
+        "PutObjectLegalHold",
+        common::ops::put_object_legal_hold_input(),
+        Method::PUT,
+    );
+    assert!(access.put_object_legal_hold(&mut req).await.is_err());
+
+    // Each lock verb alone: not the other one, and not a data write.
+    let only = |verb: &str| {
+        serde_json::json!({
+            "org_settings": { "freeze_writes": false, "reserved_tag_keys": ["acme/*"] },
+            "tenants": { "acme": {
+                "user_attributes": { "alice": { "groups": [], "attributes": [] } },
+                "bucket_attributes": { "reports": { "denylist": {} } },
+                "s3_grants": { "alice": [
+                    { "bucket": "reports", "actions": [verb], "prefixes": ["2024/"] }
+                ] },
+                "group_grants": {}
+            }}
+        })
+    };
+    let fx = common::fixture("riders-lock-only-retention", only("write_object_retention"));
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request(
+        "PutObjectRetention",
+        put_retention(ObjectLockRetentionMode::COMPLIANCE, 1),
+        Method::PUT,
+    );
+    access
+        .put_object_retention(&mut req)
+        .await
+        .expect("the retention verb sets retention");
+    let mut req = fx.request(
+        "PutObjectLegalHold",
+        common::ops::put_object_legal_hold_input(),
+        Method::PUT,
+    );
+    assert!(access.put_object_legal_hold(&mut req).await.is_err());
+    let mut req = fx.request(
+        "PutObject",
+        PutObjectInput {
+            bucket: "reports".into(),
+            key: "2024/x".into(),
+            ..Default::default()
+        },
+        Method::PUT,
+    );
+    assert!(
+        access.put_object(&mut req).await.is_err(),
+        "the retention verb writes no data"
+    );
+
+    let fx = common::fixture("riders-lock-only-hold", only("write_object_legal_hold"));
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request(
+        "PutObjectLegalHold",
+        common::ops::put_object_legal_hold_input(),
+        Method::PUT,
+    );
+    access
+        .put_object_legal_hold(&mut req)
+        .await
+        .expect("the hold verb places a hold");
+    let mut req = fx.request(
+        "PutObjectRetention",
+        put_retention(ObjectLockRetentionMode::GOVERNANCE, 1),
+        Method::PUT,
+    );
+    assert!(access.put_object_retention(&mut req).await.is_err());
+
+    // Reading retention and holds is read_objects.
+    let fx = common::fixture("riders-lock-reads", lock_bundle(&[]));
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request(
+        "GetObjectRetention",
+        GetObjectRetentionInput {
+            bucket: "reports".into(),
+            key: "2024/x".into(),
+            ..Default::default()
+        },
+        Method::GET,
+    );
+    access.get_object_retention(&mut req).await.expect("read");
+    let mut req = fx.request(
+        "GetObjectLegalHold",
+        GetObjectLegalHoldInput {
+            bucket: "reports".into(),
+            key: "2024/x".into(),
+            ..Default::default()
+        },
+        Method::GET,
+    );
+    access.get_object_legal_hold(&mut req).await.expect("read");
+}
+
+#[tokio::test]
+async fn put_object_retention_with_the_governance_bypass_is_refused_in_code() {
+    // The bypass is how a GOVERNANCE retention is shortened or lifted. The retention
+    // verb does not express it, and a wildcard grant cannot buy it.
+    for bundle in [lock_bundle(&["write_object_retention"]), wildcard_bundle()] {
+        let fx = common::fixture("riders-retention-bypass", bundle);
+        let access = GatewayAccess::new(fx.gw.clone());
+        let mut input = put_retention(ObjectLockRetentionMode::GOVERNANCE, 1);
+        input.bypass_governance_retention = Some(true);
+        let mut req = fx.request("PutObjectRetention", input, Method::PUT);
+        let err = access
+            .put_object_retention(&mut req)
+            .await
+            .expect_err("a governance bypass must never reach the backend");
+        assert_eq!(*err.code(), S3ErrorCode::AccessDenied);
+        assert!(req.extensions.get::<AuthzProof>().is_none());
+        assert_eq!(fx.pdp_calls(), 0, "refused in code, before any decision");
+        let rec = sole_refusal(&fx).await;
+        assert!(
+            rec.result.reason.contains("bypass-governance-retention"),
+            "{rec:#?}"
+        );
+        let input = rec.input.expect("an input");
+        assert!(input.bypass_governance, "the attempt is on the record");
+        assert!(input.requested_retention.is_some());
+    }
+
+    // Positive control: the wildcard grant sets a retention without the header.
+    let fx = common::fixture("riders-retention-wildcard", wildcard_bundle());
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request(
+        "PutObjectRetention",
+        put_retention(ObjectLockRetentionMode::COMPLIANCE, 1),
+        Method::PUT,
+    );
+    access
+        .put_object_retention(&mut req)
+        .await
+        .expect("\"*\" confers write_object_retention (ADR-015 D5)");
+}
+
+#[tokio::test]
+async fn freeze_writes_stops_both_lock_verbs() {
+    let mut bundle = lock_bundle(&["write_object_retention", "write_object_legal_hold"]);
+    bundle["org_settings"]["freeze_writes"] = serde_json::json!(true);
+    let fx = common::fixture("riders-lock-frozen", bundle);
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request(
+        "PutObjectRetention",
+        put_retention(ObjectLockRetentionMode::GOVERNANCE, 1),
+        Method::PUT,
+    );
+    assert!(access.put_object_retention(&mut req).await.is_err());
+    let mut req = fx.request(
+        "PutObjectLegalHold",
+        common::ops::put_object_legal_hold_input(),
+        Method::PUT,
+    );
+    assert!(access.put_object_legal_hold(&mut req).await.is_err());
+}
+
+/// alice with `create_objects` (and `read_objects`) on `2024/` — no `write_objects` —
+/// plus whatever lock verbs `lock` names, on a backend declared `conditional_create:
+/// native`, so an `If-None-Match: *` write is decided by the create-only fallback.
+fn create_only_lock_fixture(tag: &str, lock: &[&str]) -> common::Fixture {
+    let mut bundle = lock_bundle(lock);
+    bundle["tenants"]["acme"]["s3_grants"]["alice"][0]["actions"][1] =
+        serde_json::json!("create_objects");
+    common::fixture_with_config(tag, bundle, "http://127.0.0.1:1", |c| {
+        c["backends"][0]["conditional_create"] = serde_json::json!("native");
+    })
+}
+
+fn create_put(key: &str, conditional: bool) -> PutObjectInput {
+    PutObjectInput {
+        bucket: "reports".into(),
+        key: key.into(),
+        if_none_match: conditional.then_some(ETagCondition::Any),
+        object_lock_mode: compliance(),
+        object_lock_retain_until_date: Some(retain_until(30)),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn a_create_only_write_still_takes_its_lock_riders() {
+    // `create_objects` (ADR-014 F1) is only the fallback for the PRIMARY decision; the
+    // lock riders are decided before it, against their own verbs, whichever verb ends up
+    // deciding the write. A drop-box key must not stamp a COMPLIANCE retention it was
+    // never granted.
+    let fx = create_only_lock_fixture("riders-lock-create-denied", &[]);
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request("PutObject", create_put("2024/a", true), Method::PUT);
+    let err = access
+        .put_object(&mut req)
+        .await
+        .expect_err("a create-only write with a retention needs write_object_retention");
+    assert_eq!(*err.code(), S3ErrorCode::AccessDenied);
+    assert!(format!("{err}").contains("write_object_retention"), "{err}");
+    assert!(req.extensions.get::<AuthzProof>().is_none());
+    let mut req = fx.request(
+        "CreateMultipartUpload",
+        CreateMultipartUploadInput {
+            bucket: "reports".into(),
+            key: "2024/b".into(),
+            object_lock_legal_hold_status: hold_on(),
+            ..Default::default()
+        },
+        Method::POST,
+    );
+    let err = access
+        .create_multipart_upload(&mut req)
+        .await
+        .expect_err("a create-only upload with a hold needs write_object_legal_hold");
+    assert!(
+        format!("{err}").contains("write_object_legal_hold"),
+        "{err}"
+    );
+    assert!(req.extensions.get::<AuthzProof>().is_none());
+
+    // Positive control: the retention verb granted, the conditional write is allowed and
+    // recorded under create_objects, carrying the retention it asked for.
+    let fx = create_only_lock_fixture("riders-lock-create-ok", &["write_object_retention"]);
+    let access = GatewayAccess::new(fx.gw.clone());
+    let mut req = fx.request("PutObject", create_put("2024/c", true), Method::PUT);
+    access
+        .put_object(&mut req)
+        .await
+        .expect("create_objects + write_object_retention");
+    assert!(req.extensions.get::<AuthzProof>().is_some());
+    // The write, the retention rider, then the create-only fallback.
+    assert_eq!(fx.pdp_calls(), 3);
+    drop(req);
+    let records = fx.await_audit_records(1).await;
+    let input = records
+        .last()
+        .and_then(|r| r.input.as_ref())
+        .expect("the write's record");
+    assert_eq!(input.action, s0::model::Action::CreateObjects);
+    assert_eq!(
+        input
+            .requested_retention
+            .as_ref()
+            .and_then(|r| r.mode.as_deref()),
+        Some("COMPLIANCE")
+    );
+
+    // The same write without If-None-Match may overwrite: write_objects, still denied,
+    // even though the rider's own verb is held.
+    let mut req = fx.request("PutObject", create_put("2024/d", false), Method::PUT);
+    assert!(access.put_object(&mut req).await.is_err());
+    assert!(req.extensions.get::<AuthzProof>().is_none());
+}
