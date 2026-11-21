@@ -1,9 +1,12 @@
 # ADR-015: Object Lock — delegated configuration, two verbs for retention and legal hold
 
-- **Status**: Draft — amends ADR-006 (the closed verb set), ADR-008 (the object-lock residual is
-  closed; Decision 3 is kept), ADR-012 (the delegable set grows from sixteen to eighteen) and
-  ADR-013 (D5 applies to the new verb); targets release 0.6.1
-- **Date**: 2026-11-20 (revised the same day after the platform's second red-team round)
+- **Status**: Accepted — implemented in 0.6.1 (`src/model.rs`, `src/access/optable.rs`,
+  `src/access/headers.rs`, `src/access/mod.rs`, `src/authz/input.rs`, `src/proxy/mod.rs`,
+  `policy/gateway/authz.rego`, `docs/verbs.json`); amends ADR-006 (the closed verb set),
+  ADR-008 (the object-lock residual is closed; Decision 3 is kept), ADR-012 (the delegable set
+  grows from sixteen to eighteen) and ADR-013 (D5 applies to the new verbs)
+- **Date**: 2026-11-20 (revised the same day after the platform's second red-team round;
+  accepted with the implementation the same day)
 - **Owners**: gateway team (this repo); the projection that emits the new verb and the control
   backend that answers the delegated operations are the control plane of the platform that deploys
   s0
@@ -171,7 +174,7 @@ worked before.
   `write_actions` and the platform's projection, permission catalog and pushed rego.
 - **Counts.** Twenty-eight operations are enforced and seventy-one are not. Eighteen are delegable.
 - **Tests that change:**
-  - `tests/op_coverage.rs`: counts, the delegable list, eight verbs, and the inverted object-lock
+  - `tests/op_coverage.rs`: counts, the delegable list, ten verbs, and the inverted object-lock
     residual.
   - `tests/gate_invariants.rs`: hooks and arms.
   - `tests/delegation.rs`: eighteen calls, plus the `CreateBucket` lock-field test.
@@ -195,6 +198,30 @@ worked before.
     The control plane must refuse it (the reference platform's operator does).
 - **Release.** This ships as 0.6.1, by the deploying platform's decision. It is a contract change
   at feature level, released in a patch number.
+
+## Implementation notes
+
+Settled while implementing, without changing a decision above:
+
+- **Wire values.** `requested_retention.mode` is `GOVERNANCE` or `COMPLIANCE`,
+  `legal_hold` is `ON` or `OFF`, as S3 spells them; `retain_until` is RFC 3339 in UTC with
+  millisecond precision. A mode or hold state outside those lists is refused before any
+  decision, like a half-specified retention: the backend could read it differently.
+- **No double decision.** A rider whose verb is the primary decision's is not asked again:
+  `PutObjectRetention` takes one decision under `write_object_retention`, not two.
+- **Empty bodies.** A `PutObjectRetention` whose `Retention` names neither a mode nor a date
+  carries `requested_retention: {}` (no `retain_days`, so a module that denies on a missing
+  period denies it). A `PutObjectLegalHold` naming no status is refused: the gateway cannot
+  see which direction the hold moves.
+- **The deny implication lives in the pushed module.** The compiled-in default module has
+  no action-scoped deny grants, only the per-bucket denylist, which already covers every
+  verb (the corpus pins it for both lock verbs). "A deny on `write_objects` also denies both
+  verbs" (D2) is therefore a rule for a deploying platform's pushed module, which has deny
+  grants; the default module's header states it.
+- **Captured inputs.** The golden-capture probe for `PutObjectRetention` sends an empty
+  `Retention`, because `retain_days` counts from the request time and a dated probe would
+  record a different input every day. The dated shape is pinned in
+  `tests/request_riders.rs`.
 
 ## Alternatives considered
 

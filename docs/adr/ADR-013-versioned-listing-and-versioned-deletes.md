@@ -1,6 +1,6 @@
 # ADR-013: Versioned listing and the versioned-delete verb
 
-- **Status**: Proposed — amends ADR-002 (the decision record), ADR-004 (D6.4) and ADR-006 (the closed verb set); implemented
+- **Status**: Proposed — amends ADR-002 (the decision record), ADR-004 (D6.4) and ADR-006 (the closed verb set); amended by ADR-015 (D5's wildcard rule applies to the two lock verbs); implemented
   (`src/access/optable.rs`, `src/access/mod.rs`, `src/proxy/mod.rs`, `src/proxy/obligations.rs`,
   `src/audit/record.rs`, `policy/gateway/authz.rego`)
 - **Date**: 2026-11-04
